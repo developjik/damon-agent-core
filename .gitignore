@@ -1,0 +1,18 @@
+# secrets — never commit
+.env
+.env.*
+!.env.example
+
+# node
+node_modules/
+dist/
+*.log
+
+# python
+__pycache__/
+.venv/
+
+# os / editor
+.DS_Store
+.idea/
+.vscode/
