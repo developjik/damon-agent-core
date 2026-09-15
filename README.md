@@ -1,4 +1,4 @@
-# Damon
+# Damon agent core
 
 daemon의 말장난이자 실제 아키텍처. 내 맥에서 항상 떠 있는, 내 전용 멀티 프로바이더 에이전트 코어.
 
