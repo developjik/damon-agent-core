@@ -124,7 +124,7 @@ Each channel chat maps to its own daemon session; replies stream in; tool-permis
 
 - **Tailscale** (recommended): attach to `ws://<tailscale-ip>:9470/ws` — WireGuard E2E, zero daemon config.
 - **Direct TLS**: set `tls_cert`/`tls_key` to serve `wss`. Non-loopback binds refuse to start without `auth_token`.
-- **Self-hosted relay**: run `damon-relay` on a public host, add `[relay]` to the daemon config — the daemon dials out, so no inbound port is needed. Clients connect with `damon --relay ws://relay:8080 --relay-name <name> --token <auth_token>`. X25519 key exchange + `sha256(auth_token ‖ pubkey)` proof → AES-256-GCM; the relay never sees plaintext.
+- **Self-hosted relay**: run `damon-relay` on a public host (set `DAMON_RELAY_SECRET` to require it on `/register`, preventing name squatting — the daemon presents it via `[relay] secret = "env:RELAY_SECRET"`), add `[relay]` to the daemon config — the daemon dials out, so no inbound port is needed. Clients connect with `damon --relay ws://relay:8080 --relay-name <name> --token <auth_token>`. X25519 key exchange + `sha256(auth_token ‖ pubkey)` proof → AES-256-GCM; the relay never sees plaintext.
 
 ## Performance
 
