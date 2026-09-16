@@ -1,130 +1,154 @@
-# Damon 연동 가이드
+# Damon Integration Guide
 
-`damond`는 로컬 에이전트 데몬이다. 어떤 프로그램이든 두 가지 표면으로 붙는다:
+**English** | [한국어](integration.ko.md)
 
-| 표면 | 용도 |
+`damond` is a local agent daemon. Any program attaches through two surfaces:
+
+| Surface | Purpose |
 |---|---|
-| `GET /health` | 헬스체크 |
-| `POST /v1/chat/completions`, `GET /v1/models` | OpenAI 호환 패스스루 (기존 클라이언트 드롭인) |
-| `GET /ws` | ACP형 JSON-RPC over WebSocket — 에이전트 런타임 (세션, tool loop, 권한) |
+| `GET /health` | Health check |
+| `POST /v1/chat/completions`, `GET /v1/models` | OpenAI-compatible passthrough (drop-in for existing clients) |
+| `GET /ws` | ACP-style JSON-RPC over WebSocket — agent runtime (sessions, tool loop, permissions) |
 
+## Providers
 
-## 프로바이더
+`api` selects the wire transport:
 
-`api`로 wire transport 선택:
-
-| api | 대상 | 비고 |
+| api | Target | Notes |
 |---|---|---|
-| `openai-completions` | OpenAI, Groq, OpenRouter, DeepSeek, vLLM, Ollama 등 | 기본. `/chat/completions` 패스스루 + compat 셰이핑 |
-| `openai-responses` | o-series, GPT-5, Codex, xAI | `/responses` — 요청/응답 번역 |
-| `anthropic-messages` | Claude | `/v1/messages` 번역 |
-| `gemini` | Gemini | `generateContent` 번역 |
+| `openai-completions` | OpenAI, Groq, OpenRouter, DeepSeek, vLLM, Ollama, … | Default. `/chat/completions` passthrough + compat shaping |
+| `openai-responses` | o-series, GPT-5, Codex, xAI | `/responses` — request/response translation |
+| `anthropic-messages` | Claude | `/v1/messages` translation |
+| `gemini` | Gemini | `generateContent` translation |
 
-모델 라우팅: `model` 필드가 `provider/model` 접두사 → config `models` glob → default 순으로 해석.
-`/v1/chat/completions`는 어느 프로바이더든 OpenAI 스키마로 응답한다 — 클라이언트는 번역을 신경 쓸 필요 없음.
+Model routing: the `model` field resolves by `provider/model` prefix →
+config `models` glob → default, in that order. `/v1/chat/completions`
+always answers in the OpenAI schema regardless of provider — clients never
+care about translation.
 
-### compat 플래그
+### compat flags
 
-엔드포인트가 표준에서 벗어날 때 `[providers.X.compat]`로 조정:
+When an endpoint deviates from the standard, tune `[providers.X.compat]`:
 
-| 플래그 | 효과 |
+| Flag | Effect |
 |---|---|
-| `supports_store` | `store: false` 전송 |
-| `supports_developer_role` | `system` → `developer` 역할 변환 |
-| `supports_multiple_system_messages` | `false`면 연속 system 메시지 병합 |
-| `max_tokens_field` | `"max_completion_tokens"` 등 필드명 변경 |
-| `requires_tool_result_name` | tool 결과에 `name` 필드 주입 (Mistral) |
-| `requires_mistral_tool_ids` | tool_call id를 9자 영숫자로 정규화 (Mistral) |
-| `supports_usage_in_streaming` | `stream_options.include_usage` 전송 여부 |
-| `extra_body` | 모든 요청에 병합할 최상위 필드 |
+| `supports_store` | Sends `store: false` |
+| `supports_developer_role` | Converts `system` → `developer` role |
+| `supports_multiple_system_messages` | `false` merges consecutive system messages |
+| `max_tokens_field` | Renames the field, e.g. `"max_completion_tokens"` |
+| `requires_tool_result_name` | Injects `name` into tool results (Mistral) |
+| `requires_mistral_tool_ids` | Normalizes tool_call ids to 9-char alphanumeric (Mistral) |
+| `supports_usage_in_streaming` | Whether to send `stream_options.include_usage` |
+| `extra_body` | Top-level fields merged into every request |
 
-`[providers.X.headers]`로 커스텀 헤더도 추가 가능.
+Custom headers can be added via `[providers.X.headers]`.
 
-### 시크릿
+### Secrets
 
-`api_key`와 `headers` 값은 세 가지 참조를 받는다 (리터럴 금지):
+`api_key` and header values accept three reference forms (literals are rejected):
 
-| 형식 | 예시 |
+| Form | Example |
 |---|---|
 | `env:VAR` | `env:OPENAI_API_KEY` |
 | `keychain:svc/acct` | `keychain:damon/openai` |
-| `!cmd` | `"!op read op://dev/openai"` — stdout, 10s 타임아웃 |
+| `!cmd` | `"!op read op://dev/openai"` — stdout, 10s timeout |
 
-`.env` 파일은 config 디렉터리 → cwd 순으로 로드된다 (이미 설정된 env는 덮지 않음).
+`.env` files load from the config dir first, then cwd (already-set env wins).
 
-### 모델 디스커버리
+### Model discovery
 
-`discovery = "openai-models-list"` → `GET {base}/models`, `"ollama"` → `GET {base}/api/tags`.
-발견된 모델 id는 `models` glob 없이도 라우팅된다 — `model: "local-model-7b"` 요청이
-발견한 provider로 간다. `[providers.ollama]`가 없으면 `$OLLAMA_HOST`(기본
-`http://127.0.0.1:11434`)를 자동 프로브한다. `/v1/models`는 발견된 모델을
-`provider/id` 형태로 병합해서 반환.
+`discovery = "openai-models-list"` → `GET {base}/models`; `"ollama"` →
+`GET {base}/api/tags`. Discovered model ids route without a `models` glob —
+a request for `model: "local-model-7b"` goes to the provider that
+discovered it. If `[providers.ollama]` is absent, damond probes
+`$OLLAMA_HOST` (default `http://127.0.0.1:11434`) automatically.
+`/v1/models` merges discovered ids as `provider/id`.
 
-### 컨텍스트 프로모션
+### Context promotion
 
-`context_promotion_target = "model-id"` (같은 provider) 또는 `"provider/model-id"`.
-컨텍스트 오버플로 에러(`context_length_exceeded` 등)가 오면 타겟 모델로 1회 재시도.
-스트리밍/비스트리밍, 패스스루/번역 경로 모두에서 동작.
+`context_promotion_target = "model-id"` (same provider) or
+`"provider/model-id"`. On a context-overflow error
+(`context_length_exceeded`, …) the request retries once against the
+target model. Works on streaming/non-streaming and passthrough/translated
+paths alike.
 
-### 인밴드 툴 (로컬 모델)
+### In-band tools (local models)
 
-`compat.inband_tools = true` — 툴 API가 없는 모델용. `tools`를 시스템 프롬프트에
-렌더링하고, 응답 텍스트의 `<tool_call>{...}</tool_call>` 블록을 파싱해서
-`tool_calls`로 변환한다. 스트리밍은 전체 버퍼링 후 이벤트 재방출.
+`compat.inband_tools = true` — for models without a native tool API.
+`tools` are rendered into the system prompt and `<tool_call>{...}</tool_call>`
+blocks in the response text are parsed into `tool_calls`. Streaming buffers
+the full response, then re-emits events.
 
-### Thinking 레벨
+### Thinking levels
 
-모델명에 `:low` / `:medium` / `:high` 접미사 → provider별 매핑:
-OpenAI `reasoning_effort`, Anthropic `thinking.budget_tokens`(1024/8192/32768),
-Gemini `thinkingConfig.thinkingBudget`, Responses `reasoning.effort`.
+A `:low` / `:medium` / `:high` suffix on the model name maps to each
+provider's control: OpenAI `reasoning_effort`, Anthropic
+`thinking.budget_tokens` (1024/8192/32768), Gemini
+`thinkingConfig.thinkingBudget`, Responses `reasoning.effort`.
 
-### 프롬프트 캐싱 (Anthropic)
+### Prompt caching (Anthropic)
 
-`anthropic-messages`는 system 블록과 마지막 메시지의 마지막 content 블록에
-`cache_control: ephemeral`을 자동으로 붙인다. 장기 세션에서 입력 토큰 비용 절감.
+`anthropic-messages` automatically attaches `cache_control: ephemeral` to
+the system block and the last content block of the last message — cuts
+input-token cost on long sessions.
 
-### 컨텍스트 컴팩션
+### Context compaction
 
-세션의 추정 토큰(~4자/토큰)이 모델 `context_window`의 85%를 넘으면,
-가장 오래된 절반을 provider로 요약하고 `compacted_through`를 기록한다.
-이후 `messages()`는 요약 + 나머지를 반환. 요약 실패 시 truncation fallback.
+When a session's estimated tokens (~4 chars/token) exceed 85% of the
+model's `context_window`, the oldest half is summarized by the provider
+and `compacted_through` is recorded. `messages()` then returns the summary
+plus the remainder. Summarization failure falls back to truncation.
 
-## 인증
+## Authentication
 
+Required only when `auth_token` is configured. `/v1` takes
+`Authorization: Bearer <token>`; `/ws` takes the same header or a
+`?token=<token>` query. Unset → open on localhost.
 
-`auth_token`이 설정된 경우에만 필요. `/v1`은 `Authorization: Bearer <token>`,
-`/ws`는 같은 헤더 또는 `?token=<token>` 쿼리. 미설정 시 localhost 오픈.
+## WS protocol (JSON-RPC 2.0)
 
-## WS 프로토콜 (JSON-RPC 2.0)
-
-클라이언트 → 데몬 요청:
+Client → daemon requests:
 
 - `initialize` → `{protocolVersion, agentCapabilities, agentInfo}`
 - `session/new {cwd}` → `{sessionId}`
 - `session/list {}` → `{sessions: [{sessionId, createdAt}]}`
-- `session/prompt {sessionId, prompt: [{type:"text", text}]}` → `{stopReason}` — 응답은 턴 종료 시 도착
-- `session/cancel {sessionId}` — notification (응답 없음)
+- `session/resume {sessionId}` → `{sessionId}` (error if unknown)
+- `session/delete {sessionId}` → `{deleted: true}`
+- `session/search {query, limit}` → `{results: [{sessionId, messageId, snippet}]}`
+- `session/prompt {sessionId, prompt: [{type:"text", text}]}` → `{stopReason}` — the response arrives when the turn ends
+- `session/cancel {sessionId}` — notification (no response)
 
-- `session/update` notification — `update.sessionUpdate`가 `agent_message_chunk`(텍스트 델타), `agent_thought_chunk`(추론 델타), 또는 `tool_call_update`(tool_callId, status)
-- `session/request_permission` request — 클라이언트가 `{outcome: {outcome:"selected", optionId:"allow-once"|"reject-once"}}`로 응답해야 tool 실행이 진행됨. `auto_approve` 서버는 이 요청이 오지 않는다.
+Daemon → client:
 
-`session/prompt` 응답의 `stopReason`: `end_turn` | `max_tokens` | `tool_use` | `cancelled`.
+- `session/update` notification — `update.sessionUpdate` is `agent_message_chunk` (text delta), `agent_thought_chunk` (reasoning delta), or `tool_call_update` (toolCallId, status)
+- `session/request_permission` request — the client must answer `{outcome: {outcome:"selected", optionId:"allow-once"|"reject-once"}}` for tool execution to proceed. `auto_approve` servers never send this.
 
+`session/prompt` response `stopReason`: `end_turn` | `max_tokens` | `tool_use` | `cancelled`.
 
-## 최소 클라이언트 흐름
+Concurrency rules:
+
+- One live prompt per session, across all connections — a second
+  `session/prompt` for the same session is rejected with `-32602` until
+  the running turn finishes.
+- If a connection drops, every prompt it started is cancelled and wound
+  down before the session accepts a new prompt.
+- `session/cancel` works from any connection, not just the one that
+  started the turn.
+
+## Minimal client flow
 
 ```
 connect → initialize → session/new → session/prompt
-  ├─ session/update 알림을 받는 대로 렌더
-  ├─ session/request_permission 오면 응답 전송
-  └─ id가 prompt 요청과 같은 응답이 오면 턴 종료
+  ├─ render session/update notifications as they arrive
+  ├─ answer session/request_permission when it arrives
+  └─ the response whose id matches the prompt request ends the turn
 ```
 
-## 최소 클라이언트
+## Minimal clients
 
-복붙해서 바로 돌아가는 세 가지 예시. 데몬이 `127.0.0.1:9470`에 떠 있다고 가정.
+Copy-paste examples that run as-is. Assumes the daemon is on `127.0.0.1:9470`.
 
-### curl (OpenAI 호환 패스스루)
+### curl (OpenAI-compatible passthrough)
 
 ```sh
 curl -N http://127.0.0.1:9470/v1/chat/completions \
@@ -132,10 +156,33 @@ curl -N http://127.0.0.1:9470/v1/chat/completions \
   -d '{"model":"default","messages":[{"role":"user","content":"hi"}],"stream":true}'
 ```
 
-### Node.js (WS, Node ≥ 22 — 글로벌 WebSocket)
+### Node.js — the packaged client (recommended)
+
+`npm i damon-agent` ships a zero-dependency client (Node ≥ 22, or pass a
+`webSocket` constructor):
 
 ```js
-// node client.mjs
+import { DamonClient } from "damon-agent";
+
+const client = await DamonClient.connect("ws://127.0.0.1:9470/ws");
+await client.initialize();
+const sessionId = await client.newSession(process.cwd());
+client.prompt(sessionId, "hi");
+
+for await (const ev of client.events()) {
+  if (ev.type === "update" && ev.update?.sessionUpdate === "agent_message_chunk")
+    process.stdout.write(ev.update.content.text);
+  if (ev.type === "request")  // permission prompt
+    await client.respond(ev.id, { outcome: { outcome: "selected", optionId: "allow-once" } });
+  if (ev.type === "promptDone") break;
+}
+client.close();
+```
+
+### Node.js — raw WebSocket (no dependency)
+
+```js
+// node client.mjs — Node ≥ 22 (global WebSocket)
 const ws = new WebSocket("ws://127.0.0.1:9470/ws");
 let id = 0;
 const pending = new Map();
@@ -164,7 +211,7 @@ import asyncio, json, websockets
 
 async def call(ws, id, method, params):
     await ws.send(json.dumps({"jsonrpc": "2.0", "id": id, "method": method, "params": params}))
-    while True:  # 알림을 건너뛰고 이 요청의 응답을 기다림
+    while True:  # skip notifications until this request's response arrives
         m = json.loads(await ws.recv())
         if m.get("id") == id:
             return m.get("result")
@@ -181,40 +228,47 @@ async def main():
 asyncio.run(main())
 ```
 
-Rust 예시는 `examples/client.rs` (`cargo run --example client`).
+The Rust example is `examples/client.rs` (`cargo run --example client`).
 
-## Rust에서 붙이기
+## From Rust
 
-`damon::client::DamonClient`가 레퍼런스 구현이다 (`src/bin/damon.rs`가 사용 예시):
+`damon::client::DamonClient` is the reference implementation (used by
+`src/bin/damon.rs`):
 
 ```rust
 let client = DamonClient::connect("ws://127.0.0.1:9470/ws", None).await?;
 client.initialize().await?;
 let session = client.new_session("/tmp").await?;
-// events()로 ClientEvent::Update / Request를 받으며 prompt()를 await
+// consume ClientEvent::Update / Request from events() while awaiting prompt()
 ```
 
-## 데스크톱 앱 (Electron/Tauri)
+## Desktop apps (Electron/Tauri)
 
-데몬은 이미 상주 프로세스다. 앱은 데몬을 spawn하지 말고 `ws://127.0.0.1:9470/ws`에 attach한다.
-데몬이 안 떠 있으면 `damond`를 sidecar로 띄우는 패턴을 쓴다 — 앱 종료와 데몬 생명주기는 분리.
+The daemon is already a resident process. Don't spawn it from the app —
+attach to `ws://127.0.0.1:9470/ws`. If the daemon isn't running, use the
+sidecar pattern: spawn `damond`, but keep the app's lifecycle separate
+from the daemon's.
 
-## 원격 접근
+## Remote access
 
-- 권장: Tailscale — WireGuard 기반 E2E, 데몬 설정 변경 없이 `ws://<tailscale-ip>:9470/ws`로 attach
-- 직접: `tls_cert` + `tls_key` 설정 시 wss로 서빙. 비루프백 바인드는 `auth_token`이 없으면 기동을 거부한다.
+- Recommended: Tailscale — WireGuard E2E, attach to `ws://<tailscale-ip>:9470/ws` with zero daemon config.
+- Direct: set `tls_cert` + `tls_key` to serve `wss`. Non-loopback binds refuse to start without `auth_token`.
+- Self-hosted relay: `damon-relay` on a public host + `[relay]` in the daemon config — the daemon dials out, no inbound port. Clients: `damon --relay ws://relay:8080 --relay-name <name> --token <auth_token>`.
 
-## 채널 어댑터
+## Channel adapters
 
-세 채널이 같은 패턴으로 붙는다 — 채널별 chat → damon 세션 자동 매핑, 응답 스트리밍,
-권한 요청은 "allow"/"deny" 답장으로 승인.
+All three channels attach with the same pattern — each channel chat maps
+to its own daemon session, replies stream in, and permission requests are
+approved by replying `allow`/`deny`.
 
-| 어댑터 | 실행 | 수신 | 비고 |
+| Adapter | Run | Receive | Notes |
 |---|---|---|---|
-| Telegram | `damon-telegram --bot-token <token>` | Bot API long-poll | `TELEGRAM_BOT_TOKEN` env 가능 |
-| Discord | `damon-discord --bot-token <token>` | Gateway WebSocket | `DISCORD_BOT_TOKEN` env 가능. 길드 채널은 @봇 멘션 필요, DM은 그대로. MESSAGE_CONTENT privileged intent를 dev portal에서 켜야 함 |
-| Slack | `damon-slack --app-token xapp-… --bot-token xoxb-…` | Socket Mode | `SLACK_APP_TOKEN`/`SLACK_BOT_TOKEN` env 가능. 채널은 @봇 멘션 필요, DM은 그대로. 스코프: `connections:write`(앱), `chat:write`+`im:history`+`channels:history`+`app_mentions:read`(봇) |
+| Telegram | `damon-telegram --bot-token <token>` | Bot API long-poll | `TELEGRAM_BOT_TOKEN` env works |
+| Discord | `damon-discord --bot-token <token>` | Gateway WebSocket | `DISCORD_BOT_TOKEN` env. Guild channels need @bot mention; DMs work directly. Enable the MESSAGE_CONTENT privileged intent in the dev portal |
+| Slack | `damon-slack --app-token xapp-… --bot-token xoxb-…` | Socket Mode | `SLACK_APP_TOKEN`/`SLACK_BOT_TOKEN` env. Channels need @bot mention; DMs work directly. Scopes: `connections:write` (app), `chat:write`+`im:history`+`channels:history`+`app_mentions:read` (bot) |
 
-새 채널 추가: `damon_core::channel::ChannelApi`(`ready`/`recv`/`send`)를 구현하고
-`channel::Bridge::new(channel, client).run()`에 연결하면 된다 — 세션 매핑, 이벤트
-demux, 권한 흐름, 스트리밍 루프는 브리지가 소유한다. `src/telegram.rs`가 최소 예시.
+Adding a channel: implement `damon_core::channel::ChannelApi`
+(`ready`/`recv`/`send`) and hand it to `channel::Bridge::new(channel,
+client).run()` — the bridge owns session mapping, event demux, the
+permission flow, and the streaming loop. `src/telegram.rs` is the minimal
+example.

@@ -139,10 +139,12 @@ Reproduce: `cargo run --release --example bench`
 
 ## Docs
 
-- [docs/install.md](docs/install.md) — install paths, service registration, OAuth login
-- [docs/integration.md](docs/integration.md) — wire protocol, provider/compat reference, minimal clients
+- [docs/install.md](docs/install.md) ([ko](docs/install.ko.md)) — install paths, service registration, OAuth login
+- [docs/integration.md](docs/integration.md) ([ko](docs/integration.ko.md)) — wire protocol, provider/compat reference, minimal clients
+- [docs/release.md](docs/release.md) ([ko](docs/release.ko.md)) — release checklist
 - [config.example.toml](config.example.toml) — every option, annotated
 - [examples/client.rs](examples/client.rs) — Rust client (`cargo run --example client`)
+- `import { DamonClient } from "damon-agent"` — zero-dep Node client shipped in the npm package
 
 ## Contributing
 

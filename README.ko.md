@@ -139,10 +139,12 @@ Apple M4, release 빌드 기준선:
 
 ## 문서
 
-- [docs/install.md](docs/install.md) — 설치 경로, 서비스 등록, OAuth 로그인
-- [docs/integration.md](docs/integration.md) — 와이어 프로토콜, provider/compat 레퍼런스, 최소 클라이언트
+- [docs/install.ko.md](docs/install.ko.md) ([en](docs/install.md)) — 설치 경로, 서비스 등록, OAuth 로그인
+- [docs/integration.ko.md](docs/integration.ko.md) ([en](docs/integration.md)) — 와이어 프로토콜, provider/compat 레퍼런스, 최소 클라이언트
+- [docs/release.ko.md](docs/release.ko.md) ([en](docs/release.md)) — 릴리스 체크리스트
 - [config.example.toml](config.example.toml) — 모든 옵션 주석 포함
 - [examples/client.rs](examples/client.rs) — Rust 클라이언트 (`cargo run --example client`)
+- `import { DamonClient } from "damon-agent"` — npm 패키지에 포함된 무의존성 Node 클라이언트
 
 ## 기여
 

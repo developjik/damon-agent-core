@@ -1,28 +1,35 @@
-# 설치
+# Install
 
-## 검증된 설치 경로
+**English** | [한국어](install.ko.md)
 
-| 경로 | 상태 |
+## Verified install paths
+
+| Path | Status |
 | --- | --- |
-| GitHub Releases tarball | CI 태그 빌드로 생성됨 (4개 타겟) |
-| `npm install -g damon-agent` | CI가 태그 푸시 시 publish; postinstall이 릴리스 tarball 다운로드 |
-| `cargo install damon-core` | CI가 태그 푸시 시 crates.io publish |
-| `brew install developjik/tap/damon` | tap 리포지토리 생성 전 — 아래 참조 |
+| GitHub Releases tarball | Built by CI on tag push (4 targets) |
+| `npm install -g damon-agent` | CI publishes on tag push; postinstall downloads the release tarball |
+| `cargo install damon-core` | CI publishes to crates.io on tag push |
+| `brew install developjik/tap/damon` | Requires the tap repository — see below |
 
+## Binaries
 
-## 바이너리
-
-GitHub Releases에서 플랫폼별 tarball:
+Platform tarballs on GitHub Releases:
 
 ```sh
 curl -fsSL https://github.com/developjik/damon-agent-core/releases/latest/download/damon-aarch64-apple-darwin.tar.gz | tar xz
 ```
+
+Each tarball contains `damond`, `damon`, `damon-telegram`, `damon-discord`, `damon-slack`, and `damon-relay`.
 
 ## npm
 
 ```sh
 npm install -g damon-agent
 ```
+
+All six binaries are linked onto your PATH. The package also exports a
+zero-dependency Node client (`import { DamonClient } from "damon-agent"`) —
+see [integration.md](integration.md).
 
 ## cargo
 
@@ -32,41 +39,45 @@ cargo install damon-core
 
 ## Homebrew
 
-tap 리포지토리(`developjik/homebrew-tap`)가 생성되면:
+Once the tap repository (`developjik/homebrew-tap`) exists:
 
 ```sh
 brew install developjik/tap/damon
 ```
 
-formula는 이 리포지토리의 `Formula/damon.rb` — 릴리스마다 `sha256`을 갱신해야 함.
+The formula lives in this repository at `Formula/damon.rb` — its `sha256`
+must be updated on each release.
 
-## 상주 서비스 등록
+## Running as a resident service
 
 ```sh
 damond service install    # launchd (macOS) / systemd user (Linux) / Task Scheduler (Windows)
-damond service print      # 설치 전 정의 확인
+damond service print      # preview the definition before installing
 ```
 
-## 설정
+## Configuration
 
 ```sh
-damond --print-config-path   # config.toml 위치
+damond --print-config-path   # where config.toml lives
 ```
 
-`config.example.toml` 참조. provider API 키는 `env:` 또는 `keychain:` 참조만 허용.
+See `config.example.toml`. Provider API keys must be `env:` or `keychain:`
+references — literals are rejected.
 
-## OAuth 로그인 (Anthropic)
+## OAuth login (Anthropic)
 
 ```sh
-damond login anthropic     # 브라우저에서 승인 → 코드 붙여넣기 → 토큰은 OS 키체인에
+damond login anthropic     # approve in browser → paste the code → tokens go to the OS keychain
 damond logout anthropic
 ```
 
-config에서 `api_key = "oauth"`로 설정하면 데몬이 키체인에서 토큰을 읽고 자동 갱신.
+With `api_key = "oauth"` in config, the daemon reads the token from the
+keychain and refreshes it automatically.
 
-## 원격 릴레이
+## Remote relay
 
-공개 서버에 `damon-relay`를 띄우고(기본 0.0.0.0:8080), 데몬 config에:
+Run `damon-relay` on a public host (binds 0.0.0.0:8080), then add to the
+daemon config:
 
 ```toml
 [relay]
@@ -74,10 +85,11 @@ url  = "ws://your-relay:8080"
 name = "my-daemon"
 ```
 
-데몬이 아웃바운드로 연결 — 인바운드 포트 불필요. 클라이언트:
+The daemon dials out — no inbound port needed. Clients connect with:
 
 ```sh
 damon --relay ws://your-relay:8080 --relay-name my-daemon --token <auth_token> chat
 ```
 
-E2E: X25519 키 교환 + `sha256(auth_token || pubkey)` 증명 → AES-256-GCM. 릴레이는 암호문만 본다.
+E2E: X25519 key exchange + `sha256(auth_token || pubkey)` proof →
+AES-256-GCM. The relay sees only ciphertext.
