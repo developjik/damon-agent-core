@@ -170,8 +170,8 @@ async fn bridge_delivers_response_and_maps_sessions() {
 
 
     // Two different chats → two different sessions.
-    bridge.handle_message("chat-a".into(), "hi".into()).await;
-    bridge.handle_message("chat-b".into(), "hi".into()).await;
+    bridge.handle_message("chat-a".into(), None, "hi".into()).await;
+    bridge.handle_message("chat-b".into(), None, "hi".into()).await;
 
     // Wait until BOTH chats got their reply.
     let deadline = std::time::Instant::now() + std::time::Duration::from_secs(15);
@@ -241,11 +241,11 @@ async fn bridge_permission_reply_allows_tool() {
     bridge.client().initialize().await.unwrap();
     bridge.spawn_event_router().await;
 
-    bridge.handle_message("42".into(), "use the tool".into()).await;
+    bridge.handle_message("42".into(), None, "use the tool".into()).await;
     // Permission prompt lands in the chat…
     wait_for_sent(&ch.sent, "🔐").await;
     // …and "allow" approves it, letting the turn finish.
-    bridge.handle_message("42".into(), "allow".into()).await;
+    bridge.handle_message("42".into(), None, "allow".into()).await;
     wait_for_sent(&ch.sent, "✅ allowed").await;
     wait_for_sent(&ch.sent, "tool done").await;
 }

@@ -49,7 +49,7 @@ impl TelegramApi for BotApi {
 
     async fn send_message(&self, chat_id: i64, text: &str) -> anyhow::Result<()> {
         // Telegram caps messages at 4096 chars.
-        let text = if text.len() > 4000 { &text[..4000] } else { text };
+        let text = if text.len() > 4000 { &text[..text.floor_char_boundary(4000)] } else { text };
         self.http
             .post(format!("{}/sendMessage", self.base))
             .json(&serde_json::json!({"chat_id": chat_id, "text": text}))
@@ -89,7 +89,9 @@ impl ChannelApi for TelegramChannel {
     }
 
     async fn send(&self, chat_id: &str, text: &str) -> anyhow::Result<()> {
-        let id: i64 = chat_id.parse().unwrap_or(0);
+        let id: i64 = chat_id
+            .parse()
+            .map_err(|_| anyhow::anyhow!("invalid telegram chat_id: {chat_id}"))?;
         self.tg.send_message(id, text).await
     }
 }
@@ -101,6 +103,7 @@ pub fn incoming_from_update(u: &Value) -> Option<Incoming> {
     let text = u["message"]["text"].as_str()?;
     Some(Incoming {
         chat_id: chat_id.to_string(),
+        sender_id: u["message"]["from"]["id"].as_i64().map(|id| id.to_string()),
         text: text.to_string(),
     })
 }
@@ -155,7 +158,7 @@ impl Bridge {
     /// Handle one raw Telegram update.
     pub async fn handle_update(self: &Arc<Self>, u: Value) {
         if let Some(msg) = incoming_from_update(&u) {
-            self.inner.handle_message(msg.chat_id, msg.text).await;
+            self.inner.handle_message(msg.chat_id, msg.sender_id, msg.text).await;
         }
     }
 }

@@ -76,7 +76,7 @@ impl DiscordApi {
 
     /// Discord caps messages at 2000 chars.
     pub async fn send_message(&self, channel_id: &str, text: &str) -> anyhow::Result<()> {
-        let text = if text.len() > 1990 { &text[..1990] } else { text };
+        let text = if text.len() > 1990 { &text[..text.floor_char_boundary(1990)] } else { text };
         self.http
             .post(format!("{}/channels/{channel_id}/messages", self.base))
             .bearer_auth(&self.token)
@@ -111,11 +111,13 @@ pub fn incoming_from_message(d: &Value, bot_id: &str) -> Option<Incoming> {
         }
         return Some(Incoming {
             chat_id: channel_id,
+            sender_id: d["author"]["id"].as_str().map(String::from),
             text: stripped,
         });
     }
     Some(Incoming {
         chat_id: channel_id,
+        sender_id: d["author"]["id"].as_str().map(String::from),
         text,
     })
 }

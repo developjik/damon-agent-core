@@ -17,6 +17,9 @@ use crate::client::{ClientEvent, DamonClient};
 pub struct Incoming {
     /// Channel-specific chat/conversation id, normalized to String.
     pub chat_id: String,
+    /// Sender identity, when the channel exposes one — used to authorize
+    /// "allow"/"deny" permission replies in group chats.
+    pub sender_id: Option<String>,
     /// Message text with any bot mention already stripped.
     pub text: String,
 }
@@ -48,8 +51,9 @@ pub trait ChannelApi: Send + Sync {
 struct Demux {
     /// session_id -> channel to that chat's turn handler
     sessions: HashMap<String, mpsc::Sender<ClientEvent>>,
-    /// chat_id -> pending permission answer
-    pending_permissions: HashMap<String, oneshot::Sender<bool>>,
+    /// chat_id -> (requester sender_id, answer channel). The sender id
+    /// binds the reply to whoever triggered the tool call.
+    pending_permissions: HashMap<String, (Option<String>, oneshot::Sender<bool>)>,
 }
 
 pub struct Bridge {
@@ -57,6 +61,8 @@ pub struct Bridge {
     client: DamonClient,
     /// chat_id -> session_id
     chat_sessions: Mutex<HashMap<String, String>>,
+    /// chat_ids with a turn in flight — serializes turns per chat.
+    active_turns: Mutex<std::collections::HashSet<String>>,
     demux: Mutex<Demux>,
 }
 
@@ -66,6 +72,7 @@ impl Bridge {
             ch,
             client,
             chat_sessions: Mutex::new(HashMap::new()),
+            active_turns: Mutex::new(std::collections::HashSet::new()),
             demux: Mutex::new(Demux {
                 sessions: HashMap::new(),
                 pending_permissions: HashMap::new(),
@@ -80,7 +87,7 @@ impl Bridge {
         self.spawn_event_router().await;
         loop {
             match self.ch.recv().await {
-                Ok(Some(msg)) => self.handle_message(msg.chat_id, msg.text).await,
+                Ok(Some(msg)) => self.handle_message(msg.chat_id, msg.sender_id, msg.text).await,
                 Ok(None) => {}
                 Err(e) => {
                     warn!(error = %e, "channel recv failed; retrying in 5s");
@@ -125,8 +132,15 @@ impl Bridge {
     }
 
     /// Handle one inbound message: permission reply, or a new prompt turn.
-    pub async fn handle_message(self: &Arc<Self>, chat_id: String, text: String) {
-        // "allow"/"deny" answers a pending permission request.
+    pub async fn handle_message(
+        self: &Arc<Self>,
+        chat_id: String,
+        sender_id: Option<String>,
+        text: String,
+    ) {
+        // "allow"/"deny" answers a pending permission request — but only
+        // from the sender who triggered it. In group chats anyone else
+        // typing "allow" must not approve a tool run.
         let lower = text.trim().to_lowercase();
         if lower == "allow" || lower == "deny" {
             let pending = self
@@ -134,39 +148,75 @@ impl Bridge {
                 .lock()
                 .await
                 .pending_permissions
-                .remove(&chat_id);
-            if let Some(tx) = pending {
-                let _ = tx.send(lower == "allow");
+                .get(&chat_id)
+                .map(|(req, _)| req.clone());
+            let authorized = match (&pending, &sender_id) {
+                (Some(Some(req)), Some(sender)) => req == sender,
+                // Unknown requester or unknown sender: allow (DM-style
+                // channels that don't expose identity).
+                _ => true,
+            };
+            if pending.is_some() {
+                if authorized {
+                    let (_, tx) = self
+                        .demux
+                        .lock()
+                        .await
+                        .pending_permissions
+                        .remove(&chat_id)
+                        .unwrap();
+                    let _ = tx.send(lower == "allow");
+                    let _ = self
+                        .ch
+                        .send(&chat_id, if lower == "allow" { "✅ allowed" } else { "🚫 denied" })
+                        .await;
+                }
+                // Pending exists but the replier isn't the requester —
+                // swallow the reply; it must not become a prompt.
+                return;
+            }
+        }
+
+        // One live turn per chat — a second prompt would overwrite the
+        // demux entry and starve the first turn's events.
+        {
+            let mut active = self.active_turns.lock().await;
+            if !active.insert(chat_id.clone()) {
                 let _ = self
                     .ch
-                    .send(&chat_id, if lower == "allow" { "✅ allowed" } else { "🚫 denied" })
+                    .send(&chat_id, "a prompt is already running in this chat")
                     .await;
                 return;
             }
         }
 
-        let session_id = self.session_for(&chat_id).await;
+        let session_id = match self.session_for(&chat_id).await {
+            Ok(s) => s,
+            Err(e) => {
+                self.active_turns.lock().await.remove(&chat_id);
+                let _ = self.ch.send(&chat_id, &format!("error: {e:#}")).await;
+                return;
+            }
+        };
         let me = self.clone();
         tokio::spawn(async move {
-            if let Err(e) = me.run_turn(&chat_id, &session_id, &text).await {
+            if let Err(e) = me.run_turn(&chat_id, &session_id, sender_id, &text).await {
                 let _ = me.ch.send(&chat_id, &format!("error: {e:#}")).await;
             }
+            me.active_turns.lock().await.remove(&chat_id);
         });
     }
 
-    /// Get or create the damon session for this chat.
-    async fn session_for(&self, chat_id: &str) -> String {
+    /// Get or create the damon session for this chat. A creation failure
+    /// propagates — caching a fabricated id would brick the chat forever.
+    async fn session_for(&self, chat_id: &str) -> anyhow::Result<String> {
         let mut map = self.chat_sessions.lock().await;
         if let Some(s) = map.get(chat_id) {
-            return s.clone();
+            return Ok(s.clone());
         }
-        let sid = self
-            .client
-            .new_session("")
-            .await
-            .unwrap_or_else(|_| uuid::Uuid::new_v4().to_string());
+        let sid = self.client.new_session("").await?;
         map.insert(chat_id.to_string(), sid.clone());
-        sid
+        Ok(sid)
     }
 
     /// One prompt turn for a chat: forward events to the channel until done.
@@ -174,6 +224,7 @@ impl Bridge {
         self: &Arc<Self>,
         chat_id: &str,
         session_id: &str,
+        sender_id: Option<String>,
         text: &str,
     ) -> anyhow::Result<()> {
         let (tx, mut rx) = mpsc::channel(64);
@@ -196,18 +247,18 @@ impl Bridge {
         match prompt_send.await {
             Ok(Ok(())) => {}
             Ok(Err(e)) => {
-                self.demux.lock().await.sessions.remove(session_id);
+                self.end_turn(chat_id, session_id).await;
                 return Err(e);
             }
             Err(e) => {
-                self.demux.lock().await.sessions.remove(session_id);
+                self.end_turn(chat_id, session_id).await;
                 return Err(e.into());
             }
         }
         loop {
             match rx.recv().await {
                 Some(ClientEvent::PromptDone { result, .. }) => {
-                            self.demux.lock().await.sessions.remove(session_id);
+                            self.end_turn(chat_id, session_id).await;
                             self.flush(chat_id, &mut buf).await;
                             match result {
                                 Ok(v) => {
@@ -248,7 +299,7 @@ impl Bridge {
                                     .lock()
                                     .await
                                     .pending_permissions
-                                    .insert(chat_id.to_string(), ptx);
+                                    .insert(chat_id.to_string(), (sender_id.clone(), ptx));
                                 let _ = self
                                     .ch
                                     .send(
@@ -273,9 +324,20 @@ impl Bridge {
                                 });
                             }
                         }
-                None => anyhow::bail!("event channel closed"),
+                None => {
+                    self.end_turn(chat_id, session_id).await;
+                    anyhow::bail!("event channel closed")
+                }
             }
         }
+    }
+
+    /// Turn teardown: drop the demux session and any unanswered
+    /// permission request so a stale "allow" can't resolve a dead ask.
+    async fn end_turn(&self, chat_id: &str, session_id: &str) {
+        let mut demux = self.demux.lock().await;
+        demux.sessions.remove(session_id);
+        demux.pending_permissions.remove(chat_id);
     }
 
     async fn flush(&self, chat_id: &str, buf: &mut String) {
