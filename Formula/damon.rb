@@ -7,14 +7,16 @@ class Damon < Formula
   on_macos do
     on_arm do
       url "https://github.com/developjik/damon-agent-core/releases/download/v0.1.0/damon-aarch64-apple-darwin.tar.gz"
-      # TODO: replace with the real sha256 of the release tarball on each release
-      sha256 "0000000000000000000000000000000000000000000000000000000000000000"
+      sha256 "4b7086696288a0cc4e1e1f0de421aa8f2e4aa18c2105826fb30ce3a7412d34a2"
     end
     on_intel do
       url "https://github.com/developjik/damon-agent-core/releases/download/v0.1.0/damon-x86_64-apple-darwin.tar.gz"
-      # TODO: replace with the real sha256 of the release tarball on each release
-      sha256 "0000000000000000000000000000000000000000000000000000000000000000"
+      sha256 "21fd85310eda3a8863d5e578cd37a33dbdcfa6c39b8066291671426aa11eed68"
     end
+  end
+  on_linux do
+    url "https://github.com/developjik/damon-agent-core/releases/download/v0.1.0/damon-x86_64-unknown-linux-gnu.tar.gz"
+    sha256 "a814341151b85bcadd28ce9e09025824b0de563aebae9a504da8a50f02d534ac"
   end
 
   def install
