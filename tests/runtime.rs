@@ -279,6 +279,183 @@ async fn cancel_mid_tool_loop_repairs_orphan_calls() {
     assert_eq!(msgs[3]["content"], "cancelled");
 }
 
+/// Mock LLM: first call emits one SSE chunk then stalls forever;
+/// later calls return text immediately.
+async fn mock_llm_stall_then_text() -> String {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    let calls = Arc::new(AtomicUsize::new(0));
+    let app = Router::new().route(
+        "/chat/completions",
+        post(move || {
+            let calls = calls.clone();
+            async move {
+                let n = calls.fetch_add(1, Ordering::SeqCst);
+                if n == 0 {
+                    let s = futures::stream::once(async {
+                        Ok::<_, std::io::Error>(bytes::Bytes::from_static(
+                            b"data: {\"choices\":[{\"delta\":{\"content\":\"partial\"}}]}\n\n",
+                        ))
+                    })
+                    .chain(futures::stream::pending());
+                    Response::builder()
+                        .header("content-type", "text/event-stream")
+                        .body(Body::from_stream(s))
+                        .unwrap()
+                } else {
+                    Response::builder()
+                        .header("content-type", "text/event-stream")
+                        .body(Body::from(
+                            "data: {\"choices\":[{\"delta\":{\"content\":\"done!\"}}]}\n\ndata: [DONE]\n\n",
+                        ))
+                        .unwrap()
+                }
+            }
+        }),
+    );
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    tokio::spawn(async move {
+        axum::serve(listener, app).await.unwrap();
+    });
+    addr.to_string()
+}
+
+async fn ws_connect(addr: &str) -> tokio_tungstenite::WebSocketStream<
+    tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>,
+> {
+    tokio_tungstenite::connect_async(format!("ws://{addr}/ws"))
+        .await
+        .unwrap()
+        .0
+}
+
+async fn send_rpc(
+    ws: &mut (impl SinkExt<tungstenite::Message, Error = tungstenite::Error> + Unpin),
+    id: u64,
+    method: &str,
+    params: Value,
+) {
+    ws.send(tungstenite::Message::Text(
+        json!({"jsonrpc":"2.0","id":id,"method":method,"params":params})
+            .to_string()
+            .into(),
+    ))
+    .await
+    .unwrap();
+}
+
+/// A prompt started by a connection that then disconnects must be
+/// cancelled — not orphaned — and the session-level one-prompt guard
+/// must hold across connections.
+#[tokio::test]
+async fn disconnect_cancels_prompt_and_frees_session() {
+    let upstream = mock_llm_stall_then_text().await;
+
+    let mut providers = BTreeMap::new();
+    providers.insert(
+        "default".to_string(),
+        ProviderConfig {
+            api: "openai-completions".to_string(),
+            base_url: Some(format!("http://{upstream}")),
+            api_key: None,
+            models: vec![],
+            default_model: None,
+            headers: Default::default(),
+            compat: Default::default(),
+            discovery: None,
+            context_promotion_target: None,
+        },
+    );
+    let shared: damon_core::config::SharedConfig = Arc::new(parking_lot::RwLock::new(Config {
+        bind: "127.0.0.1:0".parse().unwrap(),
+        auth_token: None,
+        tls_cert: None,
+        tls_key: None,
+        data_dir: None,
+        mcp_servers: HashMap::new(),
+        providers,
+        models: BTreeMap::new(),
+        relay: None,
+    }));
+    let store = Store::in_memory().await.unwrap();
+    let mcp = McpRegistry::connect_all(&HashMap::new()).await;
+    let state = AppState::new(shared, store.clone(), mcp).await;
+    let app = api::router(state.clone());
+
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    tokio::spawn(async move {
+        axum::serve(listener, app).await.unwrap();
+    });
+
+    // conn1: create a session and start a prompt that stalls upstream.
+    let mut ws1 = ws_connect(&addr.to_string()).await;
+    send_rpc(&mut ws1, 1, "session/new", json!({"cwd": "/tmp"})).await;
+    let new: Value = read_json(&mut ws1).await;
+    let session_id = new["result"]["sessionId"].as_str().unwrap().to_string();
+    send_rpc(
+        &mut ws1,
+        2,
+        "session/prompt",
+        json!({"sessionId": session_id, "prompt": [{"type": "text", "text": "hi"}]}),
+    )
+    .await;
+
+    // Wait until the turn is registered as live.
+    for _ in 0..100 {
+        if state.live_prompts.lock().await.contains_key(&session_id) {
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+    }
+    assert!(state.live_prompts.lock().await.contains_key(&session_id));
+
+    // conn2: a second prompt on the same session is rejected — the guard
+    // is per-session, not per-connection.
+    let mut ws2 = ws_connect(&addr.to_string()).await;
+    send_rpc(
+        &mut ws2,
+        1,
+        "session/prompt",
+        json!({"sessionId": session_id, "prompt": [{"type": "text", "text": "again"}]}),
+    )
+    .await;
+    let rejected: Value = read_json(&mut ws2).await;
+    assert_eq!(rejected["id"], 1);
+    assert_eq!(rejected["error"]["code"], -32602, "got {rejected}");
+
+    // conn1 drops: its in-flight turn must be cancelled and wound down.
+    drop(ws1);
+    for _ in 0..500 {
+        if !state.live_prompts.lock().await.contains_key(&session_id) {
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+    }
+    assert!(
+        !state.live_prompts.lock().await.contains_key(&session_id),
+        "orphaned prompt still registered after disconnect"
+    );
+
+    // The session is free again: conn2's prompt now runs to completion.
+    send_rpc(
+        &mut ws2,
+        2,
+        "session/prompt",
+        json!({"sessionId": session_id, "prompt": [{"type": "text", "text": "again"}]}),
+    )
+    .await;
+    let mut stop_reason = String::new();
+    for _ in 0..50 {
+        let msg: Value = read_json(&mut ws2).await;
+        if msg["id"] == 2 {
+            stop_reason = msg["result"]["stopReason"].as_str().unwrap_or("").to_string();
+            break;
+        }
+    }
+    assert_eq!(stop_reason, "end_turn");
+}
+
 async fn read_json(
     ws: &mut (impl StreamExt<Item = Result<tungstenite::Message, tungstenite::Error>> + Unpin),
 ) -> Value {

@@ -34,6 +34,13 @@ pub struct AppState {
     /// Err is cached too: a resolution failure must fail closed, never
     /// silently open the API.
     auth_token_cache: tokio::sync::Mutex<(Option<String>, Option<Result<String, String>>)>,
+    /// Live prompt turns by session id → (connection id, cancel token).
+    /// Shared across connections: a session can have only one in-flight
+    /// prompt no matter which client asked, and a disconnect cancels the
+    /// turns it started instead of orphaning them.
+    pub live_prompts: tokio::sync::Mutex<
+        HashMap<String, (u64, tokio_util::sync::CancellationToken)>,
+    >,
 }
 
 impl AppState {
@@ -66,6 +73,7 @@ impl AppState {
             mcp,
             bind,
             auth_token_cache: tokio::sync::Mutex::new((None, None)),
+            live_prompts: tokio::sync::Mutex::new(HashMap::new()),
         })
     }
 

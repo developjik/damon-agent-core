@@ -130,19 +130,22 @@ impl WsClient {
 /// Run one client session over a generic text transport.
 /// `rx` yields inbound JSON text; `tx` carries outbound JSON text.
 /// Used by both the local WS handler and the relay tunnel.
+/// Process-wide connection counter — identifies which connection owns a
+/// live prompt so disconnect can cancel exactly its own turns.
+static CONN_ID: AtomicU64 = AtomicU64::new(1);
+
 pub async fn handle_socket(
     rx: mpsc::Receiver<String>,
     tx: mpsc::Sender<String>,
     state: Arc<AppState>,
 ) {
     let mut rx = rx;
+    let conn_id = CONN_ID.fetch_add(1, Ordering::Relaxed);
     let client = Arc::new(WsClient {
         tx,
         pending: Arc::new(Mutex::new(HashMap::new())),
         next_id: AtomicU64::new(1),
     });
-    let cancels: Arc<Mutex<HashMap<String, CancellationToken>>> =
-        Arc::new(Mutex::new(HashMap::new()));
 
     info!("ws client connected");
     while let Some(text) = rx.recv().await {
@@ -285,10 +288,13 @@ pub async fn handle_socket(
                     })
                     .unwrap_or_default();
                 let cancel = CancellationToken::new();
-                // One live prompt per session: a second prompt would
-                // overwrite the cancel token and interleave history.
+                // One live prompt per session across ALL connections: a
+                // second prompt would interleave writes into the same
+                // persisted history. The entry stays until the spawned
+                // task removes it, so a disconnect-cancelled turn still
+                // blocks a new prompt until it has fully wound down.
                 {
-                    let mut map = cancels.lock().await;
+                    let mut map = state.live_prompts.lock().await;
                     if map.contains_key(&session_id) {
                         client
                             .respond(
@@ -301,10 +307,9 @@ pub async fn handle_socket(
                             .await;
                         continue;
                     }
-                    map.insert(session_id.clone(), cancel.clone());
+                    map.insert(session_id.clone(), (conn_id, cancel.clone()));
                 }
-                let (state, client, cancels) =
-                    (state.clone(), client.clone(), cancels.clone());
+                let (state, client) = (state.clone(), client.clone());
                 tokio::spawn(async move {
                     let result = runtime::run_prompt(
                         &state,
@@ -314,7 +319,14 @@ pub async fn handle_socket(
                         cancel.clone(),
                     )
                     .await;
-                    cancels.lock().await.remove(&session_id);
+                    // Remove only our own entry — a disconnect may have
+                    // cancelled this turn while a newer connection already
+                    // started a fresh prompt on the same session.
+                    let mut map = state.live_prompts.lock().await;
+                    if map.get(&session_id).is_some_and(|(c, _)| *c == conn_id) {
+                        map.remove(&session_id);
+                    }
+                    drop(map);
                     match result {
                         Ok(reason) => {
                             let stop = if cancel.is_cancelled() {
@@ -340,8 +352,12 @@ pub async fn handle_socket(
                 });
             }
             ("session/cancel", _) => {
+                // Any connected client may cancel a session's turn — the
+                // map is shared, so this also reaches prompts started by
+                // other connections (e.g. a relay client cancelling a
+                // local prompt).
                 if let Some(sid) = params["sessionId"].as_str() {
-                    if let Some(token) = cancels.lock().await.get(sid) {
+                    if let Some((_, token)) = state.live_prompts.lock().await.get(sid) {
                         token.cancel();
                     }
                 }
@@ -352,6 +368,18 @@ pub async fn handle_socket(
                     .await;
             }
             _ => {}
+        }
+    }
+    // Connection ended: cancel every prompt this connection started so
+    // no turn keeps running (and executing tools) unattended. Entries
+    // stay in the map — the spawned tasks remove them on exit, which
+    // keeps the one-prompt-per-session guard until each turn winds down.
+    {
+        let map = state.live_prompts.lock().await;
+        for (_, (owner, token)) in map.iter() {
+            if *owner == conn_id {
+                token.cancel();
+            }
         }
     }
     info!("ws client disconnected");
