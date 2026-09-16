@@ -1,0 +1,17 @@
+{
+  "name": "damon-agent",
+  "version": "0.1.0",
+  "description": "Damon agent core — local multi-provider agent daemon",
+  "license": "MIT OR Apache-2.0",
+  "bin": {
+    "damond": "bin/damond",
+    "damon": "bin/damon"
+  },
+  "scripts": {
+    "postinstall": "node install.js"
+  },
+  "engines": {
+    "node": ">=18"
+  },
+  "files": ["install.js", "bin/"]
+}
