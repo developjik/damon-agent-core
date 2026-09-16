@@ -279,16 +279,10 @@ async fn tls_serves_https() {
     std::fs::write(&key_path, cert.signing_key.serialize_pem()).unwrap();
 
     let cfg_path = dir.join("config.toml");
-    std::fs::write(
-        &cfg_path,
-        format!(
-            "bind = \"127.0.0.1:0\"\ndata_dir = \"{}\"\ntls_cert = \"{}\"\ntls_key = \"{}\"\n",
-            dir.display(),
-            cert_path.display(),
-            key_path.display()
-        ),
-    )
-    .unwrap();
+    // Windows paths contain backslashes, which TOML basic strings treat
+    // as escape sequences — escape them or the config fails to parse and
+    // damond exits before /health comes up.
+    let toml_path = |p: &std::path::Path| p.display().to_string().replace('\\', "\\\\");
 
     // Bind a fixed port so we can connect.
     let port = {
@@ -299,9 +293,9 @@ async fn tls_serves_https() {
         &cfg_path,
         format!(
             "bind = \"127.0.0.1:{port}\"\ndata_dir = \"{}\"\ntls_cert = \"{}\"\ntls_key = \"{}\"\n",
-            dir.display(),
-            cert_path.display(),
-            key_path.display()
+            toml_path(&dir),
+            toml_path(&cert_path),
+            toml_path(&key_path),
         ),
     )
     .unwrap();
