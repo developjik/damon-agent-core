@@ -285,10 +285,24 @@ pub async fn handle_socket(
                     })
                     .unwrap_or_default();
                 let cancel = CancellationToken::new();
-                cancels
-                    .lock()
-                    .await
-                    .insert(session_id.clone(), cancel.clone());
+                // One live prompt per session: a second prompt would
+                // overwrite the cancel token and interleave history.
+                {
+                    let mut map = cancels.lock().await;
+                    if map.contains_key(&session_id) {
+                        client
+                            .respond(
+                                id,
+                                Err(rpc_error(
+                                    -32602,
+                                    "session already has a prompt in progress",
+                                )),
+                            )
+                            .await;
+                        continue;
+                    }
+                    map.insert(session_id.clone(), cancel.clone());
+                }
                 let (state, client, cancels) =
                     (state.clone(), client.clone(), cancels.clone());
                 tokio::spawn(async move {

@@ -136,7 +136,11 @@ impl McpRegistry {
                     "function": {
                         "name": namespaced,
                         "description": t.description.as_deref().unwrap_or(""),
-                        "parameters": t.input_schema.as_ref(),
+                        // Some providers reject null parameters — emit an
+                        // empty object schema instead.
+                        "parameters": serde_json::Value::Object(
+                            t.input_schema.as_ref().clone(),
+                        ),
                     }
                 })
             })
@@ -189,27 +193,49 @@ impl McpRegistry {
             p
         };
 
+        // A hung MCP child must not stall the turn forever — bound every
+        // call, and bound the retry too.
+        const TOOL_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(300);
         let result = {
             let conn = slot.conn.lock().await;
             let svc = conn.as_ref().context("MCP server not connected")?;
-            svc.peer().call_tool(make_params()).await
+            tokio::time::timeout(TOOL_TIMEOUT, svc.peer().call_tool(make_params())).await
         };
         match result {
-            Ok(r) => Ok(serde_json::to_value(r)?),
-            Err(e) => {
-                // The child may have died mid-call: drop the conn, respawn,
-                // retry exactly once.
-                warn!(server = %server, error = %e, "tool call failed; reconnecting");
+            Ok(Ok(r)) => Ok(serde_json::to_value(r)?),
+            Ok(Err(e)) => {
+                // A JSON-RPC error means the server processed the call —
+                // retrying would double-execute a side-effectful tool.
+                // Only transport failures (child died mid-call) retry.
+                use rmcp::service::ServiceError;
+                let transport = matches!(
+                    e,
+                    ServiceError::TransportSend(_)
+                        | ServiceError::TransportClosed
+                        | ServiceError::UnexpectedResponse
+                );
+                if !transport {
+                    return Err(e.into());
+                }
+                warn!(server = %server, error = %e, "tool call transport failed; reconnecting");
                 *slot.conn.lock().await = None;
                 self.ensure_connected(&server, &slot).await?;
                 let conn = slot.conn.lock().await;
                 let svc = conn.as_ref().context("MCP server not connected")?;
-                let r = svc
-                    .peer()
-                    .call_tool(make_params())
-                    .await
-                    .context("tool call failed")?;
+                let r = tokio::time::timeout(
+                    TOOL_TIMEOUT,
+                    svc.peer().call_tool(make_params()),
+                )
+                .await
+                .context("tool call timed out")?
+                .context("tool call failed")?;
                 Ok(serde_json::to_value(r)?)
+            }
+            Err(_) => {
+                // A hung child stays hung — drop the conn so the next
+                // call respawns instead of burning another timeout.
+                *slot.conn.lock().await = None;
+                Err(anyhow::anyhow!("tool call timed out after {}s", TOOL_TIMEOUT.as_secs()))
             }
         }
     }

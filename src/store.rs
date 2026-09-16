@@ -191,13 +191,16 @@ impl Store {
         let (_cutoff, summary, rows) = self
             .conn
             .call(move |c| {
-                let (cutoff, summary): (i64, Option<String>) = c
-                    .query_row(
-                        "SELECT compacted_through, summary FROM sessions WHERE id = ?1",
-                        rusqlite::params![sid],
-                        |row| Ok((row.get(0)?, row.get(1)?)),
-                    )
-                    .unwrap_or((0, None));
+                let (cutoff, summary): (i64, Option<String>) = match c.query_row(
+                    "SELECT compacted_through, summary FROM sessions WHERE id = ?1",
+                    rusqlite::params![sid],
+                    |row| Ok((row.get(0)?, row.get(1)?)),
+                ) {
+                    Ok(v) => v,
+                    // Missing session → no cutoff; other errors must surface.
+                    Err(rusqlite::Error::QueryReturnedNoRows) => (0, None),
+                    Err(e) => return Err(e.into()),
+                };
                 let mut stmt = c.prepare(
                     "SELECT data FROM messages WHERE session_id = ?1 AND id > ?2 ORDER BY id",
                 )?;
@@ -285,6 +288,29 @@ impl Store {
         Ok(())
     }
 
+    /// Current compaction state: (compacted_through message id, summary).
+    pub async fn compaction(
+        &self,
+        session_id: &str,
+    ) -> anyhow::Result<(i64, Option<String>)> {
+        let sid = session_id.to_string();
+        self.conn
+            .call(move |c| {
+                let r = c.query_row(
+                    "SELECT compacted_through, summary FROM sessions WHERE id = ?1",
+                    rusqlite::params![sid],
+                    |row| Ok((row.get(0)?, row.get(1)?)),
+                );
+                match r {
+                    Ok(v) => Ok::<(i64, Option<String>), tokio_rusqlite::Error>(v),
+                    Err(rusqlite::Error::QueryReturnedNoRows) => Ok((0, None)),
+                    Err(e) => Err(e.into()),
+                }
+            })
+            .await
+            .map_err(Into::into)
+    }
+
     pub async fn list_sessions(&self) -> anyhow::Result<Vec<(String, String)>> {
         self.conn
             .call(|c| {
@@ -320,11 +346,17 @@ impl Store {
         let id = id.to_string();
         self.conn
             .call(move |c| {
-                c.execute(
+                let tx = c.transaction()?;
+                tx.execute(
+                    "DELETE FROM messages_fts WHERE session_id = ?1",
+                    rusqlite::params![id],
+                )?;
+                tx.execute(
                     "DELETE FROM messages WHERE session_id = ?1",
                     rusqlite::params![id],
                 )?;
-                c.execute("DELETE FROM sessions WHERE id = ?1", rusqlite::params![id])?;
+                tx.execute("DELETE FROM sessions WHERE id = ?1", rusqlite::params![id])?;
+                tx.commit()?;
                 Ok::<(), tokio_rusqlite::Error>(())
             })
             .await

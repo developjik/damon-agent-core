@@ -8,6 +8,7 @@ use tracing::warn;
 use crate::api::AppState;
 use crate::config::Config;
 use crate::llm::{self, StreamEvent, ToolCallAccumulator};
+use crate::store::StoredMessage;
 
 /// Max tool-call round trips per prompt turn.
 const MAX_ITERATIONS: usize = 25;
@@ -226,7 +227,7 @@ pub async fn run_prompt(
             if cancel.is_cancelled() {
                 break;
             }
-            let result = execute_tool(state, session_id, call, client).await;
+            let result = execute_tool(state, session_id, call, client, &cancel).await;
             let mut content = match &result {
                 Ok(v) => serde_json::to_string(v).unwrap_or_default(),
                 Err(e) => format!("error: {e:#}"),
@@ -328,25 +329,48 @@ async fn maybe_compact(
     };
     let Some(window) = window else { return };
 
+    let Ok((compacted_through, prev_summary)) =
+        state.store.compaction(session_id).await
+    else {
+        return;
+    };
     let Ok(full) = state.store.messages_full(session_id).await else {
         return;
     };
-    let messages: Vec<Value> = full.iter().map(|m| m.data.clone()).collect();
-    let est = estimate_tokens(&messages);
+    // Only the uncompacted tail still costs context — counting the whole
+    // log would re-trigger compaction on every turn.
+    let tail: Vec<&StoredMessage> =
+        full.iter().filter(|m| m.id > compacted_through).collect();
+    let mut est = estimate_tokens(
+        &tail.iter().map(|m| m.data.clone()).collect::<Vec<_>>(),
+    );
+    if let Some(s) = &prev_summary {
+        est += (s.len() / 4) as u64;
+    }
     if est < window * 85 / 100 {
         return;
     }
 
-    // Split: keep the newest ~50% of messages, summarize the rest.
-    let keep_from = full.len() / 2;
-    let dropped = &full[..keep_from];
+    // Split: keep the newest ~50% of the tail, summarize the rest. The
+    // boundary must not leave a role:"tool" response at the head of the
+    // kept half — its assistant tool_calls message would be summarized
+    // away, orphaning it and 400ing every later turn.
+    let mut keep_from = tail.len() / 2;
+    while keep_from < tail.len() && tail[keep_from].data["role"] == "tool" {
+        keep_from += 1;
+    }
+    let dropped = &tail[..keep_from];
     if dropped.is_empty() {
         return;
     }
     let through_id = dropped.last().unwrap().id;
 
-    // Build a summarization prompt from the dropped messages.
+    // Build a summarization prompt from the dropped messages, carrying the
+    // previous summary forward so context is never lost across compactions.
     let mut transcript = String::new();
+    if let Some(s) = &prev_summary {
+        transcript.push_str(&format!("previous summary: {s}\n"));
+    }
     for m in dropped {
         let role = m.data["role"].as_str().unwrap_or("?");
         let content = m.data["content"].as_str().unwrap_or("");
@@ -393,18 +417,27 @@ async fn execute_tool(
     session_id: &str,
     call: &llm::ToolCall,
     client: &Arc<dyn ClientChannel>,
+    cancel: &CancellationToken,
 ) -> anyhow::Result<Value> {
     if !state.mcp.has_tool(&call.name) {
         anyhow::bail!("unknown tool {}", call.name);
     }
     if !state.mcp.auto_approve(&call.name) {
-        let granted = request_permission(state, session_id, call, client).await;
+        // Race the permission round-trip against cancellation — a silent
+        // client must not stall the turn forever.
+        let granted = tokio::select! {
+            _ = cancel.cancelled() => false,
+            g = request_permission(state, session_id, call, client) => g,
+        };
         if !granted {
             anyhow::bail!("permission denied for {}", call.name);
         }
     }
     let args: Value = llm::parse_partial_json(&call.arguments);
-    state.mcp.call(&call.name, args).await
+    tokio::select! {
+        _ = cancel.cancelled() => anyhow::bail!("cancelled"),
+        r = state.mcp.call(&call.name, args) => r,
+    }
 }
 
 /// ACP session/request_permission round-trip. Failures and non-allow
