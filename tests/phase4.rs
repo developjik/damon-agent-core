@@ -170,7 +170,10 @@ async fn mcp_tool_call_with_permission() {
     );
     let shared: damon_core::config::SharedConfig = Arc::new(parking_lot::RwLock::new(cfg));
     let store = Store::in_memory().await.unwrap();
-    let mcp = McpRegistry::connect_all(&shared.read().mcp_servers).await;
+    let mcp = {
+        let servers = shared.read().mcp_servers.clone();
+        McpRegistry::connect_all(&servers).await
+    };
     assert!(mcp.has_tool("test.ping"), "MCP tool not registered");
     let state = AppState::new(shared, store.clone(), mcp).await;
     let url = serve_app(state).await;
@@ -328,5 +331,6 @@ async fn tls_serves_https() {
         }
     }
     let _ = child.kill();
+    let _ = child.wait();
     assert!(ok, "TLS /health never became ready");
 }

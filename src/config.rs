@@ -430,8 +430,8 @@ const STARTER_CONFIG: &str = r#"# Damon agent core configuration
 pub type SharedConfig = Arc<parking_lot::RwLock<Config>>;
 
 /// Watch the config file and reload on change. Returns a receiver that
-/// fires after each successful reload (e.g. to rebuild providers), or
-/// None if the watcher could not be installed.
+/// fires after each successful reload; None if the watcher could not be
+/// installed.
 pub fn watch(path: PathBuf, shared: SharedConfig) -> Option<tokio::sync::mpsc::Receiver<()>> {
     let (event_tx, mut event_rx) = tokio::sync::mpsc::channel(8);
     let (reload_tx, reload_rx) = tokio::sync::mpsc::channel(1);
@@ -445,7 +445,13 @@ pub fn watch(path: PathBuf, shared: SharedConfig) -> Option<tokio::sync::mpsc::R
             return None;
         }
     };
+
+    // Watch the ORIGINAL path's parent dir — a symlinked config reports
+    // events under the symlink's dir, not the target's. Match events
+    // against both the given path and its canonical form (macOS reports
+    // /tmp as /private/tmp).
     let dir = path.parent().unwrap_or(Path::new(".")).to_path_buf();
+    let canonical = path.canonicalize().unwrap_or_else(|_| path.clone());
     if let Err(e) = watcher.watch(&dir, notify::RecursiveMode::NonRecursive) {
         warn!(error = %e, dir = %dir.display(), "cannot watch config dir");
         return None;
@@ -455,7 +461,12 @@ pub fn watch(path: PathBuf, shared: SharedConfig) -> Option<tokio::sync::mpsc::R
         let _watcher = watcher; // keep alive for the task's lifetime
         while let Some(res) = event_rx.recv().await {
             match res {
-                Ok(event) if event.paths.iter().any(|p| p == &path) => {
+                Ok(event)
+                    if event
+                        .paths
+                        .iter()
+                        .any(|p| p == &path || p == &canonical) =>
+                {
                     // Debounce: editors often write via rename bursts.
                     tokio::time::sleep(Duration::from_millis(100)).await;
                     match Config::load(&path) {

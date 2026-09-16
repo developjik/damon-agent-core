@@ -105,8 +105,8 @@ async fn main() -> anyhow::Result<()> {
 
     let store = Store::open(&data_dir.join("damon.db")).await?;
     let mcp = {
-        let cfg = shared.read();
-        McpRegistry::connect_all(&cfg.mcp_servers).await
+        let servers = shared.read().mcp_servers.clone();
+        McpRegistry::connect_all(&servers).await
     };
     let state = AppState::new(shared.clone(), store, mcp).await;
     if let Some(mut reloaded) = config::watch(path, shared.clone()) {
@@ -140,7 +140,14 @@ async fn main() -> anyhow::Result<()> {
     }
 
     let app = api::router(state);
-    match (shared.read().tls_cert.clone(), shared.read().tls_key.clone()) {
+    // Read TLS paths into locals first — a scrutinee guard would live for
+    // the whole match (i.e. the server's lifetime), deadlocking the config
+    // watcher's write lock on the first hot reload.
+    let tls = {
+        let cfg = shared.read();
+        (cfg.tls_cert.clone(), cfg.tls_key.clone())
+    };
+    match tls {
         (Some(cert), Some(key)) => {
             let tls = axum_server::tls_rustls::RustlsConfig::from_pem_file(&cert, &key)
                 .await

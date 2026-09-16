@@ -59,14 +59,19 @@ impl Store {
                 "ALTER TABLE sessions ADD COLUMN compacted_through INTEGER NOT NULL DEFAULT 0;
                  ALTER TABLE sessions ADD COLUMN summary TEXT;",
             );
-            // Backfill the FTS index for messages written before it existed.
-            c.execute_batch(
-                "INSERT INTO messages_fts (content, session_id, message_id)
-                 SELECT json_extract(m.data, '$.content'), m.session_id, m.id
-                 FROM messages m
-                 WHERE json_type(m.data, '$.content') = 'text'
-                   AND m.id NOT IN (SELECT message_id FROM messages_fts);",
-            )?;
+            // Backfill the FTS index once for messages written before it
+            // existed; user_version gates it so startup stays O(1).
+            let v: i64 = c.query_row("PRAGMA user_version", [], |r| r.get(0))?;
+            if v == 0 {
+                c.execute_batch(
+                    "INSERT INTO messages_fts (content, session_id, message_id)
+                     SELECT json_extract(m.data, '$.content'), m.session_id, m.id
+                     FROM messages m
+                     WHERE json_type(m.data, '$.content') = 'text'
+                       AND m.id NOT IN (SELECT message_id FROM messages_fts);
+                     PRAGMA user_version = 1;",
+                )?;
+            }
             Ok::<(), rusqlite::Error>(())
             .map_err(tokio_rusqlite::Error::from)
         })
