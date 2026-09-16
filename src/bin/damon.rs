@@ -3,6 +3,7 @@ use clap::{Parser, Subcommand};
 use damon_core::client::{ClientEvent, DamonClient};
 use serde_json::json;
 use tokio::io::AsyncBufReadExt;
+use tokio::sync::mpsc;
 
 #[derive(Parser)]
 #[command(name = "damon", version, about = "Damon agent core CLI client")]
@@ -11,6 +12,7 @@ struct Args {
     #[arg(long, default_value = "ws://127.0.0.1:9470/ws")]
     url: String,
     /// Auth token (or set DAMON_TOKEN)
+    #[arg(long, env = "DAMON_TOKEN")]
     token: Option<String>,
     /// Connect through a relay: --relay ws://relay:8080 --relay-name mydaemon
     #[arg(long)]
@@ -63,13 +65,12 @@ enum Cmd {
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
     let args = Args::parse();
-
     if let Cmd::Health = args.cmd {
         let url = args
             .url
-            .replace("ws://", "http://")
-            .replace("wss://", "https://")
-            .replace("/ws", "/health");
+            .replacen("wss://", "https://", 1)
+            .replacen("ws://", "http://", 1);
+        let url = format!("{}/health", url.trim_end_matches('/').trim_end_matches("/ws"));
         let resp = reqwest::get(&url).await?;
         println!("{}", resp.text().await?);
         return Ok(());
@@ -116,7 +117,8 @@ async fn main() -> anyhow::Result<()> {
                 Some(s) => s,
                 None => client.new_session(&cwd()).await?,
             };
-            run_turn(&client, &session_id, &text).await?;
+            let mut events = client.events().await;
+            run_turn(&client, &mut events, &session_id, &text).await?;
             println!();
         }
     }
@@ -129,9 +131,12 @@ fn cwd() -> String {
         .unwrap_or_default()
 }
 
-/// Interactive chat REPL over an existing session.
+/// Interactive chat REPL over an existing session. The event receiver is
+/// taken once — `events()` hands out the only consumer, so re-taking it
+/// per turn would starve every turn after the first.
 async fn chat_loop(client: &DamonClient, session_id: &str) -> anyhow::Result<()> {
     eprintln!("session: {session_id}  (Ctrl-D to quit)");
+    let mut events = client.events().await;
     let mut stdin = tokio::io::BufReader::new(tokio::io::stdin()).lines();
     loop {
         eprint!("> ");
@@ -139,15 +144,19 @@ async fn chat_loop(client: &DamonClient, session_id: &str) -> anyhow::Result<()>
         if line.trim().is_empty() {
             continue;
         }
-        run_turn(client, session_id, &line).await?;
+        run_turn(client, &mut events, session_id, &line).await?;
     }
     Ok(())
 }
 
 /// Run one prompt turn: stream text to stdout, handle permission
 /// requests on stderr, return when the turn ends.
-async fn run_turn(client: &DamonClient, session_id: &str, text: &str) -> anyhow::Result<()> {
-    let mut events = client.events().await;
+async fn run_turn(
+    client: &DamonClient,
+    events: &mut mpsc::Receiver<ClientEvent>,
+    session_id: &str,
+    text: &str,
+) -> anyhow::Result<()> {
     let prompt = {
         let client = client.clone();
         let session_id = session_id.to_string();

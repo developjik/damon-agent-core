@@ -73,7 +73,7 @@ impl DamonClient {
     /// Connect to `ws://host:port/ws`. `token` is sent as ?token= when set.
     pub async fn connect(url: &str, token: Option<&str>) -> anyhow::Result<Self> {
         let url = match token {
-            Some(t) => format!("{url}?token={t}"),
+            Some(t) => format!("{url}?token={}", urlencoding(t)),
             None => url.to_string(),
         };
         let (ws, _) = tokio_tungstenite::connect_async(&url)
@@ -387,4 +387,18 @@ impl DamonClient {
             .await
             .context("send failed")
     }
+}
+
+/// Percent-encode a query-param value (unreserved chars pass through).
+fn urlencoding(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    for b in s.bytes() {
+        match b {
+            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'_' | b'.' | b'~' => {
+                out.push(b as char)
+            }
+            _ => out.push_str(&format!("%{b:02X}")),
+        }
+    }
+    out
 }
