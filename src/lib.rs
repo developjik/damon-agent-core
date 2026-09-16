@@ -1,12 +1,16 @@
 pub mod api;
+pub mod channel;
 pub mod client;
 pub mod config;
+pub mod discord;
 pub mod llm;
 pub mod mcp;
 pub mod oauth;
 pub mod provider;
 pub mod relay;
 pub mod rpc;
-pub mod runtime;
+pub mod slack;
+pub mod telegram;
 pub mod service;
+pub mod runtime;
 pub mod store;
