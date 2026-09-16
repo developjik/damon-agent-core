@@ -75,24 +75,24 @@ impl OpenAiResponses {
         for m in body["messages"].as_array().cloned().unwrap_or_default() {
             match m["role"].as_str() {
                 Some("system") | Some("developer") => {
-                    if let Some(t) = m["content"].as_str() {
-                        instructions.push(t.to_string());
+                    let t = super::content_text(&m["content"]);
+                    if !t.is_empty() {
+                        instructions.push(t);
                     }
                 }
                 Some("user") => input.push(json!({
                     "type": "message",
                     "role": "user",
-                    "content": [{"type": "input_text", "text": m["content"].as_str().unwrap_or("")}],
+                    "content": [{"type": "input_text", "text": super::content_text(&m["content"])}],
                 })),
                 Some("assistant") => {
-                    if let Some(t) = m["content"].as_str() {
-                        if !t.is_empty() {
-                            input.push(json!({
-                                "type": "message",
-                                "role": "assistant",
-                                "content": [{"type": "output_text", "text": t}],
-                            }));
-                        }
+                    let t = super::content_text(&m["content"]);
+                    if !t.is_empty() {
+                        input.push(json!({
+                            "type": "message",
+                            "role": "assistant",
+                            "content": [{"type": "output_text", "text": t}],
+                        }));
                     }
                     for tc in m["tool_calls"].as_array().cloned().unwrap_or_default() {
                         let f = &tc["function"];
@@ -107,7 +107,7 @@ impl OpenAiResponses {
                 Some("tool") => input.push(json!({
                     "type": "function_call_output",
                     "call_id": m["tool_call_id"],
-                    "output": m["content"].as_str().unwrap_or(""),
+                    "output": super::content_text(&m["content"]),
                 })),
                 _ => {}
             }
@@ -281,7 +281,7 @@ fn responses_events(
     // pending holds a Usage event parsed alongside a terminal event so both
     // get emitted.
     Box::pin(futures::stream::unfold(
-        (stream, String::new(), false, None::<StreamEvent>),
+        (stream, Vec::<u8>::new(), false, None::<StreamEvent>),
         |(mut stream, mut buf, mut done, mut pending)| async move {
             loop {
                 if let Some(ev) = pending.take() {
@@ -290,8 +290,12 @@ fn responses_events(
                 if done {
                     return None;
                 }
-                if let Some(pos) = buf.find('\n') {
-                    let line = buf[..pos].trim_end_matches('\r').to_string();
+                if let Some(pos) = buf.iter().position(|&b| b == b'\n') {
+                    // buf[..pos] is a complete UTF-8 boundary: \n (0x0A)
+                    // never appears inside a multi-byte sequence.
+                    let line = String::from_utf8_lossy(&buf[..pos])
+                        .trim_end_matches('\r')
+                        .to_string();
                     buf.drain(..=pos);
                     if line.is_empty() {
                         continue;
@@ -328,7 +332,7 @@ fn responses_events(
                     continue;
                 }
                 match stream.next().await {
-                    Some(Ok(chunk)) => buf.push_str(&String::from_utf8_lossy(&chunk)),
+                    Some(Ok(chunk)) => buf.extend_from_slice(&chunk),
                     Some(Err(e)) => {
                         done = true;
                         return Some((Err(e.into()), (stream, buf, done, pending)));

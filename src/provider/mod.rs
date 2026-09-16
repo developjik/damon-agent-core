@@ -168,3 +168,28 @@ pub async fn collect_stream(
     }
     Ok(buf)
 }
+
+/// Extract text from an OpenAI message `content` field: either a plain
+/// string or the array form `[{type:"text",text:..}, ...]` (multimodal
+/// messages carry text parts alongside images — non-text parts drop).
+pub fn content_text(content: &Value) -> String {
+    if let Some(s) = content.as_str() {
+        return s.to_string();
+    }
+    content
+        .as_array()
+        .map(|parts| {
+            parts
+                .iter()
+                .filter_map(|p| {
+                    if p["type"].as_str() == Some("text") {
+                        p["text"].as_str().map(String::from)
+                    } else {
+                        None
+                    }
+                })
+                .collect::<Vec<_>>()
+                .join("")
+        })
+        .unwrap_or_default()
+}

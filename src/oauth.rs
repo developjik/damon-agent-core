@@ -94,7 +94,17 @@ pub fn authorize_url() -> (String, String) {
 /// Exchange an authorization code (pasted from the callback page, possibly
 /// "code#state") for tokens. Stores them in the keychain.
 pub async fn exchange(provider: &str, code_and_state: &str, verifier: &str) -> anyhow::Result<()> {
-    let code = code_and_state.split('#').next().unwrap_or(code_and_state);
+    // The callback may append "#state" — when present it must match the
+    // verifier we sent, or the code isn't ours.
+    let (code, state) = match code_and_state.split_once('#') {
+        Some((c, s)) => (c, Some(s)),
+        None => (code_and_state, None),
+    };
+    if let Some(s) = state {
+        if s != verifier {
+            bail!("state mismatch — the pasted code belongs to a different login attempt");
+        }
+    }
     let resp = reqwest::Client::new()
         .post(TOKEN_URL)
         .header("content-type", "application/json")

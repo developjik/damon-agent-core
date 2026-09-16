@@ -102,6 +102,11 @@ async fn probe_openai_models(base: &str, cfg: &ProviderConfig) -> anyhow::Result
             req = req.bearer_auth(key);
         }
     }
+    // Custom headers (gateway tokens etc.) apply to probes too — a
+    // header-authenticating proxy must not fail discovery.
+    for (k, v) in &cfg.headers {
+        req = req.header(k, v);
+    }
     let v: Value = req
         .send()
         .await

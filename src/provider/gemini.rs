@@ -58,6 +58,11 @@ impl Gemini {
         let mut contents = Vec::new();
         let mut system = Vec::new();
 
+        // OpenAI tool messages carry only tool_call_id — map it back to
+        // the function name from the assistant turn's tool_calls, or
+        // Gemini rejects the functionResponse for a name mismatch.
+        let mut call_names: std::collections::HashMap<String, String> =
+            std::collections::HashMap::new();
         for m in body["messages"].as_array().cloned().unwrap_or_default() {
             match m["role"].as_str() {
                 Some("system") => {
@@ -67,20 +72,23 @@ impl Gemini {
                 }
                 Some("user") => contents.push(json!({
                     "role": "user",
-                    "parts": [{"text": m["content"].as_str().unwrap_or("")}],
+                    "parts": [{"text": super::content_text(&m["content"])}],
                 })),
                 Some("assistant") => {
                     let mut parts = Vec::new();
-                    if let Some(t) = m["content"].as_str() {
-                        if !t.is_empty() {
-                            parts.push(json!({"text": t}));
-                        }
+                    let t = super::content_text(&m["content"]);
+                    if !t.is_empty() {
+                        parts.push(json!({"text": t}));
                     }
                     for tc in m["tool_calls"].as_array().cloned().unwrap_or_default() {
                         let f = &tc["function"];
+                        let name = f["name"].as_str().unwrap_or("");
+                        if let Some(id) = tc["id"].as_str() {
+                            call_names.insert(id.to_string(), name.to_string());
+                        }
                         parts.push(json!({
                             "functionCall": {
-                                "name": mangle(f["name"].as_str().unwrap_or("")),
+                                "name": mangle(name),
                                 "args": serde_json::from_str::<Value>(
                                     f["arguments"].as_str().unwrap_or("{}")
                                 ).unwrap_or(json!({})),
@@ -90,12 +98,17 @@ impl Gemini {
                     contents.push(json!({"role": "model", "parts": parts}));
                 }
                 Some("tool") => {
+                    let name = m["tool_call_id"]
+                        .as_str()
+                        .and_then(|id| call_names.get(id).cloned())
+                        .or_else(|| m["name"].as_str().map(String::from))
+                        .unwrap_or_else(|| "tool".to_string());
                     contents.push(json!({
                         "role": "user",
                         "parts": [{
                             "functionResponse": {
-                                "name": mangle(m["name"].as_str().unwrap_or("tool")),
-                                "response": {"result": m["content"].as_str().unwrap_or("")},
+                                "name": mangle(&name),
+                                "response": {"result": super::content_text(&m["content"])},
                             }
                         }],
                     }));
@@ -250,7 +263,7 @@ fn gemini_events(
     use std::collections::VecDeque;
     // Events parsed from one chunk queue up; we drain one per poll.
     Box::pin(futures::stream::unfold(
-        (stream, String::new(), false, 0usize, VecDeque::new()),
+        (stream, Vec::<u8>::new(), false, 0usize, VecDeque::new()),
         |(mut stream, mut buf, mut done, mut call_idx, mut queue)| async move {
             loop {
                 if let Some(ev) = queue.pop_front() {
@@ -259,8 +272,12 @@ fn gemini_events(
                 if done {
                     return None;
                 }
-                if let Some(pos) = buf.find('\n') {
-                    let line = buf[..pos].trim_end_matches('\r').to_string();
+                if let Some(pos) = buf.iter().position(|&b| b == b'\n') {
+                    // buf[..pos] is a complete UTF-8 boundary: \n (0x0A)
+                    // never appears inside a multi-byte sequence.
+                    let line = String::from_utf8_lossy(&buf[..pos])
+                        .trim_end_matches('\r')
+                        .to_string();
                     buf.drain(..=pos);
                     if line.is_empty() {
                         continue;
@@ -295,14 +312,19 @@ fn gemini_events(
                             call_idx += 1;
                         }
                     }
-                    if let Some(u) = v.get("usageMetadata").filter(|u| u.is_object()) {
-                        queue.push_back(StreamEvent::Usage {
-                            input: u["promptTokenCount"].as_u64().unwrap_or(0),
-                            output: u["candidatesTokenCount"].as_u64().unwrap_or(0),
-                        });
-                    }
                     if let Some(r) = v["candidates"][0]["finishReason"].as_str() {
+                        // usageMetadata rides every chunk as a running
+                        // total — emit only the final counts.
+                        if let Some(u) = v.get("usageMetadata").filter(|u| u.is_object()) {
+                            queue.push_back(StreamEvent::Usage {
+                                input: u["promptTokenCount"].as_u64().unwrap_or(0),
+                                output: u["candidatesTokenCount"].as_u64().unwrap_or(0),
+                            });
+                        }
+                        // A response that emitted function calls ends the
+                        // turn for tool use, not a plain stop.
                         let reason = match r {
+                            "STOP" if call_idx > 0 => StopReason::ToolCalls,
                             "STOP" => StopReason::Stop,
                             "MAX_TOKENS" => StopReason::Length,
                             _ => StopReason::Other,
@@ -313,7 +335,7 @@ fn gemini_events(
                     continue;
                 }
                 match stream.next().await {
-                    Some(Ok(chunk)) => buf.push_str(&String::from_utf8_lossy(&chunk)),
+                    Some(Ok(chunk)) => buf.extend_from_slice(&chunk),
                     Some(Err(e)) => {
                         done = true;
                         return Some((Err(e.into()), (stream, buf, done, call_idx, queue)));

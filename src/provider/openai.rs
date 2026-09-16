@@ -359,74 +359,66 @@ fn flush_event(
         return Some(Ok(vec![StreamEvent::Done(*finish)]));
     }
     match parse_chunk(&data) {
-        Ok(ParseOut::Events(evs)) if !evs.is_empty() => Some(Ok(evs)),
-        Ok(ParseOut::Events(_)) => None,
-        Ok(ParseOut::Finish(r)) => {
-            *finish = r;
-            None
+        Ok(parsed) => {
+            if let Some(r) = parsed.finish {
+                *finish = r;
+            }
+            if parsed.events.is_empty() {
+                None
+            } else {
+                Some(Ok(parsed.events))
+            }
         }
-        Ok(ParseOut::Skip) => None,
         Err(e) => Some(Err(e)),
     }
 }
 
-/// What a parsed SSE chunk produced: events, a finish_reason update,
-/// or nothing worth emitting.
-enum ParseOut {
-    Events(Vec<StreamEvent>),
-    Finish(crate::llm::StopReason),
-    Skip,
+/// What a parsed SSE chunk produced: events plus an optional
+/// finish_reason update (a chunk can carry both usage and a finish).
+#[derive(Default)]
+struct Parsed {
+    events: Vec<StreamEvent>,
+    finish: Option<crate::llm::StopReason>,
 }
 
-fn parse_chunk(data: &str) -> anyhow::Result<ParseOut> {
+fn parse_chunk(data: &str) -> anyhow::Result<Parsed> {
     use crate::llm::StopReason;
     let v: Value = serde_json::from_str(data).context("invalid SSE JSON")?;
+    let mut out = Parsed::default();
 
-    // Usage-only final chunk (choices empty, usage present).
+    // Usage may ride on the same chunk as content/finish — collect it
+    // without dropping the rest.
     if let Some(u) = v.get("usage").filter(|u| u.is_object()) {
-        return Ok(ParseOut::Events(vec![StreamEvent::Usage {
+        out.events.push(StreamEvent::Usage {
             input: u["prompt_tokens"].as_u64().unwrap_or(0),
             output: u["completion_tokens"].as_u64().unwrap_or(0),
-        }]));
+        });
     }
 
     let Some(choice) = v["choices"].get(0) else {
-        return Ok(ParseOut::Skip);
+        return Ok(out);
     };
     let delta = &choice["delta"];
-
-    // finish_reason rides on the last content chunk.
-    if let Some(reason) = choice["finish_reason"].as_str() {
-        let r = match reason {
-            "stop" => StopReason::Stop,
-            "length" | "max_tokens" => StopReason::Length,
-            "tool_calls" | "function_call" => StopReason::ToolCalls,
-            _ => StopReason::Other,
-        };
-        return Ok(ParseOut::Finish(r));
-    }
-
-    let mut events = Vec::new();
 
     // Reasoning deltas (DeepSeek-R1, OpenRouter, z.ai).
     for field in ["reasoning_content", "reasoning", "reasoning_text"] {
         if let Some(t) = delta[field].as_str() {
             if !t.is_empty() {
-                events.push(StreamEvent::Thinking(t.to_string()));
+                out.events.push(StreamEvent::Thinking(t.to_string()));
             }
         }
     }
 
     if let Some(text) = delta["content"].as_str() {
         if !text.is_empty() {
-            events.push(StreamEvent::Text(text.to_string()));
+            out.events.push(StreamEvent::Text(text.to_string()));
         }
     }
     if let Some(calls) = delta["tool_calls"].as_array() {
         for call in calls {
             let index = call["index"].as_u64().unwrap_or(0) as usize;
             let f = &call["function"];
-            events.push(StreamEvent::ToolCallDelta {
+            out.events.push(StreamEvent::ToolCallDelta {
                 index,
                 id: call["id"].as_str().map(String::from),
                 name: f["name"].as_str().map(String::from),
@@ -434,10 +426,17 @@ fn parse_chunk(data: &str) -> anyhow::Result<ParseOut> {
             });
         }
     }
-    if events.is_empty() {
-        Ok(ParseOut::Skip)
-    } else {
-        Ok(ParseOut::Events(events))
+
+    // finish_reason rides on the last content chunk — possibly alongside
+    // usage and trailing deltas.
+    if let Some(reason) = choice["finish_reason"].as_str() {
+        out.finish = Some(match reason {
+            "stop" => StopReason::Stop,
+            "length" | "max_tokens" => StopReason::Length,
+            "tool_calls" | "function_call" => StopReason::ToolCalls,
+            _ => StopReason::Other,
+        });
     }
+    Ok(out)
 }
 
