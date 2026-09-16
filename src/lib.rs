@@ -4,6 +4,7 @@ pub mod llm;
 pub mod mcp;
 pub mod oauth;
 pub mod provider;
+pub mod relay;
 pub mod rpc;
 pub mod runtime;
 pub mod service;

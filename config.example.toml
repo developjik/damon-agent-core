@@ -1,0 +1,76 @@
+# Damon agent core — example configuration
+# Copy to the platform config dir (run `damond --print-config-path` to see it).
+# .env files are loaded from the config dir, then cwd (existing env wins).
+
+# bind = "127.0.0.1:9470"          # default; changing requires restart
+# auth_token = "env:DAMON_TOKEN"   # optional bearer token for /v1/*
+
+[providers.default]
+api      = "openai-completions"    # openai-completions | openai-responses | anthropic-messages | gemini
+base_url = "https://api.openai.com/v1"
+api_key  = "env:OPENAI_API_KEY"    # env:VAR | keychain:svc/acct | "!cmd" (e.g. "!op read op://dev/openai")
+models   = ["gpt-*"]               # model globs routed here
+default_model = "gpt-4o"           # used by the agent runtime
+# discovery = "openai-models-list" # GET {base}/models → discovered ids join routing
+#                                  # "ollama" → GET {base}/api/tags
+# context_promotion_target = "big-model"  # retry once on context overflow ("provider/model" or bare id)
+
+# Per-model metadata overrides. Built-in hints cover common families;
+# add entries for models the hints miss.
+# [models."claude-*"]
+# context_window = 200000
+# max_output_tokens = 8192
+# input_cost = 3.0    # USD per million input tokens
+# output_cost = 15.0  # USD per million output tokens
+
+# Extra headers on every upstream request. Values may be secret refs.
+# [providers.default.headers]
+# X-Team = "platform"
+
+# Endpoint quirks — set only what the endpoint needs.
+# [providers.default.compat]
+# supports_store = true                    # send store:false
+# supports_developer_role = true           # system → developer
+# supports_multiple_system_messages = false # coalesce system messages
+# max_tokens_field = "max_completion_tokens" # o-series / newer endpoints
+# requires_tool_result_name = true         # Mistral
+# requires_mistral_tool_ids = true         # 9-char alphanumeric tool ids
+# supports_usage_in_streaming = false      # omit stream_options
+# inband_tools = true                      # render tools as text prompt, parse <tool_call> blocks
+                                          # (local models without a native tool API)
+# [providers.default.compat.extra_body]
+# gateway = "m1-01"
+
+# [providers.o3]
+# api     = "openai-responses"
+# api_key = "env:OPENAI_API_KEY"
+# models  = ["o3*", "gpt-5*"]
+
+# [providers.claude]
+# api     = "anthropic-messages"
+# api_key = "env:ANTHROPIC_API_KEY"
+# models  = ["claude-*"]
+# default_model = "claude-sonnet-4-5"
+
+# [providers.gemini]
+# api     = "gemini"
+# api_key = "env:GEMINI_API_KEY"
+# models  = ["gemini-*"]
+
+# Implicit ollama: if no [providers.ollama] exists, damond probes
+# $OLLAMA_HOST (default http://127.0.0.1:11434) at startup and on reload.
+# Discovered models route automatically — no config needed.
+
+# MCP tool servers (stdio). Tools are namespaced as "server.tool".
+# auto_approve = false → client gets a session/request_permission prompt.
+# [mcp_servers.filesystem]
+# command = "npx"
+# args = ["-y", "@modelcontextprotocol/server-filesystem", "/tmp"]
+# auto_approve = false
+
+# Remote relay: dial out to a public damon-relay so clients can reach this
+# daemon without an inbound port. E2E encrypted — the relay sees only
+# ciphertext. Run your own relay: `damon-relay` (binds 0.0.0.0:8080).
+# [relay]
+# url  = "ws://your-relay-host:8080"
+# name = "my-daemon"               # clients use this name to connect
