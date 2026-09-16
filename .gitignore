@@ -6,6 +6,9 @@
 # node
 node_modules/
 dist/
+
+# rust
+target/
 *.log
 
 # python
