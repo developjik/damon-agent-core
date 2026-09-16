@@ -52,7 +52,7 @@ impl E2e {
             .context("bad e2e_pub")?;
         let their_proof = v["e2e_proof"].as_str().context("missing e2e_proof")?;
         let their_pub: [u8; 32] = their_pub.try_into().map_err(|_| anyhow::anyhow!("bad pubkey len"))?;
-        if their_proof != proof(token, &their_pub) {
+        if !crate::config::constant_time_eq(their_proof.as_bytes(), proof(token, &their_pub).as_bytes()) {
             bail!("client failed E2E proof — wrong auth_token?");
         }
         let shared = secret.diffie_hellman(&x25519_dalek::PublicKey::from(their_pub));
@@ -72,7 +72,7 @@ impl E2e {
             .context("bad e2e_pub")?;
         let their_proof = v["e2e_proof"].as_str().context("missing e2e_proof")?;
         let their_pub: [u8; 32] = their_pub.try_into().map_err(|_| anyhow::anyhow!("bad pubkey len"))?;
-        if their_proof != proof(token, &their_pub) {
+        if !crate::config::constant_time_eq(their_proof.as_bytes(), proof(token, &their_pub).as_bytes()) {
             bail!("daemon failed E2E proof — wrong auth_token?");
         }
         let secret = x25519_dalek::StaticSecret::random_from_rng(getrandom_rng());
@@ -87,8 +87,14 @@ impl E2e {
 
     fn from_shared(shared: &[u8; 32]) -> Self {
         use aes_gcm::KeyInit;
+        // Hash the raw DH output once — binds the key to a fixed-length
+        // digest instead of using the shared secret directly.
+        let mut h = sha2::Sha256::new();
+        h.update(b"damon-e2e-v1");
+        h.update(shared);
+        let key = h.finalize();
         Self {
-            cipher: aes_gcm::Aes256Gcm::new_from_slice(shared).expect("32-byte key"),
+            cipher: aes_gcm::Aes256Gcm::new_from_slice(&key).expect("32-byte key"),
         }
     }
 
@@ -161,9 +167,14 @@ fn getrandom_rng() -> impl rand_core::RngCore + rand_core::CryptoRng {
 
 /// Connect to `relay_url` (ws://host:port), register as `name`, and serve
 /// each client that connects through the relay. Reconnects on drop.
-pub async fn run_tunnel(state: Arc<AppState>, relay_url: String, name: String) {
+pub async fn run_tunnel(
+    state: Arc<AppState>,
+    relay_url: String,
+    name: String,
+    secret: Option<String>,
+) {
     loop {
-        match tunnel_once(&state, &relay_url, &name).await {
+        match tunnel_once(&state, &relay_url, &name, secret.as_deref()).await {
             Ok(()) => info!("relay tunnel closed; reconnecting"),
             Err(e) => warn!(error = %e, "relay tunnel failed; reconnecting in 5s"),
         }
@@ -171,8 +182,20 @@ pub async fn run_tunnel(state: Arc<AppState>, relay_url: String, name: String) {
     }
 }
 
-async fn tunnel_once(state: &Arc<AppState>, relay_url: &str, name: &str) -> anyhow::Result<()> {
-    let url = format!("{}/register?name={}", relay_url.trim_end_matches('/'), name);
+async fn tunnel_once(
+    state: &Arc<AppState>,
+    relay_url: &str,
+    name: &str,
+    secret: Option<&str>,
+) -> anyhow::Result<()> {
+    let mut url = format!(
+        "{}/register?name={}",
+        relay_url.trim_end_matches('/'),
+        urlencoding(name)
+    );
+    if let Some(s) = secret {
+        url.push_str(&format!("&secret={}", urlencoding(s)));
+    }
     let (ws, _) = tokio_tungstenite::connect_async(&url)
         .await
         .context("cannot reach relay")?;
@@ -196,13 +219,19 @@ async fn tunnel_once(state: &Arc<AppState>, relay_url: &str, name: &str) -> anyh
                     Ok(v) => v,
                     Err(_) => continue,
                 };
-                let client_id = v["client"].as_u64().unwrap_or(0);
+                let Some(client_id) = v["client"].as_u64() else { continue };
+                if v["disconnect"].as_bool() == Some(true) {
+                    // Relay says this client went away — drop the session
+                    // so the map doesn't grow forever.
+                    sessions.remove(&client_id);
+                    continue;
+                }
                 if let Some(data) = v["data"].as_str() {
                     // Frame from a client.
                     if let Some(in_tx) = sessions.get(&client_id) {
                         let _ = in_tx.send(data.to_string()).await;
                     }
-                } else if v["client"].is_u64() && v.get("data").is_none() {
+                } else if v.get("data").is_none() {
                     // New client connected — spawn a session.
                     let (in_tx, in_rx) = mpsc::channel::<String>(64);
                     let (sess_out, mut sess_rx) = mpsc::channel::<String>(64);
@@ -246,7 +275,13 @@ async fn tunnel_once(state: &Arc<AppState>, relay_url: &str, name: &str) -> anyh
                             while let Some(ct) = in_rx.recv().await {
                                 match e2e_in.decrypt(&ct) {
                                     Ok(pt) => { let _ = plain_in_tx.send(pt).await; }
-                                    Err(e) => warn!(error = %e, "E2E decrypt failed"),
+                                    // Tampered or wrong-key frames: fail
+                                    // closed — drop the session rather than
+                                    // silently swallowing messages.
+                                    Err(e) => {
+                                        warn!(error = %e, "E2E decrypt failed; closing session");
+                                        return;
+                                    }
                                 }
                             }
                         });
@@ -289,7 +324,11 @@ pub async fn client_connect(
     name: &str,
     token: &str,
 ) -> anyhow::Result<(mpsc::Sender<String>, mpsc::Receiver<String>)> {
-    let url = format!("{}/connect?name={}", relay_url.trim_end_matches('/'), name);
+    let url = format!(
+        "{}/connect?name={}",
+        relay_url.trim_end_matches('/'),
+        urlencoding(name)
+    );
     let (ws, _) = tokio_tungstenite::connect_async(&url)
         .await
         .context("cannot reach relay")?;
@@ -324,8 +363,10 @@ pub async fn client_connect(
     let e2e_in = e2e.clone();
     tokio::spawn(async move {
         while let Some(ct) = raw_in_rx.recv().await {
-            if let Ok(pt) = e2e_in.decrypt(&ct) {
-                let _ = plain_in_tx.send(pt).await;
+            match e2e_in.decrypt(&ct) {
+                Ok(pt) => { let _ = plain_in_tx.send(pt).await; }
+                // Fail closed on tampered frames.
+                Err(_) => return,
             }
         }
     });
@@ -341,10 +382,26 @@ pub async fn client_connect(
 }
 
 // ---------------------------------------------------------------------------
-// Relay server binary logic (used by src/bin/damon-relay.rs)
+// Helpers
 // ---------------------------------------------------------------------------
 
-/// Shared relay state: daemon name → its outbound-tunnel writer.
+/// Percent-encode a query-param value (unreserved chars pass through).
+fn urlencoding(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    for b in s.bytes() {
+        match b {
+            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'_' | b'.' | b'~' => {
+                out.push(b as char)
+            }
+            _ => out.push_str(&format!("%{b:02X}")),
+        }
+    }
+    out
+}
+
+/// Shared relay state for embedders/tests: daemon name → tunnel writer.
+/// The `damon-relay` binary uses its own richer state (client ownership,
+/// optional registration secret).
 pub type RelayState = Arc<Mutex<HashMap<String, mpsc::Sender<String>>>>;
 
 pub fn new_relay_state() -> RelayState {

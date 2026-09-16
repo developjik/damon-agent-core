@@ -47,6 +47,9 @@ pub struct RelayConfig {
     pub url: String,
     /// Name clients use to reach this daemon through the relay.
     pub name: String,
+    /// Registration secret when the relay sets DAMON_RELAY_SECRET.
+    /// Supports env:/keychain:/!cmd secret refs.
+    pub secret: Option<String>,
 }
 
 /// Per-model metadata. User config (`[models."<id-or-glob>"]`) overrides

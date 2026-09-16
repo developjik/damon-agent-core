@@ -64,6 +64,7 @@ async fn relay_e2e() {
         state,
         relay_url.clone(),
         "test-daemon".into(),
+        None,
     ));
     // Give the tunnel a moment to register.
     tokio::time::sleep(std::time::Duration::from_millis(200)).await;

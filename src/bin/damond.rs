@@ -125,8 +125,16 @@ async fn main() -> anyhow::Result<()> {
         let state = state.clone();
         let url = relay.url.clone();
         let name = relay.name.clone();
+        // Resolve the registration secret once — a !cmd/keychain ref
+        // resolves at boot, not per reconnect.
+        let secret = relay.secret.as_deref().and_then(|s| {
+            match config::SecretRef::parse(s) {
+                Ok(r) => r.resolve().ok(),
+                Err(_) => Some(s.to_string()),
+            }
+        });
         tokio::spawn(async move {
-            damon_core::relay::run_tunnel(state, url, name).await;
+            damon_core::relay::run_tunnel(state, url, name, secret).await;
         });
     }
     // Safety: non-loopback bind requires a resolvable auth_token — a
