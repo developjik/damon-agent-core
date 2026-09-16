@@ -67,8 +67,8 @@ git tag v0.1.0 && git push origin v0.1.0
 
 ## Known gaps (decide before shipping)
 
-- The formula's `sha256` values are placeholders — `brew install` fails
-  until they're filled in after the first release.
+- The formula's `sha256` values are filled in per release by hand (see
+  step 5) — a future tag without that pass ships a checksum mismatch.
 - `damon-relay` is now in the tarball, `bin.install`, npm `bin`, and
   `install.js`'s `expected` list — keep all four in sync when binaries
   are added or renamed.
