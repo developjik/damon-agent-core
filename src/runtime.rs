@@ -90,6 +90,7 @@ pub async fn run_prompt(
         };
         let mut stream = std::pin::pin!(stream);
         let mut text_out = String::new();
+        let mut thinking_blocks: Vec<Value> = Vec::new();
         let mut acc = ToolCallAccumulator::default();
 
         use futures::StreamExt;
@@ -141,6 +142,9 @@ pub async fn run_prompt(
                         )
                         .await;
                 }
+                // Complete provider thinking block — persisted with the
+                // assistant message so it can be replayed next request.
+                Ok(StreamEvent::ThinkingBlock(b)) => thinking_blocks.push(b),
                 Ok(StreamEvent::ToolCallDelta {
                     index,
                     id,
@@ -181,14 +185,21 @@ pub async fn run_prompt(
         }
 
         let calls = acc.finish();
+        // Persisted thinking blocks ride on the assistant message — the
+        // provider needs them verbatim on the next request.
+        let thinking_json = if thinking_blocks.is_empty() {
+            Value::Null
+        } else {
+            json!(thinking_blocks)
+        };
         if calls.is_empty() {
+            let mut msg = json!({"role": "assistant", "content": text_out});
+            if !thinking_json.is_null() {
+                msg["thinking"] = thinking_json;
+            }
             state
                 .store
-                .append(
-                    session_id,
-                    "assistant",
-                    &json!({"role": "assistant", "content": text_out}),
-                )
+                .append(session_id, "assistant", &msg)
                 .await?;
             return Ok(stop);
         }
@@ -204,17 +215,17 @@ pub async fn run_prompt(
                 })
             })
             .collect();
+        let mut msg = json!({
+            "role": "assistant",
+            "content": if text_out.is_empty() { Value::Null } else { json!(text_out) },
+            "tool_calls": tool_calls_json,
+        });
+        if !thinking_json.is_null() {
+            msg["thinking"] = thinking_json;
+        }
         state
             .store
-            .append(
-                session_id,
-                "assistant",
-                &json!({
-                    "role": "assistant",
-                    "content": if text_out.is_empty() { Value::Null } else { json!(text_out) },
-                    "tool_calls": tool_calls_json,
-                }),
-            )
+            .append(session_id, "assistant", &msg)
             .await?;
 
         // Every persisted tool_call MUST get a matching role:"tool" row —

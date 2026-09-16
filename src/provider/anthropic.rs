@@ -90,20 +90,26 @@ impl Anthropic {
         for m in body["messages"].as_array().cloned().unwrap_or_default() {
             match m["role"].as_str() {
                 Some("system") => {
-                    if let Some(t) = m["content"].as_str() {
-                        system.push(t.to_string());
+                    let t = super::content_text(&m["content"]);
+                    if !t.is_empty() {
+                        system.push(t);
                     }
                 }
                 Some("user") => messages.push(json!({
                     "role": "user",
-                    "content": [{"type": "text", "text": m["content"].as_str().unwrap_or("")}],
+                    "content": [{"type": "text", "text": super::content_text(&m["content"])}],
                 })),
                 Some("assistant") => {
                     let mut content = Vec::new();
-                    if let Some(t) = m["content"].as_str() {
-                        if !t.is_empty() {
-                            content.push(json!({"type": "text", "text": t}));
-                        }
+                    // Replay persisted thinking blocks first — Anthropic
+                    // requires them verbatim (signature included) when
+                    // thinking is enabled and the turn used tools.
+                    for b in m["thinking"].as_array().cloned().unwrap_or_default() {
+                        content.push(b);
+                    }
+                    let t = super::content_text(&m["content"]);
+                    if !t.is_empty() {
+                        content.push(json!({"type": "text", "text": t}));
                     }
                     for tc in m["tool_calls"].as_array().cloned().unwrap_or_default() {
                         let f = &tc["function"];
@@ -124,7 +130,7 @@ impl Anthropic {
                         "content": [{
                             "type": "tool_result",
                             "tool_use_id": m["tool_call_id"],
-                            "content": m["content"].as_str().unwrap_or(""),
+                            "content": super::content_text(&m["content"]),
                         }],
                     }));
                 }
@@ -286,14 +292,43 @@ fn anthropic_events(
     use crate::llm::StopReason;
     // finish carries message_delta.stop_reason into the terminal Done.
     Box::pin(futures::stream::unfold(
-        (stream, String::new(), false, String::new(), 0usize, StopReason::Other),
-        |(mut stream, mut buf, mut done, mut cur_tool, mut tool_index, mut finish)| async move {
+        (
+            stream,
+            Vec::<u8>::new(),
+            false,
+            String::new(),
+            0usize,
+            StopReason::Other,
+            // (thinking text, signature) for the in-flight thinking block.
+            String::new(),
+            String::new(),
+            // Index of the current content block, to tell thinking from
+            // tool_use on content_block_stop.
+            -1i64,
+            false, // current block is thinking
+        ),
+        |(
+            mut stream,
+            mut buf,
+            mut done,
+            mut cur_tool,
+            mut tool_index,
+            mut finish,
+            mut think_text,
+            mut think_sig,
+            mut cur_index,
+            mut cur_is_thinking,
+        )| async move {
             if done {
                 return None;
             }
             loop {
-                if let Some(pos) = buf.find('\n') {
-                    let line = buf[..pos].trim_end_matches('\r').to_string();
+                if let Some(pos) = buf.iter().position(|&b| b == b'\n') {
+                    // buf[..pos] is a complete UTF-8 boundary: \n (0x0A)
+                    // never appears inside a multi-byte sequence.
+                    let line = String::from_utf8_lossy(&buf[..pos])
+                        .trim_end_matches('\r')
+                        .to_string();
                     buf.drain(..=pos);
                     if line.is_empty() {
                         continue;
@@ -318,19 +353,38 @@ fn anthropic_events(
                         }
                         Some("content_block_start") => {
                             let block = &v["content_block"];
-                            if block["type"] == "tool_use" {
-                                cur_tool = block["id"].as_str().unwrap_or("").to_string();
-                                tool_index = v["index"].as_u64().unwrap_or(0) as usize;
-                                Some(StreamEvent::ToolCallDelta {
-                                    index: tool_index,
-                                    id: Some(cur_tool.clone()),
-                                    name: Some(unmangle(
-                                        block["name"].as_str().unwrap_or(""),
-                                    )),
-                                    arguments: String::new(),
-                                })
-                            } else {
-                                None
+                            cur_index = v["index"].as_i64().unwrap_or(-1);
+                            cur_is_thinking = false;
+                            match block["type"].as_str() {
+                                Some("tool_use") => {
+                                    cur_tool = block["id"].as_str().unwrap_or("").to_string();
+                                    tool_index = cur_index.max(0) as usize;
+                                    Some(StreamEvent::ToolCallDelta {
+                                        index: tool_index,
+                                        id: Some(cur_tool.clone()),
+                                        name: Some(unmangle(
+                                            block["name"].as_str().unwrap_or(""),
+                                        )),
+                                        arguments: String::new(),
+                                    })
+                                }
+                                Some("thinking") => {
+                                    cur_is_thinking = true;
+                                    think_text.clear();
+                                    think_sig.clear();
+                                    // A thinking block can arrive with
+                                    // initial text on the start event.
+                                    if let Some(t) = block["thinking"].as_str() {
+                                        think_text.push_str(t);
+                                    }
+                                    None
+                                }
+                                // Redacted thinking arrives complete —
+                                // replay it verbatim on the next request.
+                                Some("redacted_thinking") => {
+                                    Some(StreamEvent::ThinkingBlock(block.clone()))
+                                }
+                                _ => None,
                             }
                         }
                         Some("content_block_delta") => {
@@ -339,9 +393,19 @@ fn anthropic_events(
                                 Some("text_delta") => Some(StreamEvent::Text(
                                     d["text"].as_str().unwrap_or("").to_string(),
                                 )),
-                                Some("thinking_delta") => Some(StreamEvent::Thinking(
-                                    d["thinking"].as_str().unwrap_or("").to_string(),
-                                )),
+                                Some("thinking_delta") => {
+                                    let t = d["thinking"].as_str().unwrap_or("");
+                                    think_text.push_str(t);
+                                    Some(StreamEvent::Thinking(t.to_string()))
+                                }
+                                // The signature arrives as its own delta —
+                                // required verbatim on the next request.
+                                Some("signature_delta") => {
+                                    think_sig.push_str(
+                                        d["signature"].as_str().unwrap_or(""),
+                                    );
+                                    None
+                                }
                                 Some("input_json_delta") => Some(StreamEvent::ToolCallDelta {
                                     index: tool_index,
                                     id: None,
@@ -352,6 +416,18 @@ fn anthropic_events(
                                         .to_string(),
                                 }),
                                 _ => None,
+                            }
+                        }
+                        Some("content_block_stop") => {
+                            if cur_is_thinking {
+                                cur_is_thinking = false;
+                                Some(StreamEvent::ThinkingBlock(json!({
+                                    "type": "thinking",
+                                    "thinking": think_text,
+                                    "signature": think_sig,
+                                })))
+                            } else {
+                                None
                             }
                         }
                         Some("message_delta") => {
@@ -383,25 +459,34 @@ fn anthropic_events(
                     if let Some(ev) = ev {
                         return Some((
                             Ok(ev),
-                            (stream, buf, done, cur_tool, tool_index, finish),
+                            (
+                                stream, buf, done, cur_tool, tool_index, finish,
+                                think_text, think_sig, cur_index, cur_is_thinking,
+                            ),
                         ));
                     }
                     continue;
                 }
                 match stream.next().await {
-                    Some(Ok(chunk)) => buf.push_str(&String::from_utf8_lossy(&chunk)),
+                    Some(Ok(chunk)) => buf.extend_from_slice(&chunk),
                     Some(Err(e)) => {
                         done = true;
                         return Some((
                             Err(e.into()),
-                            (stream, buf, done, cur_tool, tool_index, finish),
+                            (
+                                stream, buf, done, cur_tool, tool_index, finish,
+                                think_text, think_sig, cur_index, cur_is_thinking,
+                            ),
                         ));
                     }
                     None => {
                         done = true;
                         return Some((
                             Ok(StreamEvent::Done(finish)),
-                            (stream, buf, done, cur_tool, tool_index, finish),
+                            (
+                                stream, buf, done, cur_tool, tool_index, finish,
+                                think_text, think_sig, cur_index, cur_is_thinking,
+                            ),
                         ));
                     }
                 }

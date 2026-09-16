@@ -130,6 +130,51 @@ async fn anthropic_translates_request_and_response() {
     assert_eq!(resp["choices"][0]["message"]["content"], "hi from claude");
 }
 
+/// A persisted thinking block must be replayed verbatim (signature
+/// included) ahead of the assistant's text on the next request.
+#[tokio::test]
+async fn anthropic_replays_thinking_blocks() {
+    let (base, captured) = mock_anthropic().await;
+    let p = damon_core::provider::Provider::new(
+        "claude",
+        &provider("anthropic-messages", &base),
+    )
+    .unwrap();
+
+    let body = json!({
+        "model": "claude-sonnet-4",
+        "messages": [
+            {"role": "user", "content": "hi"},
+            {
+                "role": "assistant",
+                "content": "ok",
+                "thinking": [{
+                    "type": "thinking",
+                    "thinking": "let me think",
+                    "signature": "sig123",
+                }],
+                "tool_calls": [{
+                    "id": "call_1",
+                    "type": "function",
+                    "function": {"name": "fs.read", "arguments": "{}"},
+                }],
+            },
+            {"role": "tool", "tool_call_id": "call_1", "content": "data"},
+        ],
+    });
+    let _ = p.chat(body).await.unwrap();
+
+    let sent = &captured.lock().await[0];
+    let assistant = &sent["messages"][1];
+    assert_eq!(assistant["role"], "assistant");
+    // Thinking block first, then text, then tool_use.
+    assert_eq!(assistant["content"][0]["type"], "thinking");
+    assert_eq!(assistant["content"][0]["thinking"], "let me think");
+    assert_eq!(assistant["content"][0]["signature"], "sig123");
+    assert_eq!(assistant["content"][1]["type"], "text");
+    assert_eq!(assistant["content"][2]["type"], "tool_use");
+}
+
 /// Mock Gemini endpoint.
 async fn mock_gemini() -> (String, Arc<tokio::sync::Mutex<Vec<Value>>>) {
     let captured = Arc::new(tokio::sync::Mutex::new(Vec::new()));

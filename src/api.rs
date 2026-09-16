@@ -441,6 +441,9 @@ async fn translate_forward(
                                 "total_tokens": input + output,
                             }})
                         ),
+                        // Provider-internal block for history round-trip —
+                        // not part of the OpenAI wire shape; skip it.
+                        Ok(crate::llm::StreamEvent::ThinkingBlock(_)) => String::new(),
                         Ok(crate::llm::StreamEvent::Done(_)) => "data: [DONE]\n\n".to_string(),
                         Err(e) => format!(
                             "data: {}\n\n",
@@ -448,6 +451,10 @@ async fn translate_forward(
                         ),
                     };
                     Ok::<_, std::io::Error>(bytes::Bytes::from(chunk))
+                });
+                // ThinkingBlock maps to an empty chunk — drop it.
+                let sse = sse.filter(|c| {
+                    futures::future::ready(!c.as_ref().is_ok_and(|b| b.is_empty()))
                 });
                 Response::builder()
                     .status(200)

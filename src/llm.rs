@@ -6,6 +6,10 @@ pub enum StreamEvent {
     Text(String),
     /// Reasoning/thinking delta (o-series, Claude thinking, Gemini thought).
     Thinking(String),
+    /// A complete provider thinking block, stored verbatim for round-trip.
+    /// Anthropic requires prior thinking blocks (with signature) to be
+    /// replayed on the next request when thinking is enabled.
+    ThinkingBlock(serde_json::Value),
     /// Incremental tool-call fragment, keyed by its `index` in the chunk.
     ToolCallDelta {
         index: usize,
