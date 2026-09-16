@@ -26,13 +26,27 @@ pub struct AppState {
     pub discovered: parking_lot::RwLock<HashMap<String, Vec<String>>>,
     pub store: Store,
     pub mcp: McpRegistry,
+    /// The address the server actually bound. A non-loopback bind must
+    /// keep requiring a resolvable token even if a hot reload drops it.
+    pub bind: std::net::SocketAddr,
     /// (raw auth_token, resolved value). Resolved once per raw value —
     /// a `!cmd` or keychain ref must not spawn a shell per request.
-    auth_token_cache: parking_lot::Mutex<(Option<String>, Option<String>)>,
+    /// Err is cached too: a resolution failure must fail closed, never
+    /// silently open the API.
+    auth_token_cache: tokio::sync::Mutex<(Option<String>, Option<Result<String, String>>)>,
 }
 
 impl AppState {
     pub async fn new(config: SharedConfig, store: Store, mcp: McpRegistry) -> Arc<Self> {
+        Self::with_bind(config, store, mcp, "127.0.0.1:0".parse().unwrap()).await
+    }
+
+    pub async fn with_bind(
+        config: SharedConfig,
+        store: Store,
+        mcp: McpRegistry,
+        bind: std::net::SocketAddr,
+    ) -> Arc<Self> {
         let (mut providers, errors) = {
             let cfg = config.read();
             build_providers(&cfg)
@@ -50,25 +64,45 @@ impl AppState {
             discovered: parking_lot::RwLock::new(discovered),
             store,
             mcp,
-            auth_token_cache: parking_lot::Mutex::new((None, None)),
+            bind,
+            auth_token_cache: tokio::sync::Mutex::new((None, None)),
         })
     }
 
     /// Resolved auth token, cached per raw config value. A `!cmd` or
     /// keychain ref resolves once per config change, not per request.
-    pub fn auth_token(&self) -> Option<String> {
+    /// Err = configured but unresolvable — callers must fail closed.
+    /// Resolution runs off the async worker: `!cmd` blocks up to 10s.
+    pub async fn auth_token(&self) -> Option<Result<String, String>> {
         let raw = self.config.read().auth_token.clone();
-        let mut cache = self.auth_token_cache.lock();
-        if cache.0 != raw {
-            let resolved = raw.as_deref().map(|r| {
-                match crate::config::SecretRef::parse(r) {
-                    Ok(s) => s.resolve().ok(),
-                    Err(_) => Some(r.to_string()),
-                }
-            });
-            *cache = (raw, resolved.flatten());
+        {
+            let cache = self.auth_token_cache.lock().await;
+            if cache.0 == raw {
+                return cache.1.clone();
+            }
         }
-        cache.1.clone()
+        let raw2 = raw.clone();
+        let resolved: Option<Result<String, String>> =
+            match tokio::task::spawn_blocking(move || {
+                raw2.as_deref().map(|r| {
+                    match crate::config::SecretRef::parse(r) {
+                        Ok(s) => s.resolve().map_err(|e| e.to_string()),
+                        Err(_) => Ok(r.to_string()),
+                    }
+                })
+            })
+            .await
+            {
+                Ok(r) => r,
+                Err(e) => Some(Err(e.to_string())),
+            };
+        let mut cache = self.auth_token_cache.lock().await;
+        // Another task may have resolved a newer raw value meanwhile —
+        // only store if the raw value is still current.
+        if self.config.read().auth_token == raw {
+            *cache = (raw, resolved.clone());
+        }
+        resolved
     }
 
     /// Rebuild providers after a config reload. If every provider fails to
@@ -481,19 +515,11 @@ fn promote_translate<'a>(
             .read()
             .get(&tname)
             .cloned()?;
-        Some(
-            translate_forward(
-                state,
-                &tname,
-                &tprovider,
-                path,
-                bytes::Bytes::from(req.to_string()),
-                tmodel,
-            )
-            .await,
-        )
+        let body = bytes::Bytes::from(req.to_string());
+        Some(translate_forward(state, &tname, &tprovider, path, body, tmodel).await)
     })
 }
+
 /// Bearer-token gate for /v1/*. No token configured → open on localhost.
 async fn require_token(
     State(state): State<Arc<AppState>>,
@@ -502,16 +528,33 @@ async fn require_token(
 ) -> Response {
     // Cached per raw config value — a !cmd/keychain ref resolves once,
     // not per request.
-    let token = state.auth_token();
-    let Some(expected) = token else {
-        return next.run(req).await;
+    let expected = match state.auth_token().await {
+        Some(Ok(t)) => t,
+        // Configured but unresolvable: fail closed, never open.
+        Some(Err(e)) => {
+            return openai_error(
+                StatusCode::SERVICE_UNAVAILABLE,
+                &format!("auth token resolution failed: {e}"),
+                "server_error",
+            );
+        }
+        // A reload may have dropped the token — a non-loopback bind
+        // must not silently open the API.
+        None if !state.bind.ip().is_loopback() => {
+            return openai_error(
+                StatusCode::SERVICE_UNAVAILABLE,
+                "auth token required on non-loopback bind",
+                "server_error",
+            );
+        }
+        None => return next.run(req).await,
     };
     let ok = req
         .headers()
         .get("authorization")
         .and_then(|v| v.to_str().ok())
         .and_then(|v| v.strip_prefix("Bearer "))
-        .is_some_and(|t| t == expected);
+        .is_some_and(|t| crate::config::constant_time_eq(t.as_bytes(), expected.as_bytes()));
     if ok {
         next.run(req).await
     } else {

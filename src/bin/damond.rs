@@ -108,7 +108,7 @@ async fn main() -> anyhow::Result<()> {
         let servers = shared.read().mcp_servers.clone();
         McpRegistry::connect_all(&servers).await
     };
-    let state = AppState::new(shared.clone(), store, mcp).await;
+    let state = AppState::with_bind(shared.clone(), store, mcp, bind).await;
     if let Some(mut reloaded) = config::watch(path, shared.clone()) {
         let state = state.clone();
         tokio::spawn(async move {
@@ -129,13 +129,15 @@ async fn main() -> anyhow::Result<()> {
             damon_core::relay::run_tunnel(state, url, name).await;
         });
     }
-    // Safety: non-loopback bind requires auth_token — a remote-reachable
-    // daemon without auth is a remote code execution surface.
+    // Safety: non-loopback bind requires a resolvable auth_token — a
+    // remote-reachable daemon without auth is a remote code execution
+    // surface, and an unresolvable secret ref must fail at boot, not
+    // silently open the API.
     if !bind.ip().is_loopback() {
-        let has_token = shared.read().auth_token.is_some();
+        let has_token = matches!(state.auth_token().await, Some(Ok(_)));
         anyhow::ensure!(
             has_token,
-            "refusing to bind {bind}: non-loopback requires auth_token in config"
+            "refusing to bind {bind}: non-loopback requires a resolvable auth_token in config"
         );
     }
 

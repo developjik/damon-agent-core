@@ -221,7 +221,15 @@ async fn tunnel_once(state: &Arc<AppState>, relay_url: &str, name: &str) -> anyh
                     tokio::spawn(async move {
                         // E2E handshake over the relay pipe.
                         let mut in_rx = in_rx;
-                        let token = state.auth_token().unwrap_or_default();
+                        // Fail closed: an unresolvable or missing token
+                        // must not become an empty-token handshake.
+                        let token = match state.auth_token().await {
+                            Some(Ok(t)) => t,
+                            other => {
+                                warn!(?other, "auth_token unavailable; refusing relay session");
+                                return;
+                            }
+                        };
                         let e2e = match E2e::daemon_handshake(&sess_out, &mut in_rx, &token).await {
                             Ok(e) => e,
                             Err(e) => {

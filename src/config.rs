@@ -245,6 +245,17 @@ fn resolve_command(cmd: &str) -> anyhow::Result<String> {
         .stderr(Stdio::null())
         .spawn()
         .with_context(|| format!("cannot spawn secret command: {cmd}"))?;
+    // Drain stdout on a reader thread — a child that writes more than the
+    // OS pipe buffer blocks on write and would otherwise always time out.
+    let mut stdout = child.stdout.take();
+    let (out_tx, out_rx) = std::sync::mpsc::channel();
+    std::thread::spawn(move || {
+        let mut out = String::new();
+        if let Some(s) = stdout.as_mut() {
+            let _ = s.read_to_string(&mut out);
+        }
+        let _ = out_tx.send(out);
+    });
     let status = match child.wait_timeout(Duration::from_secs(10))? {
         Some(s) => s,
         None => {
@@ -253,10 +264,11 @@ fn resolve_command(cmd: &str) -> anyhow::Result<String> {
             bail!("secret command timed out after 10s: {cmd}");
         }
     };
-    let mut out = String::new();
-    if let Some(mut stdout) = child.stdout.take() {
-        stdout.read_to_string(&mut out).ok();
-    }
+    // A backgrounded grandchild can hold the pipe open forever — bound
+    // the read instead of joining unconditionally.
+    let out = out_rx
+        .recv_timeout(Duration::from_secs(5))
+        .unwrap_or_default();
     if !status.success() {
         bail!("secret command failed ({status}): {cmd}");
     }
@@ -265,6 +277,18 @@ fn resolve_command(cmd: &str) -> anyhow::Result<String> {
         bail!("secret command produced no output: {cmd}");
     }
     Ok(out)
+}
+/// Constant-time byte equality for token/proof comparisons — a remote
+/// endpoint must not get a timing oracle on the secret.
+pub fn constant_time_eq(a: &[u8], b: &[u8]) -> bool {
+    if a.len() != b.len() {
+        return false;
+    }
+    let mut diff = 0u8;
+    for (x, y) in a.iter().zip(b.iter()) {
+        diff |= x ^ y;
+    }
+    diff == 0
 }
 impl Config {
     pub fn load(path: &Path) -> anyhow::Result<Self> {
@@ -332,14 +356,6 @@ impl Config {
             .or_else(|| self.providers.iter().next().map(|(n, p)| (n.as_str(), p)))
     }
 
-    /// Resolved auth token, if configured. Literal or env:/keychain: reference.
-    pub fn resolved_auth_token(&self) -> Option<String> {
-        let raw = self.auth_token.as_deref()?;
-        match SecretRef::parse(raw) {
-            Ok(r) => r.resolve().ok(),
-            Err(_) => Some(raw.to_string()),
-        }
-    }
 
     /// Metadata for a model: user [models] entry (exact then glob) wins,
     /// then the built-in context-window hint.

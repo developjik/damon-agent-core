@@ -30,16 +30,31 @@ pub async fn ws_handler(
     headers: axum::http::HeaderMap,
     ws: WebSocketUpgrade,
 ) -> Result<Response, StatusCode> {
-    if let Some(expected) = state.auth_token() {
-        let header_ok = headers
-            .get("authorization")
-            .and_then(|v| v.to_str().ok())
-            .and_then(|v| v.strip_prefix("Bearer "))
-            .is_some_and(|t| t == expected);
-        let query_ok = q.token.as_deref() == Some(expected.as_str());
-        if !header_ok && !query_ok {
-            return Err(StatusCode::UNAUTHORIZED);
+    match state.auth_token().await {
+        Some(Ok(expected)) => {
+            let header_ok = headers
+                .get("authorization")
+                .and_then(|v| v.to_str().ok())
+                .and_then(|v| v.strip_prefix("Bearer "))
+                .is_some_and(|t| {
+                    crate::config::constant_time_eq(t.as_bytes(), expected.as_bytes())
+                });
+            let query_ok = q
+                .token
+                .as_deref()
+                .is_some_and(|t| crate::config::constant_time_eq(t.as_bytes(), expected.as_bytes()));
+            if !header_ok && !query_ok {
+                return Err(StatusCode::UNAUTHORIZED);
+            }
         }
+        // Configured but unresolvable: fail closed, never open.
+        Some(Err(_)) => return Err(StatusCode::SERVICE_UNAVAILABLE),
+        // A reload may have dropped the token — a non-loopback bind
+        // must not silently open the socket.
+        None if !state.bind.ip().is_loopback() => {
+            return Err(StatusCode::SERVICE_UNAVAILABLE);
+        }
+        None => {}
     }
     Ok(ws.on_upgrade(move |socket| {
         let (mut writer, mut reader) = socket.split();
