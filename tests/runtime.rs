@@ -654,18 +654,24 @@ async fn disconnect_cancels_prompt_and_frees_session() {
         json!({"sessionId": session_id, "prompt": [{"type": "text", "text": "again"}]}),
     )
     .await;
-    let mut stop_reason = String::new();
-    for _ in 0..50 {
-        let msg: Value = read_json(&mut ws2).await;
-        if msg["id"] == 2 {
-            stop_reason = msg["result"]["stopReason"]
-                .as_str()
-                .unwrap_or("")
-                .to_string();
-            break;
+    // Read until the id=2 response arrives (turn events interleave with
+    // it). Deadline-bound rather than message-count-bound: a loaded CI
+    // runner can trickle events arbitrarily slowly, and an error reply
+    // must surface verbatim, not as an empty stopReason.
+    let reply = tokio::time::timeout(std::time::Duration::from_secs(30), async {
+        loop {
+            let msg: Value = read_json(&mut ws2).await;
+            if msg["id"] == 2 {
+                return msg;
+            }
         }
-    }
-    assert_eq!(stop_reason, "end_turn");
+    })
+    .await
+    .expect("id=2 prompt response never arrived");
+    assert_eq!(
+        reply["result"]["stopReason"], "end_turn",
+        "unexpected reply: {reply}"
+    );
 }
 
 async fn read_json(
