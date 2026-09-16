@@ -5,8 +5,6 @@
 Pushing a `v*` tag → CI builds 4 targets → GitHub Releases tarballs →
 npm + crates.io publish. The items below are manual.
 
-First release? Do the one-time manual setup first: [deploy-setup.ko.md](deploy-setup.ko.md) (GitHub secrets, npm/crates accounts, Homebrew tap).
-
 ## 1. Register secrets (repo Settings → Secrets and variables → Actions)
 
 | Secret | Where | Notes |
@@ -72,3 +70,15 @@ git tag v0.1.0 && git push origin v0.1.0
 - `damon-relay` is now in the tarball, `bin.install`, npm `bin`, and
   `install.js`'s `expected` list — keep all four in sync when binaries
   are added or renamed.
+
+## Future improvements (from the initial deploy review)
+
+- Ship a `SHA256SUMS` file with each release and verify it in
+  `install.js` (no integrity check today).
+- More CI targets: `aarch64-unknown-linux-gnu` (`ubuntu-24.04-arm`
+  runner), musl/Docker images for `damon-relay` VPS deploys.
+- Remote MCP servers via rmcp's `transport-streamable-http-client-reqwest`
+  feature (stdio only today).
+- A JSON Schema for the WS protocol; opening up the `Provider` trait
+  (closed enum today).
+- `Cargo.toml` `homepage`/`documentation` fields; a CHANGELOG.

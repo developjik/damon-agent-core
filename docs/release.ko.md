@@ -62,5 +62,19 @@ git tag v0.1.0 && git push origin v0.1.0
 
 ## 알려진 갭 (배포 전 결정 필요)
 
-- `Formula/damon.rb`의 `sha256`은 플레이스홀더 — 첫 릴리스 후 실제 값으로 채우기 전까지 `brew install`은 실패한다.
-- `damon-relay`는 tarball, `bin.install`, npm `bin`, `install.js`의 `expected` 목록 모두에 포함됨 — 바이너리를 추가/이름 변경할 때 네 곳을 함께 유지할 것.
+- `Formula/damon.rb`의 `sha256`은 릴리스마다 손으로 채운다(5절) — 이
+  과정을 빠뜨린 태그는 체크섬 불일치로 실패한다.
+- `damon-relay`는 tarball, `bin.install`, npm `bin`, `install.js`의
+  `expected` 목록 모두에 포함됨 — 바이너리를 추가/이름 변경할 때 네
+  곳을 함께 유지할 것.
+
+## 향후 개선 후보 (초기 배포 리뷰에서)
+
+- 릴리스마다 `SHA256SUMS` 포함 + `install.js`에서 검증 (현재 무결성
+  검증 없음).
+- CI 타겟 추가: `aarch64-unknown-linux-gnu`(`ubuntu-24.04-arm` 러너),
+  `damon-relay` VPS 배포용 musl/Docker 이미지.
+- rmcp `transport-streamable-http-client-reqwest` 피처로 원격 MCP 서버
+  지원 (현재 stdio만).
+- WS 프로토콜 JSON Schema, `Provider` trait 개방 (현재 closed enum).
+- `Cargo.toml` `homepage`/`documentation` 필드, CHANGELOG.
