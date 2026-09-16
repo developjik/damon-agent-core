@@ -76,7 +76,11 @@ impl DiscordApi {
 
     /// Discord caps messages at 2000 chars.
     pub async fn send_message(&self, channel_id: &str, text: &str) -> anyhow::Result<()> {
-        let text = if text.len() > 1990 { &text[..text.floor_char_boundary(1990)] } else { text };
+        let text = if text.len() > 1990 {
+            &text[..text.floor_char_boundary(1990)]
+        } else {
+            text
+        };
         self.http
             .post(format!("{}/channels/{channel_id}/messages", self.base))
             .bearer_auth(&self.token)
@@ -105,7 +109,10 @@ pub fn incoming_from_message(d: &Value, bot_id: &str) -> Option<Incoming> {
             return None;
         }
         let stripped = text.replace(&mention, "").replace(&nick_mention, "");
-        let stripped = stripped.trim_start_matches([' ', ',', ':']).trim().to_string();
+        let stripped = stripped
+            .trim_start_matches([' ', ',', ':'])
+            .trim()
+            .to_string();
         if stripped.is_empty() {
             return None;
         }
@@ -159,10 +166,7 @@ impl DiscordChannel {
         let write = Arc::new(Mutex::new(write));
 
         // First frame must be Hello (op 10) with the heartbeat interval.
-        let hello = read
-            .next()
-            .await
-            .context("gateway closed before hello")??;
+        let hello = read.next().await.context("gateway closed before hello")??;
         let hello: Value = serde_json::from_str(hello.to_text()?)?;
         anyhow::ensure!(hello["op"] == 10, "expected hello, got {hello}");
         let interval_ms = hello["d"]["heartbeat_interval"].as_u64().unwrap_or(41250);

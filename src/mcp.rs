@@ -96,15 +96,15 @@ impl McpRegistry {
             }
         }
         let inner = self.inner.read();
-        info!(servers = inner.servers.len(), tools = inner.tools.len(), "MCP registry ready");
+        info!(
+            servers = inner.servers.len(),
+            tools = inner.tools.len(),
+            "MCP registry ready"
+        );
     }
 
     /// Connect a server if its slot is empty, then refresh its tool map.
-    async fn ensure_connected(
-        &self,
-        name: &str,
-        slot: &Arc<ServerSlot>,
-    ) -> anyhow::Result<()> {
+    async fn ensure_connected(&self, name: &str, slot: &Arc<ServerSlot>) -> anyhow::Result<()> {
         let mut conn = slot.conn.lock().await;
         if conn.is_some() {
             return Ok(());
@@ -222,20 +222,20 @@ impl McpRegistry {
                 self.ensure_connected(&server, &slot).await?;
                 let conn = slot.conn.lock().await;
                 let svc = conn.as_ref().context("MCP server not connected")?;
-                let r = tokio::time::timeout(
-                    TOOL_TIMEOUT,
-                    svc.peer().call_tool(make_params()),
-                )
-                .await
-                .context("tool call timed out")?
-                .context("tool call failed")?;
+                let r = tokio::time::timeout(TOOL_TIMEOUT, svc.peer().call_tool(make_params()))
+                    .await
+                    .context("tool call timed out")?
+                    .context("tool call failed")?;
                 Ok(serde_json::to_value(r)?)
             }
             Err(_) => {
                 // A hung child stays hung — drop the conn so the next
                 // call respawns instead of burning another timeout.
                 *slot.conn.lock().await = None;
-                Err(anyhow::anyhow!("tool call timed out after {}s", TOOL_TIMEOUT.as_secs()))
+                Err(anyhow::anyhow!(
+                    "tool call timed out after {}s",
+                    TOOL_TIMEOUT.as_secs()
+                ))
             }
         }
     }

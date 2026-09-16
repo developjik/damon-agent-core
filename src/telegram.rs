@@ -49,7 +49,11 @@ impl TelegramApi for BotApi {
 
     async fn send_message(&self, chat_id: i64, text: &str) -> anyhow::Result<()> {
         // Telegram caps messages at 4096 chars.
-        let text = if text.len() > 4000 { &text[..text.floor_char_boundary(4000)] } else { text };
+        let text = if text.len() > 4000 {
+            &text[..text.floor_char_boundary(4000)]
+        } else {
+            text
+        };
         self.http
             .post(format!("{}/sendMessage", self.base))
             .json(&serde_json::json!({"chat_id": chat_id, "text": text}))
@@ -77,7 +81,10 @@ impl TelegramChannel {
 #[async_trait::async_trait]
 impl ChannelApi for TelegramChannel {
     async fn recv(&self) -> anyhow::Result<Option<Incoming>> {
-        let updates = self.tg.get_updates(self.offset.load(Ordering::Relaxed), 30).await?;
+        let updates = self
+            .tg
+            .get_updates(self.offset.load(Ordering::Relaxed), 30)
+            .await?;
         for u in updates {
             self.offset
                 .fetch_max(u["update_id"].as_i64().unwrap_or(0) + 1, Ordering::Relaxed);
@@ -117,10 +124,7 @@ pub struct Bridge {
 
 impl Bridge {
     pub fn new(tg: Arc<dyn TelegramApi>, client: DamonClient) -> Arc<Self> {
-        let inner = ChannelBridge::new(
-            Arc::new(TelegramChannel::new(tg.clone())),
-            client,
-        );
+        let inner = ChannelBridge::new(Arc::new(TelegramChannel::new(tg.clone())), client);
         Arc::new(Self { tg, inner })
     }
 
@@ -158,7 +162,9 @@ impl Bridge {
     /// Handle one raw Telegram update.
     pub async fn handle_update(self: &Arc<Self>, u: Value) {
         if let Some(msg) = incoming_from_update(&u) {
-            self.inner.handle_message(msg.chat_id, msg.sender_id, msg.text).await;
+            self.inner
+                .handle_message(msg.chat_id, msg.sender_id, msg.text)
+                .await;
         }
     }
 }

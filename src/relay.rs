@@ -41,9 +41,11 @@ impl E2e {
         let secret = x25519_dalek::StaticSecret::random_from_rng(getrandom_rng());
         let public = x25519_dalek::PublicKey::from(&secret);
         let my_proof = proof(token, public.as_bytes());
-        tx.send(json!({"e2e_pub": B64.encode(public.as_bytes()), "e2e_proof": my_proof}).to_string())
-            .await
-            .context("send handshake")?;
+        tx.send(
+            json!({"e2e_pub": B64.encode(public.as_bytes()), "e2e_proof": my_proof}).to_string(),
+        )
+        .await
+        .context("send handshake")?;
 
         let msg = rx.recv().await.context("client handshake missing")?;
         let v: Value = serde_json::from_str(&msg)?;
@@ -51,8 +53,13 @@ impl E2e {
             .decode(v["e2e_pub"].as_str().context("missing e2e_pub")?)
             .context("bad e2e_pub")?;
         let their_proof = v["e2e_proof"].as_str().context("missing e2e_proof")?;
-        let their_pub: [u8; 32] = their_pub.try_into().map_err(|_| anyhow::anyhow!("bad pubkey len"))?;
-        if !crate::config::constant_time_eq(their_proof.as_bytes(), proof(token, &their_pub).as_bytes()) {
+        let their_pub: [u8; 32] = their_pub
+            .try_into()
+            .map_err(|_| anyhow::anyhow!("bad pubkey len"))?;
+        if !crate::config::constant_time_eq(
+            their_proof.as_bytes(),
+            proof(token, &their_pub).as_bytes(),
+        ) {
             bail!("client failed E2E proof — wrong auth_token?");
         }
         let shared = secret.diffie_hellman(&x25519_dalek::PublicKey::from(their_pub));
@@ -71,16 +78,23 @@ impl E2e {
             .decode(v["e2e_pub"].as_str().context("missing e2e_pub")?)
             .context("bad e2e_pub")?;
         let their_proof = v["e2e_proof"].as_str().context("missing e2e_proof")?;
-        let their_pub: [u8; 32] = their_pub.try_into().map_err(|_| anyhow::anyhow!("bad pubkey len"))?;
-        if !crate::config::constant_time_eq(their_proof.as_bytes(), proof(token, &their_pub).as_bytes()) {
+        let their_pub: [u8; 32] = their_pub
+            .try_into()
+            .map_err(|_| anyhow::anyhow!("bad pubkey len"))?;
+        if !crate::config::constant_time_eq(
+            their_proof.as_bytes(),
+            proof(token, &their_pub).as_bytes(),
+        ) {
             bail!("daemon failed E2E proof — wrong auth_token?");
         }
         let secret = x25519_dalek::StaticSecret::random_from_rng(getrandom_rng());
         let public = x25519_dalek::PublicKey::from(&secret);
         let my_proof = proof(token, public.as_bytes());
-        tx.send(json!({"e2e_pub": B64.encode(public.as_bytes()), "e2e_proof": my_proof}).to_string())
-            .await
-            .context("send handshake")?;
+        tx.send(
+            json!({"e2e_pub": B64.encode(public.as_bytes()), "e2e_proof": my_proof}).to_string(),
+        )
+        .await
+        .context("send handshake")?;
         let shared = secret.diffie_hellman(&x25519_dalek::PublicKey::from(their_pub));
         Ok(Self::from_shared(shared.as_bytes()))
     }
@@ -152,9 +166,7 @@ fn getrandom_rng() -> impl rand_core::RngCore + rand_core::CryptoRng {
             getrandom::fill(dest).unwrap();
         }
         fn try_fill_bytes(&mut self, dest: &mut [u8]) -> Result<(), rand_core::Error> {
-            getrandom::fill(dest).map_err(|_| {
-                rand_core::Error::from(std::num::NonZeroU32::MIN)
-            })
+            getrandom::fill(dest).map_err(|_| rand_core::Error::from(std::num::NonZeroU32::MIN))
         }
     }
     impl rand_core::CryptoRng for R {}
@@ -349,7 +361,11 @@ pub async fn client_connect(
     tokio::spawn(async move {
         while let Some(data) = raw_out_rx.recv().await {
             let msg = json!({"data": data}).to_string();
-            if writer.send(tokio_tungstenite::tungstenite::Message::Text(msg.into())).await.is_err() {
+            if writer
+                .send(tokio_tungstenite::tungstenite::Message::Text(msg.into()))
+                .await
+                .is_err()
+            {
                 break;
             }
         }
@@ -364,7 +380,9 @@ pub async fn client_connect(
     tokio::spawn(async move {
         while let Some(ct) = raw_in_rx.recv().await {
             match e2e_in.decrypt(&ct) {
-                Ok(pt) => { let _ = plain_in_tx.send(pt).await; }
+                Ok(pt) => {
+                    let _ = plain_in_tx.send(pt).await;
+                }
                 // Fail closed on tampered frames.
                 Err(_) => return,
             }

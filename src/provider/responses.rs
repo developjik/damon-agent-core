@@ -11,7 +11,6 @@ use serde_json::{Value, json};
 use crate::config::ProviderCompat;
 use crate::llm::StreamEvent;
 
-
 pub struct OpenAiResponses {
     pub name: String,
     pub base_url: String,
@@ -193,9 +192,8 @@ impl OpenAiResponses {
     pub async fn chat_stream(
         &self,
         body: Value,
-    ) -> anyhow::Result<
-        Box<dyn futures::Stream<Item = anyhow::Result<StreamEvent>> + Send + Unpin>,
-    > {
+    ) -> anyhow::Result<Box<dyn futures::Stream<Item = anyhow::Result<StreamEvent>> + Send + Unpin>>
+    {
         let req = self.translate_request(&body, true)?;
         let resp = self.send(req).await?;
         if !resp.status().is_success() {
@@ -259,7 +257,11 @@ fn responses_to_openai(v: &Value) -> Value {
     if !tool_calls.is_empty() {
         msg["tool_calls"] = json!(tool_calls);
     }
-    let finish = if tool_calls.is_empty() { "stop" } else { "tool_calls" };
+    let finish = if tool_calls.is_empty() {
+        "stop"
+    } else {
+        "tool_calls"
+    };
     let usage = json!({
         "prompt_tokens": v["usage"]["input_tokens"],
         "completion_tokens": v["usage"]["output_tokens"],
@@ -317,10 +319,7 @@ fn responses_events(
                                     done = true;
                                     if let Some(u) = usage_of(data) {
                                         pending = Some(ev);
-                                        return Some((
-                                            Ok(u),
-                                            (stream, buf, done, pending),
-                                        ));
+                                        return Some((Ok(u), (stream, buf, done, pending)));
                                     }
                                 }
                                 return Some((Ok(ev), (stream, buf, done, pending)));
@@ -375,8 +374,7 @@ fn parse_event(data: &str) -> anyhow::Result<Option<StreamEvent>> {
             Ok(Some(StreamEvent::Text(d.to_string())))
         }
         // Reasoning summary + raw reasoning deltas → Thinking.
-        Some("response.reasoning_summary_text.delta")
-        | Some("response.reasoning_text.delta") => {
+        Some("response.reasoning_summary_text.delta") | Some("response.reasoning_text.delta") => {
             let d = v["delta"].as_str().unwrap_or("");
             if d.is_empty() {
                 return Ok(None);
@@ -395,24 +393,26 @@ fn parse_event(data: &str) -> anyhow::Result<Option<StreamEvent>> {
             }
             Ok(None)
         }
-        Some("response.function_call_arguments.delta") => {
-            Ok(Some(StreamEvent::ToolCallDelta {
-                index: v["output_index"].as_u64().unwrap_or(0) as usize,
-                id: None,
-                name: None,
-                arguments: v["delta"].as_str().unwrap_or("").to_string(),
-            }))
-        }
-        Some("response.completed") | Some("response.failed")
-        | Some("response.incomplete") => {
+        Some("response.function_call_arguments.delta") => Ok(Some(StreamEvent::ToolCallDelta {
+            index: v["output_index"].as_u64().unwrap_or(0) as usize,
+            id: None,
+            name: None,
+            arguments: v["delta"].as_str().unwrap_or("").to_string(),
+        })),
+        Some("response.completed") | Some("response.failed") | Some("response.incomplete") => {
             let r = &v["response"];
             let reason = match r["status"].as_str() {
                 Some("completed") => {
                     // completed with function calls → tool_calls
                     let has_calls = r["output"].as_array().is_some_and(|o| {
-                        o.iter().any(|i| i["type"].as_str() == Some("function_call"))
+                        o.iter()
+                            .any(|i| i["type"].as_str() == Some("function_call"))
                     });
-                    if has_calls { StopReason::ToolCalls } else { StopReason::Stop }
+                    if has_calls {
+                        StopReason::ToolCalls
+                    } else {
+                        StopReason::Stop
+                    }
                 }
                 Some("incomplete") => StopReason::Length,
                 _ => StopReason::Other,

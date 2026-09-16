@@ -98,15 +98,17 @@ impl OpenAiCompat {
                     .await
             }
         };
-        let mut resp = send(body.clone()).await.context("upstream request failed")?;
+        let mut resp = send(body.clone())
+            .await
+            .context("upstream request failed")?;
 
         // Strict-tools fallback: a 400 mentioning "strict" on a request that
         // carried strict tools retries once without the field.
         if resp.status() == reqwest::StatusCode::BAD_REQUEST {
             if let Some(v) = &shaped {
-                let has_strict = v["tools"].as_array().is_some_and(|tools| {
-                    tools.iter().any(|t| t["strict"].as_bool() == Some(true))
-                });
+                let has_strict = v["tools"]
+                    .as_array()
+                    .is_some_and(|tools| tools.iter().any(|t| t["strict"].as_bool() == Some(true)));
                 if has_strict {
                     let status = resp.status();
                     let err = resp.text().await.unwrap_or_default();
@@ -125,9 +127,9 @@ impl OpenAiCompat {
                         return Ok(UpstreamResponse {
                             status,
                             content_type: "application/json".into(),
-                            stream: Box::pin(futures::stream::once(async move {
-                                Ok(Bytes::from(err))
-                            })),
+                            stream: Box::pin(futures::stream::once(
+                                async move { Ok(Bytes::from(err)) },
+                            )),
                         });
                     }
                 }
@@ -152,9 +154,8 @@ impl OpenAiCompat {
     pub async fn chat_stream(
         &self,
         body: Value,
-    ) -> anyhow::Result<
-        Box<dyn futures::Stream<Item = anyhow::Result<StreamEvent>> + Send + Unpin>,
-    > {
+    ) -> anyhow::Result<Box<dyn futures::Stream<Item = anyhow::Result<StreamEvent>> + Send + Unpin>>
+    {
         let mut body = body;
         body["stream"] = Value::Bool(true);
         let up = self
@@ -275,7 +276,7 @@ pub fn sse_events(
                                 return Some((
                                     Err(e),
                                     (stream, buf, data_lines, pending, done, finish),
-                                ))
+                                ));
                             }
                             None => {}
                         }
@@ -327,7 +328,7 @@ pub fn sse_events(
                                 return Some((
                                     Err(e),
                                     (stream, buf, data_lines, pending, done, finish),
-                                ))
+                                ));
                             }
                             None => {}
                         }
@@ -439,4 +440,3 @@ fn parse_chunk(data: &str) -> anyhow::Result<Parsed> {
     }
     Ok(out)
 }
-

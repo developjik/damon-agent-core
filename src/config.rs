@@ -5,9 +5,9 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use anyhow::{Context, bail};
+use notify::Watcher;
 use serde::Deserialize;
 use tracing::{info, warn};
-use notify::Watcher;
 
 /// Daemon configuration. Hot-reloaded: changes to the config file are picked
 /// up without restart, except `bind` which requires a restart.
@@ -73,9 +73,7 @@ fn builtin_context_window(model: &str) -> Option<u64> {
         m if m.starts_with("claude-") => 200_000,
         m if m.starts_with("gpt-4o") || m.starts_with("gpt-4-turbo") => 128_000,
         m if m.starts_with("gpt-4.1") || m.starts_with("gpt-5") => 400_000,
-        m if m.starts_with('o')
-            && m[1..].chars().next().is_some_and(|c| c.is_ascii_digit()) =>
-        {
+        m if m.starts_with('o') && m[1..].chars().next().is_some_and(|c| c.is_ascii_digit()) => {
             200_000
         }
         m if m.starts_with("gemini-") => 1_000_000,
@@ -185,7 +183,10 @@ fn default_true() -> bool {
 #[derive(Clone, Debug)]
 pub enum SecretRef {
     Env(String),
-    Keychain { service: String, account: String },
+    Keychain {
+        service: String,
+        account: String,
+    },
     /// `!command` — resolved from the command's stdout (10s timeout).
     Command(String),
 }
@@ -216,7 +217,9 @@ impl SecretRef {
             }
             return Ok(Self::Command(cmd.to_string()));
         }
-        bail!("secret must be a reference, not a literal — use env:VAR, keychain:service/account, or !command")
+        bail!(
+            "secret must be a reference, not a literal — use env:VAR, keychain:service/account, or !command"
+        )
     }
 
     pub fn resolve(&self) -> anyhow::Result<String> {
@@ -303,8 +306,8 @@ impl Config {
         let _ = dotenvy::from_path(Path::new(".env"));
         let text = std::fs::read_to_string(path)
             .with_context(|| format!("cannot read config {}", path.display()))?;
-        let cfg: Config = toml::from_str(&text)
-            .with_context(|| format!("invalid TOML in {}", path.display()))?;
+        let cfg: Config =
+            toml::from_str(&text).with_context(|| format!("invalid TOML in {}", path.display()))?;
         cfg.validate()?;
         Ok(cfg)
     }
@@ -325,7 +328,10 @@ impl Config {
 
     /// Route a model name to a provider: explicit `provider/model` prefix,
     /// then config globs, then default.
-    pub fn route_model<'a>(&'a self, model: &'a str) -> Option<(&'a str, &'a ProviderConfig, String)> {
+    pub fn route_model<'a>(
+        &'a self,
+        model: &'a str,
+    ) -> Option<(&'a str, &'a ProviderConfig, String)> {
         self.route_model_strict(model).or_else(|| {
             self.default_provider()
                 .map(|(n, p)| (n, p, model.to_string()))
@@ -358,7 +364,6 @@ impl Config {
             .map(|p| ("default", p))
             .or_else(|| self.providers.iter().next().map(|(n, p)| (n.as_str(), p)))
     }
-
 
     /// Metadata for a model: user [models] entry (exact then glob) wins,
     /// then the built-in context-window hint.
@@ -401,7 +406,6 @@ fn glob_rec(p: &[u8], s: &[u8]) -> bool {
         _ => false,
     }
 }
-
 
 /// Default config path: platform config dir, e.g. ~/.config/damon/config.toml
 pub fn default_config_path() -> PathBuf {
@@ -480,12 +484,7 @@ pub fn watch(path: PathBuf, shared: SharedConfig) -> Option<tokio::sync::mpsc::R
         let _watcher = watcher; // keep alive for the task's lifetime
         while let Some(res) = event_rx.recv().await {
             match res {
-                Ok(event)
-                    if event
-                        .paths
-                        .iter()
-                        .any(|p| p == &path || p == &canonical) =>
-                {
+                Ok(event) if event.paths.iter().any(|p| p == &path || p == &canonical) => {
                     // Debounce: editors often write via rename bursts.
                     tokio::time::sleep(Duration::from_millis(100)).await;
                     match Config::load(&path) {

@@ -36,8 +36,7 @@ impl OAuthTokens {
 }
 
 fn keychain_entry(provider: &str) -> anyhow::Result<keyring::Entry> {
-    keyring::Entry::new(KEYCHAIN_SERVICE, provider)
-        .context("keychain backend unavailable")
+    keyring::Entry::new(KEYCHAIN_SERVICE, provider).context("keychain backend unavailable")
 }
 
 /// Load stored tokens for a provider ("anthropic").

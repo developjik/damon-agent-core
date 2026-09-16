@@ -56,9 +56,7 @@ enum ServiceAction {
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
     tracing_subscriber::fmt()
-        .with_env_filter(
-            EnvFilter::try_from_default_env().unwrap_or_else(|_| "damon=info".into()),
-        )
+        .with_env_filter(EnvFilter::try_from_default_env().unwrap_or_else(|_| "damon=info".into()))
         .init();
     // rustls needs an explicit process-level crypto provider.
     let _ = rustls::crypto::ring::default_provider().install_default();
@@ -127,12 +125,13 @@ async fn main() -> anyhow::Result<()> {
         let name = relay.name.clone();
         // Resolve the registration secret once — a !cmd/keychain ref
         // resolves at boot, not per reconnect.
-        let secret = relay.secret.as_deref().and_then(|s| {
-            match config::SecretRef::parse(s) {
+        let secret = relay
+            .secret
+            .as_deref()
+            .and_then(|s| match config::SecretRef::parse(s) {
                 Ok(r) => r.resolve().ok(),
                 Err(_) => Some(s.to_string()),
-            }
-        });
+            });
         tokio::spawn(async move {
             damon_core::relay::run_tunnel(state, url, name, secret).await;
         });
@@ -202,7 +201,6 @@ async fn shutdown_signal() {
     }
 }
 
-
 /// `damond doctor` — verify config, secrets, provider reachability, and the
 /// store dir without starting the daemon. Exit 0 when every check passes.
 async fn doctor(path: &Path) -> anyhow::Result<()> {
@@ -210,7 +208,15 @@ async fn doctor(path: &Path) -> anyhow::Result<()> {
 
     let cfg = match Config::load(path) {
         Ok(c) => {
-            report(&mut ok, true, format!("config {} — {} provider(s)", path.display(), c.providers.len()));
+            report(
+                &mut ok,
+                true,
+                format!(
+                    "config {} — {} provider(s)",
+                    path.display(),
+                    c.providers.len()
+                ),
+            );
             Some(c)
         }
         Err(e) => {
@@ -222,10 +228,22 @@ async fn doctor(path: &Path) -> anyhow::Result<()> {
     if let Some(cfg) = &cfg {
         for (name, p) in &cfg.providers {
             match &p.api_key {
-                None => report(&mut ok, true, format!("provider {name} api_key — not set (unauthenticated upstream)")),
+                None => report(
+                    &mut ok,
+                    true,
+                    format!("provider {name} api_key — not set (unauthenticated upstream)"),
+                ),
                 Some(raw) => match SecretRef::parse(raw).and_then(|r| r.resolve()) {
-                    Ok(_) => report(&mut ok, true, format!("provider {name} api_key — {raw} resolved")),
-                    Err(e) => report(&mut ok, false, format!("provider {name} api_key — {raw}: {e:#}")),
+                    Ok(_) => report(
+                        &mut ok,
+                        true,
+                        format!("provider {name} api_key — {raw} resolved"),
+                    ),
+                    Err(e) => report(
+                        &mut ok,
+                        false,
+                        format!("provider {name} api_key — {raw}: {e:#}"),
+                    ),
                 },
             }
 
@@ -235,8 +253,16 @@ async fn doctor(path: &Path) -> anyhow::Result<()> {
                 _ => "https://api.openai.com/v1".to_string(),
             });
             match tcp_check(&base).await {
-                Ok(()) => report(&mut ok, true, format!("provider {name} base_url — {base} reachable")),
-                Err(e) => report(&mut ok, false, format!("provider {name} base_url — {base}: {e:#}")),
+                Ok(()) => report(
+                    &mut ok,
+                    true,
+                    format!("provider {name} base_url — {base} reachable"),
+                ),
+                Err(e) => report(
+                    &mut ok,
+                    false,
+                    format!("provider {name} base_url — {base}: {e:#}"),
+                ),
             }
         }
 
@@ -257,8 +283,16 @@ async fn doctor(path: &Path) -> anyhow::Result<()> {
         .and_then(|c| c.data_dir.clone())
         .unwrap_or_else(config::default_data_dir);
     match writable_dir(&data_dir) {
-        Ok(()) => report(&mut ok, true, format!("store dir {} — writable", data_dir.display())),
-        Err(e) => report(&mut ok, false, format!("store dir {} — {e:#}", data_dir.display())),
+        Ok(()) => report(
+            &mut ok,
+            true,
+            format!("store dir {} — writable", data_dir.display()),
+        ),
+        Err(e) => report(
+            &mut ok,
+            false,
+            format!("store dir {} — {e:#}", data_dir.display()),
+        ),
     }
 
     if ok { Ok(()) } else { std::process::exit(1) }
@@ -277,7 +311,11 @@ async fn tcp_check(base_url: &str) -> anyhow::Result<()> {
         .map(|(_, r)| r)
         .unwrap_or(base_url);
     let authority = rest.split('/').next().unwrap_or_default();
-    let default_port: u16 = if base_url.starts_with("https") { 443 } else { 80 };
+    let default_port: u16 = if base_url.starts_with("https") {
+        443
+    } else {
+        80
+    };
     let (host, port) = match authority.rsplit_once(':') {
         Some((h, p)) if p.bytes().all(|b| b.is_ascii_digit()) && !p.is_empty() => {
             (h.to_string(), p.parse()?)

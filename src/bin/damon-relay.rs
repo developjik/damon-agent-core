@@ -10,12 +10,12 @@ use std::collections::HashMap;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 
+use axum::Router;
 use axum::extract::ws::{Message, WebSocketUpgrade};
 use axum::extract::{Query, State};
 use axum::http::StatusCode;
 use axum::response::Response;
 use axum::routing::get;
-use axum::Router;
 use futures::{SinkExt, StreamExt};
 use serde::Deserialize;
 use serde_json::{Value, json};
@@ -43,8 +43,7 @@ struct Name {
 async fn main() -> anyhow::Result<()> {
     tracing_subscriber::fmt()
         .with_env_filter(
-            tracing_subscriber::EnvFilter::try_from_default_env()
-                .unwrap_or_else(|_| "info".into()),
+            tracing_subscriber::EnvFilter::try_from_default_env().unwrap_or_else(|_| "info".into()),
         )
         .init();
 
@@ -118,8 +117,12 @@ async fn register(
         let tx2 = tx.clone();
         let recv_task = tokio::spawn(async move {
             while let Some(Ok(Message::Text(text))) = reader.next().await {
-                let Ok(v) = serde_json::from_str::<Value>(&text) else { continue };
-                let Some(client_id) = v["client"].as_u64() else { continue };
+                let Ok(v) = serde_json::from_str::<Value>(&text) else {
+                    continue;
+                };
+                let Some(client_id) = v["client"].as_u64() else {
+                    continue;
+                };
                 if let Some(data) = v["data"].as_str() {
                     let map = clients.lock().await;
                     if let Some((owner, tx)) = map.get(&client_id) {
@@ -169,7 +172,9 @@ async fn connect(
         info!(daemon = %name, client = client_id, "client connected");
 
         // Tell the daemon a new client attached.
-        let _ = daemon_tx.send(json!({"client": client_id}).to_string()).await;
+        let _ = daemon_tx
+            .send(json!({"client": client_id}).to_string())
+            .await;
 
         // Pump: relay → client socket.
         let send_task = tokio::spawn(async move {
@@ -183,7 +188,9 @@ async fn connect(
         let daemon_tx2 = daemon_tx.clone();
         let recv_task = tokio::spawn(async move {
             while let Some(Ok(Message::Text(text))) = reader.next().await {
-                let Ok(v) = serde_json::from_str::<Value>(&text) else { continue };
+                let Ok(v) = serde_json::from_str::<Value>(&text) else {
+                    continue;
+                };
                 if let Some(data) = v["data"].as_str() {
                     let _ = daemon_tx2
                         .send(json!({"client": client_id, "data": data}).to_string())

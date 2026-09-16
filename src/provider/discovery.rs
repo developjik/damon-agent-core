@@ -40,8 +40,8 @@ pub async fn discover_all(
 
     // Implicit ollama: probe the default local endpoint when unconfigured.
     if !cfg.providers.contains_key("ollama") {
-        let base = std::env::var("OLLAMA_HOST")
-            .unwrap_or_else(|_| "http://127.0.0.1:11434".to_string());
+        let base =
+            std::env::var("OLLAMA_HOST").unwrap_or_else(|_| "http://127.0.0.1:11434".to_string());
         match probe_ollama(&base).await {
             Ok(ids) if !ids.is_empty() => {
                 debug!(count = ids.len(), "implicit ollama discovered");
@@ -71,11 +71,7 @@ pub async fn discover_all(
 }
 
 /// Discover model ids for one provider.
-async fn discover(
-    name: &str,
-    cfg: &ProviderConfig,
-    kind: &str,
-) -> anyhow::Result<Vec<String>> {
+async fn discover(name: &str, cfg: &ProviderConfig, kind: &str) -> anyhow::Result<Vec<String>> {
     let base = cfg
         .base_url
         .clone()
@@ -93,9 +89,7 @@ async fn discover(
 
 /// GET {base}/models — OpenAI-style model list.
 async fn probe_openai_models(base: &str, cfg: &ProviderConfig) -> anyhow::Result<Vec<String>> {
-    let client = reqwest::Client::builder()
-        .timeout(PROBE_TIMEOUT)
-        .build()?;
+    let client = reqwest::Client::builder().timeout(PROBE_TIMEOUT).build()?;
     let mut req = client.get(format!("{}/models", base.trim_end_matches('/')));
     if let Some(raw) = &cfg.api_key {
         if let Ok(key) = SecretRef::parse(raw).and_then(|r| r.resolve()) {
@@ -126,9 +120,7 @@ async fn probe_openai_models(base: &str, cfg: &ProviderConfig) -> anyhow::Result
 
 /// GET {base}/api/tags — Ollama model list.
 async fn probe_ollama(base: &str) -> anyhow::Result<Vec<String>> {
-    let client = reqwest::Client::builder()
-        .timeout(PROBE_TIMEOUT)
-        .build()?;
+    let client = reqwest::Client::builder().timeout(PROBE_TIMEOUT).build()?;
     let v: Value = client
         .get(format!("{}/api/tags", base.trim_end_matches('/')))
         .send()

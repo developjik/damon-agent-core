@@ -159,9 +159,8 @@ impl Gemini {
     pub async fn chat_stream(
         &self,
         body: Value,
-    ) -> anyhow::Result<
-        Box<dyn futures::Stream<Item = anyhow::Result<StreamEvent>> + Send + Unpin>,
-    > {
+    ) -> anyhow::Result<Box<dyn futures::Stream<Item = anyhow::Result<StreamEvent>> + Send + Unpin>>
+    {
         let model = body["model"].as_str().context("missing model")?.to_string();
         let req = self.translate_request(&body)?;
         let mut r = self
@@ -255,9 +254,7 @@ fn gemini_to_openai(v: &Value) -> Value {
 
 /// Parse Gemini SSE (streamGenerateContent?alt=sse) into normalized events.
 fn gemini_events(
-    stream: std::pin::Pin<
-        Box<dyn futures::Stream<Item = std::io::Result<bytes::Bytes>> + Send>,
-    >,
+    stream: std::pin::Pin<Box<dyn futures::Stream<Item = std::io::Result<bytes::Bytes>> + Send>>,
 ) -> std::pin::Pin<Box<dyn futures::Stream<Item = anyhow::Result<StreamEvent>> + Send>> {
     use crate::llm::StopReason;
     use std::collections::VecDeque;

@@ -207,17 +207,23 @@ impl Anthropic {
     pub async fn chat_stream(
         &self,
         body: Value,
-    ) -> anyhow::Result<
-        Box<dyn futures::Stream<Item = anyhow::Result<StreamEvent>> + Send + Unpin>,
-    > {
+    ) -> anyhow::Result<Box<dyn futures::Stream<Item = anyhow::Result<StreamEvent>> + Send + Unpin>>
+    {
         let req = self.translate_request(&body, true)?;
         let key = self.credential().await?;
-        let resp = self.request(req.clone(), key.as_deref()).send().await.context("upstream failed")?;
+        let resp = self
+            .request(req.clone(), key.as_deref())
+            .send()
+            .await
+            .context("upstream failed")?;
         // OAuth: a 401 may mean the token expired between requests — force
         // a refresh and retry once.
         let resp = if resp.status() == reqwest::StatusCode::UNAUTHORIZED && self.oauth {
             let key = crate::oauth::access_token("anthropic").await?;
-            self.request(req, Some(&key)).send().await.context("upstream failed")?
+            self.request(req, Some(&key))
+                .send()
+                .await
+                .context("upstream failed")?
         } else {
             resp
         };
@@ -234,10 +240,17 @@ impl Anthropic {
     pub async fn chat(&self, body: Value) -> anyhow::Result<Value> {
         let req = self.translate_request(&body, false)?;
         let key = self.credential().await?;
-        let resp = self.request(req.clone(), key.as_deref()).send().await.context("upstream failed")?;
+        let resp = self
+            .request(req.clone(), key.as_deref())
+            .send()
+            .await
+            .context("upstream failed")?;
         let resp = if resp.status() == reqwest::StatusCode::UNAUTHORIZED && self.oauth {
             let key = crate::oauth::access_token("anthropic").await?;
-            self.request(req, Some(&key)).send().await.context("upstream failed")?
+            self.request(req, Some(&key))
+                .send()
+                .await
+                .context("upstream failed")?
         } else {
             resp
         };
@@ -362,9 +375,7 @@ fn anthropic_events(
                                     Some(StreamEvent::ToolCallDelta {
                                         index: tool_index,
                                         id: Some(cur_tool.clone()),
-                                        name: Some(unmangle(
-                                            block["name"].as_str().unwrap_or(""),
-                                        )),
+                                        name: Some(unmangle(block["name"].as_str().unwrap_or(""))),
                                         arguments: String::new(),
                                     })
                                 }
@@ -401,19 +412,14 @@ fn anthropic_events(
                                 // The signature arrives as its own delta —
                                 // required verbatim on the next request.
                                 Some("signature_delta") => {
-                                    think_sig.push_str(
-                                        d["signature"].as_str().unwrap_or(""),
-                                    );
+                                    think_sig.push_str(d["signature"].as_str().unwrap_or(""));
                                     None
                                 }
                                 Some("input_json_delta") => Some(StreamEvent::ToolCallDelta {
                                     index: tool_index,
                                     id: None,
                                     name: None,
-                                    arguments: d["partial_json"]
-                                        .as_str()
-                                        .unwrap_or("")
-                                        .to_string(),
+                                    arguments: d["partial_json"].as_str().unwrap_or("").to_string(),
                                 }),
                                 _ => None,
                             }
@@ -460,8 +466,16 @@ fn anthropic_events(
                         return Some((
                             Ok(ev),
                             (
-                                stream, buf, done, cur_tool, tool_index, finish,
-                                think_text, think_sig, cur_index, cur_is_thinking,
+                                stream,
+                                buf,
+                                done,
+                                cur_tool,
+                                tool_index,
+                                finish,
+                                think_text,
+                                think_sig,
+                                cur_index,
+                                cur_is_thinking,
                             ),
                         ));
                     }
@@ -474,8 +488,16 @@ fn anthropic_events(
                         return Some((
                             Err(e.into()),
                             (
-                                stream, buf, done, cur_tool, tool_index, finish,
-                                think_text, think_sig, cur_index, cur_is_thinking,
+                                stream,
+                                buf,
+                                done,
+                                cur_tool,
+                                tool_index,
+                                finish,
+                                think_text,
+                                think_sig,
+                                cur_index,
+                                cur_is_thinking,
                             ),
                         ));
                     }
@@ -484,8 +506,16 @@ fn anthropic_events(
                         return Some((
                             Ok(StreamEvent::Done(finish)),
                             (
-                                stream, buf, done, cur_tool, tool_index, finish,
-                                think_text, think_sig, cur_index, cur_is_thinking,
+                                stream,
+                                buf,
+                                done,
+                                cur_tool,
+                                tool_index,
+                                finish,
+                                think_text,
+                                think_sig,
+                                cur_index,
+                                cur_is_thinking,
                             ),
                         ));
                     }

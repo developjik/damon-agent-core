@@ -19,8 +19,8 @@ fn provider(kind: &str, base_url: &str) -> ProviderConfig {
         default_model: None,
         headers: Default::default(),
         compat: Default::default(),
-            discovery: None,
-            context_promotion_target: None,
+        discovery: None,
+        context_promotion_target: None,
     }
 }
 
@@ -52,7 +52,7 @@ fn route_model_prefix_and_glob() {
         mcp_servers: HashMap::new(),
         providers,
         models: BTreeMap::new(),
-            relay: None,
+        relay: None,
     };
 
     // Explicit prefix wins.
@@ -79,7 +79,10 @@ async fn mock_anthropic() -> (String, Arc<tokio::sync::Mutex<Vec<Value>>>) {
         post(move |body: String| {
             let captured = captured2.clone();
             async move {
-                captured.lock().await.push(serde_json::from_str(&body).unwrap());
+                captured
+                    .lock()
+                    .await
+                    .push(serde_json::from_str(&body).unwrap());
                 Response::builder()
                     .header("content-type", "application/json")
                     .body(Body::from(
@@ -100,11 +103,8 @@ async fn mock_anthropic() -> (String, Arc<tokio::sync::Mutex<Vec<Value>>>) {
 #[tokio::test]
 async fn anthropic_translates_request_and_response() {
     let (base, captured) = mock_anthropic().await;
-    let p = damon_core::provider::Provider::new(
-        "claude",
-        &provider("anthropic-messages", &base),
-    )
-    .unwrap();
+    let p = damon_core::provider::Provider::new("claude", &provider("anthropic-messages", &base))
+        .unwrap();
 
     let body = json!({
         "model": "claude-sonnet-4",
@@ -135,11 +135,8 @@ async fn anthropic_translates_request_and_response() {
 #[tokio::test]
 async fn anthropic_replays_thinking_blocks() {
     let (base, captured) = mock_anthropic().await;
-    let p = damon_core::provider::Provider::new(
-        "claude",
-        &provider("anthropic-messages", &base),
-    )
-    .unwrap();
+    let p = damon_core::provider::Provider::new("claude", &provider("anthropic-messages", &base))
+        .unwrap();
 
     let body = json!({
         "model": "claude-sonnet-4",
@@ -230,18 +227,17 @@ async fn v1_routes_to_anthropic_by_model() {
         "default".to_string(),
         provider("openai-completions", "http://127.0.0.1:1"),
     );
-    let shared: damon_core::config::SharedConfig =
-        Arc::new(parking_lot::RwLock::new(Config {
-            bind: "127.0.0.1:0".parse().unwrap(),
-            auth_token: None,
-            data_dir: None,
-            tls_cert: None,
-            tls_key: None,
-            mcp_servers: HashMap::new(),
-            providers,
-            models: BTreeMap::new(),
-            relay: None,
-        }));
+    let shared: damon_core::config::SharedConfig = Arc::new(parking_lot::RwLock::new(Config {
+        bind: "127.0.0.1:0".parse().unwrap(),
+        auth_token: None,
+        data_dir: None,
+        tls_cert: None,
+        tls_key: None,
+        mcp_servers: HashMap::new(),
+        providers,
+        models: BTreeMap::new(),
+        relay: None,
+    }));
     let store = damon_core::store::Store::in_memory().await.unwrap();
     let mcp = damon_core::mcp::McpRegistry::connect_all(&HashMap::new()).await;
     let app = damon_core::api::router(damon_core::api::AppState::new(shared, store, mcp).await);
@@ -298,11 +294,8 @@ async fn mock_responses() -> (String, Arc<tokio::sync::Mutex<Vec<Value>>>) {
 #[tokio::test]
 async fn responses_translates_request_and_response() {
     let (base, captured) = mock_responses().await;
-    let p = damon_core::provider::Provider::new(
-        "o3",
-        &provider("openai-responses", &base),
-    )
-    .unwrap();
+    let p =
+        damon_core::provider::Provider::new("o3", &provider("openai-responses", &base)).unwrap();
 
     let body = json!({
         "model": "o3",
@@ -341,7 +334,10 @@ async fn responses_translates_request_and_response() {
     assert_eq!(sent["tools"][0]["name"], "fs.read");
 
     // Response translated back to OpenAI shape.
-    assert_eq!(resp["choices"][0]["message"]["content"], "hi from responses");
+    assert_eq!(
+        resp["choices"][0]["message"]["content"],
+        "hi from responses"
+    );
     assert_eq!(resp["usage"]["prompt_tokens"], 1);
 }
 
@@ -451,10 +447,12 @@ fn command_secret_resolves() {
     let r = damon_core::config::SecretRef::parse("!printf testkey123").unwrap();
     assert_eq!(r.resolve().unwrap(), "testkey123");
     // Failing command is an error, not a silent empty key.
-    assert!(damon_core::config::SecretRef::parse("!false")
-        .unwrap()
-        .resolve()
-        .is_err());
+    assert!(
+        damon_core::config::SecretRef::parse("!false")
+            .unwrap()
+            .resolve()
+            .is_err()
+    );
 }
 
 /// Mock /models endpoint for discovery.
@@ -505,23 +503,20 @@ async fn discovered_model_routes_to_provider() {
         "default".to_string(),
         provider("openai-completions", "http://127.0.0.1:1"),
     );
-    let shared: damon_core::config::SharedConfig =
-        Arc::new(parking_lot::RwLock::new(Config {
-            bind: "127.0.0.1:0".parse().unwrap(),
-            auth_token: None,
-            data_dir: None,
-            tls_cert: None,
-            tls_key: None,
-            mcp_servers: HashMap::new(),
-            providers,
-            models: BTreeMap::new(),
-            relay: None,
-        }));
+    let shared: damon_core::config::SharedConfig = Arc::new(parking_lot::RwLock::new(Config {
+        bind: "127.0.0.1:0".parse().unwrap(),
+        auth_token: None,
+        data_dir: None,
+        tls_cert: None,
+        tls_key: None,
+        mcp_servers: HashMap::new(),
+        providers,
+        models: BTreeMap::new(),
+        relay: None,
+    }));
     let store = damon_core::store::Store::in_memory().await.unwrap();
     let mcp = damon_core::mcp::McpRegistry::connect_all(&HashMap::new()).await;
-    let app = damon_core::api::router(
-        damon_core::api::AppState::new(shared, store, mcp).await,
-    );
+    let app = damon_core::api::router(damon_core::api::AppState::new(shared, store, mcp).await);
 
     use http_body_util::BodyExt;
     use tower::ServiceExt;
@@ -572,10 +567,12 @@ async fn ollama_discovery_reads_tags() {
         mcp_servers: HashMap::new(),
         providers,
         models: BTreeMap::new(),
-            relay: None,
+        relay: None,
     };
-    let mut built: std::collections::HashMap<String, std::sync::Arc<damon_core::provider::Provider>> =
-        std::collections::HashMap::new();
+    let mut built: std::collections::HashMap<
+        String,
+        std::sync::Arc<damon_core::provider::Provider>,
+    > = std::collections::HashMap::new();
     let found = damon_core::provider::discovery::discover_all(&config, &mut built).await;
     assert_eq!(
         found["ollama"],
@@ -641,11 +638,8 @@ async fn mock_strict_fallback() -> (String, Arc<tokio::sync::Mutex<Vec<Value>>>)
 #[tokio::test]
 async fn strict_400_retries_without_strict() {
     let (base, captured) = mock_strict_fallback().await;
-    let p = damon_core::provider::Provider::new(
-        "test",
-        &provider("openai-completions", &base),
-    )
-    .unwrap();
+    let p = damon_core::provider::Provider::new("test", &provider("openai-completions", &base))
+        .unwrap();
 
     let body = json!({
         "model": "m",
@@ -693,11 +687,8 @@ async fn mock_sse_rich() -> String {
 async fn sse_emits_thinking_usage_and_stop_reason() {
     use futures::StreamExt;
     let base = mock_sse_rich().await;
-    let p = damon_core::provider::Provider::new(
-        "test",
-        &provider("openai-completions", &base),
-    )
-    .unwrap();
+    let p = damon_core::provider::Provider::new("test", &provider("openai-completions", &base))
+        .unwrap();
 
     let body = json!({"model": "m", "messages": [{"role":"user","content":"hi"}]});
     let mut stream = std::pin::pin!(p.chat_stream(body).await.unwrap());
@@ -708,8 +699,17 @@ async fn sse_emits_thinking_usage_and_stop_reason() {
     use damon_core::llm::StreamEvent;
     assert!(matches!(&events[0], StreamEvent::Thinking(t) if t == "thinking..."));
     assert!(matches!(&events[1], StreamEvent::Text(t) if t == "hello"));
-    assert!(matches!(&events[2], StreamEvent::Usage { input: 5, output: 3 }));
-    assert!(matches!(&events[3], StreamEvent::Done(damon_core::llm::StopReason::Stop)));
+    assert!(matches!(
+        &events[2],
+        StreamEvent::Usage {
+            input: 5,
+            output: 3
+        }
+    ));
+    assert!(matches!(
+        &events[3],
+        StreamEvent::Done(damon_core::llm::StopReason::Stop)
+    ));
 }
 
 #[tokio::test]
@@ -724,8 +724,8 @@ async fn sse_utf8_chunk_boundary_not_corrupted() {
     // Find the '한' byte offset and split inside it.
     let han = payload.find("한").unwrap();
     let chunks: Vec<std::io::Result<bytes::Bytes>> = vec![
-        Ok(bytes::Bytes::from(&bytes[..han + 1])),   // E2 (first byte of 한)
-        Ok(bytes::Bytes::from(&bytes[han + 1..])),   // 95 9C + rest
+        Ok(bytes::Bytes::from(&bytes[..han + 1])), // E2 (first byte of 한)
+        Ok(bytes::Bytes::from(&bytes[han + 1..])), // 95 9C + rest
     ];
     let stream = futures::stream::iter(chunks);
     let mut events = Vec::new();
@@ -734,8 +734,10 @@ async fn sse_utf8_chunk_boundary_not_corrupted() {
         events.push(ev.unwrap());
     }
     use damon_core::llm::StreamEvent;
-    assert!(matches!(&events[0], StreamEvent::Text(t) if t == "한"),
-        "expected intact '한', got {events:?}");
+    assert!(
+        matches!(&events[0], StreamEvent::Text(t) if t == "한"),
+        "expected intact '한', got {events:?}"
+    );
 }
 
 #[tokio::test]
@@ -750,8 +752,7 @@ async fn sse_multi_data_line_event() {
         "data: {\"content\":\"hi\"}}]}\n\n",
         "data: [DONE]\n\n"
     );
-    let chunks: Vec<std::io::Result<bytes::Bytes>> =
-        vec![Ok(bytes::Bytes::from(payload))];
+    let chunks: Vec<std::io::Result<bytes::Bytes>> = vec![Ok(bytes::Bytes::from(payload))];
     let stream = futures::stream::iter(chunks);
     let mut events = Vec::new();
     let mut s = std::pin::pin!(sse_events(Box::pin(stream)));
@@ -759,8 +760,10 @@ async fn sse_multi_data_line_event() {
         events.push(ev.unwrap());
     }
     use damon_core::llm::StreamEvent;
-    assert!(matches!(&events[0], StreamEvent::Text(t) if t == "hi"),
-        "expected joined multi-line data, got {events:?}");
+    assert!(
+        matches!(&events[0], StreamEvent::Text(t) if t == "hi"),
+        "expected joined multi-line data, got {events:?}"
+    );
 }
 
 #[test]
@@ -782,11 +785,8 @@ fn thinking_level_splits_and_maps() {
 async fn thinking_maps_per_provider() {
     // Anthropic: _thinking → thinking.budget_tokens + max_tokens bump.
     let (base, captured) = mock_anthropic().await;
-    let p = damon_core::provider::Provider::new(
-        "claude",
-        &provider("anthropic-messages", &base),
-    )
-    .unwrap();
+    let p = damon_core::provider::Provider::new("claude", &provider("anthropic-messages", &base))
+        .unwrap();
     let body = json!({
         "model": "claude-sonnet-4",
         "_thinking": "high",
@@ -800,11 +800,8 @@ async fn thinking_maps_per_provider() {
 
     // OpenAI completions: _thinking → reasoning_effort.
     let (base, captured) = mock_completions().await;
-    let p = damon_core::provider::Provider::new(
-        "openai",
-        &provider("openai-completions", &base),
-    )
-    .unwrap();
+    let p = damon_core::provider::Provider::new("openai", &provider("openai-completions", &base))
+        .unwrap();
     let body = json!({
         "model": "o3",
         "_thinking": "low",
@@ -834,9 +831,14 @@ async fn inband_and_thinking_coexist() {
     let sent = &captured.lock().await[0];
     assert_eq!(sent["reasoning_effort"], "medium");
     assert!(sent.get("tools").is_none(), "inband must strip tools");
-    assert!(sent["messages"].as_array().unwrap().iter().any(|m|
-        m["content"].as_str().unwrap_or("").contains("<tool_call>")
-    ), "inband must render tools into prompt");
+    assert!(
+        sent["messages"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|m| m["content"].as_str().unwrap_or("").contains("<tool_call>")),
+        "inband must render tools into prompt"
+    );
 }
 
 #[test]
@@ -899,23 +901,20 @@ async fn context_overflow_promotes_to_target() {
     cfg.context_promotion_target = Some("big".to_string());
     let mut providers = BTreeMap::new();
     providers.insert("default".to_string(), cfg);
-    let shared: damon_core::config::SharedConfig =
-        Arc::new(parking_lot::RwLock::new(Config {
-            bind: "127.0.0.1:0".parse().unwrap(),
-            auth_token: None,
-            data_dir: None,
-            tls_cert: None,
-            tls_key: None,
-            mcp_servers: HashMap::new(),
-            providers,
-            models: BTreeMap::new(),
-            relay: None,
-        }));
+    let shared: damon_core::config::SharedConfig = Arc::new(parking_lot::RwLock::new(Config {
+        bind: "127.0.0.1:0".parse().unwrap(),
+        auth_token: None,
+        data_dir: None,
+        tls_cert: None,
+        tls_key: None,
+        mcp_servers: HashMap::new(),
+        providers,
+        models: BTreeMap::new(),
+        relay: None,
+    }));
     let store = damon_core::store::Store::in_memory().await.unwrap();
     let mcp = damon_core::mcp::McpRegistry::connect_all(&HashMap::new()).await;
-    let app = damon_core::api::router(
-        damon_core::api::AppState::new(shared, store, mcp).await,
-    );
+    let app = damon_core::api::router(damon_core::api::AppState::new(shared, store, mcp).await);
 
     use http_body_util::BodyExt;
     use tower::ServiceExt;
@@ -981,11 +980,21 @@ async fn inband_tools_roundtrip() {
     // Request had no tools field — rendered into system prompt instead.
     let sent = &captured.lock().await[0];
     assert!(sent.get("tools").is_none());
-    assert!(sent["messages"][0]["content"].as_str().unwrap().contains("fs.read"));
+    assert!(
+        sent["messages"][0]["content"]
+            .as_str()
+            .unwrap()
+            .contains("fs.read")
+    );
 
     // Response has real tool_calls.
     let tc = &resp["choices"][0]["message"]["tool_calls"][0];
     assert_eq!(tc["function"]["name"], "fs.read");
-    assert!(tc["function"]["arguments"].as_str().unwrap().contains("/tmp/x"));
+    assert!(
+        tc["function"]["arguments"]
+            .as_str()
+            .unwrap()
+            .contains("/tmp/x")
+    );
     assert_eq!(resp["choices"][0]["finish_reason"], "tool_calls");
 }

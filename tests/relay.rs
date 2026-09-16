@@ -3,11 +3,11 @@
 use std::collections::HashMap;
 use std::sync::Arc;
 
+use damon_core::api::AppState;
 use damon_core::client::DamonClient;
 use damon_core::config::{Config, ProviderConfig};
 use damon_core::mcp::McpRegistry;
 use damon_core::store::Store;
-use damon_core::api::AppState;
 use serde_json::json;
 
 fn test_config() -> Config {

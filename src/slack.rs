@@ -83,7 +83,11 @@ impl SlackApi {
 
     /// Slack messages effectively cap ~4000 chars; stay under.
     pub async fn post_message(&self, channel: &str, text: &str) -> anyhow::Result<()> {
-        let text = if text.len() > 3900 { &text[..text.floor_char_boundary(3900)] } else { text };
+        let text = if text.len() > 3900 {
+            &text[..text.floor_char_boundary(3900)]
+        } else {
+            text
+        };
         self.post(
             "chat.postMessage",
             &self.bot_token,
@@ -112,7 +116,10 @@ pub fn incoming_from_event(ev: &Value, bot_user_id: &str) -> Option<Incoming> {
             return None;
         }
         let stripped = text.replace(&mention, "");
-        let stripped = stripped.trim_start_matches([' ', ',', ':']).trim().to_string();
+        let stripped = stripped
+            .trim_start_matches([' ', ',', ':'])
+            .trim()
+            .to_string();
         if stripped.is_empty() {
             return None;
         }
@@ -216,8 +223,7 @@ impl ChannelApi for SlackChannel {
                                 continue;
                             }
                             let ev = &v["payload"]["event"];
-                            let bot_id =
-                                self.bot_id.lock().await.clone().unwrap_or_default();
+                            let bot_id = self.bot_id.lock().await.clone().unwrap_or_default();
                             if let Some(msg) = incoming_from_event(ev, &bot_id) {
                                 return Ok(Some(msg));
                             }

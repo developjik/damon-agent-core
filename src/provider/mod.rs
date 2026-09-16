@@ -44,25 +44,36 @@ impl Provider {
             .iter()
             .map(|(k, v)| {
                 let resolved = match SecretRef::parse(v) {
-                    Ok(r) => r.resolve().with_context(|| {
-                        format!("provider {name}: cannot resolve header '{k}'")
-                    })?,
+                    Ok(r) => r
+                        .resolve()
+                        .with_context(|| format!("provider {name}: cannot resolve header '{k}'"))?,
                     Err(_) => v.clone(),
                 };
                 Ok((k.clone(), resolved))
             })
             .collect::<anyhow::Result<_>>()?;
-        let base = cfg.base_url.clone().unwrap_or_else(|| match cfg.api.as_str() {
-            "anthropic-messages" => "https://api.anthropic.com".to_string(),
-            "gemini" => "https://generativelanguage.googleapis.com".to_string(),
-            _ => "https://api.openai.com/v1".to_string(),
-        });
+        let base = cfg
+            .base_url
+            .clone()
+            .unwrap_or_else(|| match cfg.api.as_str() {
+                "anthropic-messages" => "https://api.anthropic.com".to_string(),
+                "gemini" => "https://generativelanguage.googleapis.com".to_string(),
+                _ => "https://api.openai.com/v1".to_string(),
+            });
         match cfg.api.as_str() {
             "openai-completions" => Ok(Self::OpenAiCompletions(openai::OpenAiCompat::new(
-                name, &base, key, &headers, cfg.compat.clone(),
+                name,
+                &base,
+                key,
+                &headers,
+                cfg.compat.clone(),
             )?)),
             "openai-responses" => Ok(Self::OpenAiResponses(responses::OpenAiResponses::new(
-                name, &base, key, &headers, cfg.compat.clone(),
+                name,
+                &base,
+                key,
+                &headers,
+                cfg.compat.clone(),
             )?)),
             "anthropic-messages" => Ok(Self::Anthropic(anthropic::Anthropic::new(
                 name, &base, key, &headers, oauth,
@@ -127,8 +138,7 @@ impl Provider {
 pub struct UpstreamResponse {
     pub status: reqwest::StatusCode,
     pub content_type: String,
-    pub stream:
-        std::pin::Pin<Box<dyn futures::Stream<Item = std::io::Result<Bytes>> + Send>>,
+    pub stream: std::pin::Pin<Box<dyn futures::Stream<Item = std::io::Result<Bytes>> + Send>>,
 }
 
 impl UpstreamResponse {

@@ -40,10 +40,7 @@ pub fn render_tools(body: &mut Value) {
             let prev = sys["content"].as_str().unwrap_or("").to_string();
             sys["content"] = Value::String(format!("{prev}\n\n{prompt}"));
         } else {
-            msgs.insert(
-                0,
-                json!({"role": "system", "content": prompt}),
-            );
+            msgs.insert(0, json!({"role": "system", "content": prompt}));
         }
     }
 }
@@ -91,7 +88,9 @@ pub fn extract_tool_calls(text: &str) -> (String, Vec<(String, String)>) {
 
 /// Post-process a buffered event stream: extract <tool_call> blocks from the
 /// accumulated text and re-emit as ToolCallDelta events before Done.
-pub fn events_with_tool_calls(events: Vec<crate::llm::StreamEvent>) -> Vec<crate::llm::StreamEvent> {
+pub fn events_with_tool_calls(
+    events: Vec<crate::llm::StreamEvent>,
+) -> Vec<crate::llm::StreamEvent> {
     use crate::llm::StreamEvent;
     let mut text = String::new();
     let mut out = Vec::new();
@@ -138,14 +137,16 @@ pub fn response_with_tool_calls(v: &mut Value) {
         return;
     }
     msg["content"] = Value::String(clean);
-    msg["tool_calls"] = json!(calls
-        .into_iter()
-        .enumerate()
-        .map(|(i, (name, args))| json!({
-            "id": format!("call_{i}"),
-            "type": "function",
-            "function": {"name": name, "arguments": args},
-        }))
-        .collect::<Vec<_>>());
+    msg["tool_calls"] = json!(
+        calls
+            .into_iter()
+            .enumerate()
+            .map(|(i, (name, args))| json!({
+                "id": format!("call_{i}"),
+                "type": "function",
+                "function": {"name": name, "arguments": args},
+            }))
+            .collect::<Vec<_>>()
+    );
     v["choices"][0]["finish_reason"] = json!("tool_calls");
 }

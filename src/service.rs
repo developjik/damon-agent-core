@@ -53,7 +53,10 @@ pub fn schtasks_command(exe: &str, config: &str) -> String {
 
 pub fn launchd_plist_path() -> PathBuf {
     directories::BaseDirs::new()
-        .map(|d| d.home_dir().join("Library/LaunchAgents/dev.damon.damond.plist"))
+        .map(|d| {
+            d.home_dir()
+                .join("Library/LaunchAgents/dev.damon.damond.plist")
+        })
         .unwrap_or_else(|| PathBuf::from("dev.damon.damond.plist"))
 }
 

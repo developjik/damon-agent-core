@@ -36,7 +36,7 @@ fn test_config(base_url: &str, auth_token: Option<&str>) -> damon_core::config::
         mcp_servers: HashMap::new(),
         providers,
         models: BTreeMap::new(),
-            relay: None,
+        relay: None,
     };
     Arc::new(parking_lot::RwLock::new(cfg))
 }
@@ -54,7 +54,9 @@ async fn mock_upstream() -> String {
                 .to_string();
             Response::builder()
                 .header("content-type", "text/event-stream")
-                .body(Body::from(format!("data: {{\"auth\":\"{auth}\"}}\n\ndata: [DONE]\n\n")))
+                .body(Body::from(format!(
+                    "data: {{\"auth\":\"{auth}\"}}\n\ndata: [DONE]\n\n"
+                )))
                 .unwrap()
         }),
     );
@@ -163,7 +165,7 @@ async fn no_provider_returns_503_openai_error() {
         mcp_servers: HashMap::new(),
         providers: BTreeMap::new(),
         models: BTreeMap::new(),
-            relay: None,
+        relay: None,
     }));
     let store = damon_core::store::Store::in_memory().await.unwrap();
     let mcp = damon_core::mcp::McpRegistry::connect_all(&HashMap::new()).await;
@@ -194,5 +196,8 @@ api_key = "sk-literal-secret"
     let path = dir.join("bad.toml");
     std::fs::write(&path, toml).unwrap();
     let err = format!("{:#}", Config::load(&path).unwrap_err());
-    assert!(err.contains("env:") || err.contains("keychain:"), "got: {err}");
+    assert!(
+        err.contains("env:") || err.contains("keychain:"),
+        "got: {err}"
+    );
 }

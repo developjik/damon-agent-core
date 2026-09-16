@@ -39,8 +39,7 @@ async fn main() {
     let mut proxy_ttfb = Vec::new();
     let mut proxy_total = Vec::new();
     for _ in 0..5 {
-        let (t, tot) =
-            measure_stream(&format!("http://{upstream}/chat/completions"), &body).await;
+        let (t, tot) = measure_stream(&format!("http://{upstream}/chat/completions"), &body).await;
         direct_ttfb.push(t);
         direct_total.push(tot);
         let (t, tot) =
@@ -54,8 +53,14 @@ async fn main() {
     let d_tot = median(&mut direct_total);
     let p_tot = median(&mut proxy_total);
 
-    println!("TTFB  direct:        {:>7.2} ms", d_ttfb.as_secs_f64() * 1e3);
-    println!("TTFB  via damond:    {:>7.2} ms", p_ttfb.as_secs_f64() * 1e3);
+    println!(
+        "TTFB  direct:        {:>7.2} ms",
+        d_ttfb.as_secs_f64() * 1e3
+    );
+    println!(
+        "TTFB  via damond:    {:>7.2} ms",
+        p_ttfb.as_secs_f64() * 1e3
+    );
     println!(
         "TTFB  overhead:      {:>7.2} ms",
         (p_ttfb - d_ttfb).as_secs_f64() * 1e3
@@ -76,9 +81,7 @@ async fn spawn_mock_upstream() -> SocketAddr {
         "/chat/completions",
         post(|| async {
             let stream = IntervalStream::new(tokio::time::interval(CHUNK_DELAY)).map(|_| {
-                Ok::<_, std::io::Error>(bytes::Bytes::from_static(
-                    b"data: {\"choices\":[]}\n\n",
-                ))
+                Ok::<_, std::io::Error>(bytes::Bytes::from_static(b"data: {\"choices\":[]}\n\n"))
             });
             Response::builder()
                 .header("content-type", "text/event-stream")
@@ -115,9 +118,9 @@ fn spawn_damond(upstream: SocketAddr) -> (Child, SocketAddr) {
     // Examples don't get CARGO_BIN_EXE_*; locate sibling binary in target dir.
     let exe = std::env::current_exe()
         .unwrap()
-        .parent()          // examples/
+        .parent() // examples/
         .unwrap()
-        .parent()          // target/<profile>/
+        .parent() // target/<profile>/
         .unwrap()
         .join("damond");
     let mut child = Command::new(exe)
@@ -150,7 +153,10 @@ fn spawn_damond(upstream: SocketAddr) -> (Child, SocketAddr) {
 fn idle_rss(pid: u32) -> u64 {
     std::thread::sleep(Duration::from_millis(300)); // settle after boot
     let mut sys = sysinfo::System::new();
-    sys.refresh_processes(sysinfo::ProcessesToUpdate::Some(&[sysinfo::Pid::from_u32(pid)]), true);
+    sys.refresh_processes(
+        sysinfo::ProcessesToUpdate::Some(&[sysinfo::Pid::from_u32(pid)]),
+        true,
+    );
     sys.process(sysinfo::Pid::from_u32(pid))
         .map(|p| p.memory())
         .unwrap_or(0)

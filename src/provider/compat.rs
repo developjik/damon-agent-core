@@ -17,7 +17,10 @@ pub fn apply(body: &mut Value, compat: &ProviderCompat) {
 
     // Thinking level: `model:low|medium|high` was split upstream and rides
     // here as `_thinking`. Map to reasoning_effort; drop the private key.
-    if let Some(level) = obj.remove("_thinking").and_then(|v| v.as_str().map(String::from)) {
+    if let Some(level) = obj
+        .remove("_thinking")
+        .and_then(|v| v.as_str().map(String::from))
+    {
         obj.insert("reasoning_effort".into(), Value::String(level));
     }
 
@@ -70,10 +73,8 @@ fn shape_messages(messages: &mut Vec<Value>, compat: &ProviderCompat) {
                 continue;
             }
             for tc in m["tool_calls"].as_array().into_iter().flatten() {
-                if let (Some(id), Some(name)) = (
-                    tc["id"].as_str(),
-                    tc["function"]["name"].as_str(),
-                ) {
+                if let (Some(id), Some(name)) = (tc["id"].as_str(), tc["function"]["name"].as_str())
+                {
                     names.insert(id.to_string(), name.to_string());
                 }
             }
@@ -107,13 +108,12 @@ fn shape_messages(messages: &mut Vec<Value>, compat: &ProviderCompat) {
             if let Some(prev) = out.last_mut() {
                 let prev_role = prev["role"].as_str().unwrap_or("");
                 let cur_role = m["role"].as_str().unwrap_or("");
-                let mergeable = matches!(prev_role, "system" | "developer")
-                    && prev_role == cur_role;
+                let mergeable =
+                    matches!(prev_role, "system" | "developer") && prev_role == cur_role;
                 if mergeable {
                     let prev_text = prev["content"].as_str().unwrap_or("").to_string();
                     let cur_text = m["content"].as_str().unwrap_or("");
-                    prev["content"] =
-                        Value::String(format!("{prev_text}\n{cur_text}"));
+                    prev["content"] = Value::String(format!("{prev_text}\n{cur_text}"));
                     continue;
                 }
             }
