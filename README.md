@@ -1,84 +1,153 @@
-# Damon agent core
+# Damon
 
 **English** | [한국어](README.ko.md)
 
-A pun on "daemon" and the actual architecture: an open-source, multi-provider agent core that stays running on macOS + Windows + Linux.
+[![ci](https://github.com/developjik/damon-agent-core/actions/workflows/ci.yml/badge.svg)](https://github.com/developjik/damon-agent-core/actions/workflows/ci.yml)
+[![crates.io](https://img.shields.io/crates/v/damon-core.svg)](https://crates.io/crates/damon-core)
+[![npm](https://img.shields.io/npm/v/damon-agent.svg)](https://www.npmjs.com/package/damon-agent)
+[![license](https://img.shields.io/badge/license-MIT%20OR%20Apache--2.0-blue.svg)](LICENSE-MIT)
 
-You build exactly one daemon. If the API is right, any program can attach as a thin client — yours or someone else's.
+**One daemon. Every surface.**
 
-## Architecture
+Damon is a local, always-on agent core written in Rust. It owns the hard parts — the tool loop, sessions, memory, provider quirks, secrets — and exposes them through a single API. Your CLI, Telegram bot, desktop app, or web UI all become thin clients that attach to the same resident daemon.
 
+The name is a pun on *daemon* — and it's also literally what it is.
+
+## Why Damon
+
+Most agent stacks make you pick a surface first, then bolt on tools and memory inside it. Damon inverts that: the core is the product, and every surface is disposable.
+
+- **OpenAI-compatible endpoint** — point any existing OpenAI client at `http://127.0.0.1:9470/v1` and it just works. Anthropic, Gemini, and Responses-API models are translated to the OpenAI schema, so your client never cares which provider answered.
+- **A real agent runtime** — sessions, streaming, tool calls, permission prompts, cancellation, context compaction. Exposed as ACP-style JSON-RPC over WebSocket at `/ws`.
+- **Every provider, one config** — OpenAI, Anthropic, Gemini, OpenRouter, Groq, DeepSeek, vLLM, Ollama (auto-discovered, zero config). Model globs route requests; `model:low/medium/high` suffixes map to each provider's thinking controls.
+- **Tools via MCP** — declare stdio MCP servers in TOML and their tools join the loop, namespaced as `server.tool`. Per-server `auto_approve` or interactive permission prompts.
+- **Chat channels out of the box** — Telegram, Discord, and Slack adapters ship as separate binaries. Per-chat session mapping, streamed replies, approve tool calls by replying `allow`/`deny`.
+- **Secrets never touch disk in plaintext** — `env:`, `keychain:`, or `!cmd` references only; literal keys are rejected. OAuth login for Anthropic stores tokens in the OS keychain and auto-refreshes.
+- **Reachable from anywhere** — serve `wss` with your own certs, or run `damon-relay` on a public host: the daemon dials out (no inbound port), and the tunnel is end-to-end encrypted with X25519 + AES-256-GCM. The relay sees only ciphertext.
+- **Built to stay resident** — ~12 MB idle RSS, streaming passes through with sub-millisecond overhead, fast cold start, no degradation under concurrent sessions.
+
+## Install
+
+```sh
+npm install -g damon-agent        # npm (prebuilt binaries)
+cargo install damon-core          # crates.io
+brew install developjik/tap/damon # Homebrew tap
 ```
-[web] [CLI] [telegram] [discord] [slack] [browser ext] [mobile] [desktop app]   all thin clients
-                      |
-        Single API: ACP over WS/JSON-RPC + OpenAI-compatible HTTP
-                      |
-               Damon core (local daemon · Rust)
-                ├─ agent runtime (tool loop)
-                ├─ provider adapters (OpenAI-compatible LLM APIs)
-                ├─ session / memory store
-                └─ tool system = MCP client (whale map, ECOS, TradingView connectors)
+
+Or grab a platform tarball from [GitHub Releases](https://github.com/developjik/damon-agent-core/releases) — macOS (arm64/x86_64), Linux, Windows.
+
+Run it as an OS service so it's always up:
+
+```sh
+damond service install   # launchd / systemd user / Task Scheduler
+damond service print     # preview the definition first
 ```
-
-Desktop apps (Electron/Tauri) are the same kind of thin client — instead of building one, we ship docs and examples for the attach-to-resident-daemon pattern.
-
-## Principles
-
-1. Core first, surfaces later. Build the surface first and you die.
-2. The core is exposed through a single API. That's what makes "reuse it from anywhere" free.
-3. API keys live only in the OS credential store (macOS Keychain, Windows Credential Manager, Linux Secret Service). Never in code or the repo.
-4. Reuse standard protocols (OpenAI-compatible schema, ACP, MCP). Don't invent your own adapter layer.
-5. The core must run on macOS, Windows, and Linux. Platform-specific features (keychain, daemon registration, paths) go behind adapters.
-6. The API is the product. A stable, versioned contract — once an API is public, it doesn't break.
-7. It must be easy to attach: one-line install, single binary/package distribution, client examples and docs shipped with the core.
-8. Performance is a feature. It's a resident process, so idle footprint (RAM/CPU) must be small, and the API must add ~0 overhead over provider calls — streaming passes through with no buffering. Fast cold start, no degradation under concurrent sessions.
-
-## Decisions (locked in Phase 0)
-
-- Core role: agent runtime — the core owns the tool loop, sessions, and tools. The proxy is exposed as an OpenAI-compatible endpoint
-- Language/runtime: Rust — single binary, minimal footprint, ACP reference ecosystem
-- API: native API (WS/JSON-RPC, full-featured) + OpenAI-compatible HTTP endpoint (drop-in)
-- Protocols: ACP server (client↔core) + MCP client (core↔tools)
-- Local auth: bind to 127.0.0.1 by default + optional token (for multi-user/remote)
-- OS: macOS + Windows + Linux
-- License: MIT + Apache-2.0 dual
-- Config: TOML, platform directories, hot reload
-- Reference client: CLI
-
-## Open questions (decided when entering each phase — deciding early is over-engineering)
-
-- Phase 1: daemon registration (launchd / Windows Service / Task Scheduler), auto-start, single-instance/port policy, log location/rotation
-- Phase 2: storage (SQLite vs files), session model (forking/compaction), memory definition (conversation history vs long-term memory/RAG), tool source (MCP), tool execution permissions/sandbox
-- Phase 3: client SDKs (hand-written TS/Python vs generated from an OpenAPI spec)
-- Phase 4: remote relay — E2E encryption, pairing, NAT traversal (reuse Tailscale vs own relay)
-- Phase 5: distribution channels (npm/brew/binaries), CI matrix, name/registry conflict check, contribution policy (DCO)
-
-## Roadmap
-
-- Phase 0: one-page spec + gate criteria (done)
-- Phase 1: core daemon boot (Rust), one provider adapter, health-check endpoint, performance baseline bench (idle footprint, streaming overhead)
-- Phase 2: memory + tool system (done — SQLite session store, MCP client, WS/JSON-RPC ACP API, tool loop)
-- Phase 3: reference CLI client + integration guide (done — `damon` CLI, `damon::client` library, docs/integration.md)
-- Phase 4: channel expansion + remote relay (E2E) (done — `damon-telegram`/`damon-discord`/`damon-slack` adapters, wss/TLS, mandatory token on non-loopback binds, `damon-relay` + X25519/AES-256-GCM E2E tunnel)
-- Phase 5: open-source release (done — MIT/Apache-2.0, `damond service install`, CI matrix, npm `damon-agent`, crates.io `damon-core`)
 
 ## Quickstart
 
 ```sh
-cargo run --bin damond            # generates a starter config on first run
-damond --print-config-path        # show config location
-curl localhost:9470/health
-curl localhost:9470/v1/chat/completions -d '{"model":"gpt-4o","messages":[...],"stream":true}'
+damond                          # first run writes a starter config
+damond --print-config-path      # where the config lives
+damond doctor                   # verify config, secrets, provider reachability
 ```
 
-CLI: `damon health` / `damon sessions` / `damon chat` / `damon prompt "..."` — `--url`, `--token` (or `DAMON_TOKEN`)
+Add a provider key (env var, keychain, or `op read …` — never a literal), then:
 
-Channel adapters: `damon-telegram --bot-token …` / `damon-discord --bot-token …` / `damon-slack --app-token xapp-… --bot-token xoxb-…` — automatic per-channel session mapping, streaming responses, tool-permission approval by replying "allow"/"deny". Add a new channel by implementing `damon_core::channel::ChannelApi` and wiring it to a `Bridge`.
+```sh
+curl localhost:9470/health
+curl -N localhost:9470/v1/chat/completions \
+  -H 'Content-Type: application/json' \
+  -d '{"model":"gpt-4o","messages":[{"role":"user","content":"hi"}],"stream":true}'
+```
 
-Remote access: set `tls_cert`/`tls_key` to serve wss. Non-loopback binds require `auth_token`. Self-hosted relay: `damon-relay` (public server, 0.0.0.0:8080) + daemon `[relay]` config → outbound tunnel, X25519+AES-256-GCM E2E. Client: `damon --relay ws://relay:8080 --relay-name <name> --token <auth_token>`.
+Talk to it with the bundled CLI:
 
-## Baseline (Apple M4, release)
+```sh
+damon chat                      # interactive REPL (streams, tool prompts)
+damon prompt "summarize this repo"
+damon sessions                  # list sessions
+damon resume <id>               # pick a session back up
+damon search "error AND timeout"  # FTS5 full-text search over all history
+```
 
-- idle RSS: 9.3 MB (Phase 1) → 11.7 MB (Phase 2)
-- streaming overhead: TTFB +0.7ms, total +0.9ms (20-chunk SSE, vs local mock)
-- measure: `cargo run --release --example bench`
+## Architecture
+
+```
+[CLI] [Telegram] [Discord] [Slack] [web] [desktop app] [your code]
+                              |
+        Single API: OpenAI-compatible HTTP + ACP-style WS/JSON-RPC
+                              |
+                    Damon core (resident daemon · Rust)
+                     ├─ agent runtime — tool loop, permissions, compaction
+                     ├─ provider adapters — OpenAI / Anthropic / Gemini / Responses
+                     ├─ session & memory store — SQLite + FTS5
+                     └─ MCP client — tools from any stdio MCP server
+```
+
+Desktop apps (Electron/Tauri) are just another thin client: attach to `ws://127.0.0.1:9470/ws`, or spawn `damond` as a sidecar. See [docs/integration.md](docs/integration.md) for the wire protocol and copy-paste clients in Node, Python, and Rust.
+
+## Configuration
+
+One TOML file in the platform config dir, hot-reloaded on change:
+
+```toml
+[providers.default]
+api      = "openai-completions"
+base_url = "https://api.openai.com/v1"
+api_key  = "env:OPENAI_API_KEY"     # env:VAR | keychain:svc/acct | "!op read …"
+models   = ["gpt-*"]
+
+[providers.claude]
+api     = "anthropic-messages"
+api_key = "oauth"                   # `damond login anthropic` → OS keychain
+models  = ["claude-*"]
+
+[mcp_servers.filesystem]
+command = "npx"
+args    = ["-y", "@modelcontextprotocol/server-filesystem", "/tmp"]
+auto_approve = false                # client gets a permission prompt per call
+```
+
+Ollama needs no config at all — damond probes `$OLLAMA_HOST` and routes discovered models automatically. Endpoint quirks (Mistral tool ids, `max_completion_tokens`, in-band tools for local models, …) are handled by per-provider `compat` flags. Full reference: [config.example.toml](config.example.toml).
+
+## Chat channels
+
+```sh
+damon-telegram --bot-token <token>
+damon-discord  --bot-token <token>
+damon-slack    --app-token xapp-… --bot-token xoxb-…
+```
+
+Each channel chat maps to its own daemon session; replies stream in; tool-permission requests are approved by replying `allow` or `deny`. Add your own channel by implementing `damon_core::channel::ChannelApi` (`ready`/`recv`/`send`) and handing it to a `Bridge` — session mapping, event demux, and the permission flow are already done.
+
+## Remote access
+
+- **Tailscale** (recommended): attach to `ws://<tailscale-ip>:9470/ws` — WireGuard E2E, zero daemon config.
+- **Direct TLS**: set `tls_cert`/`tls_key` to serve `wss`. Non-loopback binds refuse to start without `auth_token`.
+- **Self-hosted relay**: run `damon-relay` on a public host, add `[relay]` to the daemon config — the daemon dials out, so no inbound port is needed. Clients connect with `damon --relay ws://relay:8080 --relay-name <name> --token <auth_token>`. X25519 key exchange + `sha256(auth_token ‖ pubkey)` proof → AES-256-GCM; the relay never sees plaintext.
+
+## Performance
+
+Baseline on Apple M4, release build:
+
+| Metric | Value |
+|---|---|
+| Idle RSS | 11.7 MB |
+| Streaming overhead | +0.7 ms TTFB, +0.9 ms total (20-chunk SSE vs local mock) |
+
+Reproduce: `cargo run --release --example bench`
+
+## Docs
+
+- [docs/install.md](docs/install.md) — install paths, service registration, OAuth login
+- [docs/integration.md](docs/integration.md) — wire protocol, provider/compat reference, minimal clients
+- [config.example.toml](config.example.toml) — every option, annotated
+- [examples/client.rs](examples/client.rs) — Rust client (`cargo run --example client`)
+
+## Contributing
+
+See [CONTRIBUTING.md](CONTRIBUTING.md). CI runs `cargo test` on macOS, Windows, and Linux.
+
+## License
+
+Dual-licensed under [MIT](LICENSE-MIT) or [Apache-2.0](LICENSE-APACHE), at your option.

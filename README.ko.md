@@ -1,83 +1,153 @@
-# Damon agent core
+# Damon
 
 [English](README.md) | **한국어**
 
-daemon의 말장난이자 실제 아키텍처. macOS + Windows + Linux에서 항상 떠 있는, 오픈소스 멀티 프로바이더 에이전트 코어.
+[![ci](https://github.com/developjik/damon-agent-core/actions/workflows/ci.yml/badge.svg)](https://github.com/developjik/damon-agent-core/actions/workflows/ci.yml)
+[![crates.io](https://img.shields.io/crates/v/damon-core.svg)](https://crates.io/crates/damon-core)
+[![npm](https://img.shields.io/npm/v/damon-agent.svg)](https://www.npmjs.com/package/damon-agent)
+[![license](https://img.shields.io/badge/license-MIT%20OR%20Apache--2.0-blue.svg)](LICENSE-MIT)
 
-만드는 건 데몬 하나뿐. API가 제대로면 어떤 프로그램이든 얇은 클라이언트로 붙는다 — 내 것이든 남의 것이든.
+**데몬 하나. 모든 서피스.**
 
-## 구조
+Damon은 Rust로 만든 로컬 상주 에이전트 코어다. 어려운 부분 — tool loop, 세션, 메모리, 프로바이더별 quirks, 시크릿 — 을 전부 코어가 소유하고 단일 API로 노출한다. CLI, 텔레그램 봇, 데스크톱 앱, 웹 UI는 전부 같은 상주 데몬에 붙는 얇은 클라이언트가 된다.
 
+이름은 *daemon*의 말장난이자, 말 그대로 실제 아키텍처다.
+
+## 왜 Damon인가
+
+대부분의 에이전트 스택은 서피스를 먼저 고르게 하고, 그 안에 툴과 메모리를 억지로 끼워 넣는다. Damon은 반대다: 코어가 제품이고, 서피스는 전부 소모품이다.
+
+- **OpenAI 호환 엔드포인트** — 기존 OpenAI 클라이언트를 `http://127.0.0.1:9470/v1`에 그대로 향하게 하면 된다. Anthropic, Gemini, Responses API 모델도 OpenAI 스키마로 번역되므로 클라이언트는 어느 프로바이더가 응답했는지 신경 쓸 필요가 없다.
+- **진짜 에이전트 런타임** — 세션, 스트리밍, tool call, 권한 프롬프트, 취소, 컨텍스트 컴팩션. `/ws`에서 ACP형 JSON-RPC over WebSocket으로 노출.
+- **모든 프로바이더, 하나의 config** — OpenAI, Anthropic, Gemini, OpenRouter, Groq, DeepSeek, vLLM, Ollama(자동 탐지, 설정 불필요). 모델 glob이 요청을 라우팅하고, `model:low/medium/high` 접미사가 프로바이더별 thinking 제어로 매핑된다.
+- **MCP로 툴 연결** — stdio MCP 서버를 TOML에 선언하면 `server.tool` 네임스페이스로 tool loop에 합류. 서버별 `auto_approve` 또는 대화형 권한 프롬프트.
+- **채팅 채널 기본 제공** — Telegram, Discord, Slack 어댑터가 별도 바이너리로 나간다. 채널별 세션 자동 매핑, 스트리밍 응답, `allow`/`deny` 답장으로 tool 승인.
+- **시크릿은 평문으로 디스크에 남지 않는다** — `env:`, `keychain:`, `!cmd` 참조만 허용, 리터럴 키는 거부. Anthropic OAuth 로그인은 토큰을 OS 키체인에 저장하고 자동 갱신한다.
+- **어디서든 접근** — 자체 인증서로 `wss` 서빙, 또는 공개 호스트에 `damon-relay`를 띄우면 데몬이 아웃바운드로 연결한다(인바운드 포트 불필요). 터널은 X25519 + AES-256-GCM으로 E2E 암호화 — 릴레이는 암호문만 본다.
+- **상주하도록 설계** — idle RSS ~12MB, 스트리밍은 1ms 미만 오버헤드로 패스스루, 빠른 콜드스타트, 동시 세션에서도 저하 없음.
+
+## 설치
+
+```sh
+npm install -g damon-agent        # npm (프리빌트 바이너리)
+cargo install damon-core          # crates.io
+brew install developjik/tap/damon # Homebrew tap
 ```
-[web] [CLI] [telegram] [discord] [slack] [browser ext] [mobile] [desktop app]   전부 thin client
-                      |
-        단일 API: ACP over WS/JSON-RPC + OpenAI 호환 HTTP
-                      |
-               Damon core (local daemon · Rust)
-                ├─ 에이전트 런타임 (tool loop)
-                ├─ provider 어댑터 (OpenAI 호환 LLM API)
-                ├─ 세션 / 메모리 저장소
-                └─ 툴 시스템 = MCP 클라이언트 (고래 지도, 쉼표 ECOS, TradingView 연결)
+
+또는 [GitHub Releases](https://github.com/developjik/damon-agent-core/releases)에서 플랫폼별 tarball — macOS(arm64/x86_64), Linux, Windows.
+
+OS 서비스로 등록해 항상 띄워두기:
+
+```sh
+damond service install   # launchd / systemd user / Task Scheduler
+damond service print     # 설치 전 정의 미리보기
 ```
-데스크톱 앱(Electron/Tauri)도 같은 thin client — 직접 만들지 않고, 상주 데몬에 attach하는 패턴을 문서/예제로 제공한다.
-
-## 원칙
-
-1. 코어가 먼저, 서피스는 나중. 서피스부터 만들면 죽는다.
-2. 코어는 단일 API로만 노출한다. 그래야 "여러 군데서 가져다 쓰기"가 공짜가 된다.
-3. API 키는 OS 자격증명 저장소(macOS Keychain, Windows Credential Manager, Linux Secret Service)에만 둔다. 코드와 저장소에는 절대.
-4. 프로토콜은 표준을 재사용한다(OpenAI 호환 스키마, ACP, MCP). 어댑터 레이어를 직접 발명하지 않는다.
-5. 코어는 macOS, Windows, Linux 모두에서 돌아야 한다. 플랫폼 종속 기능(키체인, 데몬 등록, 경로)은 어댑터 뒤에 둔다.
-6. API가 곧 제품이다. 안정적이고 버전드된 계약 — 한 번 공개한 API는 깨지지 않는다.
-7. 붙이기 쉬워야 한다. 설치 한 줄, 단일 바이너리/패키지 배포, 클라이언트 예제와 문서가 코어와 함께 나간다.
-8. 성능은 기능이다. 상주 프로세스니까 idle 점유(RAM/CPU)가 작아야 하고, API는 프로바이더 호출 대비 오버헤드 ~0 — 스트리밍은 버퍼링 없이 패스스루. 콜드스타트 빠르고, 동시 세션에서 저하 없어야 한다.
-
-## 결정 (Phase 0 확정)
-
-- 코어 역할: 에이전트 런타임 — 코어가 tool loop·세션·툴을 소유. 프록시는 OpenAI 호환 엔드포인트로 제공
-- 언어/런타임: Rust — 단일 바이너리, 최소 footprint, ACP 레퍼런스 생태계
-- API: 자체 API(WS/JSON-RPC, 풀기능) + OpenAI 호환 HTTP 엔드포인트(드롭인)
-- 프로토콜: ACP 서버(클라이언트↔코어) + MCP 클라이언트(코어↔툴)
-- 로컬 인증: 127.0.0.1 바인드 기본 + 토큰 옵션(멀티유저·원격 대비)
-- OS: macOS + Windows + Linux
-- 라이선스: MIT + Apache-2.0 듀얼
-- 설정: TOML, 플랫폼 디렉터리, 핫리로드
-- 레퍼런스 클라이언트: CLI
-
-## 미결정 사항 (Phase 진입 시 결정 — 미리 정하면 과잉설계)
-
-- Phase 1: 데몬 등록(launchd / Windows Service / Task Scheduler), 자동시작, 단일 인스턴스·포트 정책, 로그 위치/로테이션
-- Phase 2: 스토리지(SQLite vs 파일), 세션 모델(포킹/컴팩션), 메모리 정의(대화 이력 vs 장기기억/RAG), 툴 소스(MCP), 툴 실행 권한·샌드박스
-- Phase 3: 클라이언트 SDK(TS/Python 직접 제작 vs OpenAPI 스펙 생성)
-- Phase 4: 원격 릴레이 — E2E 암호화, 페어링, NAT traversal(Tailscale 재사용 vs 자체 릴레이)
-- Phase 5: 배포 채널(npm/brew/바이너리), CI 매트릭스, 이름/레지스트리 충돌 확인, 기여 정책(DCO)
-
-## 로드맵
-
-- Phase 0: 스펙 한 장 + 게이트 확정 (완료)
-- Phase 1: 코어 데몬 부팅(Rust), 프로바이더 어댑터 1종, 헬스체크 엔드포인트, 성능 기준선 벤치(idle footprint·스트리밍 오버헤드)
-- Phase 2: 메모리 + 툴 시스템 (완료 — SQLite 세션 저장소, MCP 클라이언트, WS/JSON-RPC ACP API, tool loop)
-- Phase 3: 레퍼런스 CLI 클라이언트 + 연동 가이드 (완료 — `damon` CLI, `damon::client` 라이브러리, docs/integration.md)
-- Phase 4: 채널 확장 + 원격 릴레이(E2E) (완료 — `damon-telegram`/`damon-discord`/`damon-slack` 어댑터, wss/TLS, 비루프백 토큰 강제, `damon-relay` + X25519/AES-256-GCM E2E 터널)
-- Phase 5: 오픈소스 릴리스 (완료 — MIT/Apache-2.0, `damond service install`, CI 매트릭스, npm `damon-agent`, crates.io `damon-core`)
 
 ## Quickstart
 
 ```sh
-cargo run --bin damond            # 첫 실행 시 스타터 config 생성
-damond --print-config-path        # config 위치 확인
-curl localhost:9470/health
-curl localhost:9470/v1/chat/completions -d '{"model":"gpt-4o","messages":[...],"stream":true}'
+damond                          # 첫 실행 시 스타터 config 생성
+damond --print-config-path      # config 위치 확인
+damond doctor                   # config·시크릿·프로바이더 연결 검증
 ```
 
-CLI: `damon health` / `damon sessions` / `damon chat` / `damon prompt "..."` — `--url`, `--token` (또는 `DAMON_TOKEN`)
+프로바이더 키를 추가하고(env var, 키체인, `op read …` — 리터럴 금지):
 
-채널 어댑터: `damon-telegram --bot-token …` / `damon-discord --bot-token …` / `damon-slack --app-token xapp-… --bot-token xoxb-…` — 채널별 세션 자동 매핑, 스트리밍 응답, "allow"/"deny" 답장으로 툴 권한 승인. 새 채널은 `damon_core::channel::ChannelApi` 구현 + `Bridge` 연결로 추가.
+```sh
+curl localhost:9470/health
+curl -N localhost:9470/v1/chat/completions \
+  -H 'Content-Type: application/json' \
+  -d '{"model":"gpt-4o","messages":[{"role":"user","content":"hi"}],"stream":true}'
+```
 
-원격 접근: `tls_cert`/`tls_key` 설정 시 wss 서빙. 비루프백 바인드는 `auth_token` 필수. 자체 릴레이: `damon-relay` (공개 서버, 0.0.0.0:8080) + 데몬 `[relay]` 설정 → 아웃바운드 터널, X25519+AES-256-GCM E2E. 클라이언트: `damon --relay ws://relay:8080 --relay-name <name> --token <auth_token>`.
+번들 CLI로 대화:
 
-## 기준선 (Apple M4, release)
+```sh
+damon chat                      # 대화형 REPL (스트리밍, tool 프롬프트)
+damon prompt "이 레포 요약해줘"
+damon sessions                  # 세션 목록
+damon resume <id>               # 세션 이어하기
+damon search "error AND timeout"  # 전체 이력 FTS5 전문 검색
+```
 
-- idle RSS: 9.3 MB (Phase 1) → 11.7 MB (Phase 2)
-- 스트리밍 오버헤드: TTFB +0.7ms, total +0.9ms (20청크 SSE, 로컬 mock 대비)
-- 측정: `cargo run --release --example bench`
+## 구조
+
+```
+[CLI] [Telegram] [Discord] [Slack] [web] [desktop app] [직접 만든 코드]
+                              |
+        단일 API: OpenAI 호환 HTTP + ACP형 WS/JSON-RPC
+                              |
+                    Damon core (상주 데몬 · Rust)
+                     ├─ 에이전트 런타임 — tool loop, 권한, 컴팩션
+                     ├─ provider 어댑터 — OpenAI / Anthropic / Gemini / Responses
+                     ├─ 세션·메모리 저장소 — SQLite + FTS5
+                     └─ MCP 클라이언트 — 모든 stdio MCP 서버의 툴
+```
+
+데스크톱 앱(Electron/Tauri)도 같은 thin client다: `ws://127.0.0.1:9470/ws`에 attach하거나 `damond`를 sidecar로 띄운다. 와이어 프로토콜과 Node/Python/Rust 복붙 클라이언트는 [docs/integration.md](docs/integration.md) 참조.
+
+## 설정
+
+플랫폼 config 디렉터리의 TOML 파일 하나. 변경 시 핫리로드:
+
+```toml
+[providers.default]
+api      = "openai-completions"
+base_url = "https://api.openai.com/v1"
+api_key  = "env:OPENAI_API_KEY"     # env:VAR | keychain:svc/acct | "!op read …"
+models   = ["gpt-*"]
+
+[providers.claude]
+api     = "anthropic-messages"
+api_key = "oauth"                   # `damond login anthropic` → OS 키체인
+models  = ["claude-*"]
+
+[mcp_servers.filesystem]
+command = "npx"
+args    = ["-y", "@modelcontextprotocol/server-filesystem", "/tmp"]
+auto_approve = false                # 호출마다 클라이언트에 권한 프롬프트
+```
+
+Ollama는 설정이 아예 필요 없다 — damond가 `$OLLAMA_HOST`를 프로브하고 발견된 모델을 자동 라우팅한다. 엔드포인트 quirks(Mistral tool id, `max_completion_tokens`, 로컬 모델용 in-band tools 등)는 프로바이더별 `compat` 플래그로 처리. 전체 레퍼런스: [config.example.toml](config.example.toml).
+
+## 채팅 채널
+
+```sh
+damon-telegram --bot-token <token>
+damon-discord  --bot-token <token>
+damon-slack    --app-token xapp-… --bot-token xoxb-…
+```
+
+채널의 각 채팅이 고유한 데몬 세션에 매핑되고, 응답은 스트리밍되며, tool 권한 요청은 `allow`/`deny` 답장으로 승인한다. 새 채널은 `damon_core::channel::ChannelApi`(`ready`/`recv`/`send`)를 구현해 `Bridge`에 넘기면 된다 — 세션 매핑, 이벤트 demux, 권한 흐름은 이미 구현돼 있다.
+
+## 원격 접근
+
+- **Tailscale**(권장): `ws://<tailscale-ip>:9470/ws`로 attach — WireGuard E2E, 데몬 설정 변경 없음.
+- **직접 TLS**: `tls_cert`/`tls_key` 설정 시 `wss` 서빙. 비루프백 바인드는 `auth_token` 없이 기동을 거부한다.
+- **자체 릴레이**: 공개 호스트에 `damon-relay`를 띄우고 데몬 config에 `[relay]` 추가 — 데몬이 아웃바운드로 연결하므로 인바운드 포트 불필요. 클라이언트는 `damon --relay ws://relay:8080 --relay-name <name> --token <auth_token>`으로 접속. X25519 키 교환 + `sha256(auth_token ‖ pubkey)` 증명 → AES-256-GCM; 릴레이는 평문을 볼 수 없다.
+
+## 성능
+
+Apple M4, release 빌드 기준선:
+
+| 지표 | 값 |
+|---|---|
+| Idle RSS | 11.7 MB |
+| 스트리밍 오버헤드 | TTFB +0.7ms, total +0.9ms (20청크 SSE, 로컬 mock 대비) |
+
+재현: `cargo run --release --example bench`
+
+## 문서
+
+- [docs/install.md](docs/install.md) — 설치 경로, 서비스 등록, OAuth 로그인
+- [docs/integration.md](docs/integration.md) — 와이어 프로토콜, provider/compat 레퍼런스, 최소 클라이언트
+- [config.example.toml](config.example.toml) — 모든 옵션 주석 포함
+- [examples/client.rs](examples/client.rs) — Rust 클라이언트 (`cargo run --example client`)
+
+## 기여
+
+[CONTRIBUTING.md](CONTRIBUTING.md) 참조. CI는 macOS, Windows, Linux에서 `cargo test`를 돌린다.
+
+## 라이선스
+
+[MIT](LICENSE-MIT) 또는 [Apache-2.0](LICENSE-APACHE) 듀얼 라이선스 — 선택 가능.
