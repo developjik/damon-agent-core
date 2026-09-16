@@ -23,6 +23,7 @@ class Damon < Formula
     bin.install "damon-telegram"
     bin.install "damon-discord"
     bin.install "damon-slack"
+    bin.install "damon-relay"
   end
 
   test do

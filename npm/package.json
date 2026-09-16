@@ -5,7 +5,11 @@
   "license": "MIT OR Apache-2.0",
   "bin": {
     "damond": "bin/damond",
-    "damon": "bin/damon"
+    "damon": "bin/damon",
+    "damon-telegram": "bin/damon-telegram",
+    "damon-discord": "bin/damon-discord",
+    "damon-slack": "bin/damon-slack",
+    "damon-relay": "bin/damon-relay"
   },
   "scripts": {
     "postinstall": "node install.js"
@@ -13,5 +17,8 @@
   "engines": {
     "node": ">=18"
   },
-  "files": ["install.js", "bin/"]
+  "files": ["install.js", "client.mjs", "bin/"],
+  "exports": {
+    ".": "./client.mjs"
+  }
 }

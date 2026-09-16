@@ -22,7 +22,7 @@ if (!target) {
 }
 
 const ext = process.platform === "win32" ? ".exe" : "";
-const expected = [`damond${ext}`, `damon${ext}`, `damon-telegram${ext}`, `damon-discord${ext}`, `damon-slack${ext}`];
+const expected = [`damond${ext}`, `damon${ext}`, `damon-telegram${ext}`, `damon-discord${ext}`, `damon-slack${ext}`, `damon-relay${ext}`];
 
 const url = `https://github.com/${REPO}/releases/download/v${VERSION}/damon-${target}.tar.gz`;
 const bin = path.join(__dirname, "bin");
