@@ -1,3 +1,4 @@
+use rusqlite::OptionalExtension;
 use std::path::Path;
 
 use anyhow::Context;
@@ -37,6 +38,7 @@ impl Store {
                      id TEXT PRIMARY KEY,
                      created_at TEXT NOT NULL DEFAULT (datetime('now')),
                      cwd TEXT NOT NULL DEFAULT '',
+                     model TEXT,
                      compacted_through INTEGER NOT NULL DEFAULT 0,
                      summary TEXT
                  );
@@ -54,11 +56,13 @@ impl Store {
                      message_id UNINDEXED
                  );",
             )?;
-            // Migrate pre-compaction databases.
+            // Migrate pre-compaction databases. Each ALTER gets its own
+            // batch — one failing statement aborts the rest of a batch.
             let _ = c.execute_batch(
-                "ALTER TABLE sessions ADD COLUMN compacted_through INTEGER NOT NULL DEFAULT 0;
-                 ALTER TABLE sessions ADD COLUMN summary TEXT;",
+                "ALTER TABLE sessions ADD COLUMN compacted_through INTEGER NOT NULL DEFAULT 0;",
             );
+            let _ = c.execute_batch("ALTER TABLE sessions ADD COLUMN summary TEXT;");
+            let _ = c.execute_batch("ALTER TABLE sessions ADD COLUMN model TEXT;");
             // Backfill the FTS index once for messages written before it
             // existed; user_version gates it so startup stays O(1).
             let v: i64 = c.query_row("PRAGMA user_version", [], |r| r.get(0))?;
@@ -72,8 +76,7 @@ impl Store {
                      PRAGMA user_version = 1;",
                 )?;
             }
-            Ok::<(), rusqlite::Error>(())
-            .map_err(tokio_rusqlite::Error::from)
+            Ok::<(), rusqlite::Error>(()).map_err(tokio_rusqlite::Error::from)
         })
         .await?;
         Ok(Self { conn })
@@ -88,6 +91,7 @@ impl Store {
                      id TEXT PRIMARY KEY,
                      created_at TEXT NOT NULL DEFAULT (datetime('now')),
                      cwd TEXT NOT NULL DEFAULT '',
+                     model TEXT,
                      compacted_through INTEGER NOT NULL DEFAULT 0,
                      summary TEXT
                  );
@@ -109,19 +113,42 @@ impl Store {
         Ok(Self { conn })
     }
 
-    pub async fn create_session(&self, id: &str, cwd: &str) -> anyhow::Result<()> {
+    /// `model` is the session's default model override (from session/new);
+    /// a per-prompt model still wins over it.
+    pub async fn create_session(
+        &self,
+        id: &str,
+        cwd: &str,
+        model: Option<&str>,
+    ) -> anyhow::Result<()> {
         let id = id.to_string();
         let cwd = cwd.to_string();
+        let model = model.map(String::from);
         self.conn
             .call(move |c| {
                 c.execute(
-                    "INSERT OR IGNORE INTO sessions (id, cwd) VALUES (?1, ?2)",
-                    rusqlite::params![id, cwd],
-                )
-                .map_err(tokio_rusqlite::Error::from)
+                    "INSERT INTO sessions (id, cwd, model) VALUES (?1, ?2, ?3)",
+                    rusqlite::params![id, cwd, model],
+                )?;
+                Ok::<(), tokio_rusqlite::Error>(())
             })
             .await?;
         Ok(())
+    }
+
+    /// The session's stored default model override, if any.
+    pub async fn session_model(&self, id: &str) -> anyhow::Result<Option<String>> {
+        let id = id.to_string();
+        Ok(self
+            .conn
+            .call(move |c| {
+                c.query_row("SELECT model FROM sessions WHERE id = ?1", [id], |r| {
+                    r.get::<_, Option<String>>(0)
+                })
+                .optional()
+            })
+            .await?
+            .flatten())
     }
 
     pub async fn append(&self, session_id: &str, role: &str, data: &Value) -> anyhow::Result<i64> {
@@ -182,7 +209,6 @@ impl Store {
             .map_err(Into::into)
     }
 
-
     /// Messages for a session in insertion order, as OpenAI-shaped JSON.
     /// Respects compaction: messages at or before `compacted_through` are
     /// replaced by the stored summary (as a leading user message).
@@ -209,9 +235,9 @@ impl Store {
                         row.get::<_, String>(0)
                     })?
                     .collect::<Result<Vec<String>, _>>()?;
-                Ok::<(i64, Option<String>, Vec<String>), tokio_rusqlite::Error>(
-                    (cutoff, summary, rows),
-                )
+                Ok::<(i64, Option<String>, Vec<String>), tokio_rusqlite::Error>((
+                    cutoff, summary, rows,
+                ))
             })
             .await?;
         let mut out: Vec<Value> = Vec::new();
@@ -229,10 +255,7 @@ impl Store {
 
     /// All messages with their row ids, ignoring compaction. Used by the
     /// compactor to summarize the dropped range.
-    pub async fn messages_full(
-        &self,
-        session_id: &str,
-    ) -> anyhow::Result<Vec<StoredMessage>> {
+    pub async fn messages_full(&self, session_id: &str) -> anyhow::Result<Vec<StoredMessage>> {
         let sid = session_id.to_string();
         self.conn
             .call(move |c| {
@@ -289,10 +312,7 @@ impl Store {
     }
 
     /// Current compaction state: (compacted_through message id, summary).
-    pub async fn compaction(
-        &self,
-        session_id: &str,
-    ) -> anyhow::Result<(i64, Option<String>)> {
+    pub async fn compaction(&self, session_id: &str) -> anyhow::Result<(i64, Option<String>)> {
         let sid = session_id.to_string();
         self.conn
             .call(move |c| {
@@ -311,15 +331,18 @@ impl Store {
             .map_err(Into::into)
     }
 
-    pub async fn list_sessions(&self) -> anyhow::Result<Vec<(String, String)>> {
+    /// All sessions as `(id, created_at, model)` — model is the stored
+    /// session default override, empty string when unset.
+    pub async fn list_sessions(&self) -> anyhow::Result<Vec<(String, String, String)>> {
         self.conn
             .call(|c| {
-                let mut stmt =
-                    c.prepare("SELECT id, created_at FROM sessions ORDER BY created_at")?;
+                let mut stmt = c.prepare(
+                    "SELECT id, created_at, COALESCE(model, '') FROM sessions ORDER BY created_at",
+                )?;
                 let rows = stmt
-                    .query_map([], |row| Ok((row.get(0)?, row.get(1)?)))?
+                    .query_map([], |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)))?
                     .collect::<Result<Vec<_>, _>>()?;
-                Ok::<Vec<(String, String)>, tokio_rusqlite::Error>(rows)
+                Ok::<Vec<(String, String, String)>, tokio_rusqlite::Error>(rows)
             })
             .await
             .map_err(Into::into)

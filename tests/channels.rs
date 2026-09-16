@@ -5,13 +5,13 @@
 use std::collections::{BTreeMap, HashMap};
 use std::sync::Arc;
 
+use axum::Json;
 use axum::Router;
 use axum::body::Body;
 use axum::extract::ws::{Message as WsMessage, WebSocket, WebSocketUpgrade};
 use axum::extract::{Path, State};
 use axum::response::Response;
 use axum::routing::{get, post};
-use axum::Json;
 use damon_core::api::{self, AppState};
 use damon_core::channel::{Bridge, ChannelApi, Incoming};
 use damon_core::config::{Config, McpServerConfig, ProviderConfig};
@@ -47,7 +47,7 @@ fn test_config(upstream: &str) -> Config {
         mcp_servers: HashMap::new(),
         providers,
         models: BTreeMap::new(),
-            relay: None,
+        relay: None,
     }
 }
 
@@ -145,7 +145,10 @@ async fn wait_for_sent(sent: &Mutex<Vec<(String, String)>>, needle: &str) {
         if sent.lock().await.iter().any(|(_, t)| t.contains(needle)) {
             return;
         }
-        assert!(std::time::Instant::now() < deadline, "timed out waiting for {needle:?}");
+        assert!(
+            std::time::Instant::now() < deadline,
+            "timed out waiting for {needle:?}"
+        );
         tokio::time::sleep(std::time::Duration::from_millis(50)).await;
     }
 }
@@ -160,7 +163,9 @@ async fn bridge_delivers_response_and_maps_sessions() {
     let state = AppState::new(shared, store.clone(), mcp).await;
     let url = serve_app(state).await;
 
-    let client = damon_core::client::DamonClient::connect(&url, None).await.unwrap();
+    let client = damon_core::client::DamonClient::connect(&url, None)
+        .await
+        .unwrap();
     let ch = Arc::new(MockChannel {
         sent: Mutex::new(vec![]),
     });
@@ -168,18 +173,25 @@ async fn bridge_delivers_response_and_maps_sessions() {
     bridge.client().initialize().await.unwrap();
     bridge.spawn_event_router().await;
 
-
     // Two different chats → two different sessions.
-    bridge.handle_message("chat-a".into(), None, "hi".into()).await;
-    bridge.handle_message("chat-b".into(), None, "hi".into()).await;
+    bridge
+        .handle_message("chat-a".into(), None, "hi".into())
+        .await;
+    bridge
+        .handle_message("chat-b".into(), None, "hi".into())
+        .await;
 
     // Wait until BOTH chats got their reply.
     let deadline = std::time::Instant::now() + std::time::Duration::from_secs(15);
     loop {
         {
             let sent = ch.sent.lock().await;
-            let a = sent.iter().any(|(c, t)| c == "chat-a" && t.contains("hello back"));
-            let b = sent.iter().any(|(c, t)| c == "chat-b" && t.contains("hello back"));
+            let a = sent
+                .iter()
+                .any(|(c, t)| c == "chat-a" && t.contains("hello back"));
+            let b = sent
+                .iter()
+                .any(|(c, t)| c == "chat-b" && t.contains("hello back"));
             if a && b {
                 break;
             }
@@ -188,11 +200,15 @@ async fn bridge_delivers_response_and_maps_sessions() {
             let sent = ch.sent.lock().await;
             let sessions = store.list_sessions().await.unwrap_or_default();
             let mut dump = String::new();
-            for (sid, _) in &sessions {
+            for (sid, ..) in &sessions {
                 let msgs = store.messages(sid).await.unwrap_or_default();
                 dump.push_str(&format!("session {sid}: {} msgs\n", msgs.len()));
                 for m in msgs {
-                    dump.push_str(&format!("  {} {}\n", m["role"], &m.to_string()[..m.to_string().len().min(120)]));
+                    dump.push_str(&format!(
+                        "  {} {}\n",
+                        m["role"],
+                        &m.to_string()[..m.to_string().len().min(120)]
+                    ));
                 }
             }
             panic!("timed out waiting for both replies; sent={sent:?}\n{dump}");
@@ -233,7 +249,9 @@ async fn bridge_permission_reply_allows_tool() {
     let state = AppState::new(shared, store, mcp).await;
     let url = serve_app(state).await;
 
-    let client = damon_core::client::DamonClient::connect(&url, None).await.unwrap();
+    let client = damon_core::client::DamonClient::connect(&url, None)
+        .await
+        .unwrap();
     let ch = Arc::new(MockChannel {
         sent: Mutex::new(vec![]),
     });
@@ -241,11 +259,15 @@ async fn bridge_permission_reply_allows_tool() {
     bridge.client().initialize().await.unwrap();
     bridge.spawn_event_router().await;
 
-    bridge.handle_message("42".into(), None, "use the tool".into()).await;
+    bridge
+        .handle_message("42".into(), None, "use the tool".into())
+        .await;
     // Permission prompt lands in the chat…
     wait_for_sent(&ch.sent, "🔐").await;
     // …and "allow" approves it, letting the turn finish.
-    bridge.handle_message("42".into(), None, "allow".into()).await;
+    bridge
+        .handle_message("42".into(), None, "allow".into())
+        .await;
     wait_for_sent(&ch.sent, "✅ allowed").await;
     wait_for_sent(&ch.sent, "tool done").await;
 }
@@ -514,7 +536,10 @@ async fn slack_socket_envelope_ack_and_dispatch() {
             // Read the ack frame.
             let msg = sock.recv().await.unwrap().unwrap();
             let v: Value = serde_json::from_str(msg.to_text().unwrap()).unwrap();
-            acked.lock().await.push(v["envelope_id"].as_str().unwrap().to_string());
+            acked
+                .lock()
+                .await
+                .push(v["envelope_id"].as_str().unwrap().to_string());
             tokio::time::sleep(std::time::Duration::from_secs(5)).await;
         })
     }

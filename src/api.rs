@@ -8,9 +8,9 @@ use axum::middleware::Next;
 use axum::response::{IntoResponse, Response};
 use axum::routing::{get, post};
 use axum::{Json, Router, middleware};
+use futures::StreamExt;
 use serde_json::json;
 use tracing::warn;
-use futures::StreamExt;
 
 use crate::config::SharedConfig;
 use crate::mcp::McpRegistry;
@@ -38,9 +38,8 @@ pub struct AppState {
     /// Shared across connections: a session can have only one in-flight
     /// prompt no matter which client asked, and a disconnect cancels the
     /// turns it started instead of orphaning them.
-    pub live_prompts: tokio::sync::Mutex<
-        HashMap<String, (u64, tokio_util::sync::CancellationToken)>,
-    >,
+    pub live_prompts:
+        tokio::sync::Mutex<HashMap<String, (u64, tokio_util::sync::CancellationToken)>>,
 }
 
 impl AppState {
@@ -92,12 +91,11 @@ impl AppState {
         let raw2 = raw.clone();
         let resolved: Option<Result<String, String>> =
             match tokio::task::spawn_blocking(move || {
-                raw2.as_deref().map(|r| {
-                    match crate::config::SecretRef::parse(r) {
+                raw2.as_deref()
+                    .map(|r| match crate::config::SecretRef::parse(r) {
                         Ok(s) => s.resolve().map_err(|e| e.to_string()),
                         Err(_) => Ok(r.to_string()),
-                    }
-                })
+                    })
             })
             .await
             {
@@ -244,10 +242,11 @@ async fn forward(
                 })
         });
         routed
-            .or_else(|| cfg.default_provider().map(|(n, _)| (n.to_string(), String::new())))
-            .and_then(|(name, upstream)| {
-                providers.get(&name).cloned().map(|p| (name, p, upstream))
+            .or_else(|| {
+                cfg.default_provider()
+                    .map(|(n, _)| (n.to_string(), String::new()))
             })
+            .and_then(|(name, upstream)| providers.get(&name).cloned().map(|p| (name, p, upstream)))
     };
     let Some((provider_name, provider, upstream_model)) = provider else {
         return openai_error(
@@ -259,8 +258,7 @@ async fn forward(
 
     // Inject the thinking level into the body for the adapters.
     let body = if let Some(level) = &thinking {
-        let mut v: serde_json::Value = serde_json::from_slice(&body)
-            .unwrap_or_else(|_| json!({}));
+        let mut v: serde_json::Value = serde_json::from_slice(&body).unwrap_or_else(|_| json!({}));
         v["_thinking"] = json!(level);
         bytes::Bytes::from(v.to_string())
     } else {
@@ -279,10 +277,8 @@ async fn forward(
             // the configured promotion target. Client errors are buffered so
             // the body can be inspected.
             if up.status.is_client_error() {
-                return promote_or_error(
-                    state, &provider_name, &provider, method, path, body, up,
-                )
-                .await;
+                return promote_or_error(state, &provider_name, &provider, method, path, body, up)
+                    .await;
             }
             up.into_response()
         }
@@ -340,15 +336,7 @@ async fn promote_or_error(
     let body = bytes::Bytes::from(req.to_string());
     // Promoted request goes through the same path (translate for non-compat).
     if !matches!(&*tprovider, crate::provider::Provider::OpenAiCompletions(_)) {
-        return translate_forward(
-            state,
-            &tname,
-            &tprovider,
-            path,
-            body,
-            tmodel,
-        )
-        .await;
+        return translate_forward(state, &tname, &tprovider, path, body, tmodel).await;
     }
     match tprovider.forward(method, path, body).await {
         Ok(up) => up.into_response(),
@@ -359,8 +347,6 @@ async fn promote_or_error(
         ),
     }
 }
-
-
 
 /// Common context-overflow signatures across providers.
 fn is_context_overflow(text: &str) -> bool {
@@ -461,9 +447,8 @@ async fn translate_forward(
                     Ok::<_, std::io::Error>(bytes::Bytes::from(chunk))
                 });
                 // ThinkingBlock maps to an empty chunk — drop it.
-                let sse = sse.filter(|c| {
-                    futures::future::ready(!c.as_ref().is_ok_and(|b| b.is_empty()))
-                });
+                let sse =
+                    sse.filter(|c| futures::future::ready(!c.as_ref().is_ok_and(|b| b.is_empty())));
                 Response::builder()
                     .status(200)
                     .header("content-type", "text/event-stream")
@@ -491,9 +476,7 @@ async fn translate_forward(
             Ok(v) => Json(v).into_response(),
             Err(e) => {
                 if is_context_overflow(&format!("{e}")) {
-                    if let Some(resp) =
-                        promote_translate(state, provider_name, path, req).await
-                    {
+                    if let Some(resp) = promote_translate(state, provider_name, path, req).await {
                         return resp;
                     }
                 }
@@ -525,22 +508,14 @@ fn promote_translate<'a>(
             Some((p, m)) => (p.to_string(), m.to_string()),
             None => (provider_name.to_string(), target),
         };
-        let tprovider = state
-            .providers
-            .read()
-            .get(&tname)
-            .cloned()?;
+        let tprovider = state.providers.read().get(&tname).cloned()?;
         let body = bytes::Bytes::from(req.to_string());
         Some(translate_forward(state, &tname, &tprovider, path, body, tmodel).await)
     })
 }
 
 /// Bearer-token gate for /v1/*. No token configured → open on localhost.
-async fn require_token(
-    State(state): State<Arc<AppState>>,
-    req: Request,
-    next: Next,
-) -> Response {
+async fn require_token(State(state): State<Arc<AppState>>, req: Request, next: Next) -> Response {
     // Cached per raw config value — a !cmd/keychain ref resolves once,
     // not per request.
     let expected = match state.auth_token().await {
@@ -562,7 +537,21 @@ async fn require_token(
                 "server_error",
             );
         }
-        None => return next.run(req).await,
+        None => {
+            // No token: browser requests must come from a loopback origin —
+            // a foreign site could otherwise burn provider quota via
+            // no-cors posts even though it can't read the response.
+            if let Some(origin) = req.headers().get("origin").and_then(|v| v.to_str().ok())
+                && !crate::rpc::is_localhost_origin(origin)
+            {
+                return openai_error(
+                    StatusCode::FORBIDDEN,
+                    "cross-origin requests require an auth token",
+                    "authentication_error",
+                );
+            }
+            return next.run(req).await;
+        }
     };
     let ok = req
         .headers()

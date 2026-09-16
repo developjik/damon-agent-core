@@ -42,7 +42,7 @@ fn test_config(upstream: &str) -> Config {
         mcp_servers: HashMap::new(),
         providers,
         models: BTreeMap::new(),
-            relay: None,
+        relay: None,
     }
 }
 
@@ -121,7 +121,9 @@ async fn telegram_bridge_delivers_response() {
     let state = AppState::new(shared, store, mcp).await;
     let url = serve_app(state).await;
 
-    let client = damon_core::client::DamonClient::connect(&url, None).await.unwrap();
+    let client = damon_core::client::DamonClient::connect(&url, None)
+        .await
+        .unwrap();
     let tg = Arc::new(MockTg {
         updates: Mutex::new(vec![json!({
             "update_id": 1,
@@ -147,7 +149,10 @@ async fn telegram_bridge_delivers_response() {
             break;
         }
         drop(sent);
-        assert!(std::time::Instant::now() < deadline, "timed out waiting for reply");
+        assert!(
+            std::time::Instant::now() < deadline,
+            "timed out waiting for reply"
+        );
         tokio::time::sleep(std::time::Duration::from_millis(50)).await;
     }
 }
@@ -178,12 +183,14 @@ async fn mcp_tool_call_with_permission() {
     let state = AppState::new(shared, store.clone(), mcp).await;
     let url = serve_app(state).await;
 
-    let client = damon_core::client::DamonClient::connect(&url, None).await.unwrap();
+    let client = damon_core::client::DamonClient::connect(&url, None)
+        .await
+        .unwrap();
     client.initialize().await.unwrap();
-    let session = client.new_session("/tmp").await.unwrap();
+    let session = client.new_session("/tmp", None).await.unwrap();
     let mut events = client.events().await;
 
-    client.prompt(&session, "use the tool").await.unwrap();
+    client.prompt(&session, "use the tool", None).await.unwrap();
 
     // Expect a permission request; answer allow. The turn result arrives
     // as PromptDone on the event stream, ordered after the chunks.
@@ -198,9 +205,12 @@ async fn mcp_tool_call_with_permission() {
             {
                 got_permission = true;
                 client
-                    .respond(id, json!({
-                        "outcome": {"outcome": "selected", "optionId": "allow-once"}
-                    }))
+                    .respond(
+                        id,
+                        json!({
+                            "outcome": {"outcome": "selected", "optionId": "allow-once"}
+                        }),
+                    )
                     .await
                     .unwrap();
             }

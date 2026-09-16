@@ -121,13 +121,15 @@ export class DamonClient {
     });
   }
 
-  /** Create a session; returns sessionId. */
-  async newSession(cwd) {
-    const r = await this.#call("session/new", { cwd, mcpServers: [] });
+  /** Create a session; returns sessionId. `model` (optional) becomes the
+   *  session's default model — accepts "provider/model", a glob-routed id,
+   *  a discovered id, or a "model:level" thinking suffix. */
+  async newSession(cwd, model) {
+    const r = await this.#call("session/new", { cwd, mcpServers: [], model });
     return r.sessionId;
   }
 
-  /** List sessions: [{sessionId, createdAt}]. */
+  /** List sessions: [{sessionId, createdAt, model}]. */
   async listSessions() {
     const r = await this.#call("session/list", {});
     return r.sessions;
@@ -149,10 +151,11 @@ export class DamonClient {
     return r.results;
   }
 
-  /** Send a prompt. Resolves with {stopReason} when the turn ends; the
-   *  same outcome is also delivered as a {type:"promptDone"} event on
-   *  the events() stream for consumers that only iterate events. */
-  async prompt(sessionId, text) {
+  /** Send a prompt. `model` (optional) overrides the session's default for
+   *  this turn. Resolves with {stopReason} when the turn ends; the same
+   *  outcome is also delivered as a {type:"promptDone"} event on the
+   *  events() stream for consumers that only iterate events. */
+  async prompt(sessionId, text, model) {
     const id = ++this.#nextId;
     const done = new Promise((resolve, reject) => {
       this.#pending.set(id, {
@@ -171,7 +174,7 @@ export class DamonClient {
     done.catch(() => {});
     this.#ws.send(JSON.stringify({
       jsonrpc: "2.0", id, method: "session/prompt",
-      params: { sessionId, prompt: [{ type: "text", text }] },
+      params: { sessionId, model, prompt: [{ type: "text", text }] },
     }));
     return done;
   }

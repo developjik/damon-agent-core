@@ -30,7 +30,7 @@ pub async fn ws_handler(
     headers: axum::http::HeaderMap,
     ws: WebSocketUpgrade,
 ) -> Result<Response, StatusCode> {
-    match state.auth_token().await {
+    let authenticated = match state.auth_token().await {
         Some(Ok(expected)) => {
             let header_ok = headers
                 .get("authorization")
@@ -39,13 +39,13 @@ pub async fn ws_handler(
                 .is_some_and(|t| {
                     crate::config::constant_time_eq(t.as_bytes(), expected.as_bytes())
                 });
-            let query_ok = q
-                .token
-                .as_deref()
-                .is_some_and(|t| crate::config::constant_time_eq(t.as_bytes(), expected.as_bytes()));
+            let query_ok = q.token.as_deref().is_some_and(|t| {
+                crate::config::constant_time_eq(t.as_bytes(), expected.as_bytes())
+            });
             if !header_ok && !query_ok {
                 return Err(StatusCode::UNAUTHORIZED);
             }
+            true
         }
         // Configured but unresolvable: fail closed, never open.
         Some(Err(_)) => return Err(StatusCode::SERVICE_UNAVAILABLE),
@@ -54,7 +54,17 @@ pub async fn ws_handler(
         None if !state.bind.ip().is_loopback() => {
             return Err(StatusCode::SERVICE_UNAVAILABLE);
         }
-        None => {}
+        None => false,
+    };
+    // Browser WS handshakes carry Origin and skip CORS preflight — without
+    // this check any website could drive an unauthenticated local daemon.
+    // Non-browser clients send no Origin. Authenticated connections are
+    // gated by the token, so their Origin is unconstrained.
+    if !authenticated
+        && let Some(origin) = headers.get("origin").and_then(|v| v.to_str().ok())
+        && !is_localhost_origin(origin)
+    {
+        return Err(StatusCode::FORBIDDEN);
     }
     Ok(ws.on_upgrade(move |socket| {
         let (mut writer, mut reader) = socket.split();
@@ -164,7 +174,9 @@ pub async fn handle_socket(
             continue;
         }
 
-        let Some(method) = v["method"].as_str() else { continue };
+        let Some(method) = v["method"].as_str() else {
+            continue;
+        };
         let id = v.get("id").cloned();
         let params = v["params"].clone();
 
@@ -186,8 +198,31 @@ pub async fn handle_socket(
             }
             ("session/new", Some(id)) => {
                 let cwd = params["cwd"].as_str().unwrap_or("").to_string();
+                // ACP clients send mcpServers; per-session MCP servers are
+                // not supported, so a non-empty list is rejected rather
+                // than silently ignored.
+                let mcp_nonempty = params["mcpServers"]
+                    .as_array()
+                    .is_some_and(|a| !a.is_empty());
+                if mcp_nonempty {
+                    client
+                        .respond(
+                            id,
+                            Err(rpc_error(
+                                -32602,
+                                "per-session mcpServers are not supported; configure [mcp_servers] in the daemon config",
+                            )),
+                        )
+                        .await;
+                    continue;
+                }
+                let model = params["model"].as_str().map(String::from);
                 let session_id = uuid::Uuid::new_v4().to_string();
-                match state.store.create_session(&session_id, &cwd).await {
+                match state
+                    .store
+                    .create_session(&session_id, &cwd, model.as_deref())
+                    .await
+                {
                     Ok(()) => {
                         client
                             .respond(id, Ok(json!({"sessionId": session_id})))
@@ -200,24 +235,22 @@ pub async fn handle_socket(
                     }
                 }
             }
-            ("session/list", Some(id)) => {
-                match state.store.list_sessions().await {
-                    Ok(sessions) => {
-                        let list: Vec<Value> = sessions
+            ("session/list", Some(id)) => match state.store.list_sessions().await {
+                Ok(sessions) => {
+                    let list: Vec<Value> = sessions
                             .into_iter()
-                            .map(|(sid, created)| {
-                                json!({"sessionId": sid, "createdAt": created})
+                            .map(|(sid, created, model)| {
+                                json!({"sessionId": sid, "createdAt": created, "model": model})
                             })
                             .collect();
-                        client.respond(id, Ok(json!({"sessions": list}))).await;
-                    }
-                    Err(e) => {
-                        client
-                            .respond(id, Err(rpc_error(-32603, &e.to_string())))
-                            .await;
-                    }
+                    client.respond(id, Ok(json!({"sessions": list}))).await;
                 }
-            }
+                Err(e) => {
+                    client
+                        .respond(id, Err(rpc_error(-32603, &e.to_string())))
+                        .await;
+                }
+            },
             ("session/delete", Some(id)) => {
                 let session_id = params["sessionId"].as_str().unwrap_or("").to_string();
                 match state.store.delete_session(&session_id).await {
@@ -277,6 +310,23 @@ pub async fn handle_socket(
             }
             ("session/prompt", Some(id)) => {
                 let session_id = params["sessionId"].as_str().unwrap_or("").to_string();
+                // Prompting an unknown session would append orphan messages
+                // — reject like session/resume does.
+                match state.store.session_exists(&session_id).await {
+                    Ok(true) => {}
+                    Ok(false) => {
+                        client
+                            .respond(id, Err(rpc_error(-32602, "session not found")))
+                            .await;
+                        continue;
+                    }
+                    Err(e) => {
+                        client
+                            .respond(id, Err(rpc_error(-32603, &e.to_string())))
+                            .await;
+                        continue;
+                    }
+                }
                 let text = params["prompt"]
                     .as_array()
                     .map(|blocks| {
@@ -287,6 +337,7 @@ pub async fn handle_socket(
                             .join("")
                     })
                     .unwrap_or_default();
+                let model = params["model"].as_str().map(String::from);
                 let cancel = CancellationToken::new();
                 // One live prompt per session across ALL connections: a
                 // second prompt would interleave writes into the same
@@ -315,6 +366,7 @@ pub async fn handle_socket(
                         &state,
                         &session_id,
                         &text,
+                        model.as_deref(),
                         &(client.clone() as Arc<dyn ClientChannel>),
                         cancel.clone(),
                     )
@@ -339,9 +391,7 @@ pub async fn handle_socket(
                                     crate::llm::StopReason::Other => "end_turn",
                                 }
                             };
-                            client
-                                .respond(id, Ok(json!({"stopReason": stop})))
-                                .await;
+                            client.respond(id, Ok(json!({"stopReason": stop}))).await;
                         }
                         Err(e) => {
                             client
@@ -387,4 +437,21 @@ pub async fn handle_socket(
 
 fn rpc_error(code: i64, message: &str) -> Value {
     json!({"code": code, "message": message})
+}
+
+/// Whether an Origin header points at a loopback host: `localhost`,
+/// `*.localhost`, or any loopback IP (127.0.0.0/8, ::1), any port/scheme.
+/// Anything unparseable — including `Origin: null` — is not loopback.
+pub(crate) fn is_localhost_origin(origin: &str) -> bool {
+    let Ok(uri) = origin.parse::<axum::http::Uri>() else {
+        return false;
+    };
+    let Some(host) = uri.host() else { return false };
+    let host = host.trim_end_matches('.');
+    if host.eq_ignore_ascii_case("localhost") || host.to_ascii_lowercase().ends_with(".localhost") {
+        return true;
+    }
+    host.trim_matches(|c| c == '[' || c == ']')
+        .parse::<std::net::IpAddr>()
+        .is_ok_and(|ip| ip.is_loopback())
 }

@@ -22,10 +22,17 @@ pub enum ClientEvent {
     Update(Value),
     /// Server-initiated request (e.g. session/request_permission).
     /// Answer with `client.respond(id, result)`.
-    Request { id: u64, method: String, params: Value },
+    Request {
+        id: u64,
+        method: String,
+        params: Value,
+    },
     /// Response to a `prompt` call, routed through the event stream so it
     /// stays ordered after that session's notifications.
-    PromptDone { session_id: String, result: Result<Value, Value> },
+    PromptDone {
+        session_id: String,
+        result: Result<Value, Value>,
+    },
 }
 
 /// How a pending RPC response should be delivered.
@@ -56,7 +63,10 @@ struct WsWriter(futures::stream::SplitSink<Ws, Message>);
 #[async_trait::async_trait]
 impl TextWriter for WsWriter {
     async fn send_text(&mut self, text: String) -> anyhow::Result<()> {
-        self.0.send(Message::Text(text.into())).await.context("ws send")
+        self.0
+            .send(Message::Text(text.into()))
+            .await
+            .context("ws send")
     }
 }
 
@@ -81,8 +91,7 @@ impl DamonClient {
             .with_context(|| format!("cannot connect to {url}"))?;
         let (writer, mut reader) = ws.split();
 
-        let pending: Arc<Mutex<HashMap<u64, Pending>>> =
-            Arc::new(Mutex::new(HashMap::new()));
+        let pending: Arc<Mutex<HashMap<u64, Pending>>> = Arc::new(Mutex::new(HashMap::new()));
         let (event_tx, event_rx) = mpsc::channel(64);
 
         let pending2 = pending.clone();
@@ -125,10 +134,7 @@ impl DamonClient {
                                     }
                                     Pending::ToEvents { session_id } => {
                                         let _ = event_tx
-                                            .send(ClientEvent::PromptDone {
-                                                session_id,
-                                                result,
-                                            })
+                                            .send(ClientEvent::PromptDone { session_id, result })
                                             .await;
                                     }
                                 }
@@ -151,11 +157,7 @@ impl DamonClient {
     /// Connect through a `damon-relay` server. `relay_url` is the relay's
     /// ws:// address, `name` the daemon's registered name, `token` the
     /// daemon's auth_token (proves identity in the E2E handshake).
-    pub async fn connect_relay(
-        relay_url: &str,
-        name: &str,
-        token: &str,
-    ) -> anyhow::Result<Self> {
+    pub async fn connect_relay(relay_url: &str, name: &str, token: &str) -> anyhow::Result<Self> {
         let (tx, rx) = crate::relay::client_connect(relay_url, name, token).await?;
         Self::from_channels(tx, rx)
     }
@@ -165,13 +167,14 @@ impl DamonClient {
         tx: mpsc::Sender<String>,
         mut rx: mpsc::Receiver<String>,
     ) -> anyhow::Result<Self> {
-        let pending: Arc<Mutex<HashMap<u64, Pending>>> =
-            Arc::new(Mutex::new(HashMap::new()));
+        let pending: Arc<Mutex<HashMap<u64, Pending>>> = Arc::new(Mutex::new(HashMap::new()));
         let (event_tx, event_rx) = mpsc::channel(64);
         let pending2 = pending.clone();
         tokio::spawn(async move {
             while let Some(text) = rx.recv().await {
-                let Ok(v) = serde_json::from_str::<Value>(&text) else { continue };
+                let Ok(v) = serde_json::from_str::<Value>(&text) else {
+                    continue;
+                };
                 match (v.get("method"), v.get("id")) {
                     (Some(method), Some(id)) => {
                         if let Some(id) = id.as_u64() {
@@ -221,7 +224,9 @@ impl DamonClient {
         let (writer_tx, mut writer_rx) = mpsc::channel::<String>(64);
         tokio::spawn(async move {
             while let Some(text) = writer_rx.recv().await {
-                if tx.send(text).await.is_err() { break; }
+                if tx.send(text).await.is_err() {
+                    break;
+                }
             }
         });
         Ok(Self {
@@ -263,10 +268,7 @@ impl DamonClient {
 
     /// Stream of server events. Only one consumer — takes the receiver.
     pub async fn events(&self) -> mpsc::Receiver<ClientEvent> {
-        std::mem::replace(
-            &mut *self.events.lock().await,
-            mpsc::channel(1).1,
-        )
+        std::mem::replace(&mut *self.events.lock().await, mpsc::channel(1).1)
     }
 
     // --- Convenience wrappers -------------------------------------------
@@ -279,9 +281,15 @@ impl DamonClient {
         .await
     }
 
-    pub async fn new_session(&self, cwd: &str) -> anyhow::Result<String> {
+    /// Create a session. `model` becomes the session's default model —
+    /// a per-prompt override still wins. Accepts `provider/model`,
+    /// a glob-routed id, a discovered id, or `model:level` thinking suffix.
+    pub async fn new_session(&self, cwd: &str, model: Option<&str>) -> anyhow::Result<String> {
         let v = self
-            .request("session/new", json!({"cwd": cwd, "mcpServers": []}))
+            .request(
+                "session/new",
+                json!({"cwd": cwd, "mcpServers": [], "model": model}),
+            )
             .await?;
         v["sessionId"]
             .as_str()
@@ -289,8 +297,8 @@ impl DamonClient {
             .context("no sessionId in response")
     }
 
-    /// All sessions as `(sessionId, createdAt)` pairs.
-    pub async fn list_sessions(&self) -> anyhow::Result<Vec<(String, String)>> {
+    /// All sessions as `(sessionId, createdAt, model)` triples.
+    pub async fn list_sessions(&self) -> anyhow::Result<Vec<(String, String, String)>> {
         let v = self.request("session/list", json!({})).await?;
         Ok(v["sessions"]
             .as_array()
@@ -300,6 +308,7 @@ impl DamonClient {
                         (
                             s["sessionId"].as_str().unwrap_or("").to_string(),
                             s["createdAt"].as_str().unwrap_or("").to_string(),
+                            s["model"].as_str().unwrap_or("").to_string(),
                         )
                     })
                     .collect()
@@ -350,11 +359,16 @@ impl DamonClient {
             })
             .unwrap_or_default())
     }
-
-    /// Start a prompt turn. The response arrives as `ClientEvent::PromptDone`
+    /// Start a prompt turn. `model` overrides the session's stored default
+    /// for this turn only. The response arrives as `ClientEvent::PromptDone`
     /// on the event stream — ordered after that session's chunk notifications,
     /// so consumers never lose trailing chunks to a race.
-    pub async fn prompt(&self, session_id: &str, text: &str) -> anyhow::Result<()> {
+    pub async fn prompt(
+        &self,
+        session_id: &str,
+        text: &str,
+        model: Option<&str>,
+    ) -> anyhow::Result<()> {
         let id = self.next_id.fetch_add(1, Ordering::Relaxed);
         self.pending.lock().await.insert(
             id,
@@ -364,7 +378,7 @@ impl DamonClient {
         );
         let msg = json!({
             "jsonrpc": "2.0", "id": id, "method": "session/prompt",
-            "params": {"sessionId": session_id, "prompt": [{"type": "text", "text": text}]},
+            "params": {"sessionId": session_id, "model": model, "prompt": [{"type": "text", "text": text}]},
         });
         self.writer
             .lock()

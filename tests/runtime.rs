@@ -83,7 +83,7 @@ async fn ws_prompt_streams_and_persists() {
         mcp_servers: HashMap::new(),
         providers,
         models: BTreeMap::new(),
-            relay: None,
+        relay: None,
     }));
     let store = Store::in_memory().await.unwrap();
     let mcp = McpRegistry::connect_all(&HashMap::new()).await;
@@ -97,10 +97,9 @@ async fn ws_prompt_streams_and_persists() {
         axum::serve(listener, app).await.unwrap();
     });
 
-    let (mut ws, _) =
-        tokio_tungstenite::connect_async(format!("ws://{addr}/ws"))
-            .await
-            .unwrap();
+    let (mut ws, _) = tokio_tungstenite::connect_async(format!("ws://{addr}/ws"))
+        .await
+        .unwrap();
 
     // initialize
     ws.send(tungstenite::Message::Text(
@@ -145,12 +144,14 @@ async fn ws_prompt_streams_and_persists() {
     for _ in 0..50 {
         let msg: Value = read_json(&mut ws).await;
         if msg["id"] == 3 {
-            stop_reason = msg["result"]["stopReason"].as_str().unwrap_or("").to_string();
+            stop_reason = msg["result"]["stopReason"]
+                .as_str()
+                .unwrap_or("")
+                .to_string();
             break;
         }
         let update = &msg["params"]["update"];
-        if update["sessionUpdate"] == "agent_message_chunk"
-            && update["content"]["text"] == "done!"
+        if update["sessionUpdate"] == "agent_message_chunk" && update["content"]["text"] == "done!"
         {
             saw_text = true;
         }
@@ -250,22 +251,26 @@ async fn cancel_mid_tool_loop_repairs_orphan_calls() {
         mcp_servers: HashMap::new(),
         providers,
         models: BTreeMap::new(),
-            relay: None,
+        relay: None,
     }));
     let store = Store::in_memory().await.unwrap();
     let mcp = McpRegistry::connect_all(&HashMap::new()).await;
     let state = AppState::new(shared, store.clone(), mcp).await;
 
     let session_id = "test-session";
-    store.create_session(session_id, "/tmp").await.unwrap();
+    store
+        .create_session(session_id, "/tmp", None)
+        .await
+        .unwrap();
 
     let cancel = tokio_util::sync::CancellationToken::new();
-    let client: Arc<dyn damon_core::runtime::ClientChannel> =
-        Arc::new(CancelOnToolUpdate { cancel: cancel.clone() });
+    let client: Arc<dyn damon_core::runtime::ClientChannel> = Arc::new(CancelOnToolUpdate {
+        cancel: cancel.clone(),
+    });
 
     // call_1 executes (fails: unknown tool), its tool_call_update fires
     // cancel → call_2 never runs → must get a "cancelled" tool row.
-    let _ = damon_core::runtime::run_prompt(&state, session_id, "hi", &client, cancel).await;
+    let _ = damon_core::runtime::run_prompt(&state, session_id, "hi", None, &client, cancel).await;
 
     let msgs = store.messages(session_id).await.unwrap();
     // user + assistant(tool_calls) + tool(error) + tool(cancelled)
@@ -320,13 +325,217 @@ async fn mock_llm_stall_then_text() -> String {
     addr.to_string()
 }
 
-async fn ws_connect(addr: &str) -> tokio_tungstenite::WebSocketStream<
-    tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>,
-> {
+async fn ws_connect(
+    addr: &str,
+) -> tokio_tungstenite::WebSocketStream<tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>> {
     tokio_tungstenite::connect_async(format!("ws://{addr}/ws"))
         .await
         .unwrap()
         .0
+}
+
+/// Build a WS handshake request with an explicit Origin header.
+fn ws_request(addr: &str, origin: Option<&str>) -> tungstenite::http::Request<()> {
+    let mut b = tungstenite::http::Request::builder()
+        .uri(format!("ws://{addr}/ws"))
+        .header("host", addr)
+        .header("connection", "Upgrade")
+        .header("upgrade", "websocket")
+        .header("sec-websocket-version", "13")
+        .header(
+            "sec-websocket-key",
+            tungstenite::handshake::client::generate_key(),
+        );
+    if let Some(o) = origin {
+        b = b.header("origin", o);
+    }
+    b.body(()).unwrap()
+}
+
+/// Shared app state for handler-level tests: one openai-completions
+/// provider pointed at `upstream`, no auth token.
+async fn test_state(upstream: &str) -> (Arc<AppState>, Store) {
+    let mut providers = BTreeMap::new();
+    providers.insert(
+        "default".to_string(),
+        ProviderConfig {
+            api: "openai-completions".to_string(),
+            base_url: Some(format!("http://{upstream}")),
+            api_key: None,
+            models: vec![],
+            default_model: None,
+            headers: Default::default(),
+            compat: Default::default(),
+            discovery: None,
+            context_promotion_target: None,
+        },
+    );
+    let shared: damon_core::config::SharedConfig = Arc::new(parking_lot::RwLock::new(Config {
+        bind: "127.0.0.1:0".parse().unwrap(),
+        auth_token: None,
+        tls_cert: None,
+        tls_key: None,
+        data_dir: None,
+        mcp_servers: HashMap::new(),
+        providers,
+        models: BTreeMap::new(),
+        relay: None,
+    }));
+    let store = Store::in_memory().await.unwrap();
+    let mcp = McpRegistry::connect_all(&HashMap::new()).await;
+    (AppState::new(shared, store.clone(), mcp).await, store)
+}
+
+async fn serve(state: Arc<AppState>) -> String {
+    let app = api::router(state);
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    tokio::spawn(async move {
+        axum::serve(listener, app).await.unwrap();
+    });
+    addr.to_string()
+}
+
+/// Without an auth token, a browser WS handshake from a non-loopback
+/// Origin must be rejected — otherwise any website could drive the agent.
+#[tokio::test]
+async fn ws_rejects_foreign_origin_without_token() {
+    let upstream = mock_llm().await;
+    let (state, _store) = test_state(&upstream).await;
+    let addr = serve(state).await;
+
+    // Foreign origin → 403.
+    let err = tokio_tungstenite::connect_async(ws_request(&addr, Some("https://evil.example")))
+        .await
+        .unwrap_err();
+    assert!(
+        matches!(err, tungstenite::Error::Http(ref r) if r.status() == tungstenite::http::StatusCode::FORBIDDEN),
+        "expected 403, got {err:?}"
+    );
+
+    // Loopback origins and no origin still work.
+    for origin in [
+        Some("http://localhost:3000"),
+        Some("http://127.0.0.1:5173"),
+        None,
+    ] {
+        tokio_tungstenite::connect_async(ws_request(&addr, origin))
+            .await
+            .unwrap_or_else(|e| panic!("origin {origin:?} rejected: {e}"));
+    }
+}
+
+/// session/new must reject a non-empty mcpServers list instead of
+/// silently ignoring it, and session/prompt must reject unknown sessions.
+#[tokio::test]
+async fn session_new_rejects_mcp_servers_and_prompt_unknown_session() {
+    let upstream = mock_llm().await;
+    let (state, _store) = test_state(&upstream).await;
+    let addr = serve(state).await;
+    let mut ws = ws_connect(&addr).await;
+
+    send_rpc(
+        &mut ws,
+        1,
+        "session/new",
+        json!({"cwd": "/tmp", "mcpServers": [{"name": "x", "command": "y"}]}),
+    )
+    .await;
+    let resp = read_json(&mut ws).await;
+    assert_eq!(resp["error"]["code"], -32602, "got {resp}");
+    assert!(
+        resp["error"]["message"]
+            .as_str()
+            .unwrap()
+            .contains("mcpServers")
+    );
+
+    send_rpc(
+        &mut ws,
+        2,
+        "session/prompt",
+        json!({"sessionId": "no-such", "prompt": [{"type": "text", "text": "hi"}]}),
+    )
+    .await;
+    let resp = read_json(&mut ws).await;
+    assert_eq!(resp["error"]["code"], -32602, "got {resp}");
+    assert_eq!(resp["error"]["message"], "session not found");
+}
+
+/// session/new's model becomes the session default; session/prompt's
+/// model overrides it for that turn. Both must reach the upstream body.
+#[tokio::test]
+async fn session_and_prompt_model_reach_upstream() {
+    let bodies = Arc::new(parking_lot::Mutex::new(Vec::<Value>::new()));
+    let b2 = bodies.clone();
+    let app = Router::new().route(
+        "/chat/completions",
+        post(move |body: String| {
+            let b2 = b2.clone();
+            async move {
+                b2.lock().push(serde_json::from_str(&body).unwrap());
+                Response::builder()
+                    .header("content-type", "text/event-stream")
+                    .body(Body::from(
+                        "data: {\"choices\":[{\"delta\":{\"content\":\"ok\"}}]}\n\ndata: [DONE]\n\n",
+                    ))
+                    .unwrap()
+            }
+        }),
+    );
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let upstream = listener.local_addr().unwrap().to_string();
+    tokio::spawn(async move {
+        axum::serve(listener, app).await.unwrap();
+    });
+
+    let (state, _store) = test_state(&upstream).await;
+    let addr = serve(state).await;
+    let mut ws = ws_connect(&addr).await;
+
+    send_rpc(
+        &mut ws,
+        1,
+        "session/new",
+        json!({"cwd": "/tmp", "model": "session-model"}),
+    )
+    .await;
+    let resp = read_json(&mut ws).await;
+    let session_id = resp["result"]["sessionId"].as_str().unwrap().to_string();
+
+    // Turn 1: no prompt model → session default applies.
+    send_rpc(
+        &mut ws,
+        2,
+        "session/prompt",
+        json!({"sessionId": session_id, "prompt": [{"type": "text", "text": "a"}]}),
+    )
+    .await;
+    // Turn 2: prompt model overrides the session default.
+    loop {
+        let m = read_json(&mut ws).await;
+        if m["id"] == 2 {
+            break;
+        }
+    }
+    send_rpc(
+        &mut ws,
+        3,
+        "session/prompt",
+        json!({"sessionId": session_id, "model": "turn-model", "prompt": [{"type": "text", "text": "b"}]}),
+    )
+    .await;
+    loop {
+        let m = read_json(&mut ws).await;
+        if m["id"] == 3 {
+            break;
+        }
+    }
+
+    let bodies = bodies.lock();
+    assert_eq!(bodies.len(), 2, "got {bodies:?}");
+    assert_eq!(bodies[0]["model"], "session-model");
+    assert_eq!(bodies[1]["model"], "turn-model");
 }
 
 async fn send_rpc(
@@ -449,7 +658,10 @@ async fn disconnect_cancels_prompt_and_frees_session() {
     for _ in 0..50 {
         let msg: Value = read_json(&mut ws2).await;
         if msg["id"] == 2 {
-            stop_reason = msg["result"]["stopReason"].as_str().unwrap_or("").to_string();
+            stop_reason = msg["result"]["stopReason"]
+                .as_str()
+                .unwrap_or("")
+                .to_string();
             break;
         }
     }

@@ -64,7 +64,8 @@ Talk to it with the bundled CLI:
 
 ```sh
 damon chat                      # interactive REPL (streams, tool prompts)
-damon prompt "summarize this repo"
+damon chat --model claude/claude-sonnet-4-5   # pin a model for the session
+damon prompt "summarize this repo" --model gpt-4o:high
 damon sessions                  # list sessions
 damon resume <id>               # pick a session back up
 damon search "error AND timeout"  # FTS5 full-text search over all history

@@ -9,12 +9,12 @@ async fn main() -> anyhow::Result<()> {
     let text = std::env::args().nth(1).unwrap_or_else(|| "hi".into());
     let client = DamonClient::connect("ws://127.0.0.1:9470/ws", None).await?;
     client.initialize().await?;
-    let session = client.new_session("/tmp").await?;
+    let session = client.new_session("/tmp", None).await?;
 
     // prompt() sends the request; the turn result arrives as PromptDone on
     // the event stream, ordered after that session's chunk notifications.
     let mut events = client.events().await;
-    client.prompt(&session, &text).await?;
+    client.prompt(&session, &text, None).await?;
 
     loop {
         match events.recv().await {
@@ -34,7 +34,10 @@ async fn main() -> anyhow::Result<()> {
             Some(ClientEvent::Request { id, .. }) => {
                 // Auto-approve permission requests.
                 client
-                    .respond(id, json!({"outcome": {"outcome": "selected", "optionId": "allow-once"}}))
+                    .respond(
+                        id,
+                        json!({"outcome": {"outcome": "selected", "optionId": "allow-once"}}),
+                    )
                     .await?;
             }
             None => anyhow::bail!("connection closed"),

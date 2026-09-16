@@ -3,6 +3,9 @@
   "version": "0.1.0",
   "description": "Damon agent core — local multi-provider agent daemon",
   "license": "MIT OR Apache-2.0",
+  "repository": "https://github.com/developjik/damon-agent-core",
+  "homepage": "https://github.com/developjik/damon-agent-core#readme",
+  "bugs": "https://github.com/developjik/damon-agent-core/issues",
   "bin": {
     "damond": "bin/damond",
     "damon": "bin/damon",
@@ -17,7 +20,7 @@
   "engines": {
     "node": ">=18"
   },
-  "files": ["install.js", "client.mjs", "bin/"],
+  "files": ["install.js", "client.mjs", "README.md", "bin/"],
   "exports": {
     ".": "./client.mjs"
   }

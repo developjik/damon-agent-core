@@ -5,6 +5,8 @@
 Pushing a `v*` tag → CI builds 4 targets → GitHub Releases tarballs →
 npm + crates.io publish. The items below are manual.
 
+First release? Do the one-time manual setup first: [deploy-setup.ko.md](deploy-setup.ko.md) (GitHub secrets, npm/crates accounts, Homebrew tap).
+
 ## 1. Register secrets (repo Settings → Secrets and variables → Actions)
 
 | Secret | Where | Notes |

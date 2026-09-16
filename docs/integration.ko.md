@@ -95,14 +95,26 @@ Gemini `thinkingConfig.thinkingBudget`, Responses `reasoning.effort`.
 `auth_token`이 설정된 경우에만 필요. `/v1`은 `Authorization: Bearer <token>`,
 `/ws`는 같은 헤더 또는 `?token=<token>` 쿼리. 미설정 시 localhost 오픈.
 
+브라우저 Origin: `auth_token` 미설정 시 `Origin` 헤더를 보내는 요청은
+루프백 origin(`localhost`, `*.localhost`, `127.0.0.0/8`, `[::1]`)만 허용
+— `/ws`와 `/v1` 모두. `Origin`이 없는 클라이언트(curl, Node, 네이티브
+앱)는 영향 없음. `auth_token` 설정 시 모든 origin 허용 — 토큰이 게이트.
+
 ## WS 프로토콜 (JSON-RPC 2.0)
 
 클라이언트 → 데몬 요청:
 
 - `initialize` → `{protocolVersion, agentCapabilities, agentInfo}`
-- `session/new {cwd}` → `{sessionId}`
-- `session/list {}` → `{sessions: [{sessionId, createdAt}]}`
-- `session/prompt {sessionId, prompt: [{type:"text", text}]}` → `{stopReason}` — 응답은 턴 종료 시 도착
+- `session/new {cwd, model?}` → `{sessionId}` — `model`은 세션 기본 모델
+  (`provider/model`, 글롭/디스커버리 id, 또는 `model:low|medium|high`
+  thinking 접미사). `mcpServers`는 비어 있거나 생략해야 함: 세션별 MCP
+  서버는 미지원이며 비어 있지 않으면 `-32602`로 거부(데몬 config의
+  `[mcp_servers]` 사용).
+- `session/list {}` → `{sessions: [{sessionId, createdAt, model}]}`
+- `session/resume {sessionId}` → `{sessionId}` (알 수 없으면 에러)
+- `session/delete {sessionId}` → `{deleted: true}`
+- `session/search {query, limit}` → `{results: [{sessionId, messageId, snippet}]}`
+- `session/prompt {sessionId, prompt: [{type:"text", text}], model?}` → `{stopReason}` — `model`은 이 턴에서만 세션 기본값을 덮어씀. 응답은 턴 종료 시 도착. 알 수 없는 `sessionId` → `-32602`.
 - `session/cancel {sessionId}` — notification (응답 없음)
 
 - `session/update` notification — `update.sessionUpdate`가 `agent_message_chunk`(텍스트 델타), `agent_thought_chunk`(추론 델타), 또는 `tool_call_update`(tool_callId, status)

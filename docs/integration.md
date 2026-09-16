@@ -105,17 +105,28 @@ Required only when `auth_token` is configured. `/v1` takes
 `Authorization: Bearer <token>`; `/ws` takes the same header or a
 `?token=<token>` query. Unset → open on localhost.
 
+Browser origins: when no `auth_token` is configured, requests carrying an
+`Origin` header are only accepted from loopback origins (`localhost`,
+`*.localhost`, `127.0.0.0/8`, `[::1]`) — on both `/ws` and `/v1`. Clients
+without an `Origin` header (curl, Node, native apps) are unaffected.
+With `auth_token` set, any origin may connect — the token is the gate.
+
 ## WS protocol (JSON-RPC 2.0)
 
 Client → daemon requests:
 
 - `initialize` → `{protocolVersion, agentCapabilities, agentInfo}`
-- `session/new {cwd}` → `{sessionId}`
-- `session/list {}` → `{sessions: [{sessionId, createdAt}]}`
+- `session/new {cwd, model?}` → `{sessionId}` — `model` sets the session's
+  default model (`provider/model`, glob-routed or discovered id, or a
+  `model:low|medium|high` thinking suffix). `mcpServers` must be empty or
+  omitted: per-session MCP servers are not supported and a non-empty list
+  is rejected with `-32602` (configure `[mcp_servers]` in the daemon
+  config instead).
+- `session/list {}` → `{sessions: [{sessionId, createdAt, model}]}`
 - `session/resume {sessionId}` → `{sessionId}` (error if unknown)
 - `session/delete {sessionId}` → `{deleted: true}`
 - `session/search {query, limit}` → `{results: [{sessionId, messageId, snippet}]}`
-- `session/prompt {sessionId, prompt: [{type:"text", text}]}` → `{stopReason}` — the response arrives when the turn ends
+- `session/prompt {sessionId, prompt: [{type:"text", text}], model?}` → `{stopReason}` — `model` overrides the session default for this turn; the response arrives when the turn ends. Unknown `sessionId` → `-32602`.
 - `session/cancel {sessionId}` — notification (no response)
 
 Daemon → client:

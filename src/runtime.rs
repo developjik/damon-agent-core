@@ -35,13 +35,24 @@ pub async fn run_prompt(
     state: &Arc<AppState>,
     session_id: &str,
     text: &str,
+    model: Option<&str>,
     client: &Arc<dyn ClientChannel>,
     cancel: CancellationToken,
 ) -> anyhow::Result<llm::StopReason> {
     state
         .store
-        .append(session_id, "user", &json!({"role": "user", "content": text}))
+        .append(
+            session_id,
+            "user",
+            &json!({"role": "user", "content": text}),
+        )
         .await?;
+
+    // Model resolution order: per-prompt param → session default (stored
+    // by session/new) → provider's default_model. Read the session row
+    // before taking the config lock so no lock is held across .await.
+    let session_model = state.store.session_model(session_id).await?;
+    let requested = model.or(session_model.as_deref()).map(String::from);
 
     for _ in 0..MAX_ITERATIONS {
         if cancel.is_cancelled() {
@@ -50,19 +61,46 @@ pub async fn run_prompt(
         let tools = state.mcp.openai_tools();
         let (provider, model, thinking) = {
             let cfg = state.config.read();
-            let (name, pcfg) = cfg.default_provider().context("no provider configured")?;
-            let raw_model = pcfg
-                .default_model
-                .clone()
-                .unwrap_or_else(|| "default".to_string());
-            let (model, thinking) = Config::split_thinking_level(&raw_model);
-            let provider = state
-                .providers
-                .read()
-                .get(name)
+            let providers = state.providers.read();
+            let discovered = state.discovered.read();
+            // A `:low|:medium|:high` suffix is a thinking-level selector —
+            // strip it before routing, same as the /v1 path.
+            let (req_model, req_thinking) = requested
+                .as_deref()
+                .map(Config::split_thinking_level)
+                .unwrap_or(("", None));
+            let resolved = if req_model.is_empty() {
+                cfg.default_provider().map(|(n, p)| {
+                    // default_model may itself carry a thinking suffix.
+                    let raw = p.default_model.clone().unwrap_or_else(|| "default".into());
+                    let (m, t) = Config::split_thinking_level(&raw);
+                    (n.to_string(), m.to_string(), t.map(String::from))
+                })
+            } else {
+                // Strict route (prefix/glob), then discovered ids, then the
+                // default provider still gets the requested model name —
+                // mirrors the /v1 forward path.
+                cfg.route_model_strict(req_model)
+                    .map(|(name, _, upstream)| (name.to_string(), upstream))
+                    .or_else(|| {
+                        discovered.iter().find_map(|(name, ids)| {
+                            ids.iter()
+                                .any(|id| id == req_model)
+                                .then(|| (name.clone(), req_model.to_string()))
+                        })
+                    })
+                    .or_else(|| {
+                        cfg.default_provider()
+                            .map(|(n, _)| (n.to_string(), req_model.to_string()))
+                    })
+                    .map(|(n, m)| (n, m, req_thinking.map(String::from)))
+            };
+            let (name, model, thinking) = resolved.context("no provider configured")?;
+            let provider = providers
+                .get(&name)
                 .cloned()
                 .context("provider not built")?;
-            (provider, model.to_string(), thinking.map(String::from))
+            (provider, model, thinking)
         };
 
         // Compact before loading messages: if the estimated token count
@@ -197,10 +235,7 @@ pub async fn run_prompt(
             if !thinking_json.is_null() {
                 msg["thinking"] = thinking_json;
             }
-            state
-                .store
-                .append(session_id, "assistant", &msg)
-                .await?;
+            state.store.append(session_id, "assistant", &msg).await?;
             return Ok(stop);
         }
 
@@ -223,10 +258,7 @@ pub async fn run_prompt(
         if !thinking_json.is_null() {
             msg["thinking"] = thinking_json;
         }
-        state
-            .store
-            .append(session_id, "assistant", &msg)
-            .await?;
+        state.store.append(session_id, "assistant", &msg).await?;
 
         // Every persisted tool_call MUST get a matching role:"tool" row —
         // an orphan poisons every later turn ("tool_calls without tool
@@ -340,9 +372,7 @@ async fn maybe_compact(
     };
     let Some(window) = window else { return };
 
-    let Ok((compacted_through, prev_summary)) =
-        state.store.compaction(session_id).await
-    else {
+    let Ok((compacted_through, prev_summary)) = state.store.compaction(session_id).await else {
         return;
     };
     let Ok(full) = state.store.messages_full(session_id).await else {
@@ -350,11 +380,8 @@ async fn maybe_compact(
     };
     // Only the uncompacted tail still costs context — counting the whole
     // log would re-trigger compaction on every turn.
-    let tail: Vec<&StoredMessage> =
-        full.iter().filter(|m| m.id > compacted_through).collect();
-    let mut est = estimate_tokens(
-        &tail.iter().map(|m| m.data.clone()).collect::<Vec<_>>(),
-    );
+    let tail: Vec<&StoredMessage> = full.iter().filter(|m| m.id > compacted_through).collect();
+    let mut est = estimate_tokens(&tail.iter().map(|m| m.data.clone()).collect::<Vec<_>>());
     if let Some(s) = &prev_summary {
         est += (s.len() / 4) as u64;
     }

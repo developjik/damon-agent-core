@@ -35,11 +35,17 @@ enum Cmd {
         /// Resume an existing session id
         #[arg(long)]
         session: Option<String>,
+        /// Model override (provider/model, glob id, or model:level)
+        #[arg(long)]
+        model: Option<String>,
     },
     /// Resume an existing session and enter the chat REPL
     Resume {
         /// Session id to resume
         id: String,
+        /// Model override for this session's turns
+        #[arg(long)]
+        model: Option<String>,
     },
     /// Delete a session and its history
     Delete {
@@ -51,6 +57,9 @@ enum Cmd {
         text: String,
         #[arg(long)]
         session: Option<String>,
+        /// Model override for this turn
+        #[arg(long)]
+        model: Option<String>,
     },
     /// Full-text search over all session history
     Search {
@@ -70,7 +79,10 @@ async fn main() -> anyhow::Result<()> {
             .url
             .replacen("wss://", "https://", 1)
             .replacen("ws://", "http://", 1);
-        let url = format!("{}/health", url.trim_end_matches('/').trim_end_matches("/ws"));
+        let url = format!(
+            "{}/health",
+            url.trim_end_matches('/').trim_end_matches("/ws")
+        );
         let resp = reqwest::get(&url).await?;
         println!("{}", resp.text().await?);
         return Ok(());
@@ -88,20 +100,20 @@ async fn main() -> anyhow::Result<()> {
     match args.cmd {
         Cmd::Health => unreachable!(),
         Cmd::Sessions => {
-            for (id, created) in client.list_sessions().await? {
-                println!("{id}\t{created}");
+            for (id, created, model) in client.list_sessions().await? {
+                println!("{id}\t{created}\t{model}");
             }
         }
-        Cmd::Chat { session } => {
+        Cmd::Chat { session, model } => {
             let session_id = match session {
                 Some(s) => s,
-                None => client.new_session(&cwd()).await?,
+                None => client.new_session(&cwd(), model.as_deref()).await?,
             };
-            chat_loop(&client, &session_id).await?;
+            chat_loop(&client, &session_id, model.as_deref()).await?;
         }
-        Cmd::Resume { id } => {
+        Cmd::Resume { id, model } => {
             let session_id = client.resume_session(&id).await?;
-            chat_loop(&client, &session_id).await?;
+            chat_loop(&client, &session_id, model.as_deref()).await?;
         }
         Cmd::Delete { id } => {
             client.delete_session(&id).await?;
@@ -112,13 +124,17 @@ async fn main() -> anyhow::Result<()> {
                 println!("{sid}:{mid}\t{snippet}");
             }
         }
-        Cmd::Prompt { text, session } => {
+        Cmd::Prompt {
+            text,
+            session,
+            model,
+        } => {
             let session_id = match session {
                 Some(s) => s,
-                None => client.new_session(&cwd()).await?,
+                None => client.new_session(&cwd(), model.as_deref()).await?,
             };
             let mut events = client.events().await;
-            run_turn(&client, &mut events, &session_id, &text).await?;
+            run_turn(&client, &mut events, &session_id, &text, model.as_deref()).await?;
             println!();
         }
     }
@@ -134,17 +150,23 @@ fn cwd() -> String {
 /// Interactive chat REPL over an existing session. The event receiver is
 /// taken once — `events()` hands out the only consumer, so re-taking it
 /// per turn would starve every turn after the first.
-async fn chat_loop(client: &DamonClient, session_id: &str) -> anyhow::Result<()> {
+async fn chat_loop(
+    client: &DamonClient,
+    session_id: &str,
+    model: Option<&str>,
+) -> anyhow::Result<()> {
     eprintln!("session: {session_id}  (Ctrl-D to quit)");
     let mut events = client.events().await;
     let mut stdin = tokio::io::BufReader::new(tokio::io::stdin()).lines();
     loop {
         eprint!("> ");
-        let Some(line) = stdin.next_line().await? else { break };
+        let Some(line) = stdin.next_line().await? else {
+            break;
+        };
         if line.trim().is_empty() {
             continue;
         }
-        run_turn(client, &mut events, session_id, &line).await?;
+        run_turn(client, &mut events, session_id, &line, model).await?;
     }
     Ok(())
 }
@@ -156,12 +178,14 @@ async fn run_turn(
     events: &mut mpsc::Receiver<ClientEvent>,
     session_id: &str,
     text: &str,
+    model: Option<&str>,
 ) -> anyhow::Result<()> {
     let prompt = {
         let client = client.clone();
         let session_id = session_id.to_string();
         let text = text.to_string();
-        tokio::spawn(async move { client.prompt(&session_id, &text).await })
+        let model = model.map(String::from);
+        tokio::spawn(async move { client.prompt(&session_id, &text, model.as_deref()).await })
     };
     tokio::pin!(prompt);
 
@@ -180,49 +204,49 @@ async fn run_turn(
                 return Ok(());
             }
             Some(ClientEvent::Update(params)) => {
-                        let u = &params["update"];
-                        match u["sessionUpdate"].as_str() {
-                            Some("agent_message_chunk") => {
-                                if let Some(t) = u["content"]["text"].as_str() {
-                                    print!("{t}");
-                                    use std::io::Write;
-                                    let _ = std::io::stdout().flush();
-                                }
-                            }
-                            Some("tool_call_update") => {
-                                eprintln!(
-                                    "\n[tool {} → {}]",
-                                    u["toolCallId"].as_str().unwrap_or(""),
-                                    u["status"].as_str().unwrap_or("")
-                                );
-                            }
-                            _ => {}
-                        }
-                    }
-                    Some(ClientEvent::Request { id, method, params }) => {
-                        if method == "session/request_permission" {
-                            let title = params["toolCall"]["title"].as_str().unwrap_or("?");
-                            let input = params["toolCall"]["rawInput"].to_string();
-                            eprint!("\n[permission] {title} {input}\nallow? [y/N] ");
+                let u = &params["update"];
+                match u["sessionUpdate"].as_str() {
+                    Some("agent_message_chunk") => {
+                        if let Some(t) = u["content"]["text"].as_str() {
+                            print!("{t}");
                             use std::io::Write;
-                            let _ = std::io::stderr().flush();
-                            let mut stdin = tokio::io::BufReader::new(tokio::io::stdin());
-                            let mut line = String::new();
-                            let _ = stdin.read_line(&mut line).await;
-                            let allow = matches!(line.trim(), "y" | "Y" | "yes");
-                            client
-                                .respond(
-                                    id,
-                                    json!({
-                                        "outcome": {
-                                            "outcome": "selected",
-                                            "optionId": if allow { "allow-once" } else { "reject-once" }
-                                        }
-                                    }),
-                                )
-                                .await?;
+                            let _ = std::io::stdout().flush();
                         }
                     }
+                    Some("tool_call_update") => {
+                        eprintln!(
+                            "\n[tool {} → {}]",
+                            u["toolCallId"].as_str().unwrap_or(""),
+                            u["status"].as_str().unwrap_or("")
+                        );
+                    }
+                    _ => {}
+                }
+            }
+            Some(ClientEvent::Request { id, method, params }) => {
+                if method == "session/request_permission" {
+                    let title = params["toolCall"]["title"].as_str().unwrap_or("?");
+                    let input = params["toolCall"]["rawInput"].to_string();
+                    eprint!("\n[permission] {title} {input}\nallow? [y/N] ");
+                    use std::io::Write;
+                    let _ = std::io::stderr().flush();
+                    let mut stdin = tokio::io::BufReader::new(tokio::io::stdin());
+                    let mut line = String::new();
+                    let _ = stdin.read_line(&mut line).await;
+                    let allow = matches!(line.trim(), "y" | "Y" | "yes");
+                    client
+                        .respond(
+                            id,
+                            json!({
+                                "outcome": {
+                                    "outcome": "selected",
+                                    "optionId": if allow { "allow-once" } else { "reject-once" }
+                                }
+                            }),
+                        )
+                        .await?;
+                }
+            }
             None => anyhow::bail!("connection closed"),
         }
     }
