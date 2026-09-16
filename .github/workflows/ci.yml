@@ -53,7 +53,7 @@ jobs:
         shell: bash
         run: |
           cd target/${{ matrix.target }}/release
-          tar czf ../../../damon-${{ matrix.target }}.tar.gz damond* damon*
+          tar czf ../../../damon-${{ matrix.target }}.tar.gz --exclude='*.d' damond* damon*
           cd ../../..
           ls -la damon-*.tar.gz
       - uses: softprops/action-gh-release@v2
