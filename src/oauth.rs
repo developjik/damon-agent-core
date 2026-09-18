@@ -16,12 +16,24 @@ const SCOPE: &str = "org:create_api_key user:profile user:inference";
 const KEYCHAIN_SERVICE: &str = "damon-oauth";
 
 /// Stored OAuth token set for one provider account.
-#[derive(Clone, Debug, Serialize, Deserialize)]
+#[derive(Clone, Serialize, Deserialize)]
 pub struct OAuthTokens {
     pub access_token: String,
     pub refresh_token: String,
     /// Unix seconds when the access token expires.
     pub expires_at: i64,
+}
+
+// Redact tokens in Debug — a derived impl would print them in plaintext
+// the first time anyone logs the struct.
+impl std::fmt::Debug for OAuthTokens {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("OAuthTokens")
+            .field("access_token", &"<redacted>")
+            .field("refresh_token", &"<redacted>")
+            .field("expires_at", &self.expires_at)
+            .finish()
+    }
 }
 
 impl OAuthTokens {
@@ -39,8 +51,51 @@ fn keychain_entry(provider: &str) -> anyhow::Result<keyring::Entry> {
     keyring::Entry::new(KEYCHAIN_SERVICE, provider).context("keychain backend unavailable")
 }
 
+/// Token endpoint. `DAMON_TEST_TOKEN_URL` overrides it — tests point this
+/// at a local mock server; production always uses `TOKEN_URL`.
+///
+/// Test hooks are compiled out of release builds (`cfg(debug_assertions)`),
+/// so the env vars have no effect there. `cargo test --release` needs a
+/// profile or `RUSTFLAGS` with `debug-assertions = true` to use them.
+#[cfg(debug_assertions)]
+fn token_url() -> String {
+    std::env::var("DAMON_TEST_TOKEN_URL").unwrap_or_else(|_| TOKEN_URL.to_string())
+}
+
+/// Release fallback — always the real endpoint (see `token_url`).
+#[cfg(not(debug_assertions))]
+fn token_url() -> String {
+    TOKEN_URL.to_string()
+}
+
+/// Test-only file path for stored tokens. When `DAMON_TEST_TOKEN_DIR` is
+/// set, tokens live in `{dir}/{provider}.json` instead of the OS keychain.
+///
+/// Compiled out of release builds — always `None` there (see `token_url`).
+#[cfg(debug_assertions)]
+fn test_token_path(provider: &str) -> Option<std::path::PathBuf> {
+    std::env::var("DAMON_TEST_TOKEN_DIR")
+        .ok()
+        .map(|dir| std::path::Path::new(&dir).join(format!("{provider}.json")))
+}
+
+/// Release fallback — always the OS keychain (see `test_token_path`).
+#[cfg(not(debug_assertions))]
+fn test_token_path(_provider: &str) -> Option<std::path::PathBuf> {
+    None
+}
+
 /// Load stored tokens for a provider ("anthropic").
 pub fn load(provider: &str) -> anyhow::Result<Option<OAuthTokens>> {
+    if let Some(path) = test_token_path(provider) {
+        return match std::fs::read_to_string(&path) {
+            Ok(json) => Ok(Some(
+                serde_json::from_str(&json).context("corrupt OAuth token file")?,
+            )),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(None),
+            Err(e) => Err(e).context("token file read failed"),
+        };
+    }
     let entry = keychain_entry(provider)?;
     match entry.get_password() {
         Ok(json) => Ok(Some(
@@ -52,13 +107,46 @@ pub fn load(provider: &str) -> anyhow::Result<Option<OAuthTokens>> {
 }
 
 fn store(provider: &str, tokens: &OAuthTokens) -> anyhow::Result<()> {
+    let json = serde_json::to_string(tokens)?;
+    if let Some(path) = test_token_path(provider) {
+        if let Some(dir) = path.parent() {
+            std::fs::create_dir_all(dir)?;
+        }
+        // Test token files hold live credentials: create with 0600 from
+        // the start (no world-readable window), and re-apply for files
+        // that already existed — mode only applies at creation.
+        #[cfg(target_family = "unix")]
+        {
+            use std::io::Write;
+            use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
+            let mut file = std::fs::OpenOptions::new()
+                .write(true)
+                .create(true)
+                .truncate(true)
+                .mode(0o600)
+                .open(&path)
+                .context("token file write failed")?;
+            file.set_permissions(std::fs::Permissions::from_mode(0o600))
+                .context("token file chmod failed")?;
+            file.write_all(json.as_bytes())
+                .context("token file write failed")?;
+            return Ok(());
+        }
+        #[cfg(not(target_family = "unix"))]
+        return std::fs::write(&path, json).context("token file write failed");
+    }
     let entry = keychain_entry(provider)?;
-    entry
-        .set_password(&serde_json::to_string(tokens)?)
-        .context("keychain write failed")
+    entry.set_password(&json).context("keychain write failed")
 }
 
 pub fn delete(provider: &str) -> anyhow::Result<()> {
+    if let Some(path) = test_token_path(provider) {
+        return match std::fs::remove_file(&path) {
+            Ok(()) => Ok(()),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
+            Err(e) => Err(e).context("token file delete failed"),
+        };
+    }
     let entry = keychain_entry(provider)?;
     match entry.delete_credential() {
         Ok(()) | Err(keyring::Error::NoEntry) => Ok(()),
@@ -99,13 +187,15 @@ pub async fn exchange(provider: &str, code_and_state: &str, verifier: &str) -> a
         Some((c, s)) => (c, Some(s)),
         None => (code_and_state, None),
     };
-    if let Some(s) = state {
-        if s != verifier {
-            bail!("state mismatch — the pasted code belongs to a different login attempt");
-        }
+    if let Some(s) = state
+        && s != verifier
+    {
+        bail!("state mismatch — the pasted code belongs to a different login attempt");
     }
-    let resp = reqwest::Client::new()
-        .post(TOKEN_URL)
+    let resp = reqwest::Client::builder()
+        .timeout(std::time::Duration::from_secs(30))
+        .build()?
+        .post(token_url())
         .header("content-type", "application/json")
         .header("user-agent", "anthropic")
         .json(&serde_json::json!({
@@ -139,7 +229,7 @@ pub async fn exchange(provider: &str, code_and_state: &str, verifier: &str) -> a
 }
 
 /// Return a valid access token, refreshing first if expired.
-/// Called by the Anthropic provider on 401 and proactively.
+/// Called by the Anthropic provider proactively.
 pub async fn access_token(provider: &str) -> anyhow::Result<String> {
     let Some(tokens) = load(provider)? else {
         bail!("not logged in — run `damond login {provider}`");
@@ -147,12 +237,37 @@ pub async fn access_token(provider: &str) -> anyhow::Result<String> {
     if !tokens.is_expired() {
         return Ok(tokens.access_token);
     }
+    refresh_locked(provider, false).await
+}
+
+/// Force a token refresh regardless of the stored expiry — used after a
+/// 401, where the server rejected a token we still believed valid.
+pub async fn force_refresh(provider: &str) -> anyhow::Result<String> {
+    refresh_locked(provider, true).await
+}
+
+/// Single-flight refresh: concurrent 401s must not race parallel
+/// refreshes — Anthropic rotates the refresh_token, so a second
+/// concurrent refresh would use the just-invalidated one and fail with
+/// invalid_grant, forcing a re-login.
+async fn refresh_locked(provider: &str, force: bool) -> anyhow::Result<String> {
+    static LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+    let _guard = LOCK.lock().await;
+    let Some(tokens) = load(provider)? else {
+        bail!("not logged in — run `damond login {provider}`");
+    };
+    // Another task may have just refreshed while we waited on the lock.
+    if !force && !tokens.is_expired() {
+        return Ok(tokens.access_token);
+    }
     refresh(provider, &tokens.refresh_token).await
 }
 
 async fn refresh(provider: &str, refresh_token: &str) -> anyhow::Result<String> {
-    let resp = reqwest::Client::new()
-        .post(TOKEN_URL)
+    let resp = reqwest::Client::builder()
+        .timeout(std::time::Duration::from_secs(30))
+        .build()?
+        .post(token_url())
         .header("content-type", "application/json")
         .header("user-agent", "anthropic")
         .json(&serde_json::json!({

@@ -43,6 +43,10 @@ fn test_config(upstream: &str) -> Config {
         providers,
         models: BTreeMap::new(),
         relay: None,
+        permission_timeout_secs: None,
+        max_tool_output: None,
+        summary_model: None,
+        session_retention_days: None,
     }
 }
 

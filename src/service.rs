@@ -5,6 +5,9 @@ use std::path::PathBuf;
 
 /// launchd plist for a user agent.
 pub fn launchd_plist(exe: &str, config: &str, log: &str) -> String {
+    // Paths go into XML verbatim — escape or a `&`/`<` in a path
+    // produces a malformed plist that launchd silently rejects.
+    let (exe, config, log) = (xml_escape(exe), xml_escape(config), xml_escape(log));
     format!(
         r#"<?xml version="1.0" encoding="UTF-8"?>
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
@@ -27,15 +30,31 @@ pub fn launchd_plist(exe: &str, config: &str, log: &str) -> String {
     )
 }
 
+/// Minimal XML escaping for plist string values.
+fn xml_escape(s: &str) -> String {
+    s.replace('&', "&amp;")
+        .replace('<', "&lt;")
+        .replace('>', "&gt;")
+        .replace('"', "&quot;")
+}
+
+/// Escape `"` and `\` for a double-quoted systemd ExecStart argument.
+fn systemd_escape(s: &str) -> String {
+    s.replace('\\', "\\\\").replace('"', "\\\"")
+}
+
 /// systemd user unit.
 pub fn systemd_unit(exe: &str, config: &str) -> String {
+    // systemd splits ExecStart on whitespace — quote paths so a space
+    // in the install dir doesn't produce a broken unit.
+    let (exe, config) = (systemd_escape(exe), systemd_escape(config));
     format!(
         "[Unit]\n\
          Description=Damon agent core daemon\n\
          After=network.target\n\
          \n\
          [Service]\n\
-         ExecStart={exe} --config {config}\n\
+         ExecStart=\"{exe}\" --config \"{config}\"\n\
          Restart=on-failure\n\
          RestartSec=5\n\
          \n\
@@ -70,10 +89,12 @@ pub fn systemd_unit_path() -> PathBuf {
 pub fn install(exe: &str, config: &str) -> anyhow::Result<String> {
     #[cfg(target_os = "macos")]
     {
-        let log = format!(
-            "{}/Library/Logs/damond.log",
-            std::env::var("HOME").unwrap_or_default()
-        );
+        // $HOME unset would produce "/Library/Logs/damond.log" — a
+        // root-owned path the user agent can't write.
+        let home = directories::BaseDirs::new()
+            .map(|d| d.home_dir().to_path_buf())
+            .unwrap_or_else(|| PathBuf::from("."));
+        let log = format!("{}/Library/Logs/damond.log", home.display());
         let path = launchd_plist_path();
         std::fs::create_dir_all(path.parent().unwrap())?;
         std::fs::write(&path, launchd_plist(exe, config, &log))?;
@@ -82,13 +103,18 @@ pub fn install(exe: &str, config: &str) -> anyhow::Result<String> {
             .arg(&path)
             .status()?;
         anyhow::ensure!(status.success(), "launchctl load failed");
-        return Ok(format!("installed launchd agent: {}", path.display()));
+        Ok(format!("installed launchd agent: {}", path.display()))
     }
     #[cfg(target_os = "linux")]
     {
         let path = systemd_unit_path();
         std::fs::create_dir_all(path.parent().unwrap())?;
         std::fs::write(&path, systemd_unit(exe, config))?;
+        // Reload first — an existing unit file would otherwise leave
+        // systemd running the stale definition until the next reload.
+        let _ = std::process::Command::new("systemctl")
+            .args(["--user", "daemon-reload"])
+            .status();
         let status = std::process::Command::new("systemctl")
             .args(["--user", "enable", "--now", "damond"])
             .status()?;
