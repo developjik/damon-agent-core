@@ -25,10 +25,10 @@ async fn main() -> anyhow::Result<()> {
             }
             Some(ClientEvent::Update(p)) => {
                 let u = &p["update"];
-                if u["sessionUpdate"] == "agent_message_chunk" {
-                    if let Some(t) = u["content"]["text"].as_str() {
-                        print!("{t}");
-                    }
+                if u["sessionUpdate"] == "agent_message_chunk"
+                    && let Some(t) = u["content"]["text"].as_str()
+                {
+                    print!("{t}");
                 }
             }
             Some(ClientEvent::Request { id, .. }) => {

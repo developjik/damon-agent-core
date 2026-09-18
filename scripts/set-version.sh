@@ -24,11 +24,18 @@ sed_i() {
   fi
 }
 
-# Cargo.toml — first `version = "…"` under [package].
-sed_i "0,/^version = \".*\"/s//version = \"$VERSION\"/" "$ROOT/Cargo.toml"
+# Cargo.toml — the `version = "…"` inside [package] only. A future
+# [workspace] or other table with a version key must not be rewritten.
+awk -v v="$VERSION" '
+  /^\[package\]/ { inpkg=1 }
+  /^\[/ && !/^\[package\]/ { inpkg=0 }
+  inpkg && !done && /^version = "/ { sub(/"[^"]*"/, "\"" v "\""); done=1 }
+  { print }
+' "$ROOT/Cargo.toml" > "$ROOT/Cargo.toml.tmp" && mv "$ROOT/Cargo.toml.tmp" "$ROOT/Cargo.toml"
 
 # npm/package.json — top-level "version" field.
-sed_i "0,/\"version\": \".*\"/s//\"version\": \"$VERSION\"/" "$ROOT/npm/package.json"
+awk -v v="$VERSION" '!done && /"version":/ { sub(/"version": "[^"]*"/, "\"version\": \"" v "\""); done=1 } { print }' \
+  "$ROOT/npm/package.json" > "$ROOT/npm/package.json.tmp" && mv "$ROOT/npm/package.json.tmp" "$ROOT/npm/package.json"
 
 # Formula/damon.rb — version line + the v<ver> in both download URLs.
 sed_i \

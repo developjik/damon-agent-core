@@ -139,11 +139,11 @@ fn spawn_damond(upstream: SocketAddr) -> (Child, SocketAddr) {
         if Instant::now() > deadline {
             break;
         }
-        if let Ok(l) = line {
-            if l.contains("listening") {
-                ready = true;
-                break;
-            }
+        if let Ok(l) = line
+            && l.contains("listening")
+        {
+            ready = true;
+            break;
         }
     }
     assert!(ready, "damond did not become ready");
