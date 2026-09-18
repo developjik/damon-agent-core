@@ -48,7 +48,7 @@ impl OpenAiResponses {
         Ok(Self {
             name: name.to_string(),
             base_url: base_url.trim_end_matches('/').to_string(),
-            client: reqwest::Client::new(),
+            client: super::http_client(),
             auth,
             headers,
             compat,
@@ -154,19 +154,56 @@ impl OpenAiResponses {
         // flattens to {type:"function",name}.
         match &body["tool_choice"] {
             Value::String(s) => out["tool_choice"] = json!(s),
-            Value::Object(_) => {
-                if body["tool_choice"]["type"].as_str() == Some("function") {
-                    out["tool_choice"] = json!({
-                        "type": "function",
-                        "name": body["tool_choice"]["function"]["name"],
-                    });
-                }
+            Value::Object(_) if body["tool_choice"]["type"].as_str() == Some("function") => {
+                out["tool_choice"] = json!({
+                    "type": "function",
+                    "name": body["tool_choice"]["function"]["name"],
+                });
             }
             _ => {}
         }
-        // Thinking level → reasoning.effort.
+        // response_format → text.format (structured output).
+        match body["response_format"]["type"].as_str() {
+            Some("json_object") => {
+                out["text"] = json!({"format": {"type": "json_object"}});
+            }
+            Some("json_schema") => {
+                let s = &body["response_format"]["json_schema"];
+                out["text"] = json!({"format": {
+                    "type": "json_schema",
+                    "name": s["name"].as_str().unwrap_or("response"),
+                    "schema": s["schema"],
+                    "strict": s["strict"],
+                }});
+            }
+            Some("text") => {}
+            _ => {}
+        }
+        // Direct passthroughs the Responses API accepts verbatim.
+        for key in [
+            "parallel_tool_calls",
+            "user",
+            "metadata",
+            "include",
+            "service_tier",
+        ] {
+            if let Some(v) = body.get(key) {
+                out[key] = v.clone();
+            }
+        }
+        // Client-sent reasoning/text/truncation merge — a caller's
+        // reasoning config must not be silently replaced by _thinking.
+        for key in ["reasoning", "text", "truncation"] {
+            if let Some(v) = body.get(key).filter(|v| v.is_object()) {
+                for (k, val) in v.as_object().unwrap() {
+                    out[key][k] = val.clone();
+                }
+            }
+        }
+        // Thinking level → reasoning.effort (merges into any client
+        // reasoning object set above).
         if let Some(level) = body["_thinking"].as_str() {
-            out["reasoning"] = json!({"effort": level});
+            out["reasoning"]["effort"] = json!(level);
         }
         // Compat: store + extra_body.
         if self.compat.supports_store {
@@ -196,6 +233,9 @@ impl OpenAiResponses {
     {
         let req = self.translate_request(&body, true)?;
         let resp = self.send(req).await?;
+        if resp.status() == reqwest::StatusCode::TOO_MANY_REQUESTS {
+            return Err(crate::provider::RateLimited(crate::provider::retry_after(&resp)).into());
+        }
         if !resp.status().is_success() {
             let status = resp.status();
             let text = resp.text().await.unwrap_or_default();
@@ -211,11 +251,17 @@ impl OpenAiResponses {
         let req = self.translate_request(&body, false)?;
         let resp = self.send(req).await?;
         let status = resp.status();
-        let v: Value = resp.json().await?;
-        if !status.is_success() {
-            bail!("upstream {status}: {v}");
+        if status == reqwest::StatusCode::TOO_MANY_REQUESTS {
+            return Err(crate::provider::RateLimited(crate::provider::retry_after(&resp)).into());
         }
-        Ok(responses_to_openai(&v))
+        // Read the body as text first: a gateway 502/504 answers HTML,
+        // and json() failing before the status check would lose both.
+        let text = resp.text().await.unwrap_or_default();
+        if !status.is_success() {
+            bail!("upstream {status}: {text}");
+        }
+        let v: Value = serde_json::from_str(&text).context("invalid upstream JSON")?;
+        responses_to_openai(&v)
     }
 
     pub async fn list_models(&self) -> anyhow::Result<Value> {
@@ -224,13 +270,28 @@ impl OpenAiResponses {
             .send()
             .await
             .context("upstream request failed")?;
-        let v: Value = resp.json().await?;
+        let status = resp.status();
+        let text = resp.text().await.unwrap_or_default();
+        if !status.is_success() {
+            bail!("upstream {status}: {text}");
+        }
+        let v: Value = serde_json::from_str(&text).context("invalid upstream JSON")?;
         Ok(v)
     }
 }
 
-/// Responses JSON → OpenAI chat-completions response.
-fn responses_to_openai(v: &Value) -> Value {
+/// Responses JSON → OpenAI chat-completions response. `status` is
+/// checked first: a `failed` response must surface as an error and an
+/// `incomplete` one as finish_reason "length" — returning them as a
+/// clean 200 with empty content is indistinguishable from a real
+/// empty reply.
+fn responses_to_openai(v: &Value) -> anyhow::Result<Value> {
+    if v["status"].as_str() == Some("failed") {
+        let msg = v["error"]["message"]
+            .as_str()
+            .unwrap_or("upstream response failed");
+        anyhow::bail!("upstream response failed: {msg}");
+    }
     let mut text = String::new();
     let mut tool_calls = Vec::new();
     for item in v["output"].as_array().cloned().unwrap_or_default() {
@@ -257,7 +318,11 @@ fn responses_to_openai(v: &Value) -> Value {
     if !tool_calls.is_empty() {
         msg["tool_calls"] = json!(tool_calls);
     }
-    let finish = if tool_calls.is_empty() {
+    // "incomplete" (max_output_tokens truncation, content filter) maps
+    // to "length" — the streaming path already maps it the same way.
+    let finish = if v["status"].as_str() == Some("incomplete") {
+        "length"
+    } else if tool_calls.is_empty() {
         "stop"
     } else {
         "tool_calls"
@@ -267,10 +332,10 @@ fn responses_to_openai(v: &Value) -> Value {
         "completion_tokens": v["usage"]["output_tokens"],
         "total_tokens": v["usage"]["total_tokens"],
     });
-    json!({
+    Ok(json!({
         "choices": [{"index": 0, "message": msg, "finish_reason": finish}],
         "usage": usage,
-    })
+    }))
 }
 
 /// Parse Responses SSE into normalized StreamEvents.
@@ -283,11 +348,20 @@ fn responses_events(
     // pending holds a Usage event parsed alongside a terminal event so both
     // get emitted.
     Box::pin(futures::stream::unfold(
-        (stream, Vec::<u8>::new(), false, None::<StreamEvent>),
-        |(mut stream, mut buf, mut done, mut pending)| async move {
+        (
+            stream,
+            Vec::<u8>::new(),
+            false,
+            None::<StreamEvent>,
+            // output_index → dense tool-call index. Output items include
+            // reasoning and message entries, so raw output_index is sparse
+            // and would leave empty accumulator slots.
+            std::collections::HashMap::<u64, usize>::new(),
+        ),
+        |(mut stream, mut buf, mut done, mut pending, mut index_map)| async move {
             loop {
                 if let Some(ev) = pending.take() {
-                    return Some((Ok(ev), (stream, buf, done, pending)));
+                    return Some((Ok(ev), (stream, buf, done, pending, index_map)));
                 }
                 if done {
                     return None;
@@ -308,24 +382,40 @@ fn responses_events(
                             done = true;
                             return Some((
                                 Ok(StreamEvent::Done(crate::llm::StopReason::Other)),
-                                (stream, buf, done, pending),
+                                (stream, buf, done, pending, index_map),
                             ));
                         }
                         match parse_event(data) {
-                            Ok(Some(ev)) => {
+                            Ok(Some(mut ev)) => {
+                                // Remap sparse output_index to a dense
+                                // tool-call index — reasoning/message items
+                                // share the output index space.
+                                if let StreamEvent::ToolCallDelta { index, .. } = &mut ev {
+                                    let next = index_map.len();
+                                    *index = *index_map.entry(*index as u64).or_insert(next);
+                                }
                                 // Terminal events may carry usage — emit it
                                 // first, then the Done on the next poll.
                                 if let StreamEvent::Done(_) = ev {
                                     done = true;
                                     if let Some(u) = usage_of(data) {
                                         pending = Some(ev);
-                                        return Some((Ok(u), (stream, buf, done, pending)));
+                                        return Some((
+                                            Ok(u),
+                                            (stream, buf, done, pending, index_map),
+                                        ));
                                     }
                                 }
-                                return Some((Ok(ev), (stream, buf, done, pending)));
+                                return Some((Ok(ev), (stream, buf, done, pending, index_map)));
                             }
                             Ok(None) => continue,
-                            Err(e) => return Some((Err(e), (stream, buf, done, pending))),
+                            Err(e) => {
+                                // A fatal event (response.failed, error)
+                                // ends the stream — continuing would emit
+                                // a second truncation error at EOF.
+                                done = true;
+                                return Some((Err(e), (stream, buf, done, pending, index_map)));
+                            }
                         }
                     }
                     continue;
@@ -334,13 +424,17 @@ fn responses_events(
                     Some(Ok(chunk)) => buf.extend_from_slice(&chunk),
                     Some(Err(e)) => {
                         done = true;
-                        return Some((Err(e.into()), (stream, buf, done, pending)));
+                        return Some((Err(e.into()), (stream, buf, done, pending, index_map)));
                     }
                     None => {
                         done = true;
+                        // Reaching EOF without response.completed/failed/
+                        // incomplete means the stream was truncated —
+                        // surface an error so the caller can retry, not a
+                        // clean Done that persists partial text.
                         return Some((
-                            Ok(StreamEvent::Done(crate::llm::StopReason::Other)),
-                            (stream, buf, done, pending),
+                            Err(anyhow::anyhow!("stream ended without a terminal event")),
+                            (stream, buf, done, pending, index_map),
                         ));
                     }
                 }
@@ -384,11 +478,13 @@ fn parse_event(data: &str) -> anyhow::Result<Option<StreamEvent>> {
         Some("response.output_item.added") => {
             let item = &v["item"];
             if item["type"].as_str() == Some("function_call") {
+                // Some providers ship complete arguments on the added
+                // event — the delta events then never come, so use them.
                 return Ok(Some(StreamEvent::ToolCallDelta {
                     index: v["output_index"].as_u64().unwrap_or(0) as usize,
                     id: item["call_id"].as_str().map(String::from),
                     name: item["name"].as_str().map(String::from),
-                    arguments: String::new(),
+                    arguments: item["arguments"].as_str().unwrap_or("").to_string(),
                 }));
             }
             Ok(None)
@@ -401,6 +497,12 @@ fn parse_event(data: &str) -> anyhow::Result<Option<StreamEvent>> {
         })),
         Some("response.completed") | Some("response.failed") | Some("response.incomplete") => {
             let r = &v["response"];
+            // A failed response carries the real error — surface it
+            // instead of ending the turn as if it completed.
+            if r["status"].as_str() == Some("failed") {
+                let msg = r["error"]["message"].as_str().unwrap_or("response failed");
+                anyhow::bail!("responses api: {msg}");
+            }
             let reason = match r["status"].as_str() {
                 Some("completed") => {
                     // completed with function calls → tool_calls
@@ -418,6 +520,12 @@ fn parse_event(data: &str) -> anyhow::Result<Option<StreamEvent>> {
                 _ => StopReason::Other,
             };
             Ok(Some(StreamEvent::Done(reason)))
+        }
+        // Mid-stream error event — surface it instead of waiting for an
+        // EOF that now reports truncation without the real message.
+        Some("error") => {
+            let msg = v["message"].as_str().unwrap_or("stream error");
+            anyhow::bail!("responses api: {msg}");
         }
         _ => Ok(None),
     }

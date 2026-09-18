@@ -53,6 +53,10 @@ fn route_model_prefix_and_glob() {
         providers,
         models: BTreeMap::new(),
         relay: None,
+        permission_timeout_secs: None,
+        max_tool_output: None,
+        summary_model: None,
+        session_retention_days: None,
     };
 
     // Explicit prefix wins.
@@ -215,6 +219,98 @@ async fn gemini_translates_request_and_response() {
     assert_eq!(resp["choices"][0]["message"]["content"], "hi from gemini");
 }
 
+/// Parallel tool calls persist one role:"tool" row per call; the
+/// translated Anthropic request must fold them into ONE user message —
+/// consecutive same-role messages are a 400 ("roles must alternate").
+#[tokio::test]
+async fn anthropic_folds_parallel_tool_results_into_one_user_message() {
+    let (base, captured) = mock_anthropic().await;
+    let p = damon_core::provider::Provider::new("claude", &provider("anthropic-messages", &base))
+        .unwrap();
+
+    let body = json!({
+        "model": "claude-sonnet-4",
+        "messages": [
+            {"role": "user", "content": "run both"},
+            {"role": "assistant", "content": "", "tool_calls": [
+                {"id": "call_a", "type": "function",
+                 "function": {"name": "fs.read", "arguments": "{\"path\":\"a\"}"}},
+                {"id": "call_b", "type": "function",
+                 "function": {"name": "fs.read", "arguments": "{\"path\":\"b\"}"}},
+            ]},
+            {"role": "tool", "tool_call_id": "call_a", "content": "A"},
+            {"role": "tool", "tool_call_id": "call_b", "content": "B"},
+        ],
+    });
+    p.chat(body).await.unwrap();
+
+    let sent = &captured.lock().await[0];
+    let msgs = sent["messages"].as_array().unwrap();
+    for w in msgs.windows(2) {
+        assert_ne!(
+            w[0]["role"], w[1]["role"],
+            "consecutive same-role: {msgs:?}"
+        );
+    }
+    // The tool turn: one assistant message carrying both tool_use blocks,
+    // then one user message carrying both tool_result blocks.
+    let assistant = &msgs[1];
+    assert_eq!(assistant["role"], "assistant");
+    assert_eq!(assistant["content"].as_array().unwrap().len(), 2);
+    assert_eq!(assistant["content"][0]["type"], "tool_use");
+    assert_eq!(assistant["content"][1]["type"], "tool_use");
+    let user = &msgs[2];
+    assert_eq!(user["role"], "user");
+    let results = user["content"].as_array().unwrap();
+    assert_eq!(results.len(), 2);
+    assert_eq!(results[0]["type"], "tool_result");
+    assert_eq!(results[0]["tool_use_id"], "call_a");
+    assert_eq!(results[1]["tool_use_id"], "call_b");
+}
+
+/// Same fold for Gemini: parallel tool results land as ONE user turn
+/// with every functionResponse part (Gemini rejects consecutive
+/// same-role contents).
+#[tokio::test]
+async fn gemini_folds_parallel_tool_results_into_one_user_turn() {
+    let (base, captured) = mock_gemini().await;
+    let p = damon_core::provider::Provider::new("gemini", &provider("gemini", &base)).unwrap();
+
+    let body = json!({
+        "model": "gemini-2.5-flash",
+        "messages": [
+            {"role": "user", "content": "run both"},
+            {"role": "assistant", "content": "", "tool_calls": [
+                {"id": "call_a", "type": "function",
+                 "function": {"name": "fs.read", "arguments": "{}"}},
+                {"id": "call_b", "type": "function",
+                 "function": {"name": "fs.read", "arguments": "{}"}},
+            ]},
+            {"role": "tool", "tool_call_id": "call_a", "content": "A"},
+            {"role": "tool", "tool_call_id": "call_b", "content": "B"},
+        ],
+    });
+    p.chat(body).await.unwrap();
+
+    let sent = &captured.lock().await[0];
+    let contents = sent["contents"].as_array().unwrap();
+    for w in contents.windows(2) {
+        assert_ne!(
+            w[0]["role"], w[1]["role"],
+            "consecutive same-role: {contents:?}"
+        );
+    }
+    let model_turn = &contents[1];
+    assert_eq!(model_turn["role"], "model");
+    assert_eq!(model_turn["parts"].as_array().unwrap().len(), 2);
+    let user_turn = &contents[2];
+    assert_eq!(user_turn["role"], "user");
+    let parts = user_turn["parts"].as_array().unwrap();
+    assert_eq!(parts.len(), 2);
+    assert_eq!(parts[0]["functionResponse"]["name"], "fs__read");
+    assert_eq!(parts[1]["functionResponse"]["name"], "fs__read");
+}
+
 /// End-to-end: /v1/chat/completions with model routing to anthropic.
 #[tokio::test]
 async fn v1_routes_to_anthropic_by_model() {
@@ -237,6 +333,126 @@ async fn v1_routes_to_anthropic_by_model() {
         providers,
         models: BTreeMap::new(),
         relay: None,
+        permission_timeout_secs: None,
+        max_tool_output: None,
+        summary_model: None,
+        session_retention_days: None,
+    }));
+    let store = damon_core::store::Store::in_memory().await.unwrap();
+    let mcp = damon_core::mcp::McpRegistry::connect_all(&HashMap::new()).await;
+    let app = damon_core::api::router(damon_core::api::AppState::new(shared, store, mcp).await);
+
+    use http_body_util::BodyExt;
+    use tower::ServiceExt;
+    // Prefix + thinking-suffix routing: the wire model must be the bare
+    // upstream id and the suffix must enable thinking.
+    let resp = app
+        .oneshot(
+            axum::http::Request::post("/v1/chat/completions")
+                .header("content-type", "application/json")
+                .body(Body::from(
+                    r#"{"model":"claude/claude-sonnet-4:high","messages":[{"role":"user","content":"hi"}]}"#,
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 200);
+    let body = resp.into_body().collect().await.unwrap().to_bytes();
+    let v: Value = serde_json::from_slice(&body).unwrap();
+    assert_eq!(v["choices"][0]["message"]["content"], "hi from claude");
+    // Verify the request actually went to the anthropic mock, with the
+    // rewritten model and the thinking budget from the :high suffix.
+    let sent = captured.lock().await[0].clone();
+    assert_eq!(sent["model"], "claude-sonnet-4", "wire model: {sent}");
+    assert_eq!(sent["thinking"]["type"], "enabled", "wire: {sent}");
+}
+
+/// M2 regression: an OpenAI-wire tool replay (assistant tool_calls, no
+/// thinking blocks — /v1 clients cannot echo them) must disable thinking
+/// instead of building a request Anthropic 400s on every later turn.
+#[tokio::test]
+async fn v1_tool_history_without_thinking_disables_thinking() {
+    let (base, captured) = mock_anthropic().await;
+    let mut providers = BTreeMap::new();
+    let mut claude = provider("anthropic-messages", &base);
+    claude.models = vec!["claude-*".to_string()];
+    providers.insert("claude".to_string(), claude);
+    let shared: damon_core::config::SharedConfig = Arc::new(parking_lot::RwLock::new(Config {
+        bind: "127.0.0.1:0".parse().unwrap(),
+        auth_token: None,
+        data_dir: None,
+        tls_cert: None,
+        tls_key: None,
+        mcp_servers: HashMap::new(),
+        providers,
+        models: BTreeMap::new(),
+        relay: None,
+        permission_timeout_secs: None,
+        max_tool_output: None,
+        summary_model: None,
+        session_retention_days: None,
+    }));
+    let store = damon_core::store::Store::in_memory().await.unwrap();
+    let mcp = damon_core::mcp::McpRegistry::connect_all(&HashMap::new()).await;
+    let app = damon_core::api::router(damon_core::api::AppState::new(shared, store, mcp).await);
+
+    use tower::ServiceExt;
+    let resp = app
+        .oneshot(
+            axum::http::Request::post("/v1/chat/completions")
+                .header("content-type", "application/json")
+                .body(Body::from(
+                    r#"{"model":"claude/claude-sonnet-4:high","messages":[
+                        {"role":"user","content":"run it"},
+                        {"role":"assistant","tool_calls":[{"id":"call_1","type":"function",
+                          "function":{"name":"fs","arguments":"{}"}}]},
+                        {"role":"tool","tool_call_id":"call_1","content":"ok"},
+                        {"role":"user","content":"thanks"}]}"#,
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 200);
+    let sent = captured.lock().await[0].clone();
+    assert!(
+        sent.get("thinking").is_none(),
+        "thinking must be dropped for un-replayable tool history: {sent}"
+    );
+}
+
+/// M1 regression: the translated SSE stream must carry a finish_reason
+/// chunk BEFORE [DONE] — OpenAI SDK tool loops key on it.
+#[tokio::test]
+async fn v1_stream_emits_finish_reason_before_done() {
+    let base = mock_anthropic_sse(concat!(
+        "data: {\"type\":\"message_start\",\"message\":{\"usage\":{\"input_tokens\":1,\"output_tokens\":1}}}\n\n",
+        "data: {\"type\":\"content_block_start\",\"index\":0,\"content_block\":{\"type\":\"tool_use\",\"id\":\"toolu_1\",\"name\":\"fs__read\"}}\n\n",
+        "data: {\"type\":\"content_block_delta\",\"index\":0,\"delta\":{\"type\":\"input_json_delta\",\"partial_json\":\"{}\"}}\n\n",
+        "data: {\"type\":\"content_block_stop\",\"index\":0}\n\n",
+        "data: {\"type\":\"message_delta\",\"delta\":{\"stop_reason\":\"tool_use\"}}\n\n",
+        "data: {\"type\":\"message_stop\"}\n\n",
+    ))
+    .await;
+    let mut providers = BTreeMap::new();
+    let mut claude = provider("anthropic-messages", &base);
+    claude.models = vec!["claude-*".to_string()];
+    providers.insert("claude".to_string(), claude);
+    let shared: damon_core::config::SharedConfig = Arc::new(parking_lot::RwLock::new(Config {
+        bind: "127.0.0.1:0".parse().unwrap(),
+        auth_token: None,
+        data_dir: None,
+        tls_cert: None,
+        tls_key: None,
+        mcp_servers: HashMap::new(),
+        providers,
+        models: BTreeMap::new(),
+        relay: None,
+        permission_timeout_secs: None,
+        max_tool_output: None,
+        summary_model: None,
+        session_retention_days: None,
     }));
     let store = damon_core::store::Store::in_memory().await.unwrap();
     let mcp = damon_core::mcp::McpRegistry::connect_all(&HashMap::new()).await;
@@ -249,7 +465,7 @@ async fn v1_routes_to_anthropic_by_model() {
             axum::http::Request::post("/v1/chat/completions")
                 .header("content-type", "application/json")
                 .body(Body::from(
-                    r#"{"model":"claude-sonnet-4","messages":[{"role":"user","content":"hi"}]}"#,
+                    r#"{"model":"claude-sonnet-4","stream":true,"messages":[{"role":"user","content":"hi"}]}"#,
                 ))
                 .unwrap(),
         )
@@ -257,10 +473,12 @@ async fn v1_routes_to_anthropic_by_model() {
         .unwrap();
     assert_eq!(resp.status(), 200);
     let body = resp.into_body().collect().await.unwrap().to_bytes();
-    let v: Value = serde_json::from_slice(&body).unwrap();
-    assert_eq!(v["choices"][0]["message"]["content"], "hi from claude");
-    // Verify the request actually went to the anthropic mock.
-    assert_eq!(captured.lock().await.len(), 1);
+    let text = String::from_utf8(body.to_vec()).unwrap();
+    let fr = text
+        .find(r#""finish_reason":"tool_calls""#)
+        .expect("no finish_reason chunk in SSE");
+    let done = text.find("data: [DONE]").expect("no [DONE] in SSE");
+    assert!(fr < done, "finish_reason must precede [DONE]: {text}");
 }
 
 /// Mock OpenAI Responses endpoint: captures the request, returns a fixed
@@ -412,8 +630,9 @@ async fn compat_flags_shape_request() {
     let id = sent["messages"][2]["tool_calls"][0]["id"].as_str().unwrap();
     assert_eq!(id.len(), 9);
     assert!(id.chars().all(|c| c.is_ascii_alphanumeric()));
-    // tool result got name + matching id
-    assert_eq!(sent["messages"][3]["name"], "fs.read");
+    // tool result got name + matching id — the dotted name is mangled
+    // for the wire (OpenAI forbids '.' in function names).
+    assert_eq!(sent["messages"][3]["name"], "fs__read");
     assert_eq!(sent["messages"][3]["tool_call_id"].as_str().unwrap(), id);
 }
 
@@ -513,6 +732,10 @@ async fn discovered_model_routes_to_provider() {
         providers,
         models: BTreeMap::new(),
         relay: None,
+        permission_timeout_secs: None,
+        max_tool_output: None,
+        summary_model: None,
+        session_retention_days: None,
     }));
     let store = damon_core::store::Store::in_memory().await.unwrap();
     let mcp = damon_core::mcp::McpRegistry::connect_all(&HashMap::new()).await;
@@ -568,6 +791,10 @@ async fn ollama_discovery_reads_tags() {
         providers,
         models: BTreeMap::new(),
         relay: None,
+        permission_timeout_secs: None,
+        max_tool_output: None,
+        summary_model: None,
+        session_retention_days: None,
     };
     let mut built: std::collections::HashMap<
         String,
@@ -911,6 +1138,10 @@ async fn context_overflow_promotes_to_target() {
         providers,
         models: BTreeMap::new(),
         relay: None,
+        permission_timeout_secs: None,
+        max_tool_output: None,
+        summary_model: None,
+        session_retention_days: None,
     }));
     let store = damon_core::store::Store::in_memory().await.unwrap();
     let mcp = damon_core::mcp::McpRegistry::connect_all(&HashMap::new()).await;
@@ -997,4 +1228,266 @@ async fn inband_tools_roundtrip() {
             .contains("/tmp/x")
     );
     assert_eq!(resp["choices"][0]["finish_reason"], "tool_calls");
+}
+
+// ---------------------------------------------------------------------------
+// Regression tests for sparse tool-call indices and mid-stream errors.
+// ---------------------------------------------------------------------------
+
+/// Mock Anthropic SSE: a text block precedes the tool_use block, so the
+/// tool call arrives at content-block index 1 — not 0.
+async fn mock_anthropic_sse(sse: &'static str) -> String {
+    let app = Router::new().route(
+        "/v1/messages",
+        post(move || async move {
+            Response::builder()
+                .header("content-type", "text/event-stream")
+                .body(Body::from(sse))
+                .unwrap()
+        }),
+    );
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    tokio::spawn(async move {
+        axum::serve(listener, app).await.unwrap();
+    });
+    format!("http://{addr}")
+}
+
+#[tokio::test]
+async fn anthropic_text_before_tool_use_yields_single_call() {
+    use damon_core::llm::{StreamEvent, ToolCallAccumulator};
+    use futures::StreamExt;
+    // [text@0, tool_use@1]: the tool call's content-block index is sparse.
+    // Old code used it as the accumulator index → a fake empty call at
+    // slot 0 was persisted, poisoning the session history.
+    let base = mock_anthropic_sse(concat!(
+        "data: {\"type\":\"message_start\",\"message\":{\"usage\":{\"input_tokens\":1,\"output_tokens\":1}}}\n\n",
+        "data: {\"type\":\"content_block_start\",\"index\":0,\"content_block\":{\"type\":\"text\",\"text\":\"\"}}\n\n",
+        "data: {\"type\":\"content_block_delta\",\"index\":0,\"delta\":{\"type\":\"text_delta\",\"text\":\"let me check\"}}\n\n",
+        "data: {\"type\":\"content_block_stop\",\"index\":0}\n\n",
+        "data: {\"type\":\"content_block_start\",\"index\":1,\"content_block\":{\"type\":\"tool_use\",\"id\":\"toolu_1\",\"name\":\"fs__read\"}}\n\n",
+        "data: {\"type\":\"content_block_delta\",\"index\":1,\"delta\":{\"type\":\"input_json_delta\",\"partial_json\":\"{\\\"p\\\":1}\"}}\n\n",
+        "data: {\"type\":\"content_block_stop\",\"index\":1}\n\n",
+        "data: {\"type\":\"message_delta\",\"delta\":{\"stop_reason\":\"tool_use\"}}\n\n",
+        "data: {\"type\":\"message_stop\"}\n\n",
+    ))
+    .await;
+    let p = damon_core::provider::Provider::new("claude", &provider("anthropic-messages", &base))
+        .unwrap();
+    let body = json!({"model": "claude-sonnet-4", "messages": [{"role":"user","content":"hi"}]});
+    let mut stream = std::pin::pin!(p.chat_stream(body).await.unwrap());
+    let mut acc = ToolCallAccumulator::default();
+    let mut saw_text = false;
+    while let Some(ev) = stream.next().await {
+        match ev.unwrap() {
+            StreamEvent::Text(_) => saw_text = true,
+            StreamEvent::ToolCallDelta {
+                index,
+                id,
+                name,
+                arguments,
+            } => acc.push(index, id, name, &arguments),
+            _ => {}
+        }
+    }
+    let calls = acc.finish();
+    assert!(saw_text);
+    assert_eq!(
+        calls.len(),
+        1,
+        "sparse index must not create empty calls: {calls:?}"
+    );
+    assert_eq!(calls[0].id, "toolu_1");
+    assert_eq!(calls[0].name, "fs.read");
+    assert_eq!(calls[0].arguments, "{\"p\":1}");
+}
+
+#[tokio::test]
+async fn anthropic_midstream_error_propagates() {
+    use futures::StreamExt;
+    // An `error` event mid-stream must surface as Err, not end the turn
+    // as if it completed.
+    let base = mock_anthropic_sse(concat!(
+        "data: {\"type\":\"content_block_start\",\"index\":0,\"content_block\":{\"type\":\"text\",\"text\":\"\"}}\n\n",
+        "data: {\"type\":\"content_block_delta\",\"index\":0,\"delta\":{\"type\":\"text_delta\",\"text\":\"partial\"}}\n\n",
+        "data: {\"type\":\"error\",\"error\":{\"type\":\"overloaded_error\",\"message\":\"Overloaded\"}}\n\n",
+    ))
+    .await;
+    let p = damon_core::provider::Provider::new("claude", &provider("anthropic-messages", &base))
+        .unwrap();
+    let body = json!({"model": "claude-sonnet-4", "messages": [{"role":"user","content":"hi"}]});
+    let mut stream = std::pin::pin!(p.chat_stream(body).await.unwrap());
+    let mut saw_err = false;
+    while let Some(ev) = stream.next().await {
+        if let Err(e) = ev {
+            assert!(e.to_string().contains("Overloaded"), "got {e}");
+            saw_err = true;
+        }
+    }
+    assert!(saw_err, "mid-stream error event must surface as Err");
+}
+
+/// Mock Responses SSE endpoint.
+async fn mock_responses_sse(sse: &'static str) -> String {
+    let app = Router::new().route(
+        "/responses",
+        post(move || async move {
+            Response::builder()
+                .header("content-type", "text/event-stream")
+                .body(Body::from(sse))
+                .unwrap()
+        }),
+    );
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    tokio::spawn(async move {
+        axum::serve(listener, app).await.unwrap();
+    });
+    format!("http://{addr}")
+}
+
+#[tokio::test]
+async fn responses_reasoning_before_function_call_yields_single_call() {
+    use damon_core::llm::{StreamEvent, ToolCallAccumulator};
+    use futures::StreamExt;
+    // reasoning@0 then function_call@1: output_index is sparse.
+    let base = mock_responses_sse(concat!(
+        "data: {\"type\":\"response.output_item.added\",\"output_index\":0,\"item\":{\"type\":\"reasoning\"}}\n\n",
+        "data: {\"type\":\"response.output_item.added\",\"output_index\":1,\"item\":{\"type\":\"function_call\",\"call_id\":\"fc_1\",\"name\":\"fs.read\"}}\n\n",
+        "data: {\"type\":\"response.function_call_arguments.delta\",\"output_index\":1,\"delta\":\"{\\\"p\\\":1}\"}\n\n",
+        "data: {\"type\":\"response.completed\",\"response\":{\"status\":\"completed\",\"output\":[{\"type\":\"function_call\"}],\"usage\":{\"input_tokens\":1,\"output_tokens\":2}}}\n\n",
+    ))
+    .await;
+    let p =
+        damon_core::provider::Provider::new("o3", &provider("openai-responses", &base)).unwrap();
+    let body = json!({"model": "o3", "messages": [{"role":"user","content":"hi"}]});
+    let mut stream = std::pin::pin!(p.chat_stream(body).await.unwrap());
+    let mut acc = ToolCallAccumulator::default();
+    while let Some(ev) = stream.next().await {
+        if let StreamEvent::ToolCallDelta {
+            index,
+            id,
+            name,
+            arguments,
+        } = ev.unwrap()
+        {
+            acc.push(index, id, name, &arguments);
+        }
+    }
+    let calls = acc.finish();
+    assert_eq!(
+        calls.len(),
+        1,
+        "sparse output_index must not create empty calls: {calls:?}"
+    );
+    assert_eq!(calls[0].id, "fc_1");
+    assert_eq!(calls[0].name, "fs.read");
+}
+
+#[tokio::test]
+async fn responses_failed_propagates_error() {
+    use futures::StreamExt;
+    let base = mock_responses_sse("data: {\"type\":\"response.failed\",\"response\":{\"status\":\"failed\",\"error\":{\"message\":\"model exploded\"}}}\n\n")
+    .await;
+    let p =
+        damon_core::provider::Provider::new("o3", &provider("openai-responses", &base)).unwrap();
+    let body = json!({"model": "o3", "messages": [{"role":"user","content":"hi"}]});
+    let mut stream = std::pin::pin!(p.chat_stream(body).await.unwrap());
+    let mut saw_err = false;
+    while let Some(ev) = stream.next().await {
+        if let Err(e) = ev {
+            assert!(e.to_string().contains("model exploded"), "got {e}");
+            saw_err = true;
+        }
+    }
+    assert!(saw_err, "response.failed must surface as Err");
+}
+
+/// Mock Gemini SSE endpoint.
+async fn mock_gemini_sse(sse: &'static str) -> String {
+    let app = Router::new().route(
+        "/v1beta/models/g:streamGenerateContent",
+        post(move || async move {
+            Response::builder()
+                .header("content-type", "text/event-stream")
+                .body(Body::from(sse))
+                .unwrap()
+        }),
+    );
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    tokio::spawn(async move {
+        axum::serve(listener, app).await.unwrap();
+    });
+    format!("http://{addr}")
+}
+
+#[tokio::test]
+async fn gemini_midstream_error_propagates() {
+    use futures::StreamExt;
+    let base = mock_gemini_sse(concat!(
+        "data: {\"candidates\":[{\"content\":{\"parts\":[{\"text\":\"partial\"}]}}]}\n\n",
+        "data: {\"error\":{\"code\":500,\"message\":\"backend exploded\"}}\n\n",
+    ))
+    .await;
+    let p = damon_core::provider::Provider::new("g", &provider("gemini", &base)).unwrap();
+    let body = json!({"model": "g", "messages": [{"role":"user","content":"hi"}]});
+    let mut stream = std::pin::pin!(p.chat_stream(body).await.unwrap());
+    let mut saw_err = false;
+    while let Some(ev) = stream.next().await {
+        if let Err(e) = ev {
+            assert!(e.to_string().contains("backend exploded"), "got {e}");
+            saw_err = true;
+        }
+    }
+    assert!(saw_err, "gemini error payload must surface as Err");
+}
+
+#[tokio::test]
+async fn anthropic_nonstream_tool_call_finish_reason() {
+    // A non-streaming response with tool_use must report
+    // finish_reason "tool_calls" — a hardcoded "stop" breaks the
+    // tool loop for /v1 clients.
+    let captured = Arc::new(tokio::sync::Mutex::new(Vec::<Value>::new()));
+    let app = Router::new().route(
+        "/v1/messages",
+        post(move || async move {
+            Response::builder()
+                .header("content-type", "application/json")
+                .body(Body::from(
+                    r#"{"content":[{"type":"tool_use","id":"t1","name":"fs__read","input":{"p":1}}],"stop_reason":"tool_use","usage":{}}"#,
+                ))
+                .unwrap()
+        }),
+    );
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    tokio::spawn(async move {
+        axum::serve(listener, app).await.unwrap();
+    });
+    let _ = captured;
+    let p = damon_core::provider::Provider::new(
+        "claude",
+        &provider("anthropic-messages", &format!("http://{addr}")),
+    )
+    .unwrap();
+    let body = json!({"model": "claude-sonnet-4", "messages": [{"role":"user","content":"hi"}]});
+    let resp = p.chat(body).await.unwrap();
+    assert_eq!(resp["choices"][0]["finish_reason"], "tool_calls");
+    assert_eq!(
+        resp["choices"][0]["message"]["tool_calls"][0]["function"]["name"],
+        "fs.read"
+    );
+}
+
+#[tokio::test]
+async fn accumulator_drops_empty_slots() {
+    // Direct unit coverage: a sparse index must not leave a fake call.
+    use damon_core::llm::ToolCallAccumulator;
+    let mut acc = ToolCallAccumulator::default();
+    acc.push(1, Some("id1".into()), Some("n".into()), "{}");
+    let calls = acc.finish();
+    assert_eq!(calls.len(), 1);
+    assert_eq!(calls[0].id, "id1");
 }

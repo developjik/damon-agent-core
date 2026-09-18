@@ -40,8 +40,16 @@ pub async fn discover_all(
 
     // Implicit ollama: probe the default local endpoint when unconfigured.
     if !cfg.providers.contains_key("ollama") {
+        // OLLAMA_HOST is conventionally `host:port` without a scheme —
+        // reqwest rejects it as a relative URL, which would silently
+        // disable implicit discovery. Default to http:// when absent.
         let base =
             std::env::var("OLLAMA_HOST").unwrap_or_else(|_| "http://127.0.0.1:11434".to_string());
+        let base = if base.contains("://") {
+            base
+        } else {
+            format!("http://{base}")
+        };
         match probe_ollama(&base).await {
             Ok(ids) if !ids.is_empty() => {
                 debug!(count = ids.len(), "implicit ollama discovered");
@@ -63,6 +71,12 @@ pub async fn discover_all(
                 }
             }
             Ok(_) => {}
+            // Explicitly-set OLLAMA_HOST failing is a misconfiguration
+            // worth surfacing; the default probe failing just means
+            // ollama isn't installed — keep that quiet.
+            Err(e) if std::env::var_os("OLLAMA_HOST").is_some() => {
+                warn!(error = %e, "OLLAMA_HOST is set but the probe failed")
+            }
             Err(e) => debug!(error = %e, "implicit ollama probe failed"),
         }
     }
@@ -91,15 +105,27 @@ async fn discover(name: &str, cfg: &ProviderConfig, kind: &str) -> anyhow::Resul
 async fn probe_openai_models(base: &str, cfg: &ProviderConfig) -> anyhow::Result<Vec<String>> {
     let client = reqwest::Client::builder().timeout(PROBE_TIMEOUT).build()?;
     let mut req = client.get(format!("{}/models", base.trim_end_matches('/')));
-    if let Some(raw) = &cfg.api_key {
-        if let Ok(key) = SecretRef::parse(raw).and_then(|r| r.resolve()) {
-            req = req.bearer_auth(key);
-        }
+    if let Some(raw) = &cfg.api_key
+        && let Ok(key) = SecretRef::parse(raw).and_then(|r| r.resolve())
+    {
+        req = req.bearer_auth(key);
     }
     // Custom headers (gateway tokens etc.) apply to probes too — a
-    // header-authenticating proxy must not fail discovery.
+    // header-authenticating proxy must not fail discovery. Values may be
+    // secret refs (env:/keychain:/!cmd) exactly like Provider::new —
+    // sending "env:FOO" literally would leak the reference AND fail auth.
     for (k, v) in &cfg.headers {
-        req = req.header(k, v);
+        let resolved = match SecretRef::parse(v) {
+            Ok(r) => match r.resolve() {
+                Ok(s) => s,
+                Err(e) => {
+                    warn!(provider_header = %k, error = %e, "discovery header unresolvable; skipped");
+                    continue;
+                }
+            },
+            Err(_) => v.clone(),
+        };
+        req = req.header(k, resolved);
     }
     let v: Value = req
         .send()

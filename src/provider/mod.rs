@@ -17,6 +17,52 @@ use serde_json::Value;
 use crate::config::{Config, ProviderConfig, SecretRef};
 use crate::llm::StreamEvent;
 
+/// How long dialing a provider may take before the request is abandoned.
+const CONNECT_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(15);
+
+/// Upstream asked us to back off (HTTP 429/529). Carries the server's
+/// Retry-After hint so callers can wait before retrying instead of
+/// failing the turn outright.
+#[derive(Debug)]
+pub struct RateLimited(pub std::time::Duration);
+
+impl std::fmt::Display for RateLimited {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "rate limited; retry after {:.0}s", self.0.as_secs_f64())
+    }
+}
+
+impl std::error::Error for RateLimited {}
+
+/// Extract a Retry-After hint (seconds) from a response, capped at 60s.
+pub(crate) fn retry_after(resp: &reqwest::Response) -> std::time::Duration {
+    let secs = resp
+        .headers()
+        .get("retry-after")
+        .and_then(|v| v.to_str().ok())
+        .and_then(|v| v.parse::<f64>().ok())
+        .unwrap_or(2.0);
+    std::time::Duration::from_secs_f64(secs.min(60.0))
+}
+
+/// Idle budget per read on a provider response — covers time-to-first-byte
+/// AND mid-stream stalls. Without it a wedged upstream (black-holed TCP,
+/// hung gateway) parks a turn forever: the caller's stall timer only arms
+/// once the response stream exists. Generous so slow models thinking
+/// before their first token are never killed.
+const READ_IDLE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(120);
+
+/// Provider HTTP client with hard connect + read-idle bounds. Never
+/// `Client::new()`: reqwest has no default timeout, so an unbounded await
+/// on `chat_stream` cannot be cancelled or timed out.
+pub(crate) fn http_client() -> reqwest::Client {
+    reqwest::Client::builder()
+        .connect_timeout(CONNECT_TIMEOUT)
+        .read_timeout(READ_IDLE_TIMEOUT)
+        .build()
+        .expect("provider HTTP client config is valid")
+}
+
 /// A provider backend. `openai-completions` passes bytes through with
 /// compat shaping; `openai-responses`/`anthropic-messages`/`gemini`
 /// translate to/from the OpenAI schema.

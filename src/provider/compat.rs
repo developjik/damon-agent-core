@@ -30,12 +30,11 @@ pub fn apply(body: &mut Value, compat: &ProviderCompat) {
     }
 
     // max_tokens field rename
-    if let Some(field) = &compat.max_tokens_field {
-        if field != "max_tokens" {
-            if let Some(v) = obj.remove("max_tokens") {
-                obj.insert(field.clone().into(), v);
-            }
-        }
+    if let Some(field) = &compat.max_tokens_field
+        && field != "max_tokens"
+        && let Some(v) = obj.remove("max_tokens")
+    {
+        obj.insert(field.clone(), v);
     }
 
     // streaming usage
@@ -50,7 +49,7 @@ pub fn apply(body: &mut Value, compat: &ProviderCompat) {
 
     // extra_body merge (top-level keys)
     for (k, v) in &compat.extra_body {
-        obj.insert(k.clone().into(), v.clone());
+        obj.insert(k.clone(), v.clone());
     }
 
     // message-level transforms
@@ -92,30 +91,29 @@ fn shape_messages(messages: &mut Vec<Value>, compat: &ProviderCompat) {
         }
 
         // tool result name
-        if compat.requires_tool_result_name && role == "tool" {
-            if let Some(id) = m["tool_call_id"].as_str() {
-                if let Some(name) = names.get(id) {
-                    m.as_object_mut()
-                        .unwrap()
-                        .insert("name".into(), Value::String(name.clone()));
-                }
-            }
+        if compat.requires_tool_result_name
+            && role == "tool"
+            && let Some(id) = m["tool_call_id"].as_str()
+            && let Some(name) = names.get(id)
+        {
+            m.as_object_mut()
+                .unwrap()
+                .insert("name".into(), Value::String(name.clone()));
         }
 
         // coalesce consecutive same-role messages when the endpoint
         // can't handle multiple system/developer entries
-        if !compat.supports_multiple_system_messages {
-            if let Some(prev) = out.last_mut() {
-                let prev_role = prev["role"].as_str().unwrap_or("");
-                let cur_role = m["role"].as_str().unwrap_or("");
-                let mergeable =
-                    matches!(prev_role, "system" | "developer") && prev_role == cur_role;
-                if mergeable {
-                    let prev_text = prev["content"].as_str().unwrap_or("").to_string();
-                    let cur_text = m["content"].as_str().unwrap_or("");
-                    prev["content"] = Value::String(format!("{prev_text}\n{cur_text}"));
-                    continue;
-                }
+        if !compat.supports_multiple_system_messages
+            && let Some(prev) = out.last_mut()
+        {
+            let prev_role = prev["role"].as_str().unwrap_or("");
+            let cur_role = m["role"].as_str().unwrap_or("");
+            let mergeable = matches!(prev_role, "system" | "developer") && prev_role == cur_role;
+            if mergeable {
+                let prev_text = crate::provider::content_text(&prev["content"]);
+                let cur_text = crate::provider::content_text(&m["content"]);
+                prev["content"] = Value::String(format!("{prev_text}\n{cur_text}"));
+                continue;
             }
         }
 
@@ -126,7 +124,7 @@ fn shape_messages(messages: &mut Vec<Value>, compat: &ProviderCompat) {
 
 /// Rewrite every tool_call id and tool_call_id to a 9-char alphanumeric
 /// form, keeping call→result pairing consistent.
-fn normalize_tool_ids(messages: &mut Vec<Value>) {
+fn normalize_tool_ids(messages: &mut [Value]) {
     let mut map: HashMap<String, String> = HashMap::new();
     for m in messages.iter_mut() {
         if m["role"].as_str() == Some("assistant") {
@@ -140,12 +138,11 @@ fn normalize_tool_ids(messages: &mut Vec<Value>) {
         }
     }
     for m in messages.iter_mut() {
-        if m["role"].as_str() == Some("tool") {
-            if let Some(id) = m["tool_call_id"].as_str() {
-                if let Some(short) = map.get(id) {
-                    m["tool_call_id"] = Value::String(short.clone());
-                }
-            }
+        if m["role"].as_str() == Some("tool")
+            && let Some(id) = m["tool_call_id"].as_str()
+            && let Some(short) = map.get(id)
+        {
+            m["tool_call_id"] = Value::String(short.clone());
         }
     }
 }

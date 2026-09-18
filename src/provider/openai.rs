@@ -46,7 +46,7 @@ impl OpenAiCompat {
         Ok(Self {
             name: name.to_string(),
             base_url: base_url.trim_end_matches('/').to_string(),
-            client: reqwest::Client::new(),
+            client: super::http_client(),
             auth,
             headers,
             compat,
@@ -61,6 +61,41 @@ impl OpenAiCompat {
         self.headers
             .iter()
             .fold(req, |r, (k, v)| r.header(k.clone(), v.clone()))
+    }
+
+    /// Mangle every tool name in the request body and return the
+    /// mangled→original map for restoring response tool_calls. A map —
+    /// not a textual reverse — because hash-shortened names don't invert.
+    /// In-band tools render as text, so callers skip this entirely.
+    fn mangle_tool_names(body: &mut Value) -> std::collections::HashMap<String, String> {
+        let mut map = std::collections::HashMap::new();
+        if let Some(tools) = body.get_mut("tools").and_then(|t| t.as_array_mut()) {
+            for t in tools {
+                if let Some(n) = t.get_mut("function").and_then(|f| f.get_mut("name")) {
+                    mangle_name(n, &mut map);
+                }
+            }
+        }
+        // Replayed assistant tool_calls and an explicit tool_choice carry
+        // the same names — upstream validates them too.
+        if let Some(msgs) = body.get_mut("messages").and_then(|m| m.as_array_mut()) {
+            for m in msgs {
+                if let Some(calls) = m.get_mut("tool_calls").and_then(|c| c.as_array_mut()) {
+                    for c in calls {
+                        if let Some(n) = c.get_mut("function").and_then(|f| f.get_mut("name")) {
+                            mangle_name(n, &mut map);
+                        }
+                    }
+                }
+            }
+        }
+        if let Some(tc) = body.get_mut("tool_choice")
+            && tc["type"].as_str() == Some("function")
+            && let Some(n) = tc.get_mut("function").and_then(|f| f.get_mut("name"))
+        {
+            mangle_name(n, &mut map);
+        }
+        map
     }
 
     pub async fn forward(
@@ -104,34 +139,34 @@ impl OpenAiCompat {
 
         // Strict-tools fallback: a 400 mentioning "strict" on a request that
         // carried strict tools retries once without the field.
-        if resp.status() == reqwest::StatusCode::BAD_REQUEST {
-            if let Some(v) = &shaped {
-                let has_strict = v["tools"]
-                    .as_array()
-                    .is_some_and(|tools| tools.iter().any(|t| t["strict"].as_bool() == Some(true)));
-                if has_strict {
-                    let status = resp.status();
-                    let err = resp.text().await.unwrap_or_default();
-                    if err.contains("strict") {
-                        let mut retry = v.clone();
-                        if let Some(tools) = retry["tools"].as_array_mut() {
-                            for t in tools.iter_mut() {
-                                t.as_object_mut().map(|o| o.remove("strict"));
-                            }
+        if resp.status() == reqwest::StatusCode::BAD_REQUEST
+            && let Some(v) = &shaped
+        {
+            let has_strict = v["tools"]
+                .as_array()
+                .is_some_and(|tools| tools.iter().any(|t| t["strict"].as_bool() == Some(true)));
+            if has_strict {
+                let status = resp.status();
+                let err = resp.text().await.unwrap_or_default();
+                if err.contains("strict") {
+                    let mut retry = v.clone();
+                    if let Some(tools) = retry["tools"].as_array_mut() {
+                        for t in tools.iter_mut() {
+                            t.as_object_mut().map(|o| o.remove("strict"));
                         }
-                        resp = send(Bytes::from(retry.to_string()))
-                            .await
-                            .context("upstream request failed")?;
-                    } else {
-                        // Rebuild a response carrying the buffered error body.
-                        return Ok(UpstreamResponse {
-                            status,
-                            content_type: "application/json".into(),
-                            stream: Box::pin(futures::stream::once(
-                                async move { Ok(Bytes::from(err)) },
-                            )),
-                        });
                     }
+                    resp = send(Bytes::from(retry.to_string()))
+                        .await
+                        .context("upstream request failed")?;
+                } else {
+                    // Rebuild a response carrying the buffered error body.
+                    return Ok(UpstreamResponse {
+                        status,
+                        content_type: "application/json".into(),
+                        stream: Box::pin(futures::stream::once(
+                            async move { Ok(Bytes::from(err)) },
+                        )),
+                    });
                 }
             }
         }
@@ -158,6 +193,13 @@ impl OpenAiCompat {
     {
         let mut body = body;
         body["stream"] = Value::Bool(true);
+        // MCP names (`server.tool`) violate the OpenAI function-name spec
+        // `^[a-zA-Z0-9_-]{1,64}$` — strict endpoints 400 on the dot.
+        let names = if self.compat.inband_tools {
+            std::collections::HashMap::new()
+        } else {
+            Self::mangle_tool_names(&mut body)
+        };
         let up = self
             .forward(
                 reqwest::Method::POST,
@@ -165,6 +207,11 @@ impl OpenAiCompat {
                 Bytes::from(body.to_string()),
             )
             .await?;
+        if up.status == reqwest::StatusCode::TOO_MANY_REQUESTS {
+            // UpstreamResponse carries no headers — use a fixed short
+            // backoff; the caller retries once.
+            return Err(crate::provider::RateLimited(std::time::Duration::from_secs(2)).into());
+        }
         if !up.status.is_success() {
             let buf = crate::provider::collect_stream(up.stream).await?;
             bail!("upstream {}: {}", up.status, String::from_utf8_lossy(&buf));
@@ -183,11 +230,36 @@ impl OpenAiCompat {
                     .map(Ok),
             )));
         }
-        Ok(Box::new(sse_events(up.stream)))
+        let stream = sse_events(up.stream);
+        if names.is_empty() {
+            return Ok(Box::new(stream));
+        }
+        // Restore original tool names in streamed ToolCallDeltas.
+        Ok(Box::new(stream.map(move |res| {
+            res.map(|ev| match ev {
+                StreamEvent::ToolCallDelta {
+                    index,
+                    id,
+                    name,
+                    arguments,
+                } => StreamEvent::ToolCallDelta {
+                    index,
+                    id,
+                    name: name.map(|n| names.get(&n).cloned().unwrap_or(n)),
+                    arguments,
+                },
+                ev => ev,
+            })
+        })))
     }
 
     pub async fn chat(&self, mut body: Value) -> anyhow::Result<Value> {
         body["stream"] = Value::Bool(false);
+        let names = if self.compat.inband_tools {
+            std::collections::HashMap::new()
+        } else {
+            Self::mangle_tool_names(&mut body)
+        };
         let up = self
             .forward(
                 reqwest::Method::POST,
@@ -195,6 +267,9 @@ impl OpenAiCompat {
                 Bytes::from(body.to_string()),
             )
             .await?;
+        if up.status == reqwest::StatusCode::TOO_MANY_REQUESTS {
+            return Err(crate::provider::RateLimited(std::time::Duration::from_secs(2)).into());
+        }
         let buf = crate::provider::collect_stream(up.stream).await?;
         if !up.status.is_success() {
             bail!("upstream {}: {}", up.status, String::from_utf8_lossy(&buf));
@@ -202,6 +277,8 @@ impl OpenAiCompat {
         let mut v: Value = serde_json::from_slice(&buf)?;
         if self.compat.inband_tools {
             crate::provider::inband::response_with_tool_calls(&mut v);
+        } else {
+            unmangle_tool_calls(&mut v, &names);
         }
         Ok(v)
     }
@@ -211,7 +288,68 @@ impl OpenAiCompat {
             .forward(reqwest::Method::GET, "/models", Bytes::new())
             .await?;
         let buf = crate::provider::collect_stream(up.stream).await?;
+        if !up.status.is_success() {
+            bail!("upstream {}: {}", up.status, String::from_utf8_lossy(&buf));
+        }
         Ok(serde_json::from_slice(&buf)?)
+    }
+}
+
+/// Mangle one name value in place; record the mapping when it changed.
+fn mangle_name(v: &mut Value, map: &mut std::collections::HashMap<String, String>) {
+    let Some(name) = v.as_str() else {
+        return;
+    };
+    let mangled = mangle(name);
+    if mangled != name {
+        map.insert(mangled.clone(), name.to_string());
+        *v = Value::String(mangled);
+    }
+}
+
+/// `server.tool` → `server__tool`; other characters outside
+/// `[a-zA-Z0-9_-]` → `_`. Names over 64 chars get a `__<sha256[:8]>`
+/// suffix so they still fit the OpenAI limit.
+fn mangle(name: &str) -> String {
+    let mut m = String::with_capacity(name.len());
+    for c in name.chars() {
+        match c {
+            '.' => m.push_str("__"),
+            c if c.is_ascii_alphanumeric() || c == '_' || c == '-' => m.push(c),
+            _ => m.push('_'),
+        }
+    }
+    if m.chars().count() > 64 {
+        use sha2::Digest;
+        let digest = sha2::Sha256::digest(name.as_bytes());
+        let hash: String = digest[..4].iter().map(|b| format!("{b:02x}")).collect();
+        let prefix: String = m.chars().take(54).collect();
+        m = format!("{prefix}__{hash}");
+    }
+    m
+}
+
+/// Restore original tool names in a non-streaming chat-completions
+/// response (`choices[].message.tool_calls[].function.name`).
+fn unmangle_tool_calls(v: &mut Value, map: &std::collections::HashMap<String, String>) {
+    let Some(choices) = v.get_mut("choices").and_then(|c| c.as_array_mut()) else {
+        return;
+    };
+    for choice in choices {
+        let Some(calls) = choice
+            .get_mut("message")
+            .and_then(|m| m.get_mut("tool_calls"))
+            .and_then(|t| t.as_array_mut())
+        else {
+            continue;
+        };
+        for call in calls {
+            if let Some(n) = call.get_mut("function").and_then(|f| f.get_mut("name"))
+                && let Some(orig) = n.as_str().and_then(|s| map.get(s)).cloned()
+            {
+                *n = Value::String(orig);
+            }
+        }
     }
 }
 
@@ -235,14 +373,29 @@ pub fn sse_events(
             std::collections::VecDeque::<anyhow::Result<StreamEvent>>::new(),
             false,
             crate::llm::StopReason::Other,
+            // A terminal marker ([DONE] or a finish_reason) distinguishes a
+            // completed stream from a truncated one — EOF without it is an
+            // error, not a clean Done.
+            false,
         ),
-        |(mut stream, mut buf, mut data_lines, mut pending, mut done, mut finish)| async move {
+        |(
+            mut stream,
+            mut buf,
+            mut data_lines,
+            mut pending,
+            mut done,
+            mut finish,
+            mut saw_terminal,
+        )| async move {
             // Drain queued events from a multi-event chunk first.
             if let Some(res) = pending.pop_front() {
                 if matches!(res, Ok(StreamEvent::Done(_))) {
                     done = true;
                 }
-                return Some((res, (stream, buf, data_lines, pending, done, finish)));
+                return Some((
+                    res,
+                    (stream, buf, data_lines, pending, done, finish, saw_terminal),
+                ));
             }
             if done {
                 return None;
@@ -256,7 +409,7 @@ pub fn sse_events(
                         .to_string();
                     buf.drain(..=pos);
                     if line.is_empty() {
-                        match flush_event(&mut data_lines, &mut finish) {
+                        match flush_event(&mut data_lines, &mut finish, &mut saw_terminal) {
                             Some(Ok(evs)) => {
                                 let mut it = evs.into_iter();
                                 if let Some(first) = it.next() {
@@ -268,14 +421,22 @@ pub fn sse_events(
                                     }
                                     return Some((
                                         Ok(first),
-                                        (stream, buf, data_lines, pending, done, finish),
+                                        (
+                                            stream,
+                                            buf,
+                                            data_lines,
+                                            pending,
+                                            done,
+                                            finish,
+                                            saw_terminal,
+                                        ),
                                     ));
                                 }
                             }
                             Some(Err(e)) => {
                                 return Some((
                                     Err(e),
-                                    (stream, buf, data_lines, pending, done, finish),
+                                    (stream, buf, data_lines, pending, done, finish, saw_terminal),
                                 ));
                             }
                             None => {}
@@ -293,7 +454,7 @@ pub fn sse_events(
                         done = true;
                         return Some((
                             Err(e.into()),
-                            (stream, buf, data_lines, pending, done, finish),
+                            (stream, buf, data_lines, pending, done, finish, saw_terminal),
                         ));
                     }
                     None => {
@@ -308,7 +469,7 @@ pub fn sse_events(
                                 data_lines.push(data.trim().to_string());
                             }
                         }
-                        match flush_event(&mut data_lines, &mut finish) {
+                        match flush_event(&mut data_lines, &mut finish, &mut saw_terminal) {
                             Some(Ok(evs)) => {
                                 let mut it = evs.into_iter();
                                 if let Some(first) = it.next() {
@@ -320,22 +481,40 @@ pub fn sse_events(
                                     }
                                     return Some((
                                         Ok(first),
-                                        (stream, buf, data_lines, pending, done, finish),
+                                        (
+                                            stream,
+                                            buf,
+                                            data_lines,
+                                            pending,
+                                            done,
+                                            finish,
+                                            saw_terminal,
+                                        ),
                                     ));
                                 }
                             }
                             Some(Err(e)) => {
                                 return Some((
                                     Err(e),
-                                    (stream, buf, data_lines, pending, done, finish),
+                                    (stream, buf, data_lines, pending, done, finish, saw_terminal),
                                 ));
                             }
                             None => {}
                         }
                         done = true;
+                        // EOF without a terminal marker ([DONE] or a
+                        // finish_reason) is a truncated stream — surface
+                        // an error so the caller can retry, not a clean
+                        // Done that persists partial text as finished.
+                        if !saw_terminal {
+                            return Some((
+                                Err(anyhow::anyhow!("stream ended without terminal event")),
+                                (stream, buf, data_lines, pending, done, finish, saw_terminal),
+                            ));
+                        }
                         return Some((
                             Ok(StreamEvent::Done(finish)),
-                            (stream, buf, data_lines, pending, done, finish),
+                            (stream, buf, data_lines, pending, done, finish, saw_terminal),
                         ));
                     }
                 }
@@ -343,13 +522,10 @@ pub fn sse_events(
         },
     ))
 }
-
-/// Flush one complete SSE event (the accumulated `data:` lines joined
-/// with `\n`). `Some(Ok(evs))` = emit these events; `None` = absorbed
-/// (finish_reason update or a skippable chunk).
 fn flush_event(
     data_lines: &mut Vec<String>,
     finish: &mut crate::llm::StopReason,
+    saw_terminal: &mut bool,
 ) -> Option<anyhow::Result<Vec<StreamEvent>>> {
     let data = data_lines.join("\n");
     data_lines.clear();
@@ -357,12 +533,14 @@ fn flush_event(
         return None;
     }
     if data == "[DONE]" {
+        *saw_terminal = true;
         return Some(Ok(vec![StreamEvent::Done(*finish)]));
     }
     match parse_chunk(&data) {
         Ok(parsed) => {
             if let Some(r) = parsed.finish {
                 *finish = r;
+                *saw_terminal = true;
             }
             if parsed.events.is_empty() {
                 None
@@ -403,17 +581,17 @@ fn parse_chunk(data: &str) -> anyhow::Result<Parsed> {
 
     // Reasoning deltas (DeepSeek-R1, OpenRouter, z.ai).
     for field in ["reasoning_content", "reasoning", "reasoning_text"] {
-        if let Some(t) = delta[field].as_str() {
-            if !t.is_empty() {
-                out.events.push(StreamEvent::Thinking(t.to_string()));
-            }
+        if let Some(t) = delta[field].as_str()
+            && !t.is_empty()
+        {
+            out.events.push(StreamEvent::Thinking(t.to_string()));
         }
     }
 
-    if let Some(text) = delta["content"].as_str() {
-        if !text.is_empty() {
-            out.events.push(StreamEvent::Text(text.to_string()));
-        }
+    if let Some(text) = delta["content"].as_str()
+        && !text.is_empty()
+    {
+        out.events.push(StreamEvent::Text(text.to_string()));
     }
     if let Some(calls) = delta["tool_calls"].as_array() {
         for call in calls {

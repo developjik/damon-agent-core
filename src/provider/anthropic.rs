@@ -45,7 +45,7 @@ impl Anthropic {
         Ok(Self {
             name: name.to_string(),
             base_url: base_url.trim_end_matches('/').to_string(),
-            client: reqwest::Client::new(),
+            client: super::http_client(),
             key,
             oauth,
             headers,
@@ -81,12 +81,49 @@ impl Anthropic {
         req
     }
 
-    /// OpenAI messages/tools → Anthropic request body.
-    fn translate_request(&self, body: &Value, stream: bool) -> anyhow::Result<Value> {
+    /// OpenAI messages/tools → Anthropic request body. Also returns the
+    /// request's mangled→original tool-name map: `mangle` rewrites every
+    /// `.`, so a one-shot `replacen` cannot restore multi-dot names —
+    /// responses must be unmangled through this map.
+    fn translate_request(
+        &self,
+        body: &Value,
+        stream: bool,
+    ) -> anyhow::Result<(Value, std::collections::HashMap<String, String>)> {
         let model = body["model"].as_str().context("missing model")?;
         let mut system = Vec::new();
         let mut messages = Vec::new();
+        let mut names = std::collections::HashMap::new();
 
+        // Set when an assistant tool-use turn arrives without its
+        // thinking blocks (OpenAI-wire clients can't carry them).
+        let mut tool_turn_missing_thinking = false;
+        // OpenAI histories store one role:"tool" row per call, and /v1
+        // clients may send adjacent user/assistant rows. Anthropic
+        // rejects consecutive same-role messages with a 400, so fold
+        // each run of user/tool rows into ONE user message — tool_result
+        // blocks leading, as the API requires — and each run of
+        // assistant rows into a single assistant message.
+        fn flush(
+            messages: &mut Vec<Value>,
+            role: &str,
+            results: &mut Vec<Value>,
+            others: &mut Vec<Value>,
+        ) {
+            if role.is_empty() {
+                return;
+            }
+            let mut content = std::mem::take(results);
+            content.append(others);
+            // Anthropic 400s on an empty content array — a folded
+            // message with no surviving blocks is dropped entirely.
+            if !content.is_empty() {
+                messages.push(json!({ "role": role, "content": content }));
+            }
+        }
+        let mut cur_role = "";
+        let mut cur_results: Vec<Value> = Vec::new();
+        let mut cur_others: Vec<Value> = Vec::new();
         for m in body["messages"].as_array().cloned().unwrap_or_default() {
             match m["role"].as_str() {
                 Some("system") => {
@@ -95,48 +132,80 @@ impl Anthropic {
                         system.push(t);
                     }
                 }
-                Some("user") => messages.push(json!({
-                    "role": "user",
-                    "content": [{"type": "text", "text": super::content_text(&m["content"])}],
-                })),
+                Some("user" | "tool") => {
+                    if cur_role != "user" {
+                        flush(&mut messages, cur_role, &mut cur_results, &mut cur_others);
+                        cur_role = "user";
+                    }
+                    if m["role"].as_str() == Some("tool") {
+                        cur_results.push(json!({
+                            "type": "tool_result",
+                            "tool_use_id": m["tool_call_id"],
+                            "content": super::content_text(&m["content"]),
+                        }));
+                    } else {
+                        // Anthropic 400s on empty text blocks — a user
+                        // message with no text (or only non-text parts)
+                        // must not emit one.
+                        let t = super::content_text(&m["content"]);
+                        if !t.is_empty() {
+                            cur_others.push(json!({
+                                "type": "text",
+                                "text": t,
+                            }));
+                        }
+                    }
+                }
                 Some("assistant") => {
                     let mut content = Vec::new();
+                    let thinking_blocks = m["thinking"].as_array().cloned().unwrap_or_default();
+                    let tool_calls = m["tool_calls"].as_array().cloned().unwrap_or_default();
+                    // Anthropic demands thinking blocks replayed before
+                    // tool_use when thinking is enabled. OpenAI-wire
+                    // clients (/v1) cannot echo them back — their history
+                    // would 400 every later turn, so drop thinking for
+                    // such requests instead.
+                    if !tool_calls.is_empty() && thinking_blocks.is_empty() {
+                        tool_turn_missing_thinking = true;
+                    }
                     // Replay persisted thinking blocks first — Anthropic
                     // requires them verbatim (signature included) when
                     // thinking is enabled and the turn used tools.
-                    for b in m["thinking"].as_array().cloned().unwrap_or_default() {
+                    for b in thinking_blocks {
                         content.push(b);
                     }
                     let t = super::content_text(&m["content"]);
                     if !t.is_empty() {
                         content.push(json!({"type": "text", "text": t}));
                     }
-                    for tc in m["tool_calls"].as_array().cloned().unwrap_or_default() {
+                    for tc in tool_calls {
                         let f = &tc["function"];
+                        let orig = f["name"].as_str().unwrap_or("");
+                        let mangled = mangle(orig);
+                        names.insert(mangled.clone(), orig.to_string());
                         content.push(json!({
                             "type": "tool_use",
                             "id": tc["id"],
-                            "name": mangle(&f["name"].as_str().unwrap_or("")),
-                            "input": serde_json::from_str::<Value>(
-                                f["arguments"].as_str().unwrap_or("{}")
-                            ).unwrap_or(json!({})),
+                            "name": mangled,
+                            "input": match &f["arguments"] {
+                                // arguments may arrive as a JSON string
+                                // (OpenAI wire) or already an object.
+                                Value::String(s) => serde_json::from_str::<Value>(s)
+                                    .unwrap_or(json!({})),
+                                other => other.clone(),
+                            },
                         }));
                     }
-                    messages.push(json!({"role": "assistant", "content": content}));
-                }
-                Some("tool") => {
-                    messages.push(json!({
-                        "role": "user",
-                        "content": [{
-                            "type": "tool_result",
-                            "tool_use_id": m["tool_call_id"],
-                            "content": super::content_text(&m["content"]),
-                        }],
-                    }));
+                    if cur_role != "assistant" {
+                        flush(&mut messages, cur_role, &mut cur_results, &mut cur_others);
+                        cur_role = "assistant";
+                    }
+                    cur_others.append(&mut content);
                 }
                 _ => {}
             }
         }
+        flush(&mut messages, cur_role, &mut cur_results, &mut cur_others);
 
         let tools: Vec<Value> = body["tools"]
             .as_array()
@@ -145,8 +214,11 @@ impl Anthropic {
             .into_iter()
             .map(|t| {
                 let f = &t["function"];
+                let orig = f["name"].as_str().unwrap_or("");
+                let mangled = mangle(orig);
+                names.insert(mangled.clone(), orig.to_string());
                 json!({
-                    "name": mangle(f["name"].as_str().unwrap_or("")),
+                    "name": mangled,
                     "description": f["description"].as_str().unwrap_or(""),
                     "input_schema": f["parameters"].clone(),
                 })
@@ -159,6 +231,47 @@ impl Anthropic {
             "messages": messages,
             "stream": stream,
         });
+
+        // Sampling parameters pass through under Anthropic names.
+        for key in ["temperature", "top_p", "top_k"] {
+            if !body[key].is_null() {
+                out[key] = body[key].clone();
+            }
+        }
+        if let Some(stop) = body
+            .get("stop_sequences")
+            .or_else(|| body.get("stop"))
+            .filter(|v| !v.is_null())
+        {
+            out["stop_sequences"] = stop.clone();
+        }
+        // OpenAI tool_choice → Anthropic tool_choice. A function pick
+        // names a mangled tool, so record it in the name map too.
+        match &body["tool_choice"] {
+            Value::String(s) => {
+                let t = match s.as_str() {
+                    "auto" => Some("auto"),
+                    "required" => Some("any"),
+                    "none" => Some("none"),
+                    _ => None,
+                };
+                if let Some(t) = t {
+                    out["tool_choice"] = json!({"type": t});
+                }
+            }
+            Value::Object(_) if body["tool_choice"]["type"].as_str() == Some("function") => {
+                let orig = body["tool_choice"]["function"]["name"]
+                    .as_str()
+                    .unwrap_or("");
+                let mangled = mangle(orig);
+                names.insert(mangled.clone(), orig.to_string());
+                out["tool_choice"] = json!({"type": "tool", "name": mangled});
+            }
+            _ => {}
+        }
+        if let Some(user) = body["user"].as_str() {
+            out["metadata"] = json!({"user_id": user});
+        }
 
         // Thinking level: `model:low|medium|high` → thinking.budget_tokens.
         // max_tokens must exceed the budget.
@@ -178,6 +291,19 @@ impl Anthropic {
             }
         }
 
+        // A tool replay that can't carry thinking blocks would make
+        // every follow-up turn 400 — drop thinking for the whole
+        // request so the tool loop keeps working (thinking resumes on
+        // requests whose history is faithfully replayable).
+        if tool_turn_missing_thinking && out["thinking"].is_object() {
+            tracing::warn!(
+                "dropping thinking: assistant tool history has no thinking blocks to replay"
+            );
+            out.as_object_mut()
+                .expect("out is an object")
+                .remove("thinking");
+        }
+
         // Prompt caching: mark the last system block and the last message's
         // last content block as ephemeral breakpoints (max 4 allowed).
         if !system.is_empty() {
@@ -190,18 +316,17 @@ impl Anthropic {
             }
             out["system"] = json!(blocks);
         }
-        if let Some(last_msg) = out["messages"].as_array_mut().and_then(|m| m.last_mut()) {
-            if let Some(blocks) = last_msg["content"].as_array_mut() {
-                if let Some(last) = blocks.last_mut() {
-                    last["cache_control"] = json!({"type": "ephemeral"});
-                }
-            }
+        if let Some(last_msg) = out["messages"].as_array_mut().and_then(|m| m.last_mut())
+            && let Some(blocks) = last_msg["content"].as_array_mut()
+            && let Some(last) = blocks.last_mut()
+        {
+            last["cache_control"] = json!({"type": "ephemeral"});
         }
 
         if !tools.is_empty() {
             out["tools"] = json!(tools);
         }
-        Ok(out)
+        Ok((out, names))
     }
 
     pub async fn chat_stream(
@@ -209,17 +334,17 @@ impl Anthropic {
         body: Value,
     ) -> anyhow::Result<Box<dyn futures::Stream<Item = anyhow::Result<StreamEvent>> + Send + Unpin>>
     {
-        let req = self.translate_request(&body, true)?;
+        let (req, names) = self.translate_request(&body, true)?;
         let key = self.credential().await?;
         let resp = self
             .request(req.clone(), key.as_deref())
             .send()
             .await
             .context("upstream failed")?;
-        // OAuth: a 401 may mean the token expired between requests — force
-        // a refresh and retry once.
+        // OAuth: a 401 means the server rejected this token — force a
+        // refresh (not the cached-token path) and retry once.
         let resp = if resp.status() == reqwest::StatusCode::UNAUTHORIZED && self.oauth {
-            let key = crate::oauth::access_token("anthropic").await?;
+            let key = crate::oauth::force_refresh("anthropic").await?;
             self.request(req, Some(&key))
                 .send()
                 .await
@@ -227,6 +352,11 @@ impl Anthropic {
         } else {
             resp
         };
+        if resp.status() == reqwest::StatusCode::TOO_MANY_REQUESTS
+            || resp.status() == reqwest::StatusCode::from_u16(529).unwrap()
+        {
+            return Err(crate::provider::RateLimited(crate::provider::retry_after(&resp)).into());
+        }
         if !resp.status().is_success() {
             let text = resp.text().await.unwrap_or_default();
             bail!("upstream: {text}");
@@ -234,11 +364,14 @@ impl Anthropic {
         let byte_stream = resp
             .bytes_stream()
             .map(|c| c.map_err(std::io::Error::other));
-        Ok(Box::new(anthropic_events(Box::pin(byte_stream))))
+        Ok(Box::new(anthropic_events(
+            Box::pin(byte_stream),
+            std::sync::Arc::new(names),
+        )))
     }
 
     pub async fn chat(&self, body: Value) -> anyhow::Result<Value> {
-        let req = self.translate_request(&body, false)?;
+        let (req, names) = self.translate_request(&body, false)?;
         let key = self.credential().await?;
         let resp = self
             .request(req.clone(), key.as_deref())
@@ -246,7 +379,7 @@ impl Anthropic {
             .await
             .context("upstream failed")?;
         let resp = if resp.status() == reqwest::StatusCode::UNAUTHORIZED && self.oauth {
-            let key = crate::oauth::access_token("anthropic").await?;
+            let key = crate::oauth::force_refresh("anthropic").await?;
             self.request(req, Some(&key))
                 .send()
                 .await
@@ -255,10 +388,17 @@ impl Anthropic {
             resp
         };
         let status = resp.status();
-        let v: Value = resp.json().await?;
-        if !status.is_success() {
-            bail!("upstream {status}: {v}");
+        if status == reqwest::StatusCode::TOO_MANY_REQUESTS
+            || status == reqwest::StatusCode::from_u16(529).unwrap()
+        {
+            return Err(crate::provider::RateLimited(crate::provider::retry_after(&resp)).into());
         }
+        // Read the body as text first: a gateway 502/504 answers HTML,
+        let text = resp.text().await.unwrap_or_default();
+        if !status.is_success() {
+            bail!("upstream {status}: {text}");
+        }
+        let v: Value = serde_json::from_str(&text).context("invalid upstream JSON")?;
         // Anthropic response → OpenAI shape.
         let mut text = String::new();
         let mut tool_calls = Vec::new();
@@ -269,7 +409,7 @@ impl Anthropic {
                     "id": block["id"],
                     "type": "function",
                     "function": {
-                        "name": unmangle(block["name"].as_str().unwrap_or("")),
+                        "name": unmangle(block["name"].as_str().unwrap_or(""), &names),
                         "arguments": block["input"].to_string(),
                     }
                 })),
@@ -280,9 +420,24 @@ impl Anthropic {
         if !tool_calls.is_empty() {
             msg["tool_calls"] = json!(tool_calls);
         }
+        // Map the real stop_reason — a hardcoded "stop" would break
+        // tool-loop detection for /v1 clients.
+        let finish_reason = match v["stop_reason"].as_str() {
+            Some("tool_use") => "tool_calls",
+            Some("max_tokens") => "length",
+            _ => "stop",
+        };
+        // Anthropic usage → OpenAI field names; upstream reports no
+        // total, so derive it.
+        let prompt = v["usage"]["input_tokens"].as_u64().unwrap_or(0);
+        let completion = v["usage"]["output_tokens"].as_u64().unwrap_or(0);
         Ok(json!({
-            "choices": [{"index": 0, "message": msg, "finish_reason": "stop"}],
-            "usage": v["usage"],
+            "choices": [{"index": 0, "message": msg, "finish_reason": finish_reason}],
+            "usage": {
+                "prompt_tokens": prompt,
+                "completion_tokens": completion,
+                "total_tokens": prompt + completion,
+            },
         }))
     }
 }
@@ -292,8 +447,14 @@ fn mangle(name: &str) -> String {
     name.replace('.', "__")
 }
 
-fn unmangle(name: &str) -> String {
-    name.replacen("__", ".", 1)
+/// Restore the original tool name. `mangle` replaces every `.`, so the
+/// per-request map is authoritative; the `replacen` fallback only covers
+/// names this request never mangled (e.g. upstream-invented calls).
+fn unmangle(name: &str, names: &std::collections::HashMap<String, String>) -> String {
+    names
+        .get(name)
+        .cloned()
+        .unwrap_or_else(|| name.replacen("__", ".", 1))
 }
 
 /// Parse Anthropic SSE into normalized StreamEvents.
@@ -301,6 +462,7 @@ fn unmangle(name: &str) -> String {
 /// (text_delta|input_json_delta), message_stop.
 fn anthropic_events(
     stream: std::pin::Pin<Box<dyn futures::Stream<Item = std::io::Result<Bytes>> + Send>>,
+    names: std::sync::Arc<std::collections::HashMap<String, String>>,
 ) -> std::pin::Pin<Box<dyn futures::Stream<Item = anyhow::Result<StreamEvent>> + Send>> {
     use crate::llm::StopReason;
     // finish carries message_delta.stop_reason into the terminal Done.
@@ -311,213 +473,281 @@ fn anthropic_events(
             false,
             String::new(),
             0usize,
+            // Dense tool-call counter — content-block indexes are sparse
+            // (text/thinking blocks share the index space), so they must
+            // not be used as ToolCallDelta.index directly.
+            0usize,
             StopReason::Other,
             // (thinking text, signature) for the in-flight thinking block.
             String::new(),
             String::new(),
-            // Index of the current content block, to tell thinking from
-            // tool_use on content_block_stop.
-            -1i64,
-            false, // current block is thinking
+            // Whether the current content block is thinking — set on
+            // content_block_start, cleared on content_block_stop.
+            false,
+            // Output tokens already reported by message_start — the
+            // message_delta Usage must carry only the increment or
+            // callers double-count.
+            0u64,
         ),
-        |(
+        move |(
             mut stream,
             mut buf,
             mut done,
             mut cur_tool,
             mut tool_index,
+            mut tool_count,
             mut finish,
             mut think_text,
             mut think_sig,
-            mut cur_index,
             mut cur_is_thinking,
-        )| async move {
-            if done {
-                return None;
-            }
-            loop {
-                if let Some(pos) = buf.iter().position(|&b| b == b'\n') {
-                    // buf[..pos] is a complete UTF-8 boundary: \n (0x0A)
-                    // never appears inside a multi-byte sequence.
-                    let line = String::from_utf8_lossy(&buf[..pos])
-                        .trim_end_matches('\r')
-                        .to_string();
-                    buf.drain(..=pos);
-                    if line.is_empty() {
-                        continue;
-                    }
-                    let Some(data) = line.strip_prefix("data:") else {
-                        continue;
-                    };
-                    let Ok(v) = serde_json::from_str::<Value>(data.trim()) else {
-                        continue;
-                    };
-                    let ev = match v["type"].as_str() {
-                        Some("message_start") => {
-                            let u = &v["message"]["usage"];
-                            if u.is_object() {
-                                Some(StreamEvent::Usage {
-                                    input: u["input_tokens"].as_u64().unwrap_or(0),
-                                    output: u["output_tokens"].as_u64().unwrap_or(0),
-                                })
-                            } else {
-                                None
-                            }
-                        }
-                        Some("content_block_start") => {
-                            let block = &v["content_block"];
-                            cur_index = v["index"].as_i64().unwrap_or(-1);
-                            cur_is_thinking = false;
-                            match block["type"].as_str() {
-                                Some("tool_use") => {
-                                    cur_tool = block["id"].as_str().unwrap_or("").to_string();
-                                    tool_index = cur_index.max(0) as usize;
-                                    Some(StreamEvent::ToolCallDelta {
-                                        index: tool_index,
-                                        id: Some(cur_tool.clone()),
-                                        name: Some(unmangle(block["name"].as_str().unwrap_or(""))),
-                                        arguments: String::new(),
-                                    })
-                                }
-                                Some("thinking") => {
-                                    cur_is_thinking = true;
-                                    think_text.clear();
-                                    think_sig.clear();
-                                    // A thinking block can arrive with
-                                    // initial text on the start event.
-                                    if let Some(t) = block["thinking"].as_str() {
-                                        think_text.push_str(t);
-                                    }
-                                    None
-                                }
-                                // Redacted thinking arrives complete —
-                                // replay it verbatim on the next request.
-                                Some("redacted_thinking") => {
-                                    Some(StreamEvent::ThinkingBlock(block.clone()))
-                                }
-                                _ => None,
-                            }
-                        }
-                        Some("content_block_delta") => {
-                            let d = &v["delta"];
-                            match d["type"].as_str() {
-                                Some("text_delta") => Some(StreamEvent::Text(
-                                    d["text"].as_str().unwrap_or("").to_string(),
-                                )),
-                                Some("thinking_delta") => {
-                                    let t = d["thinking"].as_str().unwrap_or("");
-                                    think_text.push_str(t);
-                                    Some(StreamEvent::Thinking(t.to_string()))
-                                }
-                                // The signature arrives as its own delta —
-                                // required verbatim on the next request.
-                                Some("signature_delta") => {
-                                    think_sig.push_str(d["signature"].as_str().unwrap_or(""));
-                                    None
-                                }
-                                Some("input_json_delta") => Some(StreamEvent::ToolCallDelta {
-                                    index: tool_index,
-                                    id: None,
-                                    name: None,
-                                    arguments: d["partial_json"].as_str().unwrap_or("").to_string(),
-                                }),
-                                _ => None,
-                            }
-                        }
-                        Some("content_block_stop") => {
-                            if cur_is_thinking {
-                                cur_is_thinking = false;
-                                Some(StreamEvent::ThinkingBlock(json!({
-                                    "type": "thinking",
-                                    "thinking": think_text,
-                                    "signature": think_sig,
-                                })))
-                            } else {
-                                None
-                            }
-                        }
-                        Some("message_delta") => {
-                            if let Some(r) = v["delta"]["stop_reason"].as_str() {
-                                finish = match r {
-                                    "end_turn" | "stop_sequence" => StopReason::Stop,
-                                    "max_tokens" => StopReason::Length,
-                                    "tool_use" => StopReason::ToolCalls,
-                                    _ => StopReason::Other,
-                                };
-                            }
-                            // message_delta also carries final output_tokens.
-                            let u = &v["usage"];
-                            if u.is_object() {
-                                Some(StreamEvent::Usage {
-                                    input: u["input_tokens"].as_u64().unwrap_or(0),
-                                    output: u["output_tokens"].as_u64().unwrap_or(0),
-                                })
-                            } else {
-                                None
-                            }
-                        }
-                        Some("message_stop") => {
-                            done = true;
-                            Some(StreamEvent::Done(finish))
-                        }
-                        _ => None,
-                    };
-                    if let Some(ev) = ev {
-                        return Some((
-                            Ok(ev),
-                            (
-                                stream,
-                                buf,
-                                done,
-                                cur_tool,
-                                tool_index,
-                                finish,
-                                think_text,
-                                think_sig,
-                                cur_index,
-                                cur_is_thinking,
-                            ),
-                        ));
-                    }
-                    continue;
+            mut start_output,
+        )| {
+            let names = names.clone();
+            async move {
+                if done {
+                    return None;
                 }
-                match stream.next().await {
-                    Some(Ok(chunk)) => buf.extend_from_slice(&chunk),
-                    Some(Err(e)) => {
-                        done = true;
-                        return Some((
-                            Err(e.into()),
-                            (
-                                stream,
-                                buf,
-                                done,
-                                cur_tool,
-                                tool_index,
-                                finish,
-                                think_text,
-                                think_sig,
-                                cur_index,
-                                cur_is_thinking,
-                            ),
-                        ));
+                loop {
+                    if let Some(pos) = buf.iter().position(|&b| b == b'\n') {
+                        // buf[..pos] is a complete UTF-8 boundary: \n (0x0A)
+                        // never appears inside a multi-byte sequence.
+                        let line = String::from_utf8_lossy(&buf[..pos])
+                            .trim_end_matches('\r')
+                            .to_string();
+                        buf.drain(..=pos);
+                        if line.is_empty() {
+                            continue;
+                        }
+                        let Some(data) = line.strip_prefix("data:") else {
+                            continue;
+                        };
+                        let Ok(v) = serde_json::from_str::<Value>(data.trim()) else {
+                            continue;
+                        };
+                        let ev = match v["type"].as_str() {
+                            Some("message_start") => {
+                                let u = &v["message"]["usage"];
+                                if u.is_object() {
+                                    // message_delta will re-report cumulative
+                                    // output_tokens — remember this baseline
+                                    // so the delta event carries only the
+                                    // increment, never a double count.
+                                    start_output = u["output_tokens"].as_u64().unwrap_or(0);
+                                    Some(StreamEvent::Usage {
+                                        input: u["input_tokens"].as_u64().unwrap_or(0),
+                                        output: start_output,
+                                    })
+                                } else {
+                                    None
+                                }
+                            }
+                            Some("content_block_start") => {
+                                let block = &v["content_block"];
+                                // A non-thinking block must clear the flag —
+                                // a missing content_block_stop would
+                                // otherwise emit a bogus ThinkingBlock at
+                                // the next stop.
+                                cur_is_thinking = false;
+                                match block["type"].as_str() {
+                                    Some("tool_use") => {
+                                        cur_tool = block["id"].as_str().unwrap_or("").to_string();
+                                        tool_index = tool_count;
+                                        tool_count += 1;
+                                        Some(StreamEvent::ToolCallDelta {
+                                            index: tool_index,
+                                            id: Some(cur_tool.clone()),
+                                            name: Some(unmangle(
+                                                block["name"].as_str().unwrap_or(""),
+                                                &names,
+                                            )),
+                                            arguments: String::new(),
+                                        })
+                                    }
+                                    Some("thinking") => {
+                                        cur_is_thinking = true;
+                                        think_text.clear();
+                                        think_sig.clear();
+                                        // A thinking block can arrive with
+                                        // initial text on the start event.
+                                        if let Some(t) = block["thinking"].as_str() {
+                                            think_text.push_str(t);
+                                        }
+                                        None
+                                    }
+                                    // Redacted thinking arrives complete —
+                                    // replay it verbatim on the next request.
+                                    Some("redacted_thinking") => {
+                                        Some(StreamEvent::ThinkingBlock(block.clone()))
+                                    }
+                                    _ => None,
+                                }
+                            }
+                            Some("content_block_delta") => {
+                                let d = &v["delta"];
+                                match d["type"].as_str() {
+                                    Some("text_delta") => Some(StreamEvent::Text(
+                                        d["text"].as_str().unwrap_or("").to_string(),
+                                    )),
+                                    Some("thinking_delta") => {
+                                        let t = d["thinking"].as_str().unwrap_or("");
+                                        think_text.push_str(t);
+                                        Some(StreamEvent::Thinking(t.to_string()))
+                                    }
+                                    // The signature arrives as its own delta —
+                                    // required verbatim on the next request.
+                                    Some("signature_delta") => {
+                                        think_sig.push_str(d["signature"].as_str().unwrap_or(""));
+                                        None
+                                    }
+                                    Some("input_json_delta") => Some(StreamEvent::ToolCallDelta {
+                                        index: tool_index,
+                                        id: None,
+                                        name: None,
+                                        arguments: d["partial_json"]
+                                            .as_str()
+                                            .unwrap_or("")
+                                            .to_string(),
+                                    }),
+                                    _ => None,
+                                }
+                            }
+                            Some("content_block_stop") => {
+                                if cur_is_thinking {
+                                    cur_is_thinking = false;
+                                    Some(StreamEvent::ThinkingBlock(json!({
+                                        "type": "thinking",
+                                        "thinking": think_text,
+                                        "signature": think_sig,
+                                    })))
+                                } else {
+                                    None
+                                }
+                            }
+                            Some("message_delta") => {
+                                if let Some(r) = v["delta"]["stop_reason"].as_str() {
+                                    finish = match r {
+                                        "end_turn" | "stop_sequence" => StopReason::Stop,
+                                        "max_tokens" => StopReason::Length,
+                                        "tool_use" => StopReason::ToolCalls,
+                                        _ => StopReason::Other,
+                                    };
+                                }
+                                // message_delta carries final output_tokens —
+                                // emit only the increment over message_start's
+                                // baseline or callers double-count.
+                                let u = &v["usage"];
+                                if u.is_object() {
+                                    let out = u["output_tokens"].as_u64().unwrap_or(0);
+                                    Some(StreamEvent::Usage {
+                                        input: 0,
+                                        output: out.saturating_sub(start_output),
+                                    })
+                                } else {
+                                    None
+                                }
+                            }
+                            Some("message_stop") => {
+                                done = true;
+                                Some(StreamEvent::Done(finish))
+                            }
+                            // Mid-stream errors (overloaded_error etc.) arrive
+                            // as an `error` event — surface them instead of
+                            // ending the turn as if it completed.
+                            Some("error") => {
+                                done = true;
+                                let msg = v["error"]["message"]
+                                    .as_str()
+                                    .unwrap_or("upstream stream error");
+                                return Some((
+                                    Err(anyhow::anyhow!("anthropic stream error: {msg}")),
+                                    (
+                                        stream,
+                                        buf,
+                                        done,
+                                        cur_tool,
+                                        tool_index,
+                                        tool_count,
+                                        finish,
+                                        think_text,
+                                        think_sig,
+                                        cur_is_thinking,
+                                        start_output,
+                                    ),
+                                ));
+                            }
+                            _ => None,
+                        };
+                        if let Some(ev) = ev {
+                            return Some((
+                                Ok(ev),
+                                (
+                                    stream,
+                                    buf,
+                                    done,
+                                    cur_tool,
+                                    tool_index,
+                                    tool_count,
+                                    finish,
+                                    think_text,
+                                    think_sig,
+                                    cur_is_thinking,
+                                    start_output,
+                                ),
+                            ));
+                        }
+                        continue;
                     }
-                    None => {
-                        done = true;
-                        return Some((
-                            Ok(StreamEvent::Done(finish)),
-                            (
-                                stream,
-                                buf,
-                                done,
-                                cur_tool,
-                                tool_index,
-                                finish,
-                                think_text,
-                                think_sig,
-                                cur_index,
-                                cur_is_thinking,
-                            ),
-                        ));
+                    match stream.next().await {
+                        Some(Ok(chunk)) => buf.extend_from_slice(&chunk),
+                        Some(Err(e)) => {
+                            done = true;
+                            return Some((
+                                Err(e.into()),
+                                (
+                                    stream,
+                                    buf,
+                                    done,
+                                    cur_tool,
+                                    tool_index,
+                                    tool_count,
+                                    finish,
+                                    think_text,
+                                    think_sig,
+                                    cur_is_thinking,
+                                    start_output,
+                                ),
+                            ));
+                        }
+                        None => {
+                            // A proxy may deliver the last SSE line without a
+                            // trailing newline — feed one so the loop parses
+                            // the buffered line instead of dropping it.
+                            if !buf.is_empty() {
+                                buf.push(b'\n');
+                                continue;
+                            }
+                            done = true;
+                            // Reaching EOF without a message_stop means the
+                            // stream was truncated — surface an error so the
+                            // caller can retry, not a clean Done that
+                            // persists partial text as finished.
+                            return Some((
+                                Err(anyhow::anyhow!("stream ended without message_stop")),
+                                (
+                                    stream,
+                                    buf,
+                                    done,
+                                    cur_tool,
+                                    tool_index,
+                                    tool_count,
+                                    finish,
+                                    think_text,
+                                    think_sig,
+                                    cur_is_thinking,
+                                    start_output,
+                                ),
+                            ));
+                        }
                     }
                 }
             }
