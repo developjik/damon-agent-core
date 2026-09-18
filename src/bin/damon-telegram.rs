@@ -17,6 +17,11 @@ struct Args {
     /// Telegram bot token (or TELEGRAM_BOT_TOKEN)
     #[arg(long, env = "TELEGRAM_BOT_TOKEN")]
     bot_token: String,
+    /// Allowed Telegram user/chat ids, comma-separated (or
+    /// DAMON_ALLOW). REQUIRED — a public bot without an allowlist is
+    /// unauthenticated agent access.
+    #[arg(long, env = "DAMON_ALLOW", value_delimiter = ',')]
+    allow: Vec<String>,
 }
 
 #[tokio::main]
@@ -33,5 +38,12 @@ async fn main() -> anyhow::Result<()> {
         .await
         .context("cannot connect to damond")?;
     let tg = Arc::new(BotApi::new(&args.bot_token));
-    Bridge::new(tg, client).run().await
+    if args.allow.is_empty() {
+        anyhow::bail!(
+            "--allow is required: a public bot without an allowlist is unauthenticated agent access"
+        );
+    }
+    let bridge = Bridge::new(tg, client);
+    bridge.set_allowed(args.allow);
+    bridge.run().await
 }

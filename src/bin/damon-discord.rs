@@ -18,6 +18,11 @@ struct Args {
     /// Discord bot token (or DISCORD_BOT_TOKEN)
     #[arg(long, env = "DISCORD_BOT_TOKEN")]
     bot_token: String,
+    /// Allowed Discord user/channel ids, comma-separated (or
+    /// DAMON_ALLOW). REQUIRED — a public bot without an allowlist is
+    /// unauthenticated agent access.
+    #[arg(long, env = "DAMON_ALLOW", value_delimiter = ',')]
+    allow: Vec<String>,
 }
 
 #[tokio::main]
@@ -34,7 +39,12 @@ async fn main() -> anyhow::Result<()> {
         .await
         .context("cannot connect to damond")?;
     let api = Arc::new(DiscordApi::new(&args.bot_token));
-    Bridge::new(Arc::new(DiscordChannel::new(api)), client)
-        .run()
-        .await
+    if args.allow.is_empty() {
+        anyhow::bail!(
+            "--allow is required: a public bot without an allowlist is unauthenticated agent access"
+        );
+    }
+    let bridge = Bridge::new(Arc::new(DiscordChannel::new(api)), client);
+    bridge.set_allowed(args.allow);
+    bridge.run().await
 }
