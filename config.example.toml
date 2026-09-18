@@ -5,6 +5,13 @@
 # bind = "127.0.0.1:9470"          # default; changing requires restart
 # auth_token = "env:DAMON_TOKEN"   # optional bearer token for /v1/*
 
+# permission_timeout_secs = 300   # deny tool calls if the permission prompt
+#                                 # goes unanswered this long
+# max_tool_output = 8192          # bytes persisted per tool result (head+tail kept)
+# summary_model = "gpt-4o-mini"   # cheaper model for compaction summaries;
+#                                 # default: the session's own model
+# session_retention_days = 30     # delete sessions older than this; unset = keep forever
+
 [providers.default]
 api      = "openai-completions"    # openai-completions | openai-responses | anthropic-messages | gemini
 base_url = "https://api.openai.com/v1"
@@ -74,3 +81,10 @@ default_model = "gpt-4o"           # used by the agent runtime
 # [relay]
 # url  = "ws://your-relay-host:8080"
 # name = "my-daemon"               # clients use this name to connect
+# secret = "env:RELAY_SECRET"      # set when the relay requires
+#                                  # DAMON_RELAY_SECRET (anti-squatting);
+#                                  # sent inside the handshake, never a URL
+#
+# auth_token note: relayed clients authenticate with the daemon's
+# auth_token. Use a high-entropy token (e.g. `openssl rand -hex 32`);
+# short guessable tokens are brute-forceable.

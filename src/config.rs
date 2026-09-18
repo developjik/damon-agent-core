@@ -12,6 +12,7 @@ use tracing::{info, warn};
 /// Daemon configuration. Hot-reloaded: changes to the config file are picked
 /// up without restart, except `bind` which requires a restart.
 #[derive(Clone, Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct Config {
     /// Listen address. Default 127.0.0.1:9470.
     #[serde(default = "default_bind")]
@@ -38,10 +39,20 @@ pub struct Config {
     /// Remote relay: dial out to a public `damon-relay` so clients can reach
     /// this daemon without an inbound port.
     pub relay: Option<RelayConfig>,
+    /// Seconds an unanswered permission prompt waits before it is denied.
+    /// Default 300.
+    pub permission_timeout_secs: Option<u64>,
+    /// Byte cap on persisted tool output (head+tail kept). Default 8 KiB.
+    pub max_tool_output: Option<usize>,
+    /// Model used for compaction summaries; defaults to the turn's model.
+    pub summary_model: Option<String>,
+    /// Sessions idle longer than this many days are pruned. Unset = keep all.
+    pub session_retention_days: Option<u32>,
 }
 
 /// `[relay]` — outbound tunnel to a public relay.
 #[derive(Clone, Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct RelayConfig {
     /// ws://host:port of the relay server.
     pub url: String,
@@ -93,6 +104,7 @@ fn default_bind() -> SocketAddr {
 }
 
 #[derive(Clone, Debug, Deserialize, PartialEq)]
+#[serde(deny_unknown_fields)]
 pub struct McpServerConfig {
     pub command: String,
     #[serde(default)]
@@ -105,6 +117,7 @@ pub struct McpServerConfig {
 }
 
 #[derive(Clone, Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct ProviderConfig {
     /// Wire API: "openai-completions" (default), "openai-responses",
     /// "anthropic-messages", or "gemini".
@@ -244,6 +257,15 @@ fn resolve_command(cmd: &str) -> anyhow::Result<String> {
     use std::time::Duration;
     use wait_timeout::ChildExt;
 
+    // Windows has no `sh` — use cmd /C there.
+    #[cfg(windows)]
+    let mut child = Command::new("cmd")
+        .args(["/C", cmd])
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .spawn()
+        .with_context(|| format!("cannot spawn secret command: {cmd}"))?;
+    #[cfg(not(windows))]
     let mut child = Command::new("sh")
         .arg("-c")
         .arg(cmd)
@@ -303,7 +325,26 @@ impl Config {
         if let Some(dir) = path.parent() {
             let _ = dotenvy::from_path(dir.join(".env"));
         }
+        // Debug only: the cwd is attacker-controlled in release use —
+        // running `damond` inside a cloned repo would let a hostile .env
+        // shadow provider keys or set the (also debug-gated) OAuth test
+        // hooks. Debug builds keep it for local dev/test convenience.
+        #[cfg(debug_assertions)]
         let _ = dotenvy::from_path(Path::new(".env"));
+        // A pre-existing config holding literal secrets must not be
+        // group/world-readable — warn like oauth.rs's 0600 convention.
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            if let Ok(meta) = std::fs::metadata(path)
+                && meta.permissions().mode() & 0o077 != 0
+            {
+                warn!(
+                    path = %path.display(),
+                    "config file is group/world-readable — it may hold literal secrets; chmod 600"
+                );
+            }
+        }
         let text = std::fs::read_to_string(path)
             .with_context(|| format!("cannot read config {}", path.display()))?;
         let cfg: Config =
@@ -319,8 +360,13 @@ impl Config {
                 other => bail!("provider {name}: unknown api '{other}'"),
             }
             if let Some(key) = &p.api_key {
-                SecretRef::parse(key)
-                    .with_context(|| format!("provider {name}: invalid api_key"))?;
+                // "oauth" is a sentinel handled by Provider::new — the
+                // provider resolves tokens from the OS keychain itself.
+                // It is not a SecretRef and must not be validated as one.
+                if key != "oauth" {
+                    SecretRef::parse(key)
+                        .with_context(|| format!("provider {name}: invalid api_key"))?;
+                }
             }
         }
         Ok(())
@@ -345,15 +391,27 @@ impl Config {
         &'a self,
         model: &'a str,
     ) -> Option<(&'a str, &'a ProviderConfig, String)> {
-        if let Some((name, upstream)) = model.split_once('/') {
-            if let Some(p) = self.providers.get(name) {
-                return Some((name, p, upstream.to_string()));
+        if let Some((name, upstream)) = model.split_once('/')
+            && let Some(p) = self.providers.get(name)
+        {
+            return Some((name, p, upstream.to_string()));
+        }
+        // Most-specific glob wins: iterate all providers and keep the
+        // longest matching pattern, so `aaa = ["*"]` can't shadow
+        // `zzz = ["claude-*"]` just because it sorts first in the map.
+        let mut best: Option<(&str, &ProviderConfig, usize)> = None;
+        for (name, p) in &self.providers {
+            for g in &p.models {
+                if glob_match(g, model) {
+                    let specificity = g.len();
+                    if best.is_none_or(|(_, _, s)| specificity > s) {
+                        best = Some((name, p, specificity));
+                    }
+                }
             }
         }
-        for (name, p) in &self.providers {
-            if p.models.iter().any(|g| glob_match(g, model)) {
-                return Some((name, p, model.to_string()));
-            }
+        if let Some((name, p, _)) = best {
+            return Some((name, p, model.to_string()));
         }
         None
     }
@@ -371,10 +429,15 @@ impl Config {
         if let Some(m) = self.models.get(model) {
             return m.clone();
         }
+        // Most-specific glob wins — same rule as route_model_strict.
+        let mut best: Option<(&ModelMeta, usize)> = None;
         for (pat, m) in &self.models {
-            if glob_match(pat, model) {
-                return m.clone();
+            if glob_match(pat, model) && best.is_none_or(|(_, s)| pat.len() > s) {
+                best = Some((m, pat.len()));
             }
+        }
+        if let Some((m, _)) = best {
+            return m.clone();
         }
         ModelMeta {
             context_window: builtin_context_window(model),
@@ -393,18 +456,34 @@ impl Config {
 }
 
 /// Minimal glob: `*` matches any suffix/infix, `?` one char.
+/// Iterative two-pointer with single-star backtracking — linear time, so
+/// a `*`-heavy pattern can't pin a worker thread on a long model name.
 pub fn glob_match(pattern: &str, s: &str) -> bool {
-    glob_rec(pattern.as_bytes(), s.as_bytes())
-}
-
-fn glob_rec(p: &[u8], s: &[u8]) -> bool {
-    match (p.first(), s.first()) {
-        (None, None) => true,
-        (Some(b'*'), _) => (0..=s.len()).any(|i| glob_rec(&p[1..], &s[i..])),
-        (Some(b'?'), Some(_)) => glob_rec(&p[1..], &s[1..]),
-        (Some(a), Some(b)) => a == b && glob_rec(&p[1..], &s[1..]),
-        _ => false,
+    let (p, s) = (pattern.as_bytes(), s.as_bytes());
+    let (mut pi, mut si) = (0usize, 0usize);
+    // Last `*` position and the string index it resumes from.
+    let (mut star, mut star_si) = (usize::MAX, 0usize);
+    while si < s.len() {
+        if pi < p.len() && (p[pi] == b'?' || p[pi] == s[si]) {
+            pi += 1;
+            si += 1;
+        } else if pi < p.len() && p[pi] == b'*' {
+            star = pi;
+            star_si = si;
+            pi += 1;
+        } else if star != usize::MAX {
+            // Mismatch after a `*`: let it consume one more char.
+            pi = star + 1;
+            star_si += 1;
+            si = star_si;
+        } else {
+            return false;
+        }
     }
+    while pi < p.len() && p[pi] == b'*' {
+        pi += 1;
+    }
+    pi == p.len()
 }
 
 /// Default config path: platform config dir, e.g. ~/.config/damon/config.toml
@@ -497,7 +576,10 @@ pub fn watch(path: PathBuf, shared: SharedConfig) -> Option<tokio::sync::mpsc::R
                                 *cfg = new;
                             }
                             info!("config reloaded");
-                            let _ = reload_tx.send(()).await;
+                            // Coalesce, don't block: a busy consumer would
+                            // stall this task, fill event_tx, and make
+                            // notify drop later events — losing reloads.
+                            let _ = reload_tx.try_send(());
                         }
                         Err(e) => warn!(error = %e, "config reload failed; keeping previous"),
                     }
