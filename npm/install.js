@@ -25,6 +25,7 @@ const ext = process.platform === "win32" ? ".exe" : "";
 const expected = [`damond${ext}`, `damon${ext}`, `damon-telegram${ext}`, `damon-discord${ext}`, `damon-slack${ext}`, `damon-relay${ext}`];
 
 const url = `https://github.com/${REPO}/releases/download/v${VERSION}/damon-${target}.tar.gz`;
+const sumUrl = `${url}.sha256`;
 const bin = path.join(__dirname, "bin");
 fs.mkdirSync(bin, { recursive: true });
 const tarball = path.join(bin, "damon.tar.gz");
@@ -57,6 +58,12 @@ async function download() {
   fs.writeFileSync(tarball, Buffer.from(await res.arrayBuffer()));
 }
 
+async function fetchText(u) {
+  const res = await fetch(u, { redirect: "follow" });
+  if (!res.ok) throw new Error(`HTTP ${res.status} ${res.statusText}`);
+  return res.text();
+}
+
 async function main() {
   try {
     await download();
@@ -73,6 +80,23 @@ async function main() {
     fail(`downloaded tarball is empty: ${url}`);
   }
 
+  // Verify the release checksum before extraction — a tampered or
+  // truncated artifact must never reach the install.
+  let expectedSha;
+  try {
+    expectedSha = (await fetchText(sumUrl)).trim().split(/\s+/)[0];
+  } catch (err) {
+    fail(`could not fetch checksum ${sumUrl}: ${err.message}`);
+  }
+  const actualSha = require("crypto")
+    .createHash("sha256")
+    .update(fs.readFileSync(tarball))
+    .digest("hex");
+  if (actualSha !== expectedSha) {
+    fs.unlinkSync(tarball);
+    fail(`checksum mismatch for ${path.basename(tarball)}: expected ${expectedSha}, got ${actualSha}`);
+  }
+
   try {
     execSync(`tar xzf "${tarball}" -C "${bin}"`, { stdio: "inherit" });
   } catch {
@@ -84,9 +108,26 @@ async function main() {
   if (missing.length > 0) {
     fail(`tarball missing expected binaries: ${missing.join(", ")} (url: ${url})`);
   }
+  // npm links bin shims at install time, BEFORE postinstall extracts the
+  // tarball — on Windows the extensionless targets (bin/damond) never
+  // exist, so npm skips shim creation and no command lands on PATH.
+  // Write extensionless launchers next to the .exe so the shims resolve.
+  if (process.platform === "win32") {
+    for (const f of expected) {
+      const base = f.replace(/\.exe$/, "");
+      const launcher = path.join(bin, base);
+      if (!fs.existsSync(launcher)) {
+        fs.writeFileSync(launcher, `#!/bin/sh\nexec "$(dirname "$0")/${f}" "$@"\n`);
+      }
+    }
+  }
 
-  for (const f of fs.readdirSync(bin)) {
-    fs.chmodSync(path.join(bin, f), 0o755);
+  // chmod is a no-op on Windows (NTFS has no POSIX bits) — skip it
+  // there rather than rely on its silent failure.
+  if (process.platform !== "win32") {
+    for (const f of fs.readdirSync(bin)) {
+      fs.chmodSync(path.join(bin, f), 0o755);
+    }
   }
   console.log(`damon ${VERSION} installed for ${target}`);
 }

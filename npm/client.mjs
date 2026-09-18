@@ -22,37 +22,68 @@ export class DamonClient {
   #pending = new Map(); // id -> {resolve, reject}
   #queue = [];          // buffered events for events()
   #waiters = [];        // pending event consumers
+  #url;                 // redial target (unticketed base URL)
+  #WS;                  // WebSocket constructor
+  #token;               // bearer token for ticket fetches
+  #fetch;               // fetch impl for ticket fetches
+  #closed = false;      // close() called — stop reconnecting
+  #connected;           // Promise resolved when the link is up
+  #markConnected;
 
-  constructor(ws) {
-    this.#ws = ws;
-    ws.addEventListener("message", (e) => this.#onMessage(e.data));
-    ws.addEventListener("close", () => this.#onClose());
-    ws.addEventListener("error", () => this.#onClose());
+  constructor(ws, url, WS, token, fetchFn) {
+    this.#url = url;
+    this.#WS = WS;
+    this.#token = token;
+    this.#fetch = fetchFn;
+    this.#connected = new Promise((r) => (this.#markConnected = r));
+    this.#attach(ws);
+    // connect() only resolves after "open" — the link is already up.
+    this.#markConnected();
   }
 
-  /** Connect to a damond WS endpoint. `token` is sent as ?token= (and is
-   *  only needed when the daemon has auth_token configured). */
-  static async connect(url, { token, webSocket } = {}) {
+  #attach(ws) {
+    this.#ws = ws;
+    ws.addEventListener("message", (e) => this.#onMessage(e.data));
+    // Guard on identity: a failed redial's close must not retrigger this.
+    ws.addEventListener("close", () => { if (this.#ws === ws) this.#onClose(); });
+    ws.addEventListener("error", () => { if (this.#ws === ws) this.#onClose(); });
+  }
+
+  /** Connect to a damond WS endpoint. When `token` is set, a single-use
+   *  ticket is fetched from POST /v1/ws_ticket (Bearer auth) and sent as
+   *  ?ticket= — the token never appears in a URL. If the link drops the
+   *  client redials with backoff (100ms → 5s, fresh ticket each attempt);
+   *  calls made while down wait up to 10s for the link. */
+  static async connect(url, { token, webSocket, fetchImpl } = {}) {
     const WS = webSocket ?? globalThis.WebSocket;
     if (!WS) {
       throw new Error(
         "no WebSocket implementation — use Node >= 22 or pass { webSocket }"
       );
     }
-    if (token) {
-      const sep = url.includes("?") ? "&" : "?";
-      url = `${url}${sep}token=${encodeURIComponent(token)}`;
-    }
-    const ws = new WS(url);
+    const fetchFn = fetchImpl ?? globalThis.fetch;
+    const wsUrl = token ? await ticketedUrl(url, token, fetchFn) : url;
+    const ws = new WS(wsUrl);
+    // Bound the handshake — a socket that never opens nor errors would
+    // otherwise hang connect() forever.
     await new Promise((resolve, reject) => {
-      ws.addEventListener("open", resolve, { once: true });
-      ws.addEventListener("error", (e) => reject(e.error ?? new Error("ws connect failed")), { once: true });
+      const t = setTimeout(() => reject(new Error("ws connect timed out")), 10000);
+      ws.addEventListener("open", () => { clearTimeout(t); resolve(); }, { once: true });
+      ws.addEventListener("error", (e) => { clearTimeout(t); reject(e.error ?? new Error("ws connect failed")); }, { once: true });
     });
-    return new DamonClient(ws);
+    return new DamonClient(ws, url, WS, token, fetchFn);
   }
 
+
   #onMessage(data) {
-    const m = JSON.parse(typeof data === "string" ? data : data.toString());
+    // A malformed or binary frame must not kill the process — the Rust
+    // server tolerates bad JSON the same way.
+    let m;
+    try {
+      m = JSON.parse(typeof data === "string" ? data : data.toString());
+    } catch {
+      return;
+    }
     // Response to one of our requests.
     if (m.id !== undefined && m.method === undefined && this.#pending.has(m.id)) {
       const p = this.#pending.get(m.id);
@@ -77,33 +108,105 @@ export class DamonClient {
   }
 
   #onClose() {
-    const err = new Error("connection closed");
+    // Detach FIRST: 'error' then 'close' both reach here, and without
+    // this the listener's `this.#ws === ws` guard passes twice — two
+    // redial loops, two live sockets, duplicated events.
+    this.#ws = null;
+    if (this.#closed) {
+      const err = new Error("connection closed");
+      for (const p of this.#pending.values()) p.reject(err);
+      this.#pending.clear();
+      this.#push(null); // end events() iterators
+      return;
+    }
+    // Link dropped: fail pending calls, park future calls on a fresh
+    // connected-promise, and redial with backoff until the daemon returns.
+    const err = new Error("connection lost; reconnecting");
     for (const p of this.#pending.values()) p.reject(err);
     this.#pending.clear();
-    this.#push(null); // end events() iterators
+    this.#connected = new Promise((r) => (this.#markConnected = r));
+    this.#push({ type: "disconnected" });
+    this.#redial(100);
+  }
+
+  async #redial(delay) {
+    while (!this.#closed) {
+      await new Promise((r) => setTimeout(r, delay));
+      if (this.#closed) return;
+      try {
+        // Fresh ticket per attempt — the last one was consumed or expired.
+        const u = this.#token ? await ticketedUrl(this.#url, this.#token, this.#fetch) : this.#url;
+        const ws = new this.#WS(u);
+        await new Promise((resolve, reject) => {
+          ws.addEventListener("open", resolve, { once: true });
+          ws.addEventListener("error", (e) => reject(e.error ?? new Error("ws connect failed")), { once: true });
+        });
+        this.#attach(ws);
+        // close() may have run while this socket was connecting — the
+        // loop's #closed check already passed, so re-check here or the
+        // fresh socket leaks open on a closed client.
+        if (this.#closed) { ws.close(); return; }
+        this.#markConnected();
+        this.#push({ type: "reconnected" });
+        return;
+      } catch {
+        delay = Math.min(delay * 2, 5000);
+      }
+    }
   }
 
   #push(ev) {
     const w = this.#waiters.shift();
     if (w) w(ev);
-    else this.#queue.push(ev);
+    else {
+      this.#queue.push(ev);
+      // A client that prompts but never iterates events() must not grow
+      // this buffer without bound. Drop the OLDEST non-request event —
+      // a dropped permission request leaves the daemon waiting out its
+      // timeout for an answer that never comes.
+      if (this.#queue.length > 8192) {
+        const i = this.#queue.findIndex((e) => e?.type !== "request");
+        this.#queue.splice(i === -1 ? 0 : i, 1);
+      }
+    }
   }
 
-  #call(method, params) {
+  /** Wait for the link (reconnect in flight) up to 10s. Every outbound
+   *  frame goes through this gate — sending on a closing socket throws
+   *  and silently loses the message. */
+  async #ready() {
+    await Promise.race([
+      this.#connected,
+      new Promise((_, rej) =>
+        setTimeout(() => rej(new Error("timed out waiting for reconnect")), 10000)
+      ),
+    ]);
+  }
+
+  async #call(method, params) {
+    await this.#ready();
     const id = ++this.#nextId;
     return new Promise((resolve, reject) => {
       this.#pending.set(id, { resolve, reject });
-      this.#ws.send(JSON.stringify({ jsonrpc: "2.0", id, method, params }));
+      // The socket can close between #ready() and send — a sync throw
+      // would leave the pending entry registered forever.
+      try {
+        this.#ws.send(JSON.stringify({ jsonrpc: "2.0", id, method, params }));
+      } catch (e) {
+        this.#pending.delete(id);
+        reject(e);
+      }
     });
   }
 
   /** Respond to a server-initiated request (permission prompts). */
   async respond(id, result) {
+    await this.#ready();
     this.#ws.send(JSON.stringify({ jsonrpc: "2.0", id, result }));
   }
 
-  /** Async iterator over daemon events: {type:"update"|"request"|"notification"|"promptDone"}.
-   *  Ends when the connection closes. */
+  /** Async iterator over daemon events: {type:"update"|"request"|"notification"|"promptDone"|"disconnected"|"reconnected"}.
+   *  Survives reconnects; ends only after close(). */
   async *events() {
     for (;;) {
       const ev = this.#queue.length
@@ -129,10 +232,17 @@ export class DamonClient {
     return r.sessionId;
   }
 
-  /** List sessions: [{sessionId, createdAt, model}]. */
-  async listSessions() {
-    const r = await this.#call("session/list", {});
+  /** List sessions: [{sessionId, createdAt, model}].
+   *  Pass {limit, offset} to page. */
+  async listSessions({ limit, offset } = {}) {
+    const r = await this.#call("session/list", { limit, offset });
     return r.sessions;
+  }
+
+  /** Session history: [{role, content, ...}]. Pass {limit, offset} to page. */
+  async sessionMessages(sessionId, { limit, offset } = {}) {
+    const r = await this.#call("session/messages", { sessionId, limit, offset });
+    return r.messages;
   }
 
   /** Resume an existing session; returns sessionId. Throws if unknown. */
@@ -156,6 +266,7 @@ export class DamonClient {
    *  outcome is also delivered as a {type:"promptDone"} event on the
    *  events() stream for consumers that only iterate events. */
   async prompt(sessionId, text, model) {
+    await this.#ready();
     const id = ++this.#nextId;
     const done = new Promise((resolve, reject) => {
       this.#pending.set(id, {
@@ -178,15 +289,16 @@ export class DamonClient {
     }));
     return done;
   }
-
   /** Cancel the session's in-flight turn (notification; no response). */
-  cancel(sessionId) {
+  async cancel(sessionId) {
+    await this.#ready();
     this.#ws.send(JSON.stringify({
       jsonrpc: "2.0", method: "session/cancel", params: { sessionId },
     }));
   }
 
   close() {
+    this.#closed = true;
     this.#ws.close();
   }
 }
@@ -196,4 +308,22 @@ export class RpcError extends Error {
     super(message);
     this.code = code;
   }
+}
+
+/** Exchange the bearer token for a single-use WS ticket and return the
+ *  ?ticket= URL. ws(s)://host/ws → http(s)://host/v1/ws_ticket. */
+async function ticketedUrl(wsUrl, token, fetchFn) {
+  const http = wsUrl
+    .replace(/\/+$/, "") // trailing slashes → /ws/v1/ws_ticket 404s
+    .replace(/\/ws$/, "")
+    .replace(/^wss:\/\//, "https://")
+    .replace(/^ws:\/\//, "http://");
+  const resp = await fetchFn(`${http}/v1/ws_ticket`, {
+    method: "POST",
+    headers: { authorization: `Bearer ${token}` },
+  });
+  if (!resp.ok) throw new Error(`ws_ticket rejected: ${resp.status}`);
+  const { ticket } = await resp.json();
+  const sep = wsUrl.includes("?") ? "&" : "?";
+  return `${wsUrl}${sep}ticket=${ticket}`;
 }
