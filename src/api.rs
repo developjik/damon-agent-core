@@ -1,7 +1,11 @@
 use std::collections::HashMap;
+use std::net::{IpAddr, SocketAddr};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::time::{Duration, Instant};
 
 use axum::body::Body;
+use axum::extract::connect_info::ConnectInfo;
 use axum::extract::{Request, State};
 use axum::http::StatusCode;
 use axum::middleware::Next;
@@ -10,12 +14,33 @@ use axum::routing::{get, post};
 use axum::{Json, Router, middleware};
 use futures::StreamExt;
 use serde_json::json;
-use tracing::warn;
+use tracing::{info, warn};
 
 use crate::config::SharedConfig;
 use crate::mcp::McpRegistry;
 use crate::provider::{Provider, build_providers};
 use crate::store::Store;
+
+/// Re-resolve a `!cmd`/keychain auth token at most this often — a rotated
+/// secret takes effect without a config reload, but a shell isn't spawned
+/// per request.
+const AUTH_TOKEN_TTL: Duration = Duration::from_secs(60);
+/// One-shot WS tickets expire this long after issue.
+const WS_TICKET_TTL: Duration = Duration::from_secs(60);
+/// Per-source-IP request budget for /v1/* on non-loopback binds.
+const RATE_LIMIT_PER_MIN: f64 = 60.0;
+const RATE_LIMIT_BURST: f64 = 20.0;
+
+/// (raw auth_token, resolved-at + value) — see `auth_token_cache` below.
+type AuthTokenCache = (Option<String>, Option<(Instant, Result<String, String>)>);
+
+/// Process-wide counters, exported as Prometheus text on GET /metrics.
+pub struct Metrics {
+    pub requests_total: AtomicU64,
+    pub prompts_total: AtomicU64,
+    pub tokens_input: AtomicU64,
+    pub tokens_output: AtomicU64,
+}
 
 pub struct AppState {
     pub config: SharedConfig,
@@ -28,12 +53,19 @@ pub struct AppState {
     pub mcp: McpRegistry,
     /// The address the server actually bound. A non-loopback bind must
     /// keep requiring a resolvable token even if a hot reload drops it.
-    pub bind: std::net::SocketAddr,
-    /// (raw auth_token, resolved value). Resolved once per raw value —
-    /// a `!cmd` or keychain ref must not spawn a shell per request.
-    /// Err is cached too: a resolution failure must fail closed, never
-    /// silently open the API.
-    auth_token_cache: tokio::sync::Mutex<(Option<String>, Option<Result<String, String>>)>,
+    pub bind: SocketAddr,
+    /// (raw auth_token, resolved-at + value). A `!cmd` or keychain ref
+    /// must not spawn a shell per request, but a rotated secret must take
+    /// effect without a config reload — entries expire after
+    /// `AUTH_TOKEN_TTL`. Err is cached too: a resolution failure must
+    /// fail closed, never silently open the API.
+    auth_token_cache: tokio::sync::Mutex<AuthTokenCache>,
+    /// Prometheus counters exported on GET /metrics.
+    pub metrics: Metrics,
+    /// One-shot WS auth tickets → issue time. Consumed by /ws?ticket=.
+    pub ws_tickets: tokio::sync::Mutex<HashMap<String, Instant>>,
+    /// Per-source-IP token buckets for /v1/* on non-loopback binds.
+    rate_buckets: tokio::sync::Mutex<HashMap<IpAddr, (f64, Instant)>>,
     /// Live prompt turns by session id → (connection id, cancel token).
     /// Shared across connections: a session can have only one in-flight
     /// prompt no matter which client asked, and a disconnect cancels the
@@ -51,7 +83,7 @@ impl AppState {
         config: SharedConfig,
         store: Store,
         mcp: McpRegistry,
-        bind: std::net::SocketAddr,
+        bind: SocketAddr,
     ) -> Arc<Self> {
         let (mut providers, errors) = {
             let cfg = config.read();
@@ -64,7 +96,7 @@ impl AppState {
             let cfg = config.read().clone();
             crate::provider::discovery::discover_all(&cfg, &mut providers).await
         };
-        Arc::new(Self {
+        let state = Arc::new(Self {
             config,
             providers: parking_lot::RwLock::new(providers),
             discovered: parking_lot::RwLock::new(discovered),
@@ -72,20 +104,72 @@ impl AppState {
             mcp,
             bind,
             auth_token_cache: tokio::sync::Mutex::new((None, None)),
+            metrics: Metrics {
+                requests_total: AtomicU64::new(0),
+                prompts_total: AtomicU64::new(0),
+                tokens_input: AtomicU64::new(0),
+                tokens_output: AtomicU64::new(0),
+            },
+            ws_tickets: tokio::sync::Mutex::new(HashMap::new()),
+            rate_buckets: tokio::sync::Mutex::new(HashMap::new()),
             live_prompts: tokio::sync::Mutex::new(HashMap::new()),
-        })
+        });
+        // Daily session-retention sweep, plus one immediate pass at boot.
+        // Sessions with a live prompt turn are excluded — deleting one
+        // mid-turn would orphan its message writes into a dead row.
+        let retention_days = state.config.read().session_retention_days;
+        if let Some(days) = retention_days {
+            let store = state.store.clone();
+            let state = state.clone();
+            tokio::spawn(async move {
+                let mut tick = tokio::time::interval(Duration::from_secs(24 * 60 * 60));
+                loop {
+                    tick.tick().await;
+                    let live: std::collections::HashSet<String> =
+                        state.live_prompts.lock().await.keys().cloned().collect();
+                    match store.cleanup_older_than(days, &live).await {
+                        Ok(ids) if !ids.is_empty() => {
+                            for sid in &ids {
+                                state.mcp.clear_session(sid);
+                            }
+                            info!(removed = ids.len(), days, "session retention sweep")
+                        }
+                        Ok(_) => {}
+                        Err(e) => warn!(error = %e, "session retention sweep failed"),
+                    }
+                }
+            });
+        }
+        state
     }
 
-    /// Resolved auth token, cached per raw config value. A `!cmd` or
-    /// keychain ref resolves once per config change, not per request.
-    /// Err = configured but unresolvable — callers must fail closed.
-    /// Resolution runs off the async worker: `!cmd` blocks up to 10s.
+    /// Resolved auth token, cached per raw config value for
+    /// `AUTH_TOKEN_TTL`. A `!cmd` or keychain ref resolves at most once
+    /// per TTL window, not per request — a rotated secret takes effect
+    /// on the next window without a config reload. Err = configured but
+    /// unresolvable — callers must fail closed. Resolution runs off the
+    /// async worker: `!cmd` blocks up to 10s.
     pub async fn auth_token(&self) -> Option<Result<String, String>> {
+        self.auth_token_cached(AUTH_TOKEN_TTL).await
+    }
+
+    /// `auth_token` with an explicit cache TTL — tests inject a short
+    /// one to observe re-resolution without waiting a minute.
+    #[doc(hidden)]
+    pub async fn auth_token_cached(&self, ttl: Duration) -> Option<Result<String, String>> {
         let raw = self.config.read().auth_token.clone();
         {
             let cache = self.auth_token_cache.lock().await;
-            if cache.0 == raw {
-                return cache.1.clone();
+            if cache.0 == raw
+                && let Some((at, resolved)) = &cache.1
+                && at.elapsed() < ttl
+            {
+                return Some(resolved.clone());
+            }
+            // Nothing configured and nothing cached: stay open/closed per
+            // the caller's bind check without re-resolving.
+            if raw.is_none() && cache.1.is_none() {
+                return None;
             }
         }
         let raw2 = raw.clone();
@@ -94,7 +178,27 @@ impl AppState {
                 raw2.as_deref()
                     .map(|r| match crate::config::SecretRef::parse(r) {
                         Ok(s) => s.resolve().map_err(|e| e.to_string()),
+                        // A value that LOOKS like a ref but failed to parse
+                        // ("env:", "keychain:svc", "!") is a config typo —
+                        // failing closed beats silently treating it as a
+                        // guessable literal token.
+                        Err(e)
+                            if r.starts_with("env:")
+                                || r.starts_with("keychain:")
+                                || r.starts_with('!') =>
+                        {
+                            Err(e.to_string())
+                        }
                         Err(_) => Ok(r.to_string()),
+                    })
+                    // An empty/whitespace token is a misconfiguration, not
+                    // "no auth": `Bearer ` would pass constant_time_eq and
+                    // the non-loopback boot gate would see Some(Ok(_)).
+                    .map(|r| match r {
+                        Ok(t) if t.trim().is_empty() => {
+                            Err("auth_token resolved to an empty value".to_string())
+                        }
+                        other => other,
                     })
             })
             .await
@@ -106,7 +210,7 @@ impl AppState {
         // Another task may have resolved a newer raw value meanwhile —
         // only store if the raw value is still current.
         if self.config.read().auth_token == raw {
-            *cache = (raw, resolved.clone());
+            *cache = (raw, resolved.clone().map(|r| (Instant::now(), r)));
         }
         resolved
     }
@@ -139,11 +243,26 @@ pub fn router(state: Arc<AppState>) -> Router {
     let v1 = Router::new()
         .route("/models", get(models))
         .route("/chat/completions", post(chat_completions))
-        .route_layer(middleware::from_fn_with_state(state.clone(), require_token));
+        .route("/ws_ticket", post(ws_ticket))
+        .route_layer(middleware::from_fn_with_state(state.clone(), require_token))
+        .route_layer(middleware::from_fn_with_state(state.clone(), rate_limit));
 
     Router::new()
         .route("/health", get(health))
-        .route("/ws", get(crate::rpc::ws_handler))
+        // /ws and /metrics get the same rate limit as /v1 — on a
+        // non-loopback bind an unlimited /ws would allow online
+        // brute-force of the auth token via ticket exchange.
+        .route(
+            "/ws",
+            get(crate::rpc::ws_handler)
+                .route_layer(middleware::from_fn_with_state(state.clone(), rate_limit)),
+        )
+        .route(
+            "/metrics",
+            get(metrics)
+                .route_layer(middleware::from_fn_with_state(state.clone(), require_token))
+                .route_layer(middleware::from_fn_with_state(state.clone(), rate_limit)),
+        )
         .nest("/v1", v1)
         .with_state(state)
 }
@@ -156,21 +275,65 @@ async fn health(State(state): State<Arc<AppState>>) -> Json<serde_json::Value> {
     }))
 }
 
-async fn models(State(state): State<Arc<AppState>>) -> Response {
-    // Default provider's list, merged with discovered ids from every
-    // provider that probed successfully.
-    let resp = forward(&state, reqwest::Method::GET, "/models", bytes::Bytes::new()).await;
-    let discovered = state.discovered.read().clone();
-    if discovered.is_empty() {
-        return resp;
+/// GET /metrics — Prometheus text exposition of the process counters.
+async fn metrics(State(state): State<Arc<AppState>>) -> Response {
+    let m = &state.metrics;
+    let body = format!(
+        "damon_requests_total {}\n\
+         damon_prompts_total {}\n\
+         damon_tokens_input_total {}\n\
+         damon_tokens_output_total {}\n\
+         damon_active_sessions {}\n",
+        m.requests_total.load(Ordering::Relaxed),
+        m.prompts_total.load(Ordering::Relaxed),
+        m.tokens_input.load(Ordering::Relaxed),
+        m.tokens_output.load(Ordering::Relaxed),
+        state.live_prompts.lock().await.len(),
+    );
+    (
+        [(
+            axum::http::header::CONTENT_TYPE,
+            "text/plain; version=0.0.4",
+        )],
+        body,
+    )
+        .into_response()
+}
+
+/// POST /v1/ws_ticket — issue a one-shot ticket usable as /ws?ticket=
+/// for clients that can't set an Authorization header on a WS upgrade.
+async fn ws_ticket(State(state): State<Arc<AppState>>) -> Response {
+    let mut bytes = [0u8; 32];
+    // Practically infallible, but a panic here kills the handler task —
+    // return a 500 instead.
+    if getrandom::fill(&mut bytes).is_err() {
+        return openai_error(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "OS RNG unavailable",
+            "server_error",
+        );
     }
-    let (parts, body) = resp.into_parts();
-    let bytes = match axum::body::to_bytes(body, 1 << 20).await {
-        Ok(b) => b,
-        Err(_) => return Response::from_parts(parts, Body::empty()),
+    let ticket: String = bytes.iter().map(|b| format!("{b:02x}")).collect();
+    let mut tickets = state.ws_tickets.lock().await;
+    // Sweep expired entries so the map can't grow without bound.
+    tickets.retain(|_, issued| issued.elapsed() < WS_TICKET_TTL);
+    tickets.insert(ticket.clone(), Instant::now());
+    Json(json!({ "ticket": ticket })).into_response()
+}
+
+async fn models(State(state): State<Arc<AppState>>) -> Response {
+    // Ask the default provider for its model list. Translate-only
+    // providers (anthropic/gemini) can't list — fall back to an empty
+    // list rather than forwarding a GET their API doesn't have.
+    let mut v = match state.default_provider() {
+        Some(p) => p
+            .list_models()
+            .await
+            .unwrap_or_else(|_| json!({"object": "list", "data": []})),
+        None => json!({"object": "list", "data": []}),
     };
-    let mut v: serde_json::Value =
-        serde_json::from_slice(&bytes).unwrap_or_else(|_| json!({"object":"list","data":[]}));
+    // Merge discovered ids from every provider that probed successfully.
+    let discovered = state.discovered.read().clone();
     let data = v["data"].as_array_mut();
     let mut seen: std::collections::HashSet<String> = data
         .as_ref()
@@ -212,6 +375,7 @@ async fn forward(
     path: &str,
     body: bytes::Bytes,
 ) -> Response {
+    state.metrics.requests_total.fetch_add(1, Ordering::Relaxed);
     // Route on the model field for chat completions. A `:low|:medium|:high`
     // suffix is a thinking-level selector — strip it before routing and
     // carry it as `_thinking` for the adapters.
@@ -228,17 +392,27 @@ async fn forward(
         let cfg = state.config.read();
         let providers = state.providers.read();
         let discovered = state.discovered.read();
-        // Strict route first (prefix/glob); discovered ids claim the model
-        // before it falls through to the default provider.
+        // Discovered ids claim the model FIRST — an exact id like
+        // "meta-llama/llama-3" must not be hijacked by the provider/model
+        // prefix split inside route_model_strict. Then strict (prefix/glob),
+        // then the default provider still gets the requested model name.
         let routed = model.as_deref().and_then(|m| {
-            cfg.route_model_strict(m)
-                .map(|(name, _, upstream)| (name.to_string(), upstream))
+            // HashMap order is nondeterministic — when two providers
+            // discover the same id, pick the alphabetically-first so the
+            // winner doesn't change per process.
+            let mut names: Vec<&String> = discovered.keys().collect();
+            names.sort();
+            names
+                .iter()
+                .find_map(|name| {
+                    discovered[*name]
+                        .iter()
+                        .any(|id| id == m)
+                        .then(|| ((*name).clone(), m.to_string()))
+                })
                 .or_else(|| {
-                    discovered.iter().find_map(|(name, ids)| {
-                        ids.iter()
-                            .any(|id| id == m)
-                            .then(|| (name.clone(), m.to_string()))
-                    })
+                    cfg.route_model_strict(m)
+                        .map(|(name, _, upstream)| (name.to_string(), upstream))
                 })
         });
         routed
@@ -256,10 +430,21 @@ async fn forward(
         );
     };
 
-    // Inject the thinking level into the body for the adapters.
-    let body = if let Some(level) = &thinking {
+    // Inject the thinking level for the adapters, and rewrite the model
+    // to its upstream id — otherwise the upstream receives the client's
+    // `provider/model[:level]` string verbatim and rejects it. When routing
+    // fell through to the default provider (upstream_model empty) the
+    // stripped name still replaces the suffixed one.
+    let body = if thinking.is_some() || !upstream_model.is_empty() {
         let mut v: serde_json::Value = serde_json::from_slice(&body).unwrap_or_else(|_| json!({}));
-        v["_thinking"] = json!(level);
+        if let Some(level) = &thinking {
+            v["_thinking"] = json!(level);
+        }
+        if !upstream_model.is_empty() {
+            v["model"] = json!(upstream_model);
+        } else if let Some(m) = &model {
+            v["model"] = json!(m);
+        }
         bytes::Bytes::from(v.to_string())
     } else {
         body
@@ -267,8 +452,16 @@ async fn forward(
 
     // Non-completions providers: translate instead of passthrough.
     if !matches!(&*provider, crate::provider::Provider::OpenAiCompletions(_)) {
-        return translate_forward(state, &provider_name, &provider, path, body, upstream_model)
-            .await;
+        return translate_forward(
+            state,
+            &provider_name,
+            &provider,
+            path,
+            body,
+            upstream_model,
+            0,
+        )
+        .await;
     }
 
     match provider.forward(method.clone(), path, body.clone()).await {
@@ -303,9 +496,16 @@ async fn promote_or_error(
     up: crate::provider::UpstreamResponse,
 ) -> Response {
     let status = up.status;
-    let buf = match crate::provider::collect_stream(up.stream).await {
-        Ok(b) => b,
-        Err(_) => return error_response(status, ""),
+    // Cap the buffered error body — a hostile/broken upstream could
+    // otherwise force unbounded allocation on every error response.
+    let buf = match tokio::time::timeout(
+        std::time::Duration::from_secs(30),
+        crate::provider::collect_stream(up.stream),
+    )
+    .await
+    {
+        Ok(Ok(b)) if b.len() <= (1 << 20) => b,
+        _ => return error_response(status, ""),
     };
     let text = String::from_utf8_lossy(&buf);
     if !is_context_overflow(&text) {
@@ -336,7 +536,7 @@ async fn promote_or_error(
     let body = bytes::Bytes::from(req.to_string());
     // Promoted request goes through the same path (translate for non-compat).
     if !matches!(&*tprovider, crate::provider::Provider::OpenAiCompletions(_)) {
-        return translate_forward(state, &tname, &tprovider, path, body, tmodel).await;
+        return translate_forward(state, &tname, &tprovider, path, body, tmodel, 1).await;
     }
     match tprovider.forward(method, path, body).await {
         Ok(up) => up.into_response(),
@@ -381,6 +581,9 @@ async fn translate_forward(
     path: &str,
     body: bytes::Bytes,
     upstream_model: String,
+    // Promotion retry depth — caps the recursion so cyclic
+    // context_promotion_target configs can't loop forever.
+    depth: u32,
 ) -> Response {
     if path != "/chat/completions" {
         return openai_error(
@@ -438,9 +641,26 @@ async fn translate_forward(
                         // Provider-internal block for history round-trip —
                         // not part of the OpenAI wire shape; skip it.
                         Ok(crate::llm::StreamEvent::ThinkingBlock(_)) => String::new(),
-                        Ok(crate::llm::StreamEvent::Done(_)) => "data: [DONE]\n\n".to_string(),
+                        Ok(crate::llm::StreamEvent::Done(reason)) => format!(
+                            // OpenAI clients key their tool loops on
+                            // finish_reason; emit the terminal chunk
+                            // before [DONE] or tool_calls/length are
+                            // invisible on the wire.
+                            "data: {}\n\ndata: [DONE]\n\n",
+                            serde_json::json!({"choices":[{
+                                "delta": {},
+                                "finish_reason": match reason {
+                                    crate::llm::StopReason::ToolCalls => "tool_calls",
+                                    crate::llm::StopReason::Length => "length",
+                                    _ => "stop",
+                                }
+                            }]})
+                        ),
+                        // A mid-stream provider error still terminates the
+                        // SSE stream — clients waiting on [DONE] would
+                        // otherwise hang on a truncated response.
                         Err(e) => format!(
-                            "data: {}\n\n",
+                            "data: {}\n\ndata: [DONE]\n\n",
                             serde_json::json!({"error":{"message":e.to_string()}})
                         ),
                     };
@@ -456,13 +676,25 @@ async fn translate_forward(
                     .unwrap()
             }
             Err(e) => {
+                // A provider 429 must reach the client as 429 + Retry-After —
+                // collapsing it into 502 loses the backoff signal entirely.
+                if let Some(rl) = e.downcast_ref::<crate::provider::RateLimited>() {
+                    return Response::builder()
+                        .status(StatusCode::TOO_MANY_REQUESTS)
+                        .header("retry-after", rl.0.as_secs().to_string())
+                        .header("content-type", "application/json")
+                        .body(Body::from(
+                            serde_json::json!({"error":{"message":"upstream rate limited","type":"rate_limit_error"}}).to_string(),
+                        ))
+                        .unwrap_or_else(|_| StatusCode::TOO_MANY_REQUESTS.into_response());
+                }
                 // Context promotion: overflow errors retry once on the target.
-                if is_context_overflow(&format!("{e}")) {
-                    if let Some(resp) =
+                if depth == 0
+                    && is_context_overflow(&format!("{e}"))
+                    && let Some(resp) =
                         promote_translate(state, provider_name, path, req.clone()).await
-                    {
-                        return resp;
-                    }
+                {
+                    return resp;
                 }
                 openai_error(
                     StatusCode::BAD_GATEWAY,
@@ -475,10 +707,23 @@ async fn translate_forward(
         match provider.chat(req.clone()).await {
             Ok(v) => Json(v).into_response(),
             Err(e) => {
-                if is_context_overflow(&format!("{e}")) {
-                    if let Some(resp) = promote_translate(state, provider_name, path, req).await {
-                        return resp;
-                    }
+                // A provider 429 must reach the client as 429 + Retry-After —
+                // collapsing it into 502 loses the backoff signal entirely.
+                if let Some(rl) = e.downcast_ref::<crate::provider::RateLimited>() {
+                    return Response::builder()
+                        .status(StatusCode::TOO_MANY_REQUESTS)
+                        .header("retry-after", rl.0.as_secs().to_string())
+                        .header("content-type", "application/json")
+                        .body(Body::from(
+                            serde_json::json!({"error":{"message":"upstream rate limited","type":"rate_limit_error"}}).to_string(),
+                        ))
+                        .unwrap_or_else(|_| StatusCode::TOO_MANY_REQUESTS.into_response());
+                }
+                if depth == 0
+                    && is_context_overflow(&format!("{e}"))
+                    && let Some(resp) = promote_translate(state, provider_name, path, req).await
+                {
+                    return resp;
                 }
                 openai_error(
                     StatusCode::BAD_GATEWAY,
@@ -510,21 +755,88 @@ fn promote_translate<'a>(
         };
         let tprovider = state.providers.read().get(&tname).cloned()?;
         let body = bytes::Bytes::from(req.to_string());
-        Some(translate_forward(state, &tname, &tprovider, path, body, tmodel).await)
+        Some(translate_forward(state, &tname, &tprovider, path, body, tmodel, 1).await)
     })
 }
 
-/// Bearer-token gate for /v1/*. No token configured → open on localhost.
+/// Per-source-IP token bucket for /v1/* — only on non-loopback binds,
+/// where a remote peer could hammer provider quota. Loopback binds skip
+/// entirely so local scripts are never throttled. The peer IP comes from
+/// `ConnectInfo<SocketAddr>`; when the server wasn't built with
+/// `into_make_service_with_connect_info` the extension is absent and the
+/// limiter is a no-op rather than trusting spoofable headers.
+async fn rate_limit(State(state): State<Arc<AppState>>, req: Request, next: Next) -> Response {
+    if state.bind.ip().is_loopback() {
+        return next.run(req).await;
+    }
+    let Some(peer) = req
+        .extensions()
+        .get::<ConnectInfo<SocketAddr>>()
+        .map(|c| c.0.ip())
+    else {
+        return next.run(req).await;
+    };
+    let mut buckets = state.rate_buckets.lock().await;
+    // Bound the map: drop idle buckets once it grows past a few pages of
+    // distinct peers. A sustained flood from >1024 IPs could otherwise
+    // keep every bucket "recent" and grow the map without limit — evict
+    // oldest-first until we're back under the cap.
+    if buckets.len() > 1024 {
+        buckets.retain(|_, (_, last)| last.elapsed() < Duration::from_secs(300));
+        while buckets.len() > 1024 {
+            let Some((&oldest, _)) = buckets.iter().min_by_key(|(_, (_, last))| *last) else {
+                break;
+            };
+            buckets.remove(&oldest);
+        }
+    }
+    if bucket_allow(
+        buckets
+            .entry(peer)
+            .or_insert((RATE_LIMIT_BURST, Instant::now())),
+    ) {
+        drop(buckets);
+        next.run(req).await
+    } else {
+        openai_error(
+            StatusCode::TOO_MANY_REQUESTS,
+            "rate limit exceeded",
+            "rate_limit_error",
+        )
+    }
+}
+
+/// Token bucket: refills at `RATE_LIMIT_PER_MIN`/min up to
+/// `RATE_LIMIT_BURST`, consumes one token per call. Split out so tests
+/// can drive it without a socket.
+#[doc(hidden)]
+pub fn bucket_allow(bucket: &mut (f64, Instant)) -> bool {
+    let refill = bucket.1.elapsed().as_secs_f64() * (RATE_LIMIT_PER_MIN / 60.0);
+    bucket.0 = (bucket.0 + refill).min(RATE_LIMIT_BURST);
+    bucket.1 = Instant::now();
+    if bucket.0 >= 1.0 {
+        bucket.0 -= 1.0;
+        true
+    } else {
+        false
+    }
+}
+
+/// Bearer-token gate for /v1/* and /metrics. No token configured → open on localhost.
 async fn require_token(State(state): State<Arc<AppState>>, req: Request, next: Next) -> Response {
     // Cached per raw config value — a !cmd/keychain ref resolves once,
     // not per request.
     let expected = match state.auth_token().await {
         Some(Ok(t)) => t,
-        // Configured but unresolvable: fail closed, never open.
+        // Configured but unresolvable: fail closed, never open. The
+        // detailed error (which can embed a !cmd string or keychain path)
+        // stays server-side — echoing it would leak the operator's
+        // secret-fetch mechanics to unauthenticated callers.
         Some(Err(e)) => {
+            warn!(error = %e, "auth token resolution failed");
             return openai_error(
                 StatusCode::SERVICE_UNAVAILABLE,
-                &format!("auth token resolution failed: {e}"),
+                "auth token unavailable",
                 "server_error",
             );
         }

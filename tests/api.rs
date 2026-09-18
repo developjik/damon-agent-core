@@ -37,11 +37,17 @@ fn test_config(base_url: &str, auth_token: Option<&str>) -> damon_core::config::
         providers,
         models: BTreeMap::new(),
         relay: None,
+        permission_timeout_secs: None,
+        max_tool_output: None,
+        summary_model: None,
+        session_retention_days: None,
     };
     Arc::new(parking_lot::RwLock::new(cfg))
 }
 
-/// Mock upstream that echoes the Authorization header it received.
+/// Mock upstream that echoes the Authorization header and the model name
+/// it received in the request body — the wire model is what routing
+/// assertions read back.
 async fn mock_upstream() -> String {
     let app = Router::new().route(
         "/chat/completions",
@@ -52,10 +58,14 @@ async fn mock_upstream() -> String {
                 .and_then(|v| v.to_str().ok())
                 .unwrap_or("")
                 .to_string();
+            let bytes = req.into_body().collect().await.unwrap().to_bytes();
+            let v: serde_json::Value =
+                serde_json::from_slice(&bytes).unwrap_or(serde_json::json!({}));
+            let model = v["model"].as_str().unwrap_or("").to_string();
             Response::builder()
                 .header("content-type", "text/event-stream")
                 .body(Body::from(format!(
-                    "data: {{\"auth\":\"{auth}\"}}\n\ndata: [DONE]\n\n"
+                    "data: {{\"auth\":\"{auth}\",\"model\":\"{model}\"}}\n\ndata: [DONE]\n\n"
                 )))
                 .unwrap()
         }),
@@ -108,6 +118,33 @@ async fn passthrough_injects_provider_key() {
     let body = resp.into_body().collect().await.unwrap().to_bytes();
     let text = String::from_utf8(body.to_vec()).unwrap();
     assert!(text.contains("Bearer sk-test-123"), "got: {text}");
+}
+/// The passthrough branch must forward the RESOLVED upstream model, not
+/// the client's `provider/model:level` string — prefix routing and
+/// thinking-suffix selection previously reached the upstream verbatim
+/// and were rejected as unknown models.
+#[tokio::test]
+async fn passthrough_rewrites_routed_model() {
+    unsafe { std::env::set_var("DAMON_TEST_KEY", "sk-test-123") };
+    let upstream = mock_upstream().await;
+    let app = app(&format!("http://{upstream}"), None).await;
+
+    let resp = app
+        .oneshot(
+            Request::post("/v1/chat/completions")
+                .header(header::CONTENT_TYPE, "application/json")
+                .body(Body::from(
+                    r#"{"model":"default/gpt-4o:high","messages":[{"role":"user","content":"hi"}]}"#,
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    let body = resp.into_body().collect().await.unwrap().to_bytes();
+    let text = String::from_utf8(body.to_vec()).unwrap();
+    assert!(text.contains("\"model\":\"gpt-4o\""), "got: {text}");
+    assert!(!text.contains("default/gpt-4o"), "got: {text}");
 }
 
 #[tokio::test]
@@ -166,6 +203,10 @@ async fn no_provider_returns_503_openai_error() {
         providers: BTreeMap::new(),
         models: BTreeMap::new(),
         relay: None,
+        permission_timeout_secs: None,
+        max_tool_output: None,
+        summary_model: None,
+        session_retention_days: None,
     }));
     let store = damon_core::store::Store::in_memory().await.unwrap();
     let mcp = damon_core::mcp::McpRegistry::connect_all(&HashMap::new()).await;
@@ -200,4 +241,116 @@ api_key = "sk-literal-secret"
         err.contains("env:") || err.contains("keychain:"),
         "got: {err}"
     );
+}
+
+#[tokio::test]
+async fn metrics_requires_token_and_exposes_counters() {
+    let app = app("http://127.0.0.1:1", Some("secret-token")).await;
+
+    // No token → 401
+    let resp = app
+        .clone()
+        .oneshot(Request::get("/metrics").body(Body::empty()).unwrap())
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
+
+    // Token → 200 with Prometheus text
+    let resp = app
+        .oneshot(
+            Request::get("/metrics")
+                .header(header::AUTHORIZATION, "Bearer secret-token")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    let body = resp.into_body().collect().await.unwrap().to_bytes();
+    let text = String::from_utf8(body.to_vec()).unwrap();
+    for name in [
+        "damon_requests_total",
+        "damon_prompts_total",
+        "damon_tokens_input_total",
+        "damon_tokens_output_total",
+        "damon_active_sessions",
+    ] {
+        assert!(text.contains(name), "missing {name} in: {text}");
+    }
+}
+
+#[tokio::test]
+async fn ws_ticket_requires_token_and_returns_hex() {
+    let app = app("http://127.0.0.1:1", Some("secret-token")).await;
+
+    // No token → 401
+    let resp = app
+        .clone()
+        .oneshot(Request::post("/v1/ws_ticket").body(Body::empty()).unwrap())
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
+
+    // Token → 200 with a 32-byte hex ticket
+    let resp = app
+        .oneshot(
+            Request::post("/v1/ws_ticket")
+                .header(header::AUTHORIZATION, "Bearer secret-token")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    let body = resp.into_body().collect().await.unwrap().to_bytes();
+    let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+    let ticket = json["ticket"].as_str().expect("ticket field");
+    assert_eq!(ticket.len(), 64);
+    assert!(ticket.chars().all(|c| c.is_ascii_hexdigit()));
+}
+
+#[test]
+fn token_bucket_allows_burst_then_throttles() {
+    let mut bucket = (20.0, std::time::Instant::now());
+    for _ in 0..20 {
+        assert!(api::bucket_allow(&mut bucket));
+    }
+    assert!(!api::bucket_allow(&mut bucket));
+    // A minute of elapsed time refills the bucket.
+    if let Some(past) = bucket.1.checked_sub(std::time::Duration::from_secs(60)) {
+        bucket.1 = past;
+        assert!(api::bucket_allow(&mut bucket));
+    }
+}
+
+#[tokio::test]
+async fn auth_token_cache_re_resolves_after_ttl() {
+    // A `!cmd` secret whose output changes between resolutions.
+    let dir = std::env::temp_dir().join(format!("damon-ttl-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let path = dir.join("token");
+    std::fs::write(&path, "first").unwrap();
+
+    let shared = test_config(
+        "http://127.0.0.1:1",
+        Some(&format!("!cat {}", path.display())),
+    );
+    let store = damon_core::store::Store::in_memory().await.unwrap();
+    let mcp = damon_core::mcp::McpRegistry::connect_all(&HashMap::new()).await;
+    let state = AppState::new(shared, store, mcp).await;
+
+    let ttl = std::time::Duration::from_millis(50);
+    let tok1 = state.auth_token_cached(ttl).await.unwrap().unwrap();
+    assert_eq!(tok1, "first");
+
+    // Within the TTL the cached value is served even though the
+    // command's output changed.
+    std::fs::write(&path, "second").unwrap();
+    let tok2 = state.auth_token_cached(ttl).await.unwrap().unwrap();
+    assert_eq!(tok2, "first");
+
+    // After expiry the secret is re-resolved.
+    tokio::time::sleep(ttl * 2).await;
+    let tok3 = state.auth_token_cached(ttl).await.unwrap().unwrap();
+    assert_eq!(tok3, "second");
 }
