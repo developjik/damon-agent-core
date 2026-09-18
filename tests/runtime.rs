@@ -84,6 +84,10 @@ async fn ws_prompt_streams_and_persists() {
         providers,
         models: BTreeMap::new(),
         relay: None,
+        permission_timeout_secs: None,
+        max_tool_output: None,
+        summary_model: None,
+        session_retention_days: None,
     }));
     let store = Store::in_memory().await.unwrap();
     let mcp = McpRegistry::connect_all(&HashMap::new()).await;
@@ -252,6 +256,10 @@ async fn cancel_mid_tool_loop_repairs_orphan_calls() {
         providers,
         models: BTreeMap::new(),
         relay: None,
+        permission_timeout_secs: None,
+        max_tool_output: None,
+        summary_model: None,
+        session_retention_days: None,
     }));
     let store = Store::in_memory().await.unwrap();
     let mcp = McpRegistry::connect_all(&HashMap::new()).await;
@@ -269,11 +277,13 @@ async fn cancel_mid_tool_loop_repairs_orphan_calls() {
     });
 
     // call_1 executes (fails: unknown tool), its tool_call_update fires
-    // cancel → call_2 never runs → must get a "cancelled" tool row.
+    // cancel → call_2 still runs execute_tool but its real error
+    // ("unknown tool b") is persisted — a cancelled turn must not mask
+    // a genuine tool failure as "cancelled".
     let _ = damon_core::runtime::run_prompt(&state, session_id, "hi", None, &client, cancel).await;
 
     let msgs = store.messages(session_id).await.unwrap();
-    // user + assistant(tool_calls) + tool(error) + tool(cancelled)
+    // user + assistant(tool_calls) + tool(error) + tool(error)
     assert_eq!(msgs.len(), 4, "got {msgs:?}");
     assert_eq!(msgs[0]["role"], "user");
     assert_eq!(msgs[1]["tool_calls"].as_array().unwrap().len(), 2);
@@ -281,7 +291,7 @@ async fn cancel_mid_tool_loop_repairs_orphan_calls() {
     assert_eq!(msgs[2]["tool_call_id"], "call_1");
     assert_eq!(msgs[3]["role"], "tool");
     assert_eq!(msgs[3]["tool_call_id"], "call_2");
-    assert_eq!(msgs[3]["content"], "cancelled");
+    assert_eq!(msgs[3]["content"], "error: unknown tool b");
 }
 
 /// Mock LLM: first call emits one SSE chunk then stalls forever;
@@ -380,6 +390,10 @@ async fn test_state(upstream: &str) -> (Arc<AppState>, Store) {
         providers,
         models: BTreeMap::new(),
         relay: None,
+        permission_timeout_secs: None,
+        max_tool_output: None,
+        summary_model: None,
+        session_retention_days: None,
     }));
     let store = Store::in_memory().await.unwrap();
     let mcp = McpRegistry::connect_all(&HashMap::new()).await;
@@ -585,6 +599,10 @@ async fn disconnect_cancels_prompt_and_frees_session() {
         providers,
         models: BTreeMap::new(),
         relay: None,
+        permission_timeout_secs: None,
+        max_tool_output: None,
+        summary_model: None,
+        session_retention_days: None,
     }));
     let store = Store::in_memory().await.unwrap();
     let mcp = McpRegistry::connect_all(&HashMap::new()).await;
@@ -685,4 +703,364 @@ async fn read_json(
             _ => continue,
         }
     }
+}
+
+/// Regression: a dead connection must fail pending requests, not hang
+/// them. The server accepts the WS upgrade then closes immediately.
+#[tokio::test]
+async fn client_request_fails_on_disconnect() {
+    use axum::extract::ws::{WebSocket, WebSocketUpgrade};
+    use axum::routing::get;
+    use damon_core::client::DamonClient;
+
+    async fn close_immediately(ws: WebSocketUpgrade) -> Response {
+        ws.on_upgrade(|mut sock: WebSocket| async move {
+            let _ = sock.close().await;
+        })
+    }
+    let app = Router::new().route("/ws", get(close_immediately));
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    tokio::spawn(async move {
+        axum::serve(listener, app).await.unwrap();
+    });
+
+    let client = DamonClient::connect(&format!("ws://{addr}/ws"), None)
+        .await
+        .unwrap();
+    // The request must resolve with an error once the socket dies —
+    // before the fix it waited on a response that could never arrive.
+    let result = tokio::time::timeout(
+        std::time::Duration::from_secs(5),
+        client.request("session/list", json!({})),
+    )
+    .await
+    .expect("request hung after disconnect");
+    assert!(result.is_err(), "expected error, got {result:?}");
+}
+
+/// Regression: a failed compaction summary must NOT record a compaction —
+/// the placeholder used to permanently drop half the session's context.
+#[tokio::test]
+async fn compaction_failure_keeps_full_history() {
+    use damon_core::runtime::{self, ClientChannel};
+
+    // Mock upstream: non-streaming (the summarizer) 500s, streaming
+    // (the actual turn) succeeds.
+    let app = Router::new().route(
+        "/chat/completions",
+        post(|body: String| async move {
+            let v: Value = serde_json::from_str(&body).unwrap();
+            if v["stream"].as_bool() == Some(true) {
+                Response::builder()
+                    .header("content-type", "text/event-stream")
+                    .body(Body::from(
+                        "data: {\"choices\":[{\"delta\":{\"content\":\"ok\"}}]}\n\ndata: [DONE]\n\n",
+                    ))
+                    .unwrap()
+            } else {
+                Response::builder()
+                    .status(500)
+                    .body(Body::from("boom"))
+                    .unwrap()
+            }
+        }),
+    );
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    tokio::spawn(async move {
+        axum::serve(listener, app).await.unwrap();
+    });
+
+    let mut providers = BTreeMap::new();
+    providers.insert(
+        "default".to_string(),
+        ProviderConfig {
+            api: "openai-completions".to_string(),
+            base_url: Some(format!("http://{addr}")),
+            api_key: None,
+            models: vec![],
+            default_model: Some("m".into()),
+            headers: Default::default(),
+            compat: Default::default(),
+            discovery: None,
+            context_promotion_target: None,
+        },
+    );
+    // Tiny context window forces compaction to run on this turn.
+    let mut models = BTreeMap::new();
+    models.insert(
+        "m".to_string(),
+        damon_core::config::ModelMeta {
+            context_window: Some(1),
+            ..Default::default()
+        },
+    );
+    let shared: damon_core::config::SharedConfig = Arc::new(parking_lot::RwLock::new(Config {
+        bind: "127.0.0.1:0".parse().unwrap(),
+        auth_token: None,
+        tls_cert: None,
+        tls_key: None,
+        data_dir: None,
+        mcp_servers: HashMap::new(),
+        providers,
+        models,
+        relay: None,
+        permission_timeout_secs: None,
+        max_tool_output: None,
+        summary_model: None,
+        session_retention_days: None,
+    }));
+    let store = Store::in_memory().await.unwrap();
+    let mcp = McpRegistry::connect_all(&HashMap::new()).await;
+    let state = AppState::new(shared, store.clone(), mcp).await;
+
+    store.create_session("s1", "", None).await.unwrap();
+    // Seed enough history that the dropped half is non-empty.
+    store
+        .append(
+            "s1",
+            "user",
+            &json!({"role":"user","content":"earlier message"}),
+        )
+        .await
+        .unwrap();
+    store
+        .append(
+            "s1",
+            "assistant",
+            &json!({"role":"assistant","content":"earlier reply"}),
+        )
+        .await
+        .unwrap();
+
+    struct Noop;
+    #[async_trait::async_trait]
+    impl ClientChannel for Noop {
+        async fn notify(&self, _m: &str, _p: Value) {}
+        async fn request(&self, _m: &str, _p: Value) -> anyhow::Result<Value> {
+            anyhow::bail!("no client")
+        }
+    }
+    let client: Arc<dyn ClientChannel> = Arc::new(Noop);
+    let cancel = tokio_util::sync::CancellationToken::new();
+    runtime::run_prompt(&state, "s1", "new question", None, &client, cancel)
+        .await
+        .unwrap();
+
+    // The failed summary must not have been recorded — the cutoff stays 0
+    // and messages() still returns the full history.
+    let (through, summary) = store.compaction("s1").await.unwrap();
+    assert_eq!(through, 0, "compaction was recorded despite failure");
+    assert!(summary.is_none());
+    let msgs = store.messages("s1").await.unwrap();
+    assert!(
+        msgs.iter().any(|m| m["content"] == "earlier message"),
+        "history was dropped: {msgs:?}"
+    );
+}
+
+/// Mock LLM: the first `tool_turns` calls each emit one tool call for
+/// `tool`, later calls return text. Used to drive the permission and
+/// iteration-cap paths against a real MCP tool.
+async fn mock_llm_tool(tool: &str, tool_turns: usize) -> String {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    let calls = Arc::new(AtomicUsize::new(0));
+    let tool = tool.to_string();
+    let app = Router::new().route(
+        "/chat/completions",
+        post(move |_body: String| {
+            let calls = calls.clone();
+            let tool = tool.clone();
+            async move {
+                let n = calls.fetch_add(1, Ordering::SeqCst);
+                let sse = if n < tool_turns {
+                    format!(
+                        "data: {{\"choices\":[{{\"delta\":{{\"tool_calls\":[{{\"index\":0,\"id\":\"call_{n}\",\"function\":{{\"name\":\"{tool}\",\"arguments\":\"{{}}\"}}}}]}}}}]}}\n\ndata: [DONE]\n\n"
+                    )
+                } else {
+                    "data: {\"choices\":[{\"delta\":{\"content\":\"done!\"}}]}\n\ndata: [DONE]\n\n"
+                        .to_string()
+                };
+                Response::builder()
+                    .header("content-type", "text/event-stream")
+                    .body(Body::from(sse))
+                    .unwrap()
+            }
+        }),
+    );
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    tokio::spawn(async move {
+        axum::serve(listener, app).await.unwrap();
+    });
+    addr.to_string()
+}
+
+/// App state wired to `upstream` plus the python `mcp_server.py` stdio
+/// server (tool `test.ping`). `auto_approve` controls whether calls skip
+/// the permission round-trip.
+async fn mcp_state(
+    upstream: &str,
+    auto_approve: bool,
+    permission_timeout_secs: Option<u64>,
+) -> (Arc<AppState>, Store) {
+    let mut providers = BTreeMap::new();
+    providers.insert(
+        "default".to_string(),
+        ProviderConfig {
+            api: "openai-completions".to_string(),
+            base_url: Some(format!("http://{upstream}")),
+            api_key: None,
+            models: vec![],
+            default_model: None,
+            headers: Default::default(),
+            compat: Default::default(),
+            discovery: None,
+            context_promotion_target: None,
+        },
+    );
+    let server_py = concat!(env!("CARGO_MANIFEST_DIR"), "/tests/mcp_server.py");
+    let mut mcp_servers = HashMap::new();
+    mcp_servers.insert(
+        "test".to_string(),
+        damon_core::config::McpServerConfig {
+            command: "python3".to_string(),
+            args: vec![server_py.to_string()],
+            env: HashMap::new(),
+            auto_approve,
+        },
+    );
+    let shared: damon_core::config::SharedConfig = Arc::new(parking_lot::RwLock::new(Config {
+        bind: "127.0.0.1:0".parse().unwrap(),
+        auth_token: None,
+        tls_cert: None,
+        tls_key: None,
+        data_dir: None,
+        mcp_servers,
+        providers,
+        models: BTreeMap::new(),
+        relay: None,
+        permission_timeout_secs,
+        max_tool_output: None,
+        summary_model: None,
+        session_retention_days: None,
+    }));
+    let store = Store::in_memory().await.unwrap();
+    let servers = shared.read().mcp_servers.clone();
+    let mcp = McpRegistry::connect_all(&servers).await;
+    assert!(mcp.has_tool("test.ping"), "MCP tool not registered");
+    (AppState::new(shared, store.clone(), mcp).await, store)
+}
+
+/// ClientChannel whose permission requests never resolve — the runtime
+/// must deny the tool once permission_timeout_secs elapses.
+struct SilentClient;
+
+#[async_trait::async_trait]
+impl damon_core::runtime::ClientChannel for SilentClient {
+    async fn notify(&self, _method: &str, _params: Value) {}
+    async fn request(&self, _method: &str, _params: Value) -> anyhow::Result<Value> {
+        futures::future::pending().await
+    }
+}
+
+#[tokio::test]
+async fn permission_prompt_timeout_denies_tool() {
+    let upstream = mock_llm_tool("test.ping", 1).await;
+    let (state, store) = mcp_state(&upstream, false, Some(1)).await;
+    store.create_session("s1", "/tmp", None).await.unwrap();
+
+    let client: Arc<dyn damon_core::runtime::ClientChannel> = Arc::new(SilentClient);
+    let cancel = tokio_util::sync::CancellationToken::new();
+    // The client never answers; without the timeout this hangs forever.
+    damon_core::runtime::run_prompt(&state, "s1", "hi", None, &client, cancel)
+        .await
+        .unwrap();
+
+    let msgs = store.messages("s1").await.unwrap();
+    let tool_row = msgs.iter().find(|m| m["role"] == "tool").unwrap();
+    assert!(
+        tool_row["content"]
+            .as_str()
+            .unwrap()
+            .contains("permission denied"),
+        "expected denial, got {tool_row}"
+    );
+}
+
+/// ClientChannel that answers every permission prompt with
+/// "allow-always" and counts how many it saw.
+struct AlwaysAllowClient {
+    requests: Arc<std::sync::atomic::AtomicUsize>,
+}
+
+#[async_trait::async_trait]
+impl damon_core::runtime::ClientChannel for AlwaysAllowClient {
+    async fn notify(&self, _method: &str, _params: Value) {}
+    async fn request(&self, _method: &str, _params: Value) -> anyhow::Result<Value> {
+        self.requests
+            .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        Ok(json!({"outcome": {"optionId": "allow-always"}}))
+    }
+}
+
+#[tokio::test]
+async fn always_allow_skips_later_prompts() {
+    // Two tool-call turns: the first prompts, the second must not.
+    let upstream = mock_llm_tool("test.ping", 2).await;
+    let (state, store) = mcp_state(&upstream, false, None).await;
+    store.create_session("s1", "/tmp", None).await.unwrap();
+
+    let requests = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let client: Arc<dyn damon_core::runtime::ClientChannel> = Arc::new(AlwaysAllowClient {
+        requests: requests.clone(),
+    });
+    let cancel = tokio_util::sync::CancellationToken::new();
+    damon_core::runtime::run_prompt(&state, "s1", "hi", None, &client, cancel)
+        .await
+        .unwrap();
+
+    assert_eq!(
+        requests.load(std::sync::atomic::Ordering::SeqCst),
+        1,
+        "second call to test.ping should have been auto-approved"
+    );
+    // Both tool rows carry real results, not permission errors.
+    let msgs = store.messages("s1").await.unwrap();
+    let tool_rows: Vec<&Value> = msgs.iter().filter(|m| m["role"] == "tool").collect();
+    assert_eq!(tool_rows.len(), 2, "got {msgs:?}");
+    for row in tool_rows {
+        assert!(
+            !row["content"]
+                .as_str()
+                .unwrap()
+                .contains("permission denied"),
+            "unexpected denial: {row}"
+        );
+    }
+}
+
+#[tokio::test]
+async fn max_iterations_returns_max_turn_requests() {
+    // The model never stops calling tools — the loop must give up with
+    // MaxTurnRequests after MAX_ITERATIONS rounds.
+    let upstream = mock_llm_tool("test.ping", usize::MAX).await;
+    let (state, store) = mcp_state(&upstream, true, None).await;
+    store.create_session("s1", "/tmp", None).await.unwrap();
+
+    struct Noop;
+    #[async_trait::async_trait]
+    impl damon_core::runtime::ClientChannel for Noop {
+        async fn notify(&self, _m: &str, _p: Value) {}
+        async fn request(&self, _m: &str, _p: Value) -> anyhow::Result<Value> {
+            anyhow::bail!("no client")
+        }
+    }
+    let client: Arc<dyn damon_core::runtime::ClientChannel> = Arc::new(Noop);
+    let cancel = tokio_util::sync::CancellationToken::new();
+    let stop = damon_core::runtime::run_prompt(&state, "s1", "hi", None, &client, cancel)
+        .await
+        .unwrap();
+    assert_eq!(stop, damon_core::llm::StopReason::MaxTurnRequests);
 }
