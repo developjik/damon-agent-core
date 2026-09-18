@@ -15,7 +15,7 @@ struct Args {
     #[arg(long, env = "DAMON_TOKEN")]
     token: Option<String>,
     /// Connect through a relay: --relay ws://relay:8080 --relay-name mydaemon
-    #[arg(long)]
+    #[arg(long, requires = "relay_name")]
     relay: Option<String>,
     /// Daemon name registered on the relay
     #[arg(long)]
@@ -75,6 +75,10 @@ enum Cmd {
 async fn main() -> anyhow::Result<()> {
     let args = Args::parse();
     if let Cmd::Health = args.cmd {
+        anyhow::ensure!(
+            args.relay.is_none(),
+            "--relay is not supported for `damon health` — query the daemon's /health endpoint directly"
+        );
         let url = args
             .url
             .replacen("wss://", "https://", 1)
@@ -83,7 +87,11 @@ async fn main() -> anyhow::Result<()> {
             "{}/health",
             url.trim_end_matches('/').trim_end_matches("/ws")
         );
-        let resp = reqwest::get(&url).await?;
+        // A hung daemon must not hang the health check forever.
+        let http = reqwest::Client::builder()
+            .timeout(std::time::Duration::from_secs(5))
+            .build()?;
+        let resp = http.get(&url).send().await?.error_for_status()?;
         println!("{}", resp.text().await?);
         return Ok(());
     }
@@ -106,7 +114,9 @@ async fn main() -> anyhow::Result<()> {
         }
         Cmd::Chat { session, model } => {
             let session_id = match session {
-                Some(s) => s,
+                // Verify the id exists up front — prompting into a dead
+                // session would only fail on the first turn.
+                Some(s) => client.resume_session(&s).await?,
                 None => client.new_session(&cwd(), model.as_deref()).await?,
             };
             chat_loop(&client, &session_id, model.as_deref()).await?;
@@ -134,7 +144,18 @@ async fn main() -> anyhow::Result<()> {
                 None => client.new_session(&cwd(), model.as_deref()).await?,
             };
             let mut events = client.events().await;
-            run_turn(&client, &mut events, &session_id, &text, model.as_deref()).await?;
+            // One-shot prompt: no REPL reader exists yet — create the
+            // single stdin reader here for permission answers.
+            let mut stdin = tokio::io::BufReader::new(tokio::io::stdin()).lines();
+            run_turn(
+                &client,
+                &mut events,
+                &session_id,
+                &text,
+                model.as_deref(),
+                &mut stdin,
+            )
+            .await?;
             println!();
         }
     }
@@ -166,7 +187,15 @@ async fn chat_loop(
         if line.trim().is_empty() {
             continue;
         }
-        run_turn(client, &mut events, session_id, &line, model).await?;
+        // A failed turn (provider error, "session not found", "prompt in
+        // progress") must not kill the REPL — only a dead event stream
+        // means the connection is gone for good.
+        if let Err(e) = run_turn(client, &mut events, session_id, &line, model, &mut stdin).await {
+            if events.is_closed() {
+                return Err(e);
+            }
+            eprintln!("[turn error] {e:#}");
+        }
     }
     Ok(())
 }
@@ -179,6 +208,7 @@ async fn run_turn(
     session_id: &str,
     text: &str,
     model: Option<&str>,
+    stdin: &mut tokio::io::Lines<tokio::io::BufReader<tokio::io::Stdin>>,
 ) -> anyhow::Result<()> {
     let prompt = {
         let client = client.clone();
@@ -227,23 +257,35 @@ async fn run_turn(
                 if method == "session/request_permission" {
                     let title = params["toolCall"]["title"].as_str().unwrap_or("?");
                     let input = params["toolCall"]["rawInput"].to_string();
-                    eprint!("\n[permission] {title} {input}\nallow? [y/N] ");
+                    eprint!("\n[permission] {title} {input}\nallow? [y/N/a(lways)] ");
                     use std::io::Write;
                     let _ = std::io::stderr().flush();
-                    let mut stdin = tokio::io::BufReader::new(tokio::io::stdin());
-                    let mut line = String::new();
-                    let _ = stdin.read_line(&mut line).await;
-                    let allow = matches!(line.trim(), "y" | "Y" | "yes");
+                    // Reuse the REPL's single buffered stdin — a second
+                    // BufReader on the same fd would race it for bytes.
+                    let line = stdin.next_line().await?.unwrap_or_default();
+                    let option = match line.trim() {
+                        "a" | "A" | "always" => "allow-always",
+                        "y" | "Y" | "yes" => "allow-once",
+                        _ => "reject-once",
+                    };
                     client
                         .respond(
                             id,
                             json!({
                                 "outcome": {
                                     "outcome": "selected",
-                                    "optionId": if allow { "allow-once" } else { "reject-once" }
+                                    "optionId": option
                                 }
                             }),
                         )
+                        .await?;
+                } else {
+                    // Unknown server-initiated request: answer with a
+                    // JSON-RPC error instead of leaving the daemon
+                    // waiting on a reply that never comes.
+                    eprintln!("\n[unsupported request: {method}]");
+                    client
+                        .respond_error(id, -32601, &format!("unsupported method: {method}"))
                         .await?;
                 }
             }

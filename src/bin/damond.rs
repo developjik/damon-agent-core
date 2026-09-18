@@ -95,6 +95,24 @@ async fn main() -> anyhow::Result<()> {
     let path = config::ensure_config(&path)?;
     let cfg = Config::load(&path)?;
     let bind = cfg.bind;
+    // Safety: non-loopback bind requires a resolvable auth_token — a
+    // remote-reachable daemon without auth is a remote code execution
+    // surface, and an unresolvable secret ref must fail at boot, not
+    // silently open the API. Runs before Store::open/MCP spawn so a bad
+    // config bails without side effects.
+    if !bind.ip().is_loopback() {
+        let has_token = cfg.auth_token.as_deref().is_some_and(|raw| {
+            match SecretRef::parse(raw) {
+                Ok(r) => r.resolve().is_ok(),
+                // Not a secret ref → a literal token, which is valid.
+                Err(_) => true,
+            }
+        });
+        anyhow::ensure!(
+            has_token,
+            "refusing to bind {bind}: non-loopback requires a resolvable auth_token in config"
+        );
+    }
     let data_dir = cfg
         .data_dir
         .clone()
@@ -119,36 +137,20 @@ async fn main() -> anyhow::Result<()> {
         });
     }
     // Remote relay: dial out so clients can reach us without an inbound port.
+    // The registration secret passes as its RAW ref (env:/keychain:/!cmd or
+    // literal) — run_tunnel re-resolves it per attempt, so rotation takes
+    // effect without a restart and a resolution failure is logged loudly
+    // instead of silently registering without the secret.
     if let Some(relay) = &shared.read().relay {
         let state = state.clone();
         let url = relay.url.clone();
         let name = relay.name.clone();
-        // Resolve the registration secret once — a !cmd/keychain ref
-        // resolves at boot, not per reconnect.
-        let secret = relay
-            .secret
-            .as_deref()
-            .and_then(|s| match config::SecretRef::parse(s) {
-                Ok(r) => r.resolve().ok(),
-                Err(_) => Some(s.to_string()),
-            });
+        let secret = relay.secret.clone();
         tokio::spawn(async move {
             damon_core::relay::run_tunnel(state, url, name, secret).await;
         });
     }
-    // Safety: non-loopback bind requires a resolvable auth_token — a
-    // remote-reachable daemon without auth is a remote code execution
-    // surface, and an unresolvable secret ref must fail at boot, not
-    // silently open the API.
-    if !bind.ip().is_loopback() {
-        let has_token = matches!(state.auth_token().await, Some(Ok(_)));
-        anyhow::ensure!(
-            has_token,
-            "refusing to bind {bind}: non-loopback requires a resolvable auth_token in config"
-        );
-    }
-
-    let app = api::router(state);
+    let app = api::router(state.clone());
     // Read TLS paths into locals first — a scrutinee guard would live for
     // the whole match (i.e. the server's lifetime), deadlocking the config
     // watcher's write lock on the first hot reload.
@@ -162,19 +164,46 @@ async fn main() -> anyhow::Result<()> {
                 .await
                 .context("cannot load TLS cert/key")?;
             info!(bind = %bind, "damond listening (TLS)");
+            let handle = axum_server::Handle::new();
+            // Keep the handle so SIGTERM can drain connections instead of
+            // dropping mid-request.
+            let shutdown_handle = handle.clone();
+            tokio::spawn(async move {
+                shutdown_signal().await;
+                shutdown_handle.graceful_shutdown(Some(std::time::Duration::from_secs(5)));
+            });
             axum_server::bind_rustls(bind, tls)
-                .handle(axum_server::Handle::new())
-                .serve(app.into_make_service())
+                .handle(handle)
+                // ConnectInfo installs the peer IP the rate limiter reads.
+                .serve(app.into_make_service_with_connect_info::<std::net::SocketAddr>())
                 .await?;
+            let prompts = state.live_prompts.lock().await;
+            for (_, (_, token)) in prompts.iter() {
+                token.cancel();
+            }
+            drop(prompts);
+            tokio::time::sleep(std::time::Duration::from_secs(2)).await;
         }
         (None, None) => {
             let listener = tokio::net::TcpListener::bind(bind)
                 .await
                 .with_context(|| format!("cannot bind {bind} — is another damond running?"))?;
-            info!(bind = %listener.local_addr()?, "damond listening");
-            axum::serve(listener, app)
-                .with_graceful_shutdown(shutdown_signal())
-                .await?;
+            axum::serve(
+                listener,
+                // ConnectInfo installs the peer IP the rate limiter reads.
+                app.into_make_service_with_connect_info::<std::net::SocketAddr>(),
+            )
+            .with_graceful_shutdown(shutdown_signal())
+            .await?;
+            // Cancel in-flight turns and give them a moment to persist
+            // "cancelled" tool rows — exiting mid-turn would orphan the
+            // assistant tool_calls and 400 every later turn.
+            let prompts = state.live_prompts.lock().await;
+            for (_, (_, token)) in prompts.iter() {
+                token.cancel();
+            }
+            drop(prompts);
+            tokio::time::sleep(std::time::Duration::from_secs(2)).await;
         }
         _ => anyhow::bail!("tls_cert and tls_key must be set together"),
     }
@@ -273,7 +302,20 @@ async fn doctor(path: &Path) -> anyhow::Result<()> {
                     Ok(_) => report(&mut ok, true, format!("auth_token — {raw} resolved")),
                     Err(e) => report(&mut ok, false, format!("auth_token — {raw}: {e:#}")),
                 },
-                Err(_) => report(&mut ok, true, "auth_token — literal token set"),
+                Err(_) => {
+                    // SecretRef::parse rejecting the raw string means a
+                    // literal token. A short one is offline-guessable —
+                    // the relay handshake exposes token-derived proofs.
+                    if raw.len() < 32 {
+                        report(
+                            &mut ok,
+                            true,
+                            "auth_token — literal token set (weak: <32 chars; use `openssl rand -hex 32`)",
+                        );
+                    } else {
+                        report(&mut ok, true, "auth_token — literal token set");
+                    }
+                }
             },
         }
     }
@@ -298,29 +340,34 @@ async fn doctor(path: &Path) -> anyhow::Result<()> {
     if ok { Ok(()) } else { std::process::exit(1) }
 }
 
+/// Print one doctor check line and fold it into the overall verdict.
 fn report(ok: &mut bool, pass: bool, msg: impl std::fmt::Display) {
-    println!("{} {msg}", if pass { "✓" } else { "✗" });
+    println!("{} {msg}", if pass { "ok  " } else { "FAIL" });
     *ok &= pass;
 }
 
 /// TCP-connect to the host:port implied by a base URL (3s timeout).
 async fn tcp_check(base_url: &str) -> anyhow::Result<()> {
     use anyhow::bail;
-    let rest = base_url
-        .split_once("://")
-        .map(|(_, r)| r)
-        .unwrap_or(base_url);
+    let (scheme, rest) = base_url.split_once("://").unwrap_or(("", base_url));
     let authority = rest.split('/').next().unwrap_or_default();
-    let default_port: u16 = if base_url.starts_with("https") {
-        443
-    } else {
-        80
-    };
-    let (host, port) = match authority.rsplit_once(':') {
-        Some((h, p)) if p.bytes().all(|b| b.is_ascii_digit()) && !p.is_empty() => {
-            (h.to_string(), p.parse()?)
+    // Exact scheme match — "httpsx://…" must not count as TLS.
+    let default_port: u16 = if scheme == "https" { 443 } else { 80 };
+    // Bracketed IPv6 ("[::1]:8080") needs its own split — rsplit_once(':')
+    // would leave the brackets on the host and break the connect.
+    let (host, port) = if let Some(rest) = authority.strip_prefix('[') {
+        match rest.split_once(']') {
+            Some((h, "")) => (h.to_string(), default_port),
+            Some((h, p)) => (h.to_string(), p[1..].parse()?),
+            None => bail!("cannot parse host"),
         }
-        _ => (authority.to_string(), default_port),
+    } else {
+        match authority.rsplit_once(':') {
+            Some((h, p)) if p.bytes().all(|b| b.is_ascii_digit()) && !p.is_empty() => {
+                (h.to_string(), p.parse()?)
+            }
+            _ => (authority.to_string(), default_port),
+        }
     };
     if host.is_empty() {
         bail!("cannot parse host");
