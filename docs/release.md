@@ -73,8 +73,9 @@ git tag v0.1.0 && git push origin v0.1.0
 
 ## Future improvements (from the initial deploy review)
 
-- Ship a `SHA256SUMS` file with each release and verify it in
-  `install.js` (no integrity check today).
+- `install.js` now verifies each tarball's `.sha256` sidecar before
+  extraction; a `SHA256SUMS` manifest would let one file cover all
+  targets instead of per-target sidecars.
 - More CI targets: `aarch64-unknown-linux-gnu` (`ubuntu-24.04-arm`
   runner), musl/Docker images for `damon-relay` VPS deploys.
 - Remote MCP servers via rmcp's `transport-streamable-http-client-reqwest`

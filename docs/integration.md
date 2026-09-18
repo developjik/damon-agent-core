@@ -94,16 +94,23 @@ input-token cost on long sessions.
 
 ### Context compaction
 
-When a session's estimated tokens (~4 chars/token) exceed 85% of the
-model's `context_window`, the oldest half is summarized by the provider
-and `compacted_through` is recorded. `messages()` then returns the summary
-plus the remainder. Summarization failure falls back to truncation.
+When a session's estimated tokens exceed 85% of the model's
+`context_window`, the oldest half is summarized by the provider
+(`summary_model` config overrides which model summarizes) and
+`compacted_through` is recorded. `messages()` then returns the summary
+plus the remainder. A failed summarization records nothing — the full
+history is kept and the turn proceeds.
 
-## Authentication
+### Authentication
 
 Required only when `auth_token` is configured. `/v1` takes
 `Authorization: Bearer <token>`; `/ws` takes the same header or a
-`?token=<token>` query. Unset → open on localhost.
+single-use `?ticket=<ticket>` issued by `POST /v1/ws_ticket` (60s TTL).
+Query-string tokens (`?token=`) are not accepted — they leak into logs
+and browser history. Unset → open on localhost.
+`GET /metrics` (behind the token gate) exposes Prometheus counters:
+`damon_requests_total`, `damon_prompts_total`, `damon_tokens_input_total`,
+`damon_tokens_output_total`, `damon_active_sessions`.
 
 Browser origins: when no `auth_token` is configured, requests carrying an
 `Origin` header are only accepted from loopback origins (`localhost`,
@@ -122,19 +129,19 @@ Client → daemon requests:
   omitted: per-session MCP servers are not supported and a non-empty list
   is rejected with `-32602` (configure `[mcp_servers]` in the daemon
   config instead).
-- `session/list {}` → `{sessions: [{sessionId, createdAt, model}]}`
+- `session/list {limit?, offset?}` → `{sessions: [{sessionId, createdAt, model}]}`
 - `session/resume {sessionId}` → `{sessionId}` (error if unknown)
-- `session/delete {sessionId}` → `{deleted: true}`
+- `session/delete {sessionId}` → `{deleted: true}` — cancels a live turn
+  first; `-32603 "session busy"` if it is still winding down after 10s
+- `session/messages {sessionId, limit?, offset?}` → `{messages: [...]}`
 - `session/search {query, limit}` → `{results: [{sessionId, messageId, snippet}]}`
 - `session/prompt {sessionId, prompt: [{type:"text", text}], model?}` → `{stopReason}` — `model` overrides the session default for this turn; the response arrives when the turn ends. Unknown `sessionId` → `-32602`.
-- `session/cancel {sessionId}` — notification (no response)
+- `session/cancel {sessionId}` — notification; if sent with an `id` it gets an empty `{}` result
 
 Daemon → client:
+- `session/request_permission` request — the client must answer `{outcome: {outcome:"selected", optionId:"allow-once"|"reject-once"|"allow-always"}}` for tool execution to proceed. `allow-always` approves that tool for the rest of the session (in-memory only). Unanswered prompts are denied after `permission_timeout_secs` (default 300s). `auto_approve` servers never send this.
 
-- `session/update` notification — `update.sessionUpdate` is `agent_message_chunk` (text delta), `agent_thought_chunk` (reasoning delta), or `tool_call_update` (toolCallId, status)
-- `session/request_permission` request — the client must answer `{outcome: {outcome:"selected", optionId:"allow-once"|"reject-once"}}` for tool execution to proceed. `auto_approve` servers never send this.
-
-`session/prompt` response `stopReason`: `end_turn` | `max_tokens` | `tool_use` | `cancelled`.
+`session/prompt` response `stopReason`: `end_turn` | `max_tokens` | `tool_use` | `cancelled` | `max_turn_requests` (tool-loop iteration cap hit).
 
 Concurrency rules:
 
@@ -243,7 +250,7 @@ The Rust example is `examples/client.rs` (`cargo run --example client`).
 
 ## From Rust
 
-`damon::client::DamonClient` is the reference implementation (used by
+`damon_core::client::DamonClient` is the reference implementation (used by
 `src/bin/damon.rs`):
 
 ```rust

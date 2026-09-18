@@ -68,7 +68,7 @@ damon chat --model claude/claude-sonnet-4-5   # 세션에 모델 고정
 damon prompt "이 레포 요약해줘" --model gpt-4o:high
 damon sessions                  # 세션 목록
 damon resume <id>               # 세션 이어하기
-damon search "error AND timeout"  # 전체 이력 FTS5 전문 검색
+damon search "error timeout"      # 전체 이력 FTS5 구문 검색
 ```
 
 ## 구조

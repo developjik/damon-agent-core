@@ -85,15 +85,22 @@ Gemini `thinkingConfig.thinkingBudget`, Responses `reasoning.effort`.
 
 ### 컨텍스트 컴팩션
 
-세션의 추정 토큰(~4자/토큰)이 모델 `context_window`의 85%를 넘으면,
-가장 오래된 절반을 provider로 요약하고 `compacted_through`를 기록한다.
-이후 `messages()`는 요약 + 나머지를 반환. 요약 실패 시 truncation fallback.
+세션의 추정 토큰이 모델 `context_window`의 85%를 넘으면,
+가장 오래된 절반을 provider로 요약하고(`summary_model` 설정으로 요약 모델 지정 가능)
+`compacted_through`를 기록한다. 이후 `messages()`는 요약 + 나머지를 반환.
+요약 실패 시 아무것도 기록하지 않음 — 전체 히스토리를 유지한 채 턴 진행.
 
 ## 인증
 
 
 `auth_token`이 설정된 경우에만 필요. `/v1`은 `Authorization: Bearer <token>`,
-`/ws`는 같은 헤더 또는 `?token=<token>` 쿼리. 미설정 시 localhost 오픈.
+`/ws`는 같은 헤더 또는 `POST /v1/ws_ticket`이 발급한 단회성
+`?ticket=<ticket>`(60초 TTL). 쿼리 문자열 토큰(`?token=`)은 미지원 —
+로그와 브라우저 히스토리에 새어나가므로. 미설정 시 localhost 오픈.
+
+`GET /metrics`(토큰 게이트 뒤)는 Prometheus 카운터를 노출:
+`damon_requests_total`, `damon_prompts_total`, `damon_tokens_input_total`,
+`damon_tokens_output_total`, `damon_active_sessions`.
 
 브라우저 Origin: `auth_token` 미설정 시 `Origin` 헤더를 보내는 요청은
 루프백 origin(`localhost`, `*.localhost`, `127.0.0.0/8`, `[::1]`)만 허용
@@ -110,17 +117,19 @@ Gemini `thinkingConfig.thinkingBudget`, Responses `reasoning.effort`.
   thinking 접미사). `mcpServers`는 비어 있거나 생략해야 함: 세션별 MCP
   서버는 미지원이며 비어 있지 않으면 `-32602`로 거부(데몬 config의
   `[mcp_servers]` 사용).
-- `session/list {}` → `{sessions: [{sessionId, createdAt, model}]}`
+- `session/list {limit?, offset?}` → `{sessions: [{sessionId, createdAt, model}]}`
 - `session/resume {sessionId}` → `{sessionId}` (알 수 없으면 에러)
-- `session/delete {sessionId}` → `{deleted: true}`
+- `session/delete {sessionId}` → `{deleted: true}` — 실행 중인 턴을 먼저 취소;
+  10초 후에도 종료 중이면 `-32603 "session busy"`
+- `session/messages {sessionId, limit?, offset?}` → `{messages: [...]}`
 - `session/search {query, limit}` → `{results: [{sessionId, messageId, snippet}]}`
 - `session/prompt {sessionId, prompt: [{type:"text", text}], model?}` → `{stopReason}` — `model`은 이 턴에서만 세션 기본값을 덮어씀. 응답은 턴 종료 시 도착. 알 수 없는 `sessionId` → `-32602`.
-- `session/cancel {sessionId}` — notification (응답 없음)
+- `session/cancel {sessionId}` — notification; `id`를 포함하면 빈 `{}` 결과가 옴
 
 - `session/update` notification — `update.sessionUpdate`가 `agent_message_chunk`(텍스트 델타), `agent_thought_chunk`(추론 델타), 또는 `tool_call_update`(tool_callId, status)
-- `session/request_permission` request — 클라이언트가 `{outcome: {outcome:"selected", optionId:"allow-once"|"reject-once"}}`로 응답해야 tool 실행이 진행됨. `auto_approve` 서버는 이 요청이 오지 않는다.
+- `session/request_permission` request — 클라이언트가 `{outcome: {outcome:"selected", optionId:"allow-once"|"reject-once"|"allow-always"}}`로 응답해야 tool 실행이 진행됨. `allow-always`는 해당 툴을 세션 동안 자동 승인(메모리에만 유지). 응답 없는 프롬프트는 `permission_timeout_secs`(기본 300초) 후 거부. `auto_approve` 서버는 이 요청이 오지 않는다.
 
-`session/prompt` 응답의 `stopReason`: `end_turn` | `max_tokens` | `tool_use` | `cancelled`.
+`session/prompt` 응답의 `stopReason`: `end_turn` | `max_tokens` | `tool_use` | `cancelled` | `max_turn_requests` (tool-loop 반복 상한 도달).
 
 
 ## 최소 클라이언트 흐름

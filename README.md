@@ -9,7 +9,7 @@
 
 **One daemon. Every surface.**
 
-Damon is a local, always-on agent core written in Rust. It owns the hard parts — the tool loop, sessions, memory, provider quirks, secrets — and exposes them through a single API. Your CLI, Telegram bot, desktop app, or web UI all become thin clients that attach to the same resident daemon.
+Damon is a local, always-on agent core written in Rust. It owns the hard parts — the tool loop, sessions, session memory (SQLite + FTS5 search), provider quirks, secrets — and exposes them through a single API. Your CLI, Telegram bot, desktop app, or web UI all become thin clients that attach to the same resident daemon.
 
 The name is a pun on *daemon* — and it's also literally what it is.
 
@@ -68,7 +68,7 @@ damon chat --model claude/claude-sonnet-4-5   # pin a model for the session
 damon prompt "summarize this repo" --model gpt-4o:high
 damon sessions                  # list sessions
 damon resume <id>               # pick a session back up
-damon search "error AND timeout"  # FTS5 full-text search over all history
+damon search "error timeout"      # FTS5 phrase search over all history
 ```
 
 ## Architecture
