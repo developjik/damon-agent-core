@@ -15,11 +15,26 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy, rustfmt
       - uses: Swatinem/rust-cache@v2
       - name: Install Linux deps
         if: runner.os == 'Linux'
         run: sudo apt-get update && sudo apt-get install -y libdbus-1-dev pkg-config
+      - run: cargo fmt --check
+      - run: cargo clippy --all-targets -- -D warnings
       - run: cargo test
+      # Release-only code paths (cfg(not(debug_assertions))) get no
+      # compile coverage from a debug test run — check them explicitly.
+      - run: cargo check --release --all-targets
+
+  audit:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: rustsec/audit-check@v2
+        with:
+          token: ${{ secrets.GITHUB_TOKEN }}
 
   release:
     if: startsWith(github.ref, 'refs/tags/v')
@@ -41,6 +56,17 @@ jobs:
     runs-on: ${{ matrix.os }}
     steps:
       - uses: actions/checkout@v4
+      - name: Verify tag matches manifest versions
+        shell: bash
+        run: |
+          tag="${GITHUB_REF_NAME#v}"
+          cargo_v=$(grep -m1 '^version = ' Cargo.toml | cut -d'"' -f2)
+          npm_v=$(node -p "require('./npm/package.json').version" 2>/dev/null || grep -m1 '"version"' npm/package.json | cut -d'"' -f4)
+          formula_v=$(grep -m1 '^  version ' Formula/damon.rb | cut -d'"' -f2)
+          echo "tag=$tag cargo=$cargo_v npm=$npm_v formula=$formula_v"
+          [ "$tag" = "$cargo_v" ] && [ "$tag" = "$npm_v" ] && [ "$tag" = "$formula_v" ] || {
+            echo "tag v$tag does not match manifest versions" >&2; exit 1;
+          }
       - uses: dtolnay/rust-toolchain@stable
         with:
           targets: ${{ matrix.target }}
@@ -55,13 +81,14 @@ jobs:
           cd target/${{ matrix.target }}/release
           tar czf ../../../damon-${{ matrix.target }}.tar.gz --exclude='*.d' damond* damon*
           cd ../../..
-          ls -la damon-*.tar.gz
+          shasum -a 256 damon-${{ matrix.target }}.tar.gz > damon-${{ matrix.target }}.tar.gz.sha256
+          ls -la damon-*.tar.gz*
       - uses: softprops/action-gh-release@v2
         with:
-          files: damon-*.tar.gz
+          files: damon-*.tar.gz*
 
   publish-npm:
-    if: startsWith(github.ref, 'refs/tags/')
+    if: startsWith(github.ref, 'refs/tags/v')
     needs: release
     runs-on: ubuntu-latest
     steps:
@@ -77,7 +104,7 @@ jobs:
           NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
 
   publish-crates:
-    if: startsWith(github.ref, 'refs/tags/')
+    if: startsWith(github.ref, 'refs/tags/v')
     needs: release
     runs-on: ubuntu-latest
     steps:
