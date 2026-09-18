@@ -63,7 +63,14 @@ pub struct Bridge {
     chat_sessions: Mutex<HashMap<String, String>>,
     /// chat_ids with a turn in flight — serializes turns per chat.
     active_turns: Mutex<std::collections::HashSet<String>>,
+    /// Sender/chat ids allowed to drive the agent. `None` = open (the
+    /// channel binaries refuse to start without one — a public bot with
+    /// no allowlist is unauthenticated agent access).
+    allowed: parking_lot::RwLock<Option<std::collections::HashSet<String>>>,
     demux: Mutex<Demux>,
+    /// events() is single-consumer — a second router would get a dead
+    /// receiver and exit silently, hanging every turn. Spawn at most one.
+    router_started: std::sync::atomic::AtomicBool,
 }
 
 impl Bridge {
@@ -73,11 +80,19 @@ impl Bridge {
             client,
             chat_sessions: Mutex::new(HashMap::new()),
             active_turns: Mutex::new(std::collections::HashSet::new()),
+            allowed: parking_lot::RwLock::new(None),
             demux: Mutex::new(Demux {
                 sessions: HashMap::new(),
                 pending_permissions: HashMap::new(),
             }),
+            router_started: std::sync::atomic::AtomicBool::new(false),
         })
+    }
+
+    /// Restrict the bridge to these sender/chat ids. Checked before any
+    /// session or prompt work — an unlisted sender is dropped silently.
+    pub fn set_allowed(&self, ids: impl IntoIterator<Item = String>) {
+        *self.allowed.write() = Some(ids.into_iter().collect());
     }
 
     /// Main loop: channel setup, then dispatch inbound messages forever.
@@ -107,8 +122,16 @@ impl Bridge {
 
     /// Single consumer of client.events(); fans out to per-session channels.
     /// PromptDone arrives through the same stream, ordered after that
-    /// session's notifications, so trailing chunks are never lost.
     pub async fn spawn_event_router(self: &Arc<Self>) {
+        // events() is single-consumer: a second call gets a dead
+        // receiver whose router exits instantly and hangs every turn.
+        // An embedder that already spawned one must not start another.
+        if self
+            .router_started
+            .swap(true, std::sync::atomic::Ordering::SeqCst)
+        {
+            return;
+        }
         let mut events = self.client.events().await;
         let me = self.clone();
         tokio::spawn(async move {
@@ -123,13 +146,26 @@ impl Bridge {
                 if let Some(sid) = session_id {
                     let tx = me.demux.lock().await.sessions.get(&sid).cloned();
                     if let Some(tx) = tx {
-                        let _ = tx.send(ev).await;
+                        // A slow chat (rate-limited send, hung HTTP) fills
+                        // its 64-slot channel and would otherwise block
+                        // this router — stalling EVERY session's events.
+                        // Streamed Update chunks are droppable (the final
+                        // flush happens on PromptDone); PromptDone and
+                        // Request are always awaited — they can't pile up
+                        // once Updates stop queueing.
+                        match &ev {
+                            ClientEvent::Update(_) => {
+                                let _ = tx.try_send(ev);
+                            }
+                            _ => {
+                                let _ = tx.send(ev).await;
+                            }
+                        }
                     }
                 }
             }
         });
     }
-
     /// Handle one inbound message: permission reply, or a new prompt turn.
     pub async fn handle_message(
         self: &Arc<Self>,
@@ -137,50 +173,60 @@ impl Bridge {
         sender_id: Option<String>,
         text: String,
     ) {
+        // Allowlist gate: an unlisted sender/chat must not reach the
+        // agent at all — no session, no prompt, no permission reply.
+        if let Some(allowed) = &*self.allowed.read() {
+            let sender_ok = sender_id.as_deref().is_some_and(|s| allowed.contains(s));
+            if !sender_ok && !allowed.contains(&chat_id) {
+                return;
+            }
+        }
         // "allow"/"deny" answers a pending permission request — but only
         // from the sender who triggered it. In group chats anyone else
         // typing "allow" must not approve a tool run.
         let lower = text.trim().to_lowercase();
         if lower == "allow" || lower == "deny" {
-            let pending = self
-                .demux
-                .lock()
-                .await
-                .pending_permissions
-                .get(&chat_id)
-                .map(|(req, _)| req.clone());
-            let authorized = match (&pending, &sender_id) {
-                (Some(Some(req)), Some(sender)) => req == sender,
-                // Unknown requester or unknown sender: allow (DM-style
-                // channels that don't expose identity).
-                _ => true,
+            // Check + consume under ONE lock — splitting them let end_turn
+            // remove the entry between the two and panic on unwrap.
+            let mut demux = self.demux.lock().await;
+            let authorized = match demux.pending_permissions.get(&chat_id) {
+                None => false,
+                Some((req, _)) => match (req, &sender_id) {
+                    (Some(req), Some(sender)) => req == sender,
+                    // An unidentified REQUESTER may only be answered by
+                    // an unidentified sender (DM-style channels without
+                    // identity). A named replier must never approve an
+                    // anonymous requester's prompt — in a group chat
+                    // that would let any member authorize the tool run.
+                    (None, None) => true,
+                    (None, Some(_)) | (Some(_), None) => false,
+                },
             };
-            if pending.is_some() {
-                if authorized {
-                    let (_, tx) = self
-                        .demux
-                        .lock()
-                        .await
-                        .pending_permissions
-                        .remove(&chat_id)
-                        .unwrap();
-                    let _ = tx.send(lower == "allow");
-                    let _ = self
-                        .ch
-                        .send(
-                            &chat_id,
-                            if lower == "allow" {
-                                "✅ allowed"
-                            } else {
-                                "🚫 denied"
-                            },
-                        )
-                        .await;
-                }
+            if !demux.pending_permissions.contains_key(&chat_id) {
+                // No pending request — fall through to prompt handling.
+            } else if !authorized {
                 // Pending exists but the replier isn't the requester —
                 // swallow the reply; it must not become a prompt.
                 return;
+            } else {
+                if let Some((_, tx)) = demux.pending_permissions.remove(&chat_id) {
+                    let _ = tx.send(lower == "allow");
+                }
+                drop(demux);
+                let _ = self
+                    .ch
+                    .send(
+                        &chat_id,
+                        if lower == "allow" {
+                            "✅ allowed"
+                        } else {
+                            "🚫 denied"
+                        },
+                    )
+                    .await;
+                return;
             }
+            drop(demux);
         }
 
         // One live turn per chat — a second prompt would overwrite the
@@ -206,10 +252,28 @@ impl Bridge {
         };
         let me = self.clone();
         tokio::spawn(async move {
+            // RAII cleanup: a panic inside run_turn must still free the
+            // active_turns entry or this chat bricks until restart.
+            struct TurnGuard<'a> {
+                bridge: &'a Arc<Bridge>,
+                chat_id: String,
+            }
+            impl Drop for TurnGuard<'_> {
+                fn drop(&mut self) {
+                    let bridge = self.bridge.clone();
+                    let chat_id = std::mem::take(&mut self.chat_id);
+                    tokio::spawn(async move {
+                        bridge.active_turns.lock().await.remove(&chat_id);
+                    });
+                }
+            }
+            let _guard = TurnGuard {
+                bridge: &me,
+                chat_id: chat_id.clone(),
+            };
             if let Err(e) = me.run_turn(&chat_id, &session_id, sender_id, &text).await {
                 let _ = me.ch.send(&chat_id, &format!("error: {e:#}")).await;
             }
-            me.active_turns.lock().await.remove(&chat_id);
         });
     }
 
@@ -234,99 +298,147 @@ impl Bridge {
         text: &str,
     ) -> anyhow::Result<()> {
         let (tx, mut rx) = mpsc::channel(64);
+        let mut session_id = session_id.to_string();
         self.demux
             .lock()
             .await
             .sessions
-            .insert(session_id.to_string(), tx);
+            .insert(session_id.clone(), tx.clone());
 
         // Send the prompt; the turn result arrives as PromptDone on `rx`.
-        let prompt_send = {
-            let client = self.client.clone();
-            let sid = session_id.to_string();
-            let text = text.to_string();
-            tokio::spawn(async move { client.prompt(&sid, &text, None).await })
-        };
-
+        // A stale cached session (deleted via session/delete or the
+        // retention sweep) reports "session not found" as a PromptDone
+        // error — prompt() itself only fails on send. Drop the mapping
+        // and retry once on a fresh session instead of bricking the
+        // chat until restart.
         let mut buf = String::new();
-        // Fail fast if the send itself errors; otherwise wait for PromptDone.
-        match prompt_send.await {
-            Ok(Ok(())) => {}
-            Ok(Err(e)) => {
-                self.end_turn(chat_id, session_id).await;
-                return Err(e);
+        let mut retried = false;
+        'turn: loop {
+            {
+                let client = self.client.clone();
+                let sid = session_id.clone();
+                let text = text.to_string();
+                if let Err(e) = tokio::spawn(async move { client.prompt(&sid, &text, None).await })
+                    .await
+                    .map_err(anyhow::Error::from)
+                    .and_then(|r| r)
+                {
+                    self.end_turn(chat_id, &session_id).await;
+                    return Err(e);
+                }
             }
-            Err(e) => {
-                self.end_turn(chat_id, session_id).await;
-                return Err(e.into());
-            }
-        }
-        loop {
-            match rx.recv().await {
-                Some(ClientEvent::PromptDone { result, .. }) => {
-                    self.end_turn(chat_id, session_id).await;
-                    self.flush(chat_id, &mut buf).await;
-                    match result {
-                        Ok(v) => {
-                            let stop = v["stopReason"].as_str().unwrap_or("?");
-                            if stop != "end_turn" {
-                                let _ = self.ch.send(chat_id, &format!("[{stop}]")).await;
+            loop {
+                match rx.recv().await {
+                    Some(ClientEvent::PromptDone { result, .. }) => {
+                        // Stale session: remap and retry once on a fresh
+                        // session before giving up.
+                        if let Err(e) = &result
+                            && !retried
+                            && e["message"]
+                                .as_str()
+                                .unwrap_or("")
+                                .contains("session not found")
+                        {
+                            retried = true;
+                            self.chat_sessions.lock().await.remove(chat_id);
+                            self.demux.lock().await.sessions.remove(&session_id);
+                            match self.session_for(chat_id).await {
+                                Ok(fresh) => {
+                                    session_id = fresh;
+                                    self.demux
+                                        .lock()
+                                        .await
+                                        .sessions
+                                        .insert(session_id.clone(), tx.clone());
+                                    continue 'turn;
+                                }
+                                Err(e) => {
+                                    self.end_turn(chat_id, &session_id).await;
+                                    return Err(e);
+                                }
                             }
                         }
-                        Err(e) => bail!("{}", e["message"].as_str().unwrap_or("rpc error")),
-                    }
-                    return Ok(());
-                }
-                Some(ClientEvent::Update(p)) => {
-                    let u = &p["update"];
-                    if u["sessionUpdate"] == "agent_message_chunk" {
-                        if let Some(t) = u["content"]["text"].as_str() {
-                            buf.push_str(t);
-                            if buf.len() > self.ch.flush_threshold() {
-                                self.flush(chat_id, &mut buf).await;
+                        self.end_turn(chat_id, &session_id).await;
+                        self.flush(chat_id, &mut buf).await;
+                        match result {
+                            Ok(v) => {
+                                let stop = v["stopReason"].as_str().unwrap_or("?");
+                                if stop != "end_turn" {
+                                    let _ = self.ch.send(chat_id, &format!("[{stop}]")).await;
+                                }
                             }
+                            Err(e) => bail!("{}", e["message"].as_str().unwrap_or("rpc error")),
                         }
-                    } else if u["sessionUpdate"] == "tool_call_update" {
-                        let status = u["status"].as_str().unwrap_or("");
-                        let _ = self.ch.send(chat_id, &format!("🔧 tool {}", status)).await;
+                        return Ok(());
                     }
-                }
-                Some(ClientEvent::Request { id, method, params }) => {
-                    if method == "session/request_permission" {
-                        let title = params["toolCall"]["title"]
-                            .as_str()
-                            .unwrap_or("tool")
-                            .to_string();
-                        let (ptx, prx) = oneshot::channel();
-                        self.demux
-                            .lock()
-                            .await
-                            .pending_permissions
-                            .insert(chat_id.to_string(), (sender_id.clone(), ptx));
-                        let _ = self
-                            .ch
-                            .send(chat_id, &format!("🔐 {title}\nreply 'allow' or 'deny'"))
-                            .await;
-                        let client = self.client.clone();
-                        tokio::spawn(async move {
-                            let allow = prx.await.unwrap_or(false);
-                            let _ = client
-                                        .respond(
-                                            id,
-                                            json!({
-                                                "outcome": {
-                                                    "outcome": "selected",
-                                                    "optionId": if allow { "allow-once" } else { "reject-once" }
-                                                }
-                                            }),
-                                        )
-                                        .await;
-                        });
+                    Some(ClientEvent::Update(p)) => {
+                        let u = &p["update"];
+                        if u["sessionUpdate"] == "agent_message_chunk" {
+                            if let Some(t) = u["content"]["text"].as_str() {
+                                buf.push_str(t);
+                                if buf.len() > self.ch.flush_threshold() {
+                                    self.flush(chat_id, &mut buf).await;
+                                }
+                            }
+                        } else if u["sessionUpdate"] == "tool_call_update" {
+                            let status = u["status"].as_str().unwrap_or("");
+                            let _ = self.ch.send(chat_id, &format!("🔧 tool {}", status)).await;
+                        }
                     }
-                }
-                None => {
-                    self.end_turn(chat_id, session_id).await;
-                    anyhow::bail!("event channel closed")
+                    Some(ClientEvent::Request { id, method, params }) => {
+                        if method == "session/request_permission" {
+                            let title = params["toolCall"]["title"]
+                                .as_str()
+                                .unwrap_or("tool")
+                                .to_string();
+                            let (ptx, prx) = oneshot::channel();
+                            self.demux
+                                .lock()
+                                .await
+                                .pending_permissions
+                                .insert(chat_id.to_string(), (sender_id.clone(), ptx));
+                            let _ = self
+                                .ch
+                                .send(chat_id, &format!("🔐 {title}\nreply 'allow' or 'deny'"))
+                                .await;
+                            let client = self.client.clone();
+                            let me = self.clone();
+                            let cid = chat_id.to_string();
+                            tokio::spawn(async move {
+                                // Bound the wait by the daemon's default
+                                // permission timeout — a late "allow"
+                                // after the daemon already denied the
+                                // call must not print ✅ for a dead ask.
+                                let timeout = std::time::Duration::from_secs(300);
+                                let allow = match tokio::time::timeout(timeout, prx).await {
+                                    Ok(a) => a.unwrap_or(false),
+                                    Err(_) => {
+                                        me.demux.lock().await.pending_permissions.remove(&cid);
+                                        let _ = me
+                                            .ch
+                                            .send(&cid, "⏱ permission request timed out")
+                                            .await;
+                                        false
+                                    }
+                                };
+                                let _ = client
+                                            .respond(
+                                                id,
+                                                json!({
+                                                    "outcome": {
+                                                        "outcome": "selected",
+                                                        "optionId": if allow { "allow-once" } else { "reject-once" }
+                                                    }
+                                                }),
+                                            )
+                                            .await;
+                            });
+                        }
+                    }
+                    None => {
+                        self.end_turn(chat_id, &session_id).await;
+                        anyhow::bail!("event channel closed")
+                    }
                 }
             }
         }

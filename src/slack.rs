@@ -35,23 +35,41 @@ impl SlackApi {
     pub fn with_base(app_token: &str, bot_token: &str, base: &str) -> Self {
         Self {
             base: base.trim_end_matches('/').to_string(),
-            http: reqwest::Client::new(),
+            // A stalled TCP connection must not park a send forever —
+            // the bridge's run_turn would hang and brick the chat.
+            http: reqwest::Client::builder()
+                .connect_timeout(std::time::Duration::from_secs(10))
+                .timeout(std::time::Duration::from_secs(30))
+                .build()
+                .unwrap_or_else(|_| reqwest::Client::new()),
             app_token: app_token.to_string(),
             bot_token: bot_token.to_string(),
         }
     }
 
     async fn post(&self, method: &str, token: &str, body: &Value) -> anyhow::Result<Value> {
-        let resp: Value = self
-            .http
-            .post(format!("{}/{method}", self.base))
-            .bearer_auth(token)
-            .json(body)
-            .send()
-            .await?
-            .error_for_status()?
-            .json()
-            .await?;
+        let send = || {
+            self.http
+                .post(format!("{}/{method}", self.base))
+                .bearer_auth(token)
+                .json(body)
+        };
+        let resp = send().send().await?;
+        // A 429 mid-split must not lose the remaining chunks — honor
+        // Retry-After and retry the failed request once.
+        let resp = if resp.status() == reqwest::StatusCode::TOO_MANY_REQUESTS {
+            let wait = resp
+                .headers()
+                .get("retry-after")
+                .and_then(|v| v.to_str().ok())
+                .and_then(|v| v.parse::<f64>().ok())
+                .unwrap_or(1.0);
+            tokio::time::sleep(std::time::Duration::from_secs_f64(wait.min(30.0))).await;
+            send().send().await?
+        } else {
+            resp
+        };
+        let resp: Value = resp.error_for_status()?.json().await?;
         // Slack returns 200 with {"ok": false, "error": "..."} on API errors.
         anyhow::ensure!(
             resp["ok"].as_bool().unwrap_or(false),
@@ -81,19 +99,31 @@ impl SlackApi {
             .context("auth.test returned no user_id")
     }
 
-    /// Slack messages effectively cap ~4000 chars; stay under.
+    /// Slack messages effectively cap ~4000 chars — split instead of
+    /// truncating so long agent replies aren't silently lost.
     pub async fn post_message(&self, channel: &str, text: &str) -> anyhow::Result<()> {
-        let text = if text.len() > 3900 {
-            &text[..text.floor_char_boundary(3900)]
-        } else {
-            text
-        };
-        self.post(
-            "chat.postMessage",
-            &self.bot_token,
-            &json!({"channel": channel, "text": text}),
-        )
-        .await?;
+        const MAX: usize = 3900;
+        let mut rest = text;
+        while !rest.is_empty() {
+            let end = if rest.len() > MAX {
+                rest.floor_char_boundary(MAX)
+            } else {
+                rest.len()
+            };
+            self.post(
+                "chat.postMessage",
+                &self.bot_token,
+                &json!({
+                    "channel": channel,
+                    "text": &rest[..end],
+                    // Agent output must never ping — a reply containing
+                    // <!channel>/<!here> would otherwise notify the room.
+                    "parse": "none"
+                }),
+            )
+            .await?;
+            rest = &rest[end..];
+        }
         Ok(())
     }
 }
@@ -149,6 +179,10 @@ pub struct SlackChannel {
     api: Arc<SlackApi>,
     bot_id: Mutex<Option<String>>,
     conn: Mutex<Option<SocketConn>>,
+    /// Bounded dedup of processed envelope_ids — Slack retries an
+    /// envelope when our ack is late, and a retry we never received
+    /// must not be dropped as a duplicate.
+    seen_envelopes: Mutex<std::collections::HashSet<String>>,
 }
 
 impl SlackChannel {
@@ -157,6 +191,7 @@ impl SlackChannel {
             api,
             bot_id: Mutex::new(None),
             conn: Mutex::new(None),
+            seen_envelopes: Mutex::new(std::collections::HashSet::new()),
         }
     }
 
@@ -197,49 +232,69 @@ impl ChannelApi for SlackChannel {
 
             let mut guard = self.conn.lock().await;
             let conn = guard.as_mut().unwrap();
-            match conn.read.next().await {
-                Some(Ok(Message::Text(txt))) => {
-                    let v: Value = match serde_json::from_str(&txt) {
-                        Ok(v) => v,
-                        Err(_) => continue,
-                    };
-                    // Every envelope must be acked, even ones we skip.
-                    if let Some(eid) = v["envelope_id"].as_str() {
-                        let ack = json!({"envelope_id": eid});
-                        let _ = conn
-                            .write
-                            .lock()
-                            .await
-                            .send(Message::Text(ack.to_string().into()))
-                            .await;
-                    }
-                    match v["type"].as_str() {
-                        // Slack asked us to reconnect.
-                        Some("disconnect") => *guard = None,
-                        Some("events_api") => {
-                            // Skip retried envelopes — we may have already
-                            // processed them before a late ack.
-                            if v["retry_attempt"].as_u64().unwrap_or(0) > 0 {
-                                continue;
-                            }
-                            let ev = &v["payload"]["event"];
-                            let bot_id = self.bot_id.lock().await.clone().unwrap_or_default();
-                            if let Some(msg) = incoming_from_event(ev, &bot_id) {
-                                return Ok(Some(msg));
-                            }
+            // Slack sends keepalive pings on idle sockets — no frame at
+            // all for 60s means a half-open connection (NAT timeout,
+            // silent drop); drop it and reconnect.
+            match tokio::time::timeout(std::time::Duration::from_secs(60), conn.read.next()).await {
+                Err(_) => {
+                    warn!("slack socket silent for 60s; reconnecting");
+                    *guard = None;
+                }
+                Ok(msg) => match msg {
+                    Some(Ok(Message::Text(txt))) => {
+                        let v: Value = match serde_json::from_str(&txt) {
+                            Ok(v) => v,
+                            Err(_) => continue,
+                        };
+                        // Every envelope must be acked, even ones we skip.
+                        if let Some(eid) = v["envelope_id"].as_str() {
+                            let ack = json!({"envelope_id": eid});
+                            let _ = conn
+                                .write
+                                .lock()
+                                .await
+                                .send(Message::Text(ack.to_string().into()))
+                                .await;
                         }
-                        _ => {} // hello, interactive, slash_commands…
+                        match v["type"].as_str() {
+                            // Slack asked us to reconnect.
+                            Some("disconnect") => *guard = None,
+                            Some("events_api") => {
+                                // Dedup by envelope_id, not retry_attempt:
+                                // a retry we never received must be
+                                // processed, a retry of a SEEN envelope must
+                                // not run twice.
+                                if let Some(eid) = v["envelope_id"].as_str() {
+                                    let mut seen = self.seen_envelopes.lock().await;
+                                    // Bound the set — clear at the cap rather
+                                    // than grow forever (a cleared entry just
+                                    // reprocesses one late retry).
+                                    if seen.len() >= 4096 {
+                                        seen.clear();
+                                    }
+                                    if !seen.insert(eid.to_string()) {
+                                        continue;
+                                    }
+                                }
+                                let ev = &v["payload"]["event"];
+                                let bot_id = self.bot_id.lock().await.clone().unwrap_or_default();
+                                if let Some(msg) = incoming_from_event(ev, &bot_id) {
+                                    return Ok(Some(msg));
+                                }
+                            }
+                            _ => {} // hello, interactive, slash_commands…
+                        }
                     }
-                }
-                Some(Ok(_)) => {} // ping/pong/binary
-                Some(Err(e)) => {
-                    warn!(error = %e, "slack socket read error; reconnecting");
-                    *guard = None;
-                }
-                None => {
-                    warn!("slack socket closed; reconnecting");
-                    *guard = None;
-                }
+                    Some(Ok(_)) => {} // ping/pong/binary
+                    Some(Err(e)) => {
+                        warn!(error = %e, "slack socket read error; reconnecting");
+                        *guard = None;
+                    }
+                    None => {
+                        warn!("slack socket closed; reconnecting");
+                        *guard = None;
+                    }
+                },
             }
             drop(guard);
         }

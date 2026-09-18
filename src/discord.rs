@@ -35,7 +35,13 @@ impl DiscordApi {
     pub fn with_base(token: &str, base: &str) -> Self {
         Self {
             base: base.trim_end_matches('/').to_string(),
-            http: reqwest::Client::new(),
+            // A stalled TCP connection must not park a send forever —
+            // the bridge's run_turn would hang and brick the chat.
+            http: reqwest::Client::builder()
+                .connect_timeout(std::time::Duration::from_secs(10))
+                .timeout(std::time::Duration::from_secs(30))
+                .build()
+                .unwrap_or_else(|_| reqwest::Client::new()),
             token: token.to_string(),
         }
     }
@@ -74,20 +80,54 @@ impl DiscordApi {
             .context("gateway/bot returned no url")
     }
 
-    /// Discord caps messages at 2000 chars.
+    /// Discord caps messages at 2000 chars — split instead of
+    /// truncating so long agent replies aren't silently lost.
     pub async fn send_message(&self, channel_id: &str, text: &str) -> anyhow::Result<()> {
-        let text = if text.len() > 1990 {
-            &text[..text.floor_char_boundary(1990)]
-        } else {
-            text
-        };
-        self.http
-            .post(format!("{}/channels/{channel_id}/messages", self.base))
-            .bearer_auth(&self.token)
-            .json(&json!({"content": text}))
-            .send()
-            .await?
-            .error_for_status()?;
+        const MAX: usize = 1990;
+        let mut rest = text;
+        while !rest.is_empty() {
+            let end = if rest.len() > MAX {
+                rest.floor_char_boundary(MAX)
+            } else {
+                rest.len()
+            };
+            // A 429 mid-split must not lose the remaining chunks —
+            // honor Retry-After and retry the failed chunk once.
+            let resp = self
+                .http
+                .post(format!("{}/channels/{channel_id}/messages", self.base))
+                .bearer_auth(&self.token)
+                .json(&json!({
+                    "content": &rest[..end],
+                    // Agent output must never ping — a reply containing
+                    // @everyone/@here would otherwise mention the guild.
+                    "allowed_mentions": {"parse": []}
+                }))
+                .send()
+                .await?;
+            if resp.status() == reqwest::StatusCode::TOO_MANY_REQUESTS {
+                let wait = resp
+                    .headers()
+                    .get("retry-after")
+                    .and_then(|v| v.to_str().ok())
+                    .and_then(|v| v.parse::<f64>().ok())
+                    .unwrap_or(1.0);
+                tokio::time::sleep(std::time::Duration::from_secs_f64(wait.min(30.0))).await;
+                self.http
+                    .post(format!("{}/channels/{channel_id}/messages", self.base))
+                    .bearer_auth(&self.token)
+                    .json(&json!({
+                        "content": &rest[..end],
+                        "allowed_mentions": {"parse": []}
+                    }))
+                    .send()
+                    .await?
+                    .error_for_status()?;
+            } else {
+                resp.error_for_status()?;
+            }
+            rest = &rest[end..];
+        }
         Ok(())
     }
 }
@@ -134,8 +174,19 @@ type WsStream =
 
 struct GatewayConn {
     read: futures::stream::SplitStream<WsStream>,
-    /// Aborted on reconnect.
-    _heartbeat: tokio::task::JoinHandle<()>,
+    /// Aborted when the conn is dropped — a detached JoinHandle would
+    /// keep heartbeating on the dead socket until its next tick.
+    heartbeat: tokio::task::JoinHandle<()>,
+    /// Dead-conn detector: heartbeat ACKs arrive every interval, so no
+    /// frame at all for 2 intervals + slack means a half-open socket
+    /// (NAT timeout, silent drop) — drop it and reconnect.
+    read_timeout: std::time::Duration,
+}
+
+impl Drop for GatewayConn {
+    fn drop(&mut self) {
+        self.heartbeat.abort();
+    }
 }
 
 /// Discord transport for the generic bridge.
@@ -169,7 +220,12 @@ impl DiscordChannel {
         let hello = read.next().await.context("gateway closed before hello")??;
         let hello: Value = serde_json::from_str(hello.to_text()?)?;
         anyhow::ensure!(hello["op"] == 10, "expected hello, got {hello}");
-        let interval_ms = hello["d"]["heartbeat_interval"].as_u64().unwrap_or(41250);
+        // A malicious/buggy gateway could send 0 — tokio's interval panics
+        // on a zero period, killing the heartbeat task.
+        let interval_ms = hello["d"]["heartbeat_interval"]
+            .as_u64()
+            .unwrap_or(41250)
+            .max(1000);
 
         // Identify.
         let identify = json!({
@@ -209,9 +265,12 @@ impl DiscordChannel {
             }
         });
 
+        let read_timeout =
+            std::time::Duration::from_millis(interval_ms * 2) + std::time::Duration::from_secs(15);
         Ok(GatewayConn {
             read,
-            _heartbeat: heartbeat,
+            heartbeat,
+            read_timeout,
         })
     }
 }
@@ -241,36 +300,49 @@ impl ChannelApi for DiscordChannel {
 
             let mut guard = self.conn.lock().await;
             let conn = guard.as_mut().unwrap();
-            match conn.read.next().await {
-                Some(Ok(Message::Text(txt))) => {
-                    let v: Value = match serde_json::from_str(&txt) {
-                        Ok(v) => v,
-                        Err(_) => continue,
-                    };
-                    if let Some(s) = v["s"].as_i64() {
-                        self.seq.store(s, Ordering::Relaxed);
-                    }
-                    // op 0 dispatch
-                    if v["op"] == 0 && v["t"] == "MESSAGE_CREATE" {
-                        let bot_id = self.bot_id.lock().await.clone().unwrap_or_default();
-                        if let Some(msg) = incoming_from_message(&v["d"], &bot_id) {
-                            return Ok(Some(msg));
+            match tokio::time::timeout(conn.read_timeout, conn.read.next()).await {
+                Err(_) => {
+                    // No frame (not even a heartbeat ACK) for 2 intervals
+                    // + slack — the socket is half-open; reconnect.
+                    warn!("discord gateway silent past heartbeat window; reconnecting");
+                    *guard = None;
+                }
+                Ok(msg) => match msg {
+                    Some(Ok(Message::Text(txt))) => {
+                        let v: Value = match serde_json::from_str(&txt) {
+                            Ok(v) => v,
+                            Err(_) => continue,
+                        };
+                        if let Some(s) = v["s"].as_i64() {
+                            self.seq.store(s, Ordering::Relaxed);
+                        }
+                        // op 0 dispatch
+                        if v["op"] == 0 && v["t"] == "MESSAGE_CREATE" {
+                            let bot_id = self.bot_id.lock().await.clone().unwrap_or_default();
+                            if let Some(msg) = incoming_from_message(&v["d"], &bot_id) {
+                                return Ok(Some(msg));
+                            }
+                        }
+                        // op 7 reconnect / op 9 invalid session → drop and
+                        // reconnect. A tight loop here would burn Discord's
+                        // daily identify limit if the gateway keeps refusing.
+                        if v["op"] == 7 || v["op"] == 9 {
+                            *guard = None;
+                            drop(guard);
+                            tokio::time::sleep(std::time::Duration::from_secs(5)).await;
+                            continue;
                         }
                     }
-                    // op 7 reconnect / op 9 invalid session → drop and reconnect
-                    if v["op"] == 7 || v["op"] == 9 {
+                    Some(Ok(_)) => {} // ping/pong/binary — tungstenite answers pings
+                    Some(Err(e)) => {
+                        warn!(error = %e, "discord gateway read error; reconnecting");
                         *guard = None;
                     }
-                }
-                Some(Ok(_)) => {} // ping/pong/binary — tungstenite answers pings
-                Some(Err(e)) => {
-                    warn!(error = %e, "discord gateway read error; reconnecting");
-                    *guard = None;
-                }
-                None => {
-                    warn!("discord gateway closed; reconnecting");
-                    *guard = None;
-                }
+                    None => {
+                        warn!("discord gateway closed; reconnecting");
+                        *guard = None;
+                    }
+                },
             }
             drop(guard);
         }

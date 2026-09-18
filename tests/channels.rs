@@ -48,6 +48,10 @@ fn test_config(upstream: &str) -> Config {
         providers,
         models: BTreeMap::new(),
         relay: None,
+        permission_timeout_secs: None,
+        max_tool_output: None,
+        summary_model: None,
+        session_retention_days: None,
     }
 }
 
@@ -590,4 +594,48 @@ async fn slack_socket_envelope_ack_and_dispatch() {
         tokio::time::sleep(std::time::Duration::from_millis(20)).await;
     }
     assert_eq!(acked.lock().await[0], "e1");
+}
+
+/// An unlisted sender must be dropped before any session/prompt work —
+/// a public bot without an allowlist is unauthenticated agent access.
+#[tokio::test]
+async fn bridge_allowlist_drops_unlisted_senders() {
+    let upstream = mock_llm_text().await;
+    let cfg = test_config(&upstream);
+    let shared: damon_core::config::SharedConfig = Arc::new(parking_lot::RwLock::new(cfg));
+    let store = Store::in_memory().await.unwrap();
+    let mcp = McpRegistry::connect_all(&HashMap::new()).await;
+    let state = AppState::new(shared, store.clone(), mcp).await;
+    let url = serve_app(state).await;
+
+    let client = damon_core::client::DamonClient::connect(&url, None)
+        .await
+        .unwrap();
+    let ch = Arc::new(MockChannel {
+        sent: Mutex::new(vec![]),
+    });
+    let bridge = Bridge::new(ch.clone(), client);
+    bridge.set_allowed(["user-ok".to_string()]);
+    bridge.client().initialize().await.unwrap();
+    bridge.spawn_event_router().await;
+
+    // Unlisted sender: dropped before any session is created.
+    bridge
+        .handle_message("chat-evil".into(), Some("user-evil".into()), "hi".into())
+        .await;
+    tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+    assert!(
+        ch.sent.lock().await.is_empty(),
+        "unlisted sender got a response"
+    );
+    assert!(
+        store.list_sessions().await.unwrap().is_empty(),
+        "unlisted sender created a session"
+    );
+
+    // Listed sender: works normally.
+    bridge
+        .handle_message("chat-ok".into(), Some("user-ok".into()), "hi".into())
+        .await;
+    wait_for_sent(&ch.sent, "hello back").await;
 }
