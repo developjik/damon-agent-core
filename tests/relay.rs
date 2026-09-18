@@ -36,6 +36,10 @@ fn test_config() -> Config {
         providers,
         models: Default::default(),
         relay: None,
+        permission_timeout_secs: None,
+        max_tool_output: None,
+        summary_model: None,
+        session_retention_days: None,
     }
 }
 
@@ -80,6 +84,77 @@ async fn relay_e2e() {
     let resp = client.initialize().await.unwrap();
     assert_eq!(resp["agentInfo"]["name"], "damond");
 }
+
+// ---------------------------------------------------------------------------
+// E2e handshake + frame crypto (channel-level, no relay server needed)
+// ---------------------------------------------------------------------------
+
+/// Run the 4-message handshake over an in-memory pipe; returns
+/// (daemon_e2e, client_e2e) on success.
+async fn established_pair(token: &'static str) -> (damon_core::relay::E2e, damon_core::relay::E2e) {
+    let (c2d_tx, mut c2d_rx) = tokio::sync::mpsc::channel::<String>(8);
+    let (d2c_tx, mut d2c_rx) = tokio::sync::mpsc::channel::<String>(8);
+    let daemon = tokio::spawn(async move {
+        damon_core::relay::E2e::daemon_handshake(&d2c_tx, &mut c2d_rx, token).await
+    });
+    let client = damon_core::relay::E2e::client_handshake(&c2d_tx, &mut d2c_rx, token).await;
+    let daemon = daemon.await.unwrap();
+    (daemon.unwrap(), client.unwrap())
+}
+
+#[tokio::test]
+async fn e2e_handshake_and_frame_roundtrip() {
+    let (daemon, client) = established_pair("test-token").await;
+    // Both directions carry frames with independent sequence counters.
+    let ct = client.encrypt(r#"{"jsonrpc":"2.0","id":1}"#).unwrap();
+    assert_eq!(daemon.decrypt(&ct).unwrap(), r#"{"jsonrpc":"2.0","id":1}"#);
+    let ct = daemon.encrypt(r#"{"jsonrpc":"2.0","result":{}}"#).unwrap();
+    assert_eq!(
+        client.decrypt(&ct).unwrap(),
+        r#"{"jsonrpc":"2.0","result":{}}"#
+    );
+    // A second frame in each direction still works (seq advanced).
+    let ct = client.encrypt("second").unwrap();
+    assert_eq!(daemon.decrypt(&ct).unwrap(), "second");
+    let ct = daemon.encrypt("second").unwrap();
+    assert_eq!(client.decrypt(&ct).unwrap(), "second");
+}
+
+#[tokio::test]
+async fn e2e_replayed_frame_rejected() {
+    let (daemon, client) = established_pair("test-token").await;
+    let ct = client.encrypt("hello").unwrap();
+    assert_eq!(daemon.decrypt(&ct).unwrap(), "hello");
+    // Relay replays the identical frame — seq 0 was already consumed.
+    assert!(daemon.decrypt(&ct).is_err());
+}
+
+#[tokio::test]
+async fn e2e_reordered_frame_rejected() {
+    let (daemon, client) = established_pair("test-token").await;
+    let ct0 = client.encrypt("first").unwrap();
+    let ct1 = client.encrypt("second").unwrap();
+    // Relay delivers seq 1 before seq 0 — must fail closed.
+    assert!(daemon.decrypt(&ct1).is_err());
+    assert_eq!(daemon.decrypt(&ct0).unwrap(), "first");
+}
+
+#[tokio::test]
+async fn e2e_wrong_token_handshake_fails() {
+    let (c2d_tx, mut c2d_rx) = tokio::sync::mpsc::channel::<String>(8);
+    let (d2c_tx, mut d2c_rx) = tokio::sync::mpsc::channel::<String>(8);
+    let daemon = tokio::spawn(async move {
+        damon_core::relay::E2e::daemon_handshake(&d2c_tx, &mut c2d_rx, "test-token").await
+    });
+    let client =
+        damon_core::relay::E2e::client_handshake(&c2d_tx, &mut d2c_rx, "wrong-token").await;
+    // The daemon rejects the client's proof (computed with a different
+    // token) and drops the pipe before ever sending its own — the client
+    // then fails waiting for the daemon proof.
+    assert!(client.is_err());
+    drop(c2d_tx);
+    assert!(daemon.await.unwrap().is_err());
+}
 async fn relay_register(
     ws: axum::extract::ws::WebSocketUpgrade,
     axum::extract::Query(q): axum::extract::Query<HashMap<String, String>>,
@@ -88,7 +163,16 @@ async fn relay_register(
     let name = q.get("name").cloned().unwrap_or_default();
     ws.on_upgrade(move |socket| async move {
         use futures::{SinkExt, StreamExt};
+        // The daemon tunnel presents {"auth": secret} as its first
+        // frame; accept it (test relay enforces no secret) and pipe on.
         let (mut writer, mut reader) = socket.split();
+        let first = reader.next().await;
+        if !matches!(
+            first,
+            Some(Ok(axum::extract::ws::Message::Text(t))) if t.contains("auth")
+        ) {
+            return;
+        }
         let (tx, mut rx) = tokio::sync::mpsc::channel::<String>(256);
         state.lock().await.insert(name, tx);
         tokio::spawn(async move {
