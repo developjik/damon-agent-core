@@ -852,8 +852,14 @@ async fn client_request_fails_on_disconnect() {
         .unwrap();
     // The request must resolve with an error once the socket dies —
     // before the fix it waited on a response that could never arrive.
+    // The deadline must exceed request()'s documented worst case, not
+    // the healthy-path latency: up to 3 attempts, each parking as long
+    // as RECONNECT_WAIT (10s) for a reconnect that keeps half-arriving
+    // (this peer accepts then closes), plus the redial backoff chain.
+    // A pre-fix hang trips any finite deadline; a healthy runner
+    // resolves in milliseconds.
     let result = tokio::time::timeout(
-        std::time::Duration::from_secs(5),
+        std::time::Duration::from_secs(60),
         client.request("session/list", json!({})),
     )
     .await
