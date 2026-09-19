@@ -11,7 +11,7 @@ class Damon < Formula
     end
     on_intel do
       url "https://github.com/developjik/damon-agent-core/releases/download/v0.2.0/damon-x86_64-apple-darwin.tar.gz"
-      sha256 "4c66e0e5f7623ee3c28ff9ba827c66a5c8ad298745ee38c8061e4651ee72379e"
+      sha256 "7304ceae2a7840c4e8537a62f8973129c82066aacacfbfd6968e52461aa75dde"
     end
   end
   on_linux do
