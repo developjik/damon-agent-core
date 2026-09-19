@@ -335,22 +335,38 @@ async fn auth_token_cache_re_resolves_after_ttl() {
         "http://127.0.0.1:1",
         Some(&format!("!cat {}", path.display())),
     );
-    let store = damon_core::store::Store::in_memory().await.unwrap();
-    let mcp = damon_core::mcp::McpRegistry::connect_all(&HashMap::new()).await;
-    let state = AppState::new(shared, store, mcp).await;
-
-    let ttl = std::time::Duration::from_millis(50);
-    let tok1 = state.auth_token_cached(ttl).await.unwrap().unwrap();
-    assert_eq!(tok1, "first");
 
     // Within the TTL the cached value is served even though the
-    // command's output changed.
+    // command's output changed. The window is wide (30s) so no realistic
+    // scheduler pause between the two awaits can outlast it.
+    let state = AppState::new(
+        shared.clone(),
+        damon_core::store::Store::in_memory().await.unwrap(),
+        damon_core::mcp::McpRegistry::connect_all(&HashMap::new()).await,
+    )
+    .await;
+    let ttl = std::time::Duration::from_secs(30);
+    let tok1 = state.auth_token_cached(ttl).await.unwrap().unwrap();
+    assert_eq!(tok1, "first");
     std::fs::write(&path, "second").unwrap();
     let tok2 = state.auth_token_cached(ttl).await.unwrap().unwrap();
     assert_eq!(tok2, "first");
 
-    // After expiry the secret is re-resolved.
-    tokio::time::sleep(ttl * 2).await;
+    // After expiry the secret is re-resolved. Fresh state and a tiny
+    // ttl: expiry is carried by an at-least sleep (100ms ≫ 10ms), never
+    // by an un-sleepable gap between two awaits — the naive version of
+    // this arm flaked on loaded CI runners.
+    let state = AppState::new(
+        shared,
+        damon_core::store::Store::in_memory().await.unwrap(),
+        damon_core::mcp::McpRegistry::connect_all(&HashMap::new()).await,
+    )
+    .await;
+    let ttl = std::time::Duration::from_millis(10);
     let tok3 = state.auth_token_cached(ttl).await.unwrap().unwrap();
     assert_eq!(tok3, "second");
+    std::fs::write(&path, "third").unwrap();
+    tokio::time::sleep(ttl * 20).await;
+    let tok4 = state.auth_token_cached(ttl).await.unwrap().unwrap();
+    assert_eq!(tok4, "third");
 }
