@@ -8,7 +8,7 @@ use damon_core::config::{self, Config, SecretRef, SharedConfig};
 use damon_core::mcp::McpRegistry;
 use damon_core::store::Store;
 use tokio::io::AsyncBufReadExt;
-use tracing::info;
+use tracing::{info, warn};
 use tracing_subscriber::EnvFilter;
 
 #[derive(Parser)]
@@ -135,7 +135,7 @@ async fn main() -> anyhow::Result<()> {
         McpRegistry::connect_all(&servers).await
     };
     let state = AppState::with_bind(shared.clone(), store, mcp, bind).await;
-    if let Some(mut reloaded) = config::watch(path, shared.clone()) {
+    if let Some(mut reloaded) = config::watch(path.clone(), shared.clone()) {
         let state = state.clone();
         tokio::spawn(async move {
             while reloaded.recv().await.is_some() {
@@ -167,6 +167,22 @@ async fn main() -> anyhow::Result<()> {
     let tls = {
         let cfg = shared.read();
         (cfg.tls_cert.clone(), cfg.tls_key.clone())
+    };
+    // Discovery file (~/.damon/daemon.json): local clients read it to find
+    // our port without parsing config. Written before serving starts; the
+    // tls flag is derived from the same locals the match below serves
+    // with — taking the lock a second time here could race a hot reload
+    // between the two reads and advertise the wrong scheme.
+    let discovery_tls = tls.0.is_some() && tls.1.is_some();
+    // Best-effort, mirroring the no-home path inside discovery::write:
+    // discovery is additive, so a failed write degrades to a no-op Guard
+    // instead of blocking boot with `?`.
+    let _discovery_guard = match damon_core::discovery::write(bind, discovery_tls, &path) {
+        Ok(guard) => guard,
+        Err(e) => {
+            warn!(error = %e, "daemon.json write failed; discovery disabled");
+            damon_core::discovery::Guard::noop()
+        }
     };
     match tls {
         (Some(cert), Some(key)) => {

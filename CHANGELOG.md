@@ -1,5 +1,23 @@
 # Changelog
 
+## Unreleased
+
+### Added
+
+- **`~/.damon/daemon.json` discovery file** — the daemon writes
+  `{port, pid, version, tls, configPath}` (0700/0600) at boot and removes
+  it on shutdown, deleting only while the file still names its own pid so
+  a successor daemon's file is never clobbered. Deliberately contains no
+  token or secret — local clients find the port; the token still comes
+  from the user or config. A stale file after SIGKILL is overwritten by
+  the next boot.
+- **`session/prompt` result gains `model`** — the upstream model string
+  actually sent to the provider for the turn. With default-provider
+  fallback the requested name passes through; with `provider/model` or
+  glob routing it is the remapped upstream id, so clients can badge the
+  real route taken. Absent only when the turn was cancelled before the
+  first model resolution.
+
 ## 0.2.0 — unreleased
 
 ### Breaking

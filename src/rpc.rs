@@ -671,11 +671,11 @@ pub async fn handle_socket(
                     }
                     drop(map);
                     match result {
-                        Ok(reason) => {
+                        Ok(outcome) => {
                             let stop = if cancel.is_cancelled() {
                                 "cancelled"
                             } else {
-                                match reason {
+                                match outcome.stop_reason {
                                     crate::llm::StopReason::Stop => "end_turn",
                                     crate::llm::StopReason::Length => "max_tokens",
                                     crate::llm::StopReason::ToolCalls => "tool_use",
@@ -683,7 +683,14 @@ pub async fn handle_socket(
                                     crate::llm::StopReason::Other => "end_turn",
                                 }
                             };
-                            client.respond(id, Ok(json!({"stopReason": stop}))).await;
+                            // The model that actually served the turn —
+                            // fallback routing may differ from what the
+                            // client requested, so surfaces it when known.
+                            let mut result = json!({"stopReason": stop});
+                            if let Some(m) = &outcome.model {
+                                result["model"] = json!(m);
+                            }
+                            client.respond(id, Ok(result)).await;
                         }
                         Err(e) => {
                             client

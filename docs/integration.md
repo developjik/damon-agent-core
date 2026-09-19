@@ -101,6 +101,23 @@ When a session's estimated tokens exceed 85% of the model's
 plus the remainder. A failed summarization records nothing — the full
 history is kept and the turn proceeds.
 
+### Discovery
+
+At boot the daemon writes `~/.damon/daemon.json` (0700 dir / 0600 file)
+and removes it on shutdown (graceful or unwound — only while the file
+still names this daemon's pid, so a successor's file is never clobbered):
+
+```json
+{"port": 9470, "pid": 1234, "version": "0.2.0", "tls": false,
+ "configPath": "/…/config.toml"}
+```
+
+Local clients read this to find the port without configuration. It
+deliberately contains **no token or secret** — secrets never touch disk
+in plaintext; the token still comes from the user or the config. A stale
+file (SIGKILL) is simply overwritten by the next boot; clients can
+liveness-check `pid`.
+
 ### Authentication
 
 Required only when `auth_token` is configured. `/v1` takes
@@ -135,7 +152,7 @@ Client → daemon requests:
   first; `-32603 "session busy"` if it is still winding down after 10s
 - `session/messages {sessionId, limit?, offset?}` → `{messages: [...]}`
 - `session/search {query, limit}` → `{results: [{sessionId, messageId, snippet}]}`
-- `session/prompt {sessionId, prompt: [{type:"text", text}], model?}` → `{stopReason}` — `model` overrides the session default for this turn; the response arrives when the turn ends. Unknown `sessionId` → `-32602`.
+- `session/prompt {sessionId, prompt: [{type:"text", text}], model?}` → `{stopReason, model?}` — `model` overrides the session default for this turn; the response arrives when the turn ends. The result's `model` is the upstream model string actually sent to the provider — with default-provider fallback the request name passes through, with `provider/model` or glob routing it is the remapped upstream id, so clients can badge the real route taken. Absent only when the turn was cancelled before the first model resolution. Unknown `sessionId` → `-32602`.
 - `session/cancel {sessionId}` — notification; if sent with an `id` it gets an empty `{}` result
 
 Daemon → client:

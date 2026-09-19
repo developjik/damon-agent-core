@@ -54,6 +54,18 @@ pub trait ClientChannel: Send + Sync {
         PERMISSION_TIMEOUT
     }
 }
+/// Result of one prompt turn: the terminal stop reason plus the upstream
+/// model that actually served the first iteration. Fallback routing can
+/// make the routed model differ from the requested one, so clients need
+/// this to show what really answered.
+#[derive(Debug, Clone, PartialEq)]
+pub struct PromptOutcome {
+    pub stop_reason: llm::StopReason,
+    /// Upstream model resolved on the FIRST iteration. Later iterations
+    /// re-resolve (config may change mid-turn), but the first answer is
+    /// the one that produced the turn's opening output — keep it.
+    pub model: Option<String>,
+}
 
 /// Run one prompt turn: append the user message, stream the model,
 /// execute tool calls (with permission), repeat until the model stops.
@@ -65,7 +77,7 @@ pub async fn run_prompt(
     model: Option<&str>,
     client: &Arc<dyn ClientChannel>,
     cancel: CancellationToken,
-) -> anyhow::Result<llm::StopReason> {
+) -> anyhow::Result<PromptOutcome> {
     state.metrics.prompts_total.fetch_add(1, Ordering::Relaxed);
     state
         .store
@@ -85,9 +97,13 @@ pub async fn run_prompt(
     // loop appends messages (assistant row + one tool row per call), so
     // history can only grow within a turn.
 
+    let mut model_used: Option<String> = None;
     for _ in 0..MAX_ITERATIONS {
         if cancel.is_cancelled() {
-            return Ok(llm::StopReason::Other);
+            return Ok(PromptOutcome {
+                stop_reason: llm::StopReason::Other,
+                model: None,
+            });
         }
         let tools = state.mcp.openai_tools();
         let (provider, model, thinking) = {
@@ -139,6 +155,12 @@ pub async fn run_prompt(
                 .context("provider not built")?;
             (provider, model, thinking)
         };
+        // First successful resolution wins — later iterations re-resolve
+        // (config may change mid-turn) but must not rewrite what the
+        // client was told answered.
+        if model_used.is_none() {
+            model_used = Some(model.clone());
+        }
 
         // Compact before loading messages — every iteration appends, so
         // this runs each pass. maybe_compact itself early-returns cheaply
@@ -161,7 +183,7 @@ pub async fn run_prompt(
         // rejects every new prompt ("busy") until daemon restart.
         let ttfb = std::time::Duration::from_secs(120);
         let stream = tokio::select! {
-            _ = cancel.cancelled() => return Ok(llm::StopReason::Other),
+            _ = cancel.cancelled() => return Ok(PromptOutcome { stop_reason: llm::StopReason::Other, model: model_used.clone() }),
             r = tokio::time::timeout(ttfb, provider.chat_stream(body.clone())) => {
                 match r {
                     Ok(Ok(s)) => s,
@@ -171,14 +193,14 @@ pub async fn run_prompt(
                         if let Some(rl) = e.downcast_ref::<crate::provider::RateLimited>() {
                             warn!(wait = ?rl.0, "rate limited; backing off before retry");
                             tokio::select! {
-                                _ = cancel.cancelled() => return Ok(llm::StopReason::Other),
+                                _ = cancel.cancelled() => return Ok(PromptOutcome { stop_reason: llm::StopReason::Other, model: model_used.clone() }),
                                 _ = tokio::time::sleep(rl.0) => {}
                             }
                         } else {
                             warn!(error = %e, "chat_stream failed; retrying once");
                         }
                         let retried = tokio::select! {
-                            _ = cancel.cancelled() => return Ok(llm::StopReason::Other),
+                            _ = cancel.cancelled() => return Ok(PromptOutcome { stop_reason: llm::StopReason::Other, model: model_used.clone() }),
                             r = tokio::time::timeout(ttfb, provider.chat_stream(body)) => r,
                         };
                         match retried {
@@ -297,7 +319,10 @@ pub async fn run_prompt(
             if let Some(e) = stream_err {
                 return Err(e);
             }
-            return Ok(llm::StopReason::Other);
+            return Ok(PromptOutcome {
+                stop_reason: llm::StopReason::Other,
+                model: model_used,
+            });
         }
 
         let calls = acc.finish();
@@ -307,7 +332,10 @@ pub async fn run_prompt(
                 msg["thinking"] = thinking_json;
             }
             state.store.append(session_id, "assistant", &msg).await?;
-            return Ok(stop);
+            return Ok(PromptOutcome {
+                stop_reason: stop,
+                model: model_used,
+            });
         }
 
         // Persist the assistant turn with its tool calls, then execute each.
@@ -445,14 +473,20 @@ pub async fn run_prompt(
             return Err(e);
         }
         if cancel.is_cancelled() {
-            return Ok(llm::StopReason::Other);
+            return Ok(PromptOutcome {
+                stop_reason: llm::StopReason::Other,
+                model: model_used.clone(),
+            });
         }
         // This iteration appended the assistant tool_calls row plus one
         // tool row per call — history grew, so compaction re-evaluates
         // at the top of the next iteration.
     }
     warn!(session_id, "hit max tool iterations");
-    Ok(llm::StopReason::MaxTurnRequests)
+    Ok(PromptOutcome {
+        stop_reason: llm::StopReason::MaxTurnRequests,
+        model: model_used,
+    })
 }
 
 /// Rough token estimate. Text runs ~4 chars/token for ASCII; non-ASCII

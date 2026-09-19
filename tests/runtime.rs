@@ -1304,7 +1304,10 @@ async fn max_iterations_returns_max_turn_requests() {
     let stop = damon_core::runtime::run_prompt(&state, "s1", "hi", None, &client, cancel)
         .await
         .unwrap();
-    assert_eq!(stop, damon_core::llm::StopReason::MaxTurnRequests);
+    assert_eq!(
+        stop.stop_reason,
+        damon_core::llm::StopReason::MaxTurnRequests
+    );
 }
 
 #[tokio::test]
