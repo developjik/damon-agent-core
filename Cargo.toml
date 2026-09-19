@@ -7,6 +7,7 @@ description = "Damon agent core — local multi-provider agent daemon"
 repository = "https://github.com/developjik/damon-agent-core"
 keywords = ["agent", "llm", "daemon", "mcp", "acp"]
 categories = ["network-programming", "command-line-utilities"]
+exclude = ["audit-findings-2026-09-19.md", "audit-scratch-2026-09-19"]
 
 [dependencies]
 anyhow = "1"
