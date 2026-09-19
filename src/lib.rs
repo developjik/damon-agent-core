@@ -3,6 +3,7 @@ pub mod channel;
 pub mod client;
 pub mod config;
 pub mod discord;
+pub mod discovery;
 pub mod llm;
 pub mod mcp;
 pub mod oauth;
