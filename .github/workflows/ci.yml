@@ -6,6 +6,9 @@ on:
     tags: ["v*"]
   pull_request:
 
+permissions:
+  contents: read
+
 jobs:
   test:
     strategy:
@@ -13,11 +16,11 @@ jobs:
         os: [macos-latest, windows-latest, ubuntu-latest]
     runs-on: ${{ matrix.os }}
     steps:
-      - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@stable
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - uses: dtolnay/rust-toolchain@46817827a5bfabe028bf34e1cce71fd40e2ff697 # 1.95.0
         with:
           components: clippy, rustfmt
-      - uses: Swatinem/rust-cache@v2
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
       - name: Install Linux deps
         if: runner.os == 'Linux'
         run: sudo apt-get update && sudo apt-get install -y libdbus-1-dev pkg-config
@@ -29,10 +32,13 @@ jobs:
       - run: cargo check --release --all-targets
 
   audit:
+    # audit-check reports findings by creating a failing check run.
+    permissions:
+      checks: write
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
-      - uses: rustsec/audit-check@v2
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - uses: rustsec/audit-check@69366f33c96575abad1ee0dba8212993eecbe998 # v2
         with:
           token: ${{ secrets.GITHUB_TOKEN }}
 
@@ -55,7 +61,7 @@ jobs:
             target: x86_64-pc-windows-msvc
     runs-on: ${{ matrix.os }}
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
       - name: Verify tag matches manifest versions
         shell: bash
         run: |
@@ -67,7 +73,7 @@ jobs:
           [ "$tag" = "$cargo_v" ] && [ "$tag" = "$npm_v" ] && [ "$tag" = "$formula_v" ] || {
             echo "tag v$tag does not match manifest versions" >&2; exit 1;
           }
-      - uses: dtolnay/rust-toolchain@stable
+      - uses: dtolnay/rust-toolchain@46817827a5bfabe028bf34e1cce71fd40e2ff697 # 1.95.0
         with:
           targets: ${{ matrix.target }}
       - name: Install Linux deps
@@ -79,21 +85,63 @@ jobs:
         shell: bash
         run: |
           cd target/${{ matrix.target }}/release
-          tar czf ../../../damon-${{ matrix.target }}.tar.gz --exclude='*.d' damond* damon*
+          tar czf ../../../damon-${{ matrix.target }}.tar.gz --exclude='*.d' --exclude='*.pdb' damond* damon*
           cd ../../..
           shasum -a 256 damon-${{ matrix.target }}.tar.gz > damon-${{ matrix.target }}.tar.gz.sha256
           ls -la damon-*.tar.gz*
-      - uses: softprops/action-gh-release@v2
+      - uses: softprops/action-gh-release@3bb12739c298aeb8a4eeaf626c5b8d85266b0e65 # v2
         with:
           files: damon-*.tar.gz*
+      - name: Update Formula sha256
+        # One leg only: rewrite Formula/damon.rb from the published tarballs
+        # and push to the default branch. Fails loudly if the tag commit is
+        # not the branch head (non-fast-forward push).
+        if: matrix.target == 'x86_64-unknown-linux-gnu'
+        shell: bash
+        env:
+          DEFAULT_BRANCH: ${{ github.event.repository.default_branch }}
+        run: |
+          tag="${GITHUB_REF_NAME}"
+          version="${tag#v}"
+          base="https://github.com/${GITHUB_REPOSITORY}/releases/download/${tag}"
+          tmp="$(mktemp -d)"
+          targets="aarch64-apple-darwin x86_64-apple-darwin x86_64-unknown-linux-gnu"
+
+          sed -i "s/^  version \".*\"/  version \"$version\"/" Formula/damon.rb
+          for target in $targets; do
+            curl --proto '=https' --tlsv1.2 --retry 5 --retry-all-errors -fsSL "$base/damon-$target.tar.gz" -o "$tmp/$target.tar.gz"
+            sha256sum "$tmp/$target.tar.gz" | cut -d' ' -f1 > "$tmp/$target.sha256"
+          done
+          for target in $targets; do
+            awk -v t="$target" -v s="$(cat "$tmp/$target.sha256")" '
+              index($0, "damon-" t ".tar.gz") { url=1 }
+              url && /^ *sha256 / { sub(/"[0-9a-fA-F]*"/, "\"" s "\""); url=0 }
+              { print }
+            ' Formula/damon.rb > Formula/damon.rb.tmp && mv Formula/damon.rb.tmp Formula/damon.rb
+          done
+          for target in $targets; do
+            grep -q "sha256 \"$(cat "$tmp/$target.sha256")\"" Formula/damon.rb || {
+              echo "sha256 for $target not updated in Formula/damon.rb" >&2; exit 1;
+            }
+          done
+
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add Formula/damon.rb
+          if git diff --cached --quiet; then
+            echo "Formula already up to date for ${tag}"
+          else
+            git commit -m "chore(formula): sha256 for ${tag}"
+            git push origin "HEAD:${DEFAULT_BRANCH:-main}"
+          fi
 
   publish-npm:
     if: startsWith(github.ref, 'refs/tags/v')
     needs: release
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-node@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
         with:
           node-version: "20"
           registry-url: "https://registry.npmjs.org"
@@ -108,8 +156,8 @@ jobs:
     needs: release
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@stable
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - uses: dtolnay/rust-toolchain@46817827a5bfabe028bf34e1cce71fd40e2ff697 # 1.95.0
       - name: Install Linux deps
         run: sudo apt-get update && sudo apt-get install -y libdbus-1-dev pkg-config
       - name: Publish to crates.io
