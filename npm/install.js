@@ -46,16 +46,30 @@ function hasCurl() {
 }
 
 async function download() {
-  if (hasCurl()) {
-    execSync(`curl -fsSL "${url}" -o "${tarball}"`, { stdio: "inherit" });
-    return;
+  try {
+    if (hasCurl()) {
+      // --connect-timeout: dead host fails fast; --max-time: a stalled
+      // transfer must not hang the postinstall forever.
+      execSync(`curl -fsSL --connect-timeout 15 --max-time 300 "${url}" -o "${tarball}"`, { stdio: "inherit" });
+      return;
+    }
+    // No curl: fall back to Node's built-in fetch (Node >= 18).
+    const res = await fetch(url, { redirect: "follow", signal: AbortSignal.timeout(300_000) });
+    if (!res.ok) {
+      throw new Error(`HTTP ${res.status} ${res.statusText}`);
+    }
+    fs.writeFileSync(tarball, Buffer.from(await res.arrayBuffer()));
+  } catch (err) {
+    // A failed transfer must not leave a partial tarball in bin/ — it
+    // would fail the checksum anyway, but the stale file muddies the
+    // next run's diagnostics.
+    try {
+      fs.unlinkSync(tarball);
+    } catch {
+      // nothing to clean if the file was never created
+    }
+    throw err;
   }
-  // No curl: fall back to Node's built-in fetch (Node >= 18).
-  const res = await fetch(url, { redirect: "follow" });
-  if (!res.ok) {
-    throw new Error(`HTTP ${res.status} ${res.statusText}`);
-  }
-  fs.writeFileSync(tarball, Buffer.from(await res.arrayBuffer()));
 }
 
 async function fetchText(u) {
@@ -118,6 +132,12 @@ async function main() {
       const launcher = path.join(bin, base);
       if (!fs.existsSync(launcher)) {
         fs.writeFileSync(launcher, `#!/bin/sh\nexec "$(dirname "$0")/${f}" "$@"\n`);
+      }
+      // cmd.exe can't run the sh launcher — write a .cmd one-liner that
+      // calls the real exe relative to the script's own directory.
+      const cmd = path.join(bin, `${base}.cmd`);
+      if (!fs.existsSync(cmd)) {
+        fs.writeFileSync(cmd, `@"%~dp0${f}" %*\r\n`);
       }
     }
   }

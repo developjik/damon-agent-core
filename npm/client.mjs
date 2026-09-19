@@ -131,16 +131,34 @@ export class DamonClient {
 
   async #redial(delay) {
     while (!this.#closed) {
-      await new Promise((r) => setTimeout(r, delay));
+      await new Promise((r) => {
+        const t = setTimeout(r, delay);
+        t.unref?.(); // unref the backoff sleep so a post-close redial never keeps the process alive
+      });
       if (this.#closed) return;
       try {
         // Fresh ticket per attempt — the last one was consumed or expired.
         const u = this.#token ? await ticketedUrl(this.#url, this.#token, this.#fetch) : this.#url;
         const ws = new this.#WS(u);
-        await new Promise((resolve, reject) => {
-          ws.addEventListener("open", resolve, { once: true });
-          ws.addEventListener("error", (e) => reject(e.error ?? new Error("ws connect failed")), { once: true });
-        });
+        // Same 10s gate as connect() — a socket that never opens nor
+        // errors would stall the whole loop; the timeout rejects into
+        // the catch below and counts as a failed attempt.
+        let timer;
+        try {
+          await Promise.race([
+            new Promise((resolve, reject) => {
+              ws.addEventListener("open", resolve, { once: true });
+              ws.addEventListener("error", (e) => reject(e.error ?? new Error("ws connect failed")), { once: true });
+            }),
+            new Promise((_, reject) => {
+              timer = setTimeout(() => reject(new Error("ws connect timed out")), 10000);
+            }),
+          ]);
+        } finally {
+          clearTimeout(timer);
+          // A timed-out handshake leaves the socket CONNECTING — abandon it or it opens unnoticed and leaks.
+          if (ws.readyState === 0 || ws.readyState === 2) { try { ws.close(); } catch {} }
+        }
         this.#attach(ws);
         // close() may have run while this socket was connecting — the
         // loop's #closed check already passed, so re-check here or the
@@ -175,12 +193,20 @@ export class DamonClient {
    *  frame goes through this gate — sending on a closing socket throws
    *  and silently loses the message. */
   async #ready() {
-    await Promise.race([
-      this.#connected,
-      new Promise((_, rej) =>
-        setTimeout(() => rej(new Error("timed out waiting for reconnect")), 10000)
-      ),
-    ]);
+    // Fail fast once closed: #connected never resolves post-close, so this call would sit out the full 10s below.
+    if (this.#closed) throw new Error("connection closed");
+    let timer;
+    try {
+      await Promise.race([
+        this.#connected,
+        new Promise((_, rej) => {
+          timer = setTimeout(() => rej(new Error("timed out waiting for reconnect")), 10000);
+        }),
+      ]);
+    } finally {
+      // Race losers must not leave a live 10s timer behind on every call.
+      clearTimeout(timer);
+    }
   }
 
   async #call(method, params) {
@@ -202,7 +228,13 @@ export class DamonClient {
   /** Respond to a server-initiated request (permission prompts). */
   async respond(id, result) {
     await this.#ready();
-    this.#ws.send(JSON.stringify({ jsonrpc: "2.0", id, result }));
+    // Same close-window guard as #call — a sync throw on a dead socket
+    // must surface as a clean error, not an unhandled TypeError.
+    try {
+      this.#ws.send(JSON.stringify({ jsonrpc: "2.0", id, result }));
+    } catch {
+      throw new Error("connection closed");
+    }
   }
 
   /** Async iterator over daemon events: {type:"update"|"request"|"notification"|"promptDone"|"disconnected"|"reconnected"}.
@@ -283,23 +315,40 @@ export class DamonClient {
     // Callers may consume the outcome via events() only — don't let an
     // ignored promise rejection crash the process.
     done.catch(() => {});
-    this.#ws.send(JSON.stringify({
-      jsonrpc: "2.0", id, method: "session/prompt",
-      params: { sessionId, model, prompt: [{ type: "text", text }] },
-    }));
+    // Same close-window guard as #call — a sync throw on a dead socket
+    // must not leave the id registered in #pending forever.
+    try {
+      this.#ws.send(JSON.stringify({
+        jsonrpc: "2.0", id, method: "session/prompt",
+        params: { sessionId, model, prompt: [{ type: "text", text }] },
+      }));
+    } catch (e) {
+      this.#pending.delete(id);
+      throw e;
+    }
     return done;
   }
-  /** Cancel the session's in-flight turn (notification; no response). */
   async cancel(sessionId) {
     await this.#ready();
-    this.#ws.send(JSON.stringify({
-      jsonrpc: "2.0", method: "session/cancel", params: { sessionId },
-    }));
+    try {
+      this.#ws.send(JSON.stringify({
+        jsonrpc: "2.0", method: "session/cancel", params: { sessionId },
+      }));
+    } catch {
+      throw new Error("connection closed");
+    }
   }
 
   close() {
     this.#closed = true;
-    this.#ws.close();
+    // #ws is null inside a reconnect window — guard the deref, then end
+    // events() iterators and reject pending calls ourselves: no live
+    // socket means no close event will ever drive #onClose's cleanup.
+    this.#ws?.close();
+    const err = new Error("connection closed");
+    for (const p of this.#pending.values()) p.reject(err);
+    this.#pending.clear();
+    this.#push(null);
   }
 }
 
@@ -313,17 +362,22 @@ export class RpcError extends Error {
 /** Exchange the bearer token for a single-use WS ticket and return the
  *  ?ticket= URL. ws(s)://host/ws → http(s)://host/v1/ws_ticket. */
 async function ticketedUrl(wsUrl, token, fetchFn) {
-  const http = wsUrl
-    .replace(/\/+$/, "") // trailing slashes → /ws/v1/ws_ticket 404s
-    .replace(/\/ws$/, "")
-    .replace(/^wss:\/\//, "https://")
-    .replace(/^ws:\/\//, "http://");
-  const resp = await fetchFn(`${http}/v1/ws_ticket`, {
+  // Parse instead of regex surgery — a query string (`/ws?x=1`) would
+  // defeat the `/ws` path check and pollute the ticket URL.
+  const base = new URL(wsUrl);
+  base.pathname = base.pathname.replace(/\/+$/, ""); // trailing slashes → /ws/v1/ws_ticket 404s
+  if (!base.pathname.endsWith("/ws")) {
+    throw new Error(`expected a ws(s) URL ending in /ws, got: ${wsUrl}`);
+  }
+  if (base.protocol === "wss:") base.protocol = "https:";
+  else if (base.protocol === "ws:") base.protocol = "http:";
+  // Preserve the path prefix before /ws (/sub/ws → /sub/v1/ws_ticket), matching Rust client.rs:411-416.
+  const resp = await fetchFn(`${base.origin}${base.pathname.slice(0, -3)}/v1/ws_ticket`, {
     method: "POST",
     headers: { authorization: `Bearer ${token}` },
   });
   if (!resp.ok) throw new Error(`ws_ticket rejected: ${resp.status}`);
   const { ticket } = await resp.json();
-  const sep = wsUrl.includes("?") ? "&" : "?";
+  const sep = base.search ? "&" : "?";
   return `${wsUrl}${sep}ticket=${ticket}`;
 }
