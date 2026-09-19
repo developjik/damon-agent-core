@@ -7,17 +7,17 @@ class Damon < Formula
   on_macos do
     on_arm do
       url "https://github.com/developjik/damon-agent-core/releases/download/v0.2.0/damon-aarch64-apple-darwin.tar.gz"
-      sha256 "4b7086696288a0cc4e1e1f0de421aa8f2e4aa18c2105826fb30ce3a7412d34a2"
+      sha256 "f0d4cf8245440ada666ae4ac5b004a071e1a558e2dcfe898d4b8427d107dcbea"
     end
     on_intel do
       url "https://github.com/developjik/damon-agent-core/releases/download/v0.2.0/damon-x86_64-apple-darwin.tar.gz"
-      sha256 "21fd85310eda3a8863d5e578cd37a33dbdcfa6c39b8066291671426aa11eed68"
+      sha256 "bbac167bb38dfeec89ebb83be9a07ff275e7212c313684bad83a28ce219726b4"
     end
   end
   on_linux do
     on_intel do
       url "https://github.com/developjik/damon-agent-core/releases/download/v0.2.0/damon-x86_64-unknown-linux-gnu.tar.gz"
-      sha256 "a814341151b85bcadd28ce9e09025824b0de563aebae9a504da8a50f02d534ac"
+      sha256 "06659c2ccee688aa5bcdb7ce66103f8fc7a26e907076627af9d056bab9f75d68"
     end
     on_arm do
       # No aarch64 Linux tarball is published — fail loudly rather than
