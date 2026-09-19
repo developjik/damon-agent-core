@@ -88,7 +88,13 @@ jobs:
           cd target/${{ matrix.target }}/release
           tar czf ../../../damon-${{ matrix.target }}.tar.gz --exclude='*.d' --exclude='*.pdb' damond* damon*
           cd ../../..
-          shasum -a 256 damon-${{ matrix.target }}.tar.gz > damon-${{ matrix.target }}.tar.gz.sha256
+          # Git Bash has no shasum but ships sha256sum; macOS is the
+          # reverse. Both emit "<hash>  <file>".
+          if command -v sha256sum >/dev/null 2>&1; then
+            sha256sum damon-${{ matrix.target }}.tar.gz > damon-${{ matrix.target }}.tar.gz.sha256
+          else
+            shasum -a 256 damon-${{ matrix.target }}.tar.gz > damon-${{ matrix.target }}.tar.gz.sha256
+          fi
           ls -la damon-*.tar.gz*
       - uses: softprops/action-gh-release@3bb12739c298aeb8a4eeaf626c5b8d85266b0e65 # v2
         with:
