@@ -1,0 +1,71 @@
+{
+  "architecture": "llm.rs is the provider-neutral stream contract layer: StreamEvent variants, StopReason normalization, ToolCallAccumulator (sparse index to dense slots, id+name joint filter), parse_partial_json (strict parse then bracket/string repair with comma-cut retry). Producers: provider adapters; consumers: runtime, api, rpc.",
+  "clean": "parse_partial_json (llm.rs:103-178) verified correct: escape handling, comma tracking outside strings, char-boundary cuts, guaranteed termination. finish (llm.rs:81-99) id+name joint filter matches all providers (anthropic renumbers at 477-479; openai args-only continuations fine). StopReason mappings consistent across anthropic 629-632, openai 613-616, gemini 495-500, responses 513-520; rpc 640-644 covers all. StreamEvent has no serde derives (internal-only, no asymmetry path). gemini usageMetadata emitted once final (487-491), no double count. Anthropic usage increment is metric-accurate.",
+  "coverage": [
+    "src/llm.rs:1-207 full",
+    "src/api.rs:611-657",
+    "src/runtime.rs:196-308",
+    "src/provider/anthropic.rs:477-653",
+    "src/provider/gemini.rs:462-505",
+    "src/provider/openai.rs:236-618",
+    "src/provider/responses.rs:383-523",
+    "src/provider/inband.rs:89-118",
+    "src/rpc.rs:636-647"
+  ],
+  "files": [
+    {
+      "description": "Audit target full read: StreamEvent, StopReason, ToolCall, ToolCallAccumulator, parse_partial_json, tests",
+      "path": "src/llm.rs"
+    },
+    {
+      "description": "Cross-check: Usage SSE propagation and finish_reason mapping",
+      "path": "src/api.rs:611-657"
+    },
+    {
+      "description": "Cross-check: Usage metric accumulation consumer",
+      "path": "src/runtime.rs:249-308"
+    },
+    {
+      "description": "Cross-check: provider Usage/ToolCallDelta/StopReason production",
+      "path": "src/provider/anthropic.rs:477-653"
+    },
+    {
+      "description": "Cross-check: usageMetadata single final emission",
+      "path": "src/provider/gemini.rs:462-505"
+    },
+    {
+      "description": "Cross-check: ToolCallDelta production and name restore",
+      "path": "src/provider/openai.rs:236-618"
+    },
+    {
+      "description": "Cross-check: index remap and Done/Usage",
+      "path": "src/provider/responses.rs:383-523"
+    }
+  ],
+  "findings": [
+    {
+      "category": "Correctness: silent loss",
+      "evidence": "llm.rs:63-67: const MAX_INDEX: usize = 256; pub fn push(...) { if index >= Self::MAX_INDEX { return; } ... }",
+      "fix": "Log a warn on drop, or densely renumber slots carrying id/name and cap by actual call count.",
+      "location": "src/llm.rs:63-67",
+      "scenario": "Upstream sends tool_call delta with index=300 carrying valid id/name/arguments; push drops it entirely; Done(ToolCalls) still arrives; runtime sees empty calls and ignores the model's tool request. The assistant tool call silently vanishes while the model awaits tool results. Intentional cap per comment, but silent loss on the normal path - Low.",
+      "severity": "Low",
+      "title": "ToolCallAccumulator silently discards deltas with index >= 256, contradicting Done(ToolCalls)"
+    },
+    {
+      "category": "Type/API contract violation",
+      "evidence": "llm.rs:33-35: Usage { input: u64, output: u64 } documented as provider token usage. anthropic.rs:640-644 emits Usage { input: 0, output: out.saturating_sub(start_output) } from message_delta.",
+      "fix": "Document Usage as latest cumulative values and fill current input on anthropic message_delta, or forward only the final usage SSE chunk in api.rs.",
+      "location": "src/llm.rs:33-35 (contract); cross-evidence src/provider/anthropic.rs:638-644, src/api.rs:633-640",
+      "scenario": "Anthropic stream emits Usage at message_start (input=N) and message_delta (input=0, output increment); api.rs 633-640 forwards each as OpenAI-compatible usage SSE chunks; a client reading the last usage chunk receives prompt_tokens=0 as final. Metrics are accidentally correct via accumulation, but Usage.input meaning (cumulative vs 0) differs per emission site.",
+      "severity": "Low",
+      "title": "Usage contract mismatch: Anthropic adapter emits input:0 Usage, surfacing prompt_tokens=0 in api.rs SSE"
+    }
+  ],
+  "notes": [
+    "Provider-internal defects belong to their own scouts; I cross-read only for contract verification.",
+    "parse_partial_json single-pair numeric truncation is a recovery-quality nit, excluded.",
+    "cargo test not run per audit constraints; built-in tests statically reviewed, no false-pass elements."
+  ],
+  "summary": "Full audit of src/llm.rs (1-207) complete with contract cross-checks against providers, runtime, api, rpc. Two Low findings: silent drop of tool deltas with index>=256 despite Done(ToolCalls), and Anthropic input:0 Usage surfacing prompt_tokens=0 in SSE. parse_partial_json and slot filtering verified defect-free."
+}

@@ -1,0 +1,23 @@
+{
+  "architecture": "해당 없음 — 감사 검증 과제. 후보 2 근거: llm.rs StreamEvent::Usage는 중간/최종 복수 emission 허용, api.rs translate_forward가 각 Usage를 개별 usage SSE 청크로 1:1 변환, anthropic 어댑터가 message_start(누적 input)와 message_delta(input:0, 증분 output)를 모두 emit하는 구조적 원인.",
+  "files": [
+    {
+      "description": "MAX_INDEX 방어 주석(59-62) 및 push 드롭(63-67), finish id+name 필터(88-90) 재독회",
+      "path": "src/llm.rs"
+    },
+    {
+      "description": "message_start Usage{input=N}(528-543), message_delta Usage{input:0}(638-644) 스트림 순서 재추적",
+      "path": "src/provider/anthropic.rs"
+    },
+    {
+      "description": "Usage 이벤트의 usage SSE 청크 1:1 전달(633-640)로 마지막 청크 prompt_tokens=0 노출 확인",
+      "path": "src/api.rs"
+    },
+    {
+      "description": "검증 대상 후보 JSON",
+      "path": "audit-scratch-2026-09-19/LlmTypes.json"
+    }
+  ],
+  "report": "{\"verdicts\":[{\"id\":\"index>=256 델타 무음 드롭 (llm.rs:63-67)\",\"verdict\":\"rejected\",\"severity_final\":\"none\",\"reason\":\"드롭은 llm.rs:59-62 주석에 명시된 의도적 OOM 방어 계약('deltas past the cap are dropped')이며, 시나리오 성립 요건이 256개 이상 유효 tool call을 보내는 적대적 업스트림뿐이라 정상 경로가 아님. 드롭된 슬롯은 finish()의 id+name 필터(llm.rs:88-90)로 정리되어 빈 Vec 반환으로 일관되게 종료됨.\",\"location_final\":\"src/llm.rs:63-67\"},{\"id\":\"Anthropic input:0 Usage → SSE prompt_tokens=0 (anthropic.rs:638-644, api.rs:633-640)\",\"verdict\":\"confirmed\",\"severity_final\":\"Low\",\"reason\":\"스트림 순서 재추적으로 재현: message_start(anthropic.rs:528-543)가 Usage{input=N} emit 후 message_delta(anthropic.rs:638-644)가 Usage{input:0, output=증분}을 emit하고, api.rs:633-640이 각 Usage를 그대로 usage SSE 청크로 전달하므로 클라이언트가 받는 마지막 usage 청크의 prompt_tokens가 실제로 0이 됨. 정상 경로에서 OpenAI 와이어 계약(최종 usage는 누적값)과 불일치하는 실제 결함이나 메트릭은 누적 소비로 정확하여 Low 적절.\",\"location_final\":\"src/provider/anthropic.rs:638-644 (근원); src/api.rs:633-640 (노출점)\"}],\"notes\":\"후보 1: 인용 위치/코드 정확하나 정상 경로 시나리오로 재구성 실패 — MAX_INDEX 주석 자체가 방어 존재를 문서화. 후보 2: 인용·시나리오 모두 코드 추적으로 그대로 재현됨. cargo test 미실행(읽기 전용 제약) 준수.\"}",
+  "summary": "LlmTypes.json 후보 2건 적대적 검증 완료: (1) index>=256 드롭은 폐기(문서화된 OOM 방어, 정상 경로 아님), (2) Anthropic input:0 Usage → SSE prompt_tokens=0은 확정(Low, 스트림 순서 재추적으로 재현)."
+}

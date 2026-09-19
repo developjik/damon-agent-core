@@ -1,0 +1,39 @@
+{
+  "summary": "Phase 2 적대적 검증: 12건 후보(Npm 6, TestsCore 4, TestsProvidersB 2) 원 코드 재독회로 반증 시도 → 10 confirmed, 2 rejected(TestsProvidersB 갭 봉인 2건 — 구현 결함 미연결).",
+  "files": [
+    {
+      "path": "npm/client.mjs",
+      "description": "검증 대상: F1 redial 무한대기(137-152), F5 ticketedUrl 쿼리 경계(338-347) — 실코드로 확인"
+    },
+    {
+      "path": "npm/install.js",
+      "description": "검증 대상: F2 TOFU 체크섬, F3 타임아웃 부재, F4 부분파일 잔존, F6 Windows sh 런처 — 실코드로 확인"
+    },
+    {
+      "path": "tests/phase4.rs",
+      "description": "239-240 tautology 확인: contains(\"content\")는 runtime persist 형식상 항상 참"
+    },
+    {
+      "path": "src/runtime.rs",
+      "description": "대조: 380-397 tool 결과 persist 형식(content = to_string(결과)) — tautology 근거"
+    },
+    {
+      "path": "tests/mcp_server.py",
+      "description": "ping 분기 부재 확인 — 미지 요청 전부 -32601"
+    },
+    {
+      "path": "examples/bench.rs",
+      "description": "137-146 deadline 이후 blocking read, 153-163 unwrap_or(0) — 실코드로 확인"
+    },
+    {
+      "path": "src/provider/openai.rs",
+      "description": "141-162 strict 400 재시도 3중 조건 확인 — 갭 후보 1 반증 근거"
+    },
+    {
+      "path": "src/api.rs",
+      "description": "552-565 is_context_overflow 시그니처 확인 — 갭 후보 2 반증 근거"
+    }
+  ],
+  "architecture": "변경 없음(읽기 전용 감사 검증).",
+  "report": "{\"verdicts\": [{\"id\": \"F1 client.mjs redial 무한대기\", \"verdict\": \"confirmed\", \"severity_final\": \"Medium\", \"reason\": \"재독회 확인: connect()는 10초 바운드가 있으나 #redial의 WebSocket open await(client.mjs:140-142)에는 없음. 블랙홀 호스트에서 open/error 미발생으로 redial 수 분 정체, 데몬 복귀 후에도 #connected 미해소로 모든 호출 10초 게이트 타임아웃 — 초기/재접속 비대칭이 코드로 추적됨.\", \"location_final\": \"npm/client.mjs:137-152\"}, {\"id\": \"F2 install.js 동일오리진 체크섬 TOFU\", \"verdict\": \"confirmed\", \"severity_final\": \"Low\", \"reason\": \"install.js:84-96 실제 확인: tarball과 .sha256이 동일 GitHub 오리진, 서명 부재(TOFU). 단 오리진 침해 전제의 공급망 강화 갭이며 체크섬은 잘림/전송 오류를 실제로 잡으므로 Low 적절.\", \"location_final\": \"npm/install.js:24-25,84-96\"}, {\"id\": \"F3 install.js curl/fetch 타임아웃 부재\", \"verdict\": \"confirmed\", \"severity_final\": \"Low\", \"reason\": \"curl -fsSL에 --max-time/--connect-timeout 없고 fetch에 AbortSignal 없음(52-68) — 정지 네트워크에서 postinstall 무기한 정체. 견고성 Low.\", \"location_final\": \"npm/install.js:52-68\"}, {\"id\": \"F4 install.js 부분파일 잔존\", \"verdict\": \"confirmed\", \"severity_final\": \"Low\", \"reason\": \"불일치 경로(97행)만 unlink; curl 전송 중단 시 부분 tarball이 bin/에 잔존, 체크섬 페치 실패 경로도 미삭제. fetch 경로는 buffer 완성 후 write라 해당 없음 — curl 경로로 한정되나 성립, 진단 혼란 수준 Low.\", \"location_final\": \"npm/install.js:52-54,87-97\"}, {\"id\": \"F5 client.mjs ticketedUrl 쿼리스트링 경계\", \"verdict\": \"confirmed\", \"severity_final\": \"Low\", \"reason\": \"'?x=1'로 끝나는 URL에 /\\\\/ws$/ 미매치 → '{http}/ws?x=1/v1/ws_ticket' 404 → throw. 조용한 오동작 아닌 connect 시점 명시 예외이고 기본 URL에서 미발동 — 엣지 Low.\", \"location_final\": \"npm/client.mjs:338-347\"}, {\"id\": \"F6 install.js Windows sh 런처\", \"verdict\": \"confirmed\", \"severity_final\": \"Low\", \"reason\": \"install.js:104-112가 '#!/bin/sh' 확장자 없는 런처 생성, package.json bin이 이를 가리키며 패키지 어디서도 sh 보장 없음(의존성 0). cmd-shim 실패 부분은 [INFERENCE]대로 darwin 실기 검증 불가 — 그러나 'sh 미보장'은 정적 추적 가능하므로 Low 확정.\", \"location_final\": \"npm/install.js:104-112\"}, {\"id\": \"phase4 통합 테스트의 유일한\", \"verdict\": \"confirmed\", \"severity_final\": \"Medium\", \"reason\": \"발췌 실제와 일치(phase4.rs:239-240). runtime.rs:380-397에서 content=to_string(결과)인데 MCP 봉투는 어떤 경로에서도 직렬화 시 'content' 키 필수 → 단언이 논리적으로 항상 참. args echo 유실·에러 봉투 오염을 전부 가리는 tautology.\", \"location_final\": \"tests/phase4.rs:239-240\"}, {\"id\": \"bench.rs 준비 대기가 deadline\", \"verdict\": \"confirmed\", \"severity_final\": \"Low\", \"reason\": \"137-146 재확인: deadline 검사가 lines()의 다음 blocking read 전에만 수행 — damond가 stdout 없이 정체하면 첫 read에서 영구 블로킹, assert 도달 불가. Low.\", \"location_final\": \"examples/bench.rs:137-146\"}, {\"id\": \"bench.rs idle_rss가 프로세스\", \"verdict\": \"confirmed\", \"severity_final\": \"Low\", \"reason\": \"153-163 재확인: 조회 실패가 unwrap_or(0)로 침묵 출력, 무효 베이스라인(0.0 MB)이 정상 종료로 통과. Low.\", \"location_final\": \"examples/bench.rs:153-163\"}, {\"id\": \"mcp_server.py가 ping 요청에\", \"verdict\": \"confirmed\", \"severity_final\": \"Low\", \"reason\": \"전수 재독회: initialize/tools/list/tools/call 외 전부 elif mid is not None → -32601. MCP 스펙상 ping은 빈 result 응답 의무. 현재 테스트가 ping 미호출로 미발동 — 잠재 계약 위반 Low.\", \"location_final\": \"tests/mcp_server.py:44-51\"}, {\"id\": \"strict_400_retries_without_strict 갭 봉인\", \"verdict\": \"rejected\", \"severity_final\": \"Low\", \"reason\": \"openai.rs:141-162 재독회: 재시도는 status==BAD_REQUEST && 요청이 strict tools 보유 && 본문 contains(\\\"strict\\\") 3중 조건. '본문에 우연히 strict 포함' 시나리오는 strict 무관 400 메시지가 정확히 그 단어를 포함해야 하고 그 경우 무해한 단 1회 재시도 후 원 응답 그대로 반환 — 관측 오동작 없음. 순수 테스트 갭으로 배제 원칙 적용.\", \"location_final\": \"src/provider/openai.rs:141-162\"}, {\"id\": \"context_overflow_promotes_to_target 갭 봉인\", \"verdict\": \"rejected\", \"severity_final\": \"Low\", \"reason\": \"api.rs:552-565 재독회: 시그니처 7종('context_length_exceeded', 'prompt is too long' 등)은 공식 에러 문자열로 구체적 — 인증 실패 등 임의 에러가 부분문자열로 매치될 현실적 경로 재구성 실패. 구현 결함 미연결 테스트 갭으로 폐기.\", \"location_final\": \"src/api.rs:552-565\"}], \"notes\": \"12건 전부 재판정: 10 confirmed(심각도 전원 유지 — 보고자 판정과 일치), 2 rejected(TestsProvidersB 갭 봉인 — 구현 재독회 결과 두 휴리스틱 모두 합리적으로 보수적, '갭이 가리는 실제 결함' 재구성 불가; 구현 결함 연결 시에만 유지 원칙 적용). 병합 없음, 후보 간 모순 없음. F6은 [INFERENCE] 표시분 중 '패키지가 sh 존재를 보장하지 않음'만 정적 근거로 확정, cmd-shim 실동작은 darwin 검증 불가 명시. F1은 blackhole 종료 후 redial 회복 가능하므로 Medium. 추가 발견: NpmAudit 스파이 지적대로 repo map의 'client.mjs — JS 클라이언트+E2E' 기술이 stale(E2E 코드 부재, 결함 아님) — 문서 갱신 후보.\"}"
+}

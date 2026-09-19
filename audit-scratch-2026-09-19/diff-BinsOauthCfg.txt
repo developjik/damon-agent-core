@@ -1,0 +1,488 @@
+diff --git a/src/bin/damon-discord.rs b/src/bin/damon-discord.rs
+index fd59716..94401b4 100644
+--- a/src/bin/damon-discord.rs
++++ b/src/bin/damon-discord.rs
+@@ -1,7 +1,7 @@
+ use std::sync::Arc;
+ 
+ use anyhow::Context;
+-use clap::Parser;
++use clap::{CommandFactory, FromArgMatches, Parser};
+ use damon_core::channel::Bridge;
+ use damon_core::client::DamonClient;
+ use damon_core::discord::{DiscordApi, DiscordChannel};
+@@ -34,7 +34,14 @@ async fn main() -> anyhow::Result<()> {
+         )
+         .init();
+ 
+-    let args = Args::parse();
++    let matches = Args::command().get_matches();
++    let args = Args::from_arg_matches(&matches).expect("clap-validated matches");
++    // A --token on argv is readable by any local user via the process
++    // list; the DAMON_TOKEN env alternative is not. Keep the flag for
++    // scripts, but warn once so the exposure is at least visible.
++    if matches.value_source("token") == Some(clap::parser::ValueSource::CommandLine) {
++        eprintln!("warning: --token is visible in process lists; prefer DAMON_TOKEN env");
++    }
+     let client = DamonClient::connect(&args.url, args.token.as_deref())
+         .await
+         .context("cannot connect to damond")?;
+diff --git a/src/bin/damon-slack.rs b/src/bin/damon-slack.rs
+index 4833197..49ddcb3 100644
+--- a/src/bin/damon-slack.rs
++++ b/src/bin/damon-slack.rs
+@@ -1,7 +1,7 @@
+ use std::sync::Arc;
+ 
+ use anyhow::Context;
+-use clap::Parser;
++use clap::{CommandFactory, FromArgMatches, Parser};
+ use damon_core::channel::Bridge;
+ use damon_core::client::DamonClient;
+ use damon_core::slack::{SlackApi, SlackChannel};
+@@ -37,7 +37,14 @@ async fn main() -> anyhow::Result<()> {
+         )
+         .init();
+ 
+-    let args = Args::parse();
++    let matches = Args::command().get_matches();
++    let args = Args::from_arg_matches(&matches).expect("clap-validated matches");
++    // A --token on argv is readable by any local user via the process
++    // list; the DAMON_TOKEN env alternative is not. Keep the flag for
++    // scripts, but warn once so the exposure is at least visible.
++    if matches.value_source("token") == Some(clap::parser::ValueSource::CommandLine) {
++        eprintln!("warning: --token is visible in process lists; prefer DAMON_TOKEN env");
++    }
+     let client = DamonClient::connect(&args.url, args.token.as_deref())
+         .await
+         .context("cannot connect to damond")?;
+diff --git a/src/bin/damon-telegram.rs b/src/bin/damon-telegram.rs
+index dcd8434..163548b 100644
+--- a/src/bin/damon-telegram.rs
++++ b/src/bin/damon-telegram.rs
+@@ -1,7 +1,7 @@
+ use std::sync::Arc;
+ 
+ use anyhow::Context;
+-use clap::Parser;
++use clap::{CommandFactory, FromArgMatches, Parser};
+ use damon_core::client::DamonClient;
+ use damon_core::telegram::{BotApi, Bridge};
+ 
+@@ -33,7 +33,14 @@ async fn main() -> anyhow::Result<()> {
+         )
+         .init();
+ 
+-    let args = Args::parse();
++    let matches = Args::command().get_matches();
++    let args = Args::from_arg_matches(&matches).expect("clap-validated matches");
++    // A --token on argv is readable by any local user via the process
++    // list; the DAMON_TOKEN env alternative is not. Keep the flag for
++    // scripts, but warn once so the exposure is at least visible.
++    if matches.value_source("token") == Some(clap::parser::ValueSource::CommandLine) {
++        eprintln!("warning: --token is visible in process lists; prefer DAMON_TOKEN env");
++    }
+     let client = DamonClient::connect(&args.url, args.token.as_deref())
+         .await
+         .context("cannot connect to damond")?;
+diff --git a/src/bin/damon.rs b/src/bin/damon.rs
+index feeadcd..2505d56 100644
+--- a/src/bin/damon.rs
++++ b/src/bin/damon.rs
+@@ -63,7 +63,7 @@ enum Cmd {
+     },
+     /// Full-text search over all session history
+     Search {
+-        /// FTS5 query (e.g. 'error AND timeout', '"exact phrase"')
++        /// Search query — terms AND together; "exact phrase" and AND/OR/NOT supported
+         query: String,
+         /// Max results
+         #[arg(long, default_value = "10")]
+@@ -92,7 +92,7 @@ async fn main() -> anyhow::Result<()> {
+             .timeout(std::time::Duration::from_secs(5))
+             .build()?;
+         let resp = http.get(&url).send().await?.error_for_status()?;
+-        println!("{}", resp.text().await?);
++        outln(resp.text().await?);
+         return Ok(());
+     }
+ 
+@@ -109,7 +109,7 @@ async fn main() -> anyhow::Result<()> {
+         Cmd::Health => unreachable!(),
+         Cmd::Sessions => {
+             for (id, created, model) in client.list_sessions().await? {
+-                println!("{id}\t{created}\t{model}");
++                outln(format!("{id}\t{created}\t{model}"));
+             }
+         }
+         Cmd::Chat { session, model } => {
+@@ -127,11 +127,11 @@ async fn main() -> anyhow::Result<()> {
+         }
+         Cmd::Delete { id } => {
+             client.delete_session(&id).await?;
+-            println!("deleted {id}");
++            outln(format!("deleted {id}"));
+         }
+         Cmd::Search { query, limit } => {
+             for (sid, mid, snippet) in client.search(&query, limit).await? {
+-                println!("{sid}:{mid}\t{snippet}");
++                outln(format!("{sid}:{mid}\t{snippet}"));
+             }
+         }
+         Cmd::Prompt {
+@@ -156,7 +156,7 @@ async fn main() -> anyhow::Result<()> {
+                 &mut stdin,
+             )
+             .await?;
+-            println!();
++            outln("");
+         }
+     }
+     Ok(())
+@@ -168,6 +168,27 @@ fn cwd() -> String {
+         .unwrap_or_default()
+ }
+ 
++/// Write one line to stdout, exiting quietly with 141 (128+SIGPIPE, the
++/// killed-by-SIGPIPE convention) when the pipe is gone. Rust ignores
++/// SIGPIPE, so `damon sessions | head -1` would otherwise panic inside
++/// println! with a noisy exit 101.
++fn outln(s: impl std::fmt::Display) {
++    use std::io::Write;
++    if writeln!(std::io::stdout(), "{s}").is_err() {
++        std::process::exit(141);
++    }
++}
++
++/// Like `outln` but without a trailing newline and with an explicit
++/// flush — streamed turn text must reach the terminal immediately.
++fn out(s: impl std::fmt::Display) {
++    use std::io::Write;
++    let mut stdout = std::io::stdout();
++    if write!(stdout, "{s}").is_err() || stdout.flush().is_err() {
++        std::process::exit(141);
++    }
++}
++
+ /// Interactive chat REPL over an existing session. The event receiver is
+ /// taken once — `events()` hands out the only consumer, so re-taking it
+ /// per turn would starve every turn after the first.
+@@ -238,9 +259,7 @@ async fn run_turn(
+                 match u["sessionUpdate"].as_str() {
+                     Some("agent_message_chunk") => {
+                         if let Some(t) = u["content"]["text"].as_str() {
+-                            print!("{t}");
+-                            use std::io::Write;
+-                            let _ = std::io::stdout().flush();
++                            out(t);
+                         }
+                     }
+                     Some("tool_call_update") => {
+diff --git a/src/bin/damond.rs b/src/bin/damond.rs
+index 322dfab..624fc16 100644
+--- a/src/bin/damond.rs
++++ b/src/bin/damond.rs
+@@ -55,14 +55,24 @@ enum ServiceAction {
+ 
+ #[tokio::main]
+ async fn main() -> anyhow::Result<()> {
++    let args = Args::parse();
++    let path = args.config.unwrap_or_else(config::default_config_path);
++    // Pre-load .env BEFORE tracing init: RUST_LOG from the same .env
++    // files Config::load reads must shape the EnvFilter — it used to be
++    // built first and silently ignored RUST_LOG. Same precedence as
++    // Config::load (config dir first, cwd only in debug); dotenvy never
++    // overrides already-set vars, so the later load there stays a no-op.
++    if let Some(dir) = path.parent() {
++        let _ = dotenvy::from_path(dir.join(".env"));
++    }
++    #[cfg(debug_assertions)]
++    let _ = dotenvy::from_path(Path::new(".env"));
+     tracing_subscriber::fmt()
+         .with_env_filter(EnvFilter::try_from_default_env().unwrap_or_else(|_| "damon=info".into()))
+         .init();
+     // rustls needs an explicit process-level crypto provider.
+     let _ = rustls::crypto::ring::default_provider().install_default();
+ 
+-    let args = Args::parse();
+-    let path = args.config.unwrap_or_else(config::default_config_path);
+     if args.print_config_path {
+         println!("{}", path.display());
+         return Ok(());
+@@ -207,6 +217,9 @@ async fn main() -> anyhow::Result<()> {
+         }
+         _ => anyhow::bail!("tls_cert and tls_key must be set together"),
+     }
++    // Tear down MCP children explicitly — rmcp's Drop only *schedules* an
++    // async close, so relying on it at process exit can orphan servers.
++    state.mcp.shutdown().await;
+     info!("damond stopped");
+     Ok(())
+ }
+diff --git a/src/config.rs b/src/config.rs
+index 08f26c7..0a7082c 100644
+--- a/src/config.rs
++++ b/src/config.rs
+@@ -66,6 +66,7 @@ pub struct RelayConfig {
+ /// Per-model metadata. User config (`[models."<id-or-glob>"]`) overrides
+ /// the built-in hints; unknown models get None → no context-aware features.
+ #[derive(Clone, Debug, Default, Deserialize)]
++#[serde(deny_unknown_fields)]
+ pub struct ModelMeta {
+     /// Total context window in tokens.
+     pub context_window: Option<u64>,
+@@ -309,12 +310,14 @@ fn resolve_command(cmd: &str) -> anyhow::Result<String> {
+ /// Constant-time byte equality for token/proof comparisons — a remote
+ /// endpoint must not get a timing oracle on the secret.
+ pub fn constant_time_eq(a: &[u8], b: &[u8]) -> bool {
+-    if a.len() != b.len() {
+-        return false;
+-    }
+-    let mut diff = 0u8;
+-    for (x, y) in a.iter().zip(b.iter()) {
+-        diff |= x ^ y;
++    // Length difference folds into the accumulator and every byte slot is
++    // visited either way, so short-vs-long inputs take the same path —
++    // no early return to leak the length via timing.
++    let mut diff = a.len() ^ b.len();
++    for i in 0..a.len().max(b.len()) {
++        let x = a.get(i).copied().unwrap_or(0);
++        let y = b.get(i).copied().unwrap_or(0);
++        diff |= (x ^ y) as usize;
+     }
+     diff == 0
+ }
+@@ -455,7 +458,7 @@ impl Config {
+     }
+ }
+ 
+-/// Minimal glob: `*` matches any suffix/infix, `?` one char.
++/// Minimal glob: `*` matches any suffix/infix, `?` one char (UTF-8 scalar).
+ /// Iterative two-pointer with single-star backtracking — linear time, so
+ /// a `*`-heavy pattern can't pin a worker thread on a long model name.
+ pub fn glob_match(pattern: &str, s: &str) -> bool {
+@@ -464,7 +467,14 @@ pub fn glob_match(pattern: &str, s: &str) -> bool {
+     // Last `*` position and the string index it resumes from.
+     let (mut star, mut star_si) = (usize::MAX, 0usize);
+     while si < s.len() {
+-        if pi < p.len() && (p[pi] == b'?' || p[pi] == s[si]) {
++        if pi < p.len() && p[pi] == b'?' {
++            // `?` consumes one whole UTF-8 scalar, not one byte.
++            pi += 1;
++            si += 1;
++            while si < s.len() && (s[si] & 0xC0) == 0x80 {
++                si += 1;
++            }
++        } else if pi < p.len() && p[pi] == s[si] {
+             pi += 1;
+             si += 1;
+         } else if pi < p.len() && p[pi] == b'*' {
+@@ -508,11 +518,29 @@ pub fn ensure_config(path: &Path) -> anyhow::Result<PathBuf> {
+     if let Some(parent) = path.parent() {
+         std::fs::create_dir_all(parent)?;
+     }
+-    std::fs::write(path, STARTER_CONFIG)?;
+     #[cfg(unix)]
+     {
+-        use std::os::unix::fs::PermissionsExt;
+-        std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600))?;
++        use std::io::Write;
++        use std::os::unix::fs::OpenOptionsExt;
++        // create_new + mode creates the file 0600 atomically — no window
++        // where the starter config sits world-readable before the chmod.
++        match std::fs::OpenOptions::new()
++            .write(true)
++            .create_new(true)
++            .mode(0o600)
++            .open(path)
++        {
++            Ok(mut f) => f.write_all(STARTER_CONFIG.as_bytes())?,
++            // Lost a create race — same outcome as the exists() check.
++            Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {
++                return Ok(path.to_path_buf());
++            }
++            Err(e) => return Err(e.into()),
++        }
++    }
++    #[cfg(not(unix))]
++    {
++        std::fs::write(path, STARTER_CONFIG)?;
+     }
+     info!(path = %path.display(), "wrote starter config");
+     Ok(path.to_path_buf())
+@@ -591,3 +619,67 @@ pub fn watch(path: PathBuf, shared: SharedConfig) -> Option<tokio::sync::mpsc::R
+     });
+     Some(reload_rx)
+ }
++
++#[cfg(test)]
++mod tests {
++    use super::*;
++
++    #[test]
++    fn glob_question_mark_matches_one_utf8_scalar() {
++        // `?` consumes one whole scalar — not one byte of a multibyte char.
++        assert!(glob_match("ollama-?", "ollama-é"));
++        assert!(glob_match("??", "日本"));
++        // ASCII behavior unchanged.
++        assert!(glob_match("ollama-?", "ollama-a"));
++        assert!(glob_match("gpt-4?", "gpt-4o"));
++        // `?` must not match two scalars or zero.
++        assert!(!glob_match("ollama-?", "ollama-ae"));
++        assert!(!glob_match("ollama-?", "ollama-"));
++        assert!(!glob_match("???", "日本"));
++    }
++
++    #[test]
++    fn glob_star_and_literals_unchanged() {
++        assert!(glob_match("claude-*", "claude-sonnet-4"));
++        assert!(glob_match("*", "anything"));
++        assert!(glob_match("gpt-*", "gpt-4o-mini"));
++        assert!(!glob_match("claude-*", "gpt-4o"));
++        assert!(glob_match("", ""));
++        assert!(!glob_match("gpt-4", "gpt-4o"));
++    }
++
++    #[test]
++    fn constant_time_eq_accepts_equal_rejects_unequal() {
++        assert!(constant_time_eq(b"secret", b"secret"));
++        assert!(constant_time_eq(b"", b""));
++        assert!(!constant_time_eq(b"secret", b"secreT"));
++        assert!(!constant_time_eq(b"secret", b"secre"));
++        assert!(!constant_time_eq(b"", b"x"));
++        assert!(!constant_time_eq(b"short", b"a-longer-secret"));
++    }
++
++    #[test]
++    fn model_meta_rejects_unknown_fields() {
++        assert!(toml::from_str::<ModelMeta>("context_window = 200000").is_ok());
++        assert!(toml::from_str::<ModelMeta>("bogus = 1").is_err());
++    }
++
++    #[test]
++    #[cfg(unix)]
++    fn ensure_config_atomic_0600_and_existing_untouched() {
++        use std::os::unix::fs::PermissionsExt;
++        let dir = std::env::temp_dir().join(format!("damon-config-test-{}", std::process::id()));
++        let path = dir.join("config.toml");
++
++        ensure_config(&path).unwrap();
++        let mode = std::fs::metadata(&path).unwrap().permissions().mode();
++        assert_eq!(mode & 0o777, 0o600, "starter config must be 0600 at rest");
++
++        // Existing file: returned as-is, content left alone.
++        std::fs::write(&path, "# custom").unwrap();
++        ensure_config(&path).unwrap();
++        assert_eq!(std::fs::read_to_string(&path).unwrap(), "# custom");
++
++        std::fs::remove_dir_all(&dir).unwrap();
++    }
++}
+diff --git a/src/oauth.rs b/src/oauth.rs
+index 54c87a5..5cc9a57 100644
+--- a/src/oauth.rs
++++ b/src/oauth.rs
+@@ -210,7 +210,15 @@ pub async fn exchange(provider: &str, code_and_state: &str, verifier: &str) -> a
+         .await
+         .context("token exchange request failed")?;
+     let status = resp.status();
+-    let v: serde_json::Value = resp.json().await?;
++    // A non-JSON body (HTML error page, empty 5xx) must not bury the HTTP
++    // status; on success statuses keep the plain decode error.
++    let v: serde_json::Value = match resp.json().await {
++        Ok(v) => v,
++        Err(_) if !status.is_success() => {
++            bail!("token exchange failed ({status}): non-JSON response body");
++        }
++        Err(e) => return Err(e.into()),
++    };
+     if !status.is_success() {
+         bail!("token exchange failed ({status}): {v}");
+     }
+@@ -279,7 +287,13 @@ async fn refresh(provider: &str, refresh_token: &str) -> anyhow::Result<String>
+         .await
+         .context("token refresh request failed")?;
+     let status = resp.status();
+-    let v: serde_json::Value = resp.json().await?;
++    let v: serde_json::Value = match resp.json().await {
++        Ok(v) => v,
++        Err(_) if !status.is_success() => {
++            bail!("token refresh failed ({status}): non-JSON response body");
++        }
++        Err(e) => return Err(e.into()),
++    };
+     if !status.is_success() {
+         bail!("token refresh failed ({status}): {v}");
+     }
+@@ -313,3 +327,71 @@ fn urlencoding(s: &str) -> String {
+         })
+         .collect()
+ }
++
++#[cfg(test)]
++mod tests {
++    use super::*;
++
++    /// Serve raw, non-JSON HTTP responses on an ephemeral port.
++    fn serve_raw(status_line: &str, body: &str) -> String {
++        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
++        let addr = listener.local_addr().unwrap();
++        let status_line = status_line.to_string();
++        let body = body.to_string();
++        std::thread::spawn(move || {
++            use std::io::{Read, Write};
++            // One response per connection — exchange and refresh each open
++            // their own.
++            while let Ok((mut sock, _)) = listener.accept() {
++                let mut buf = [0u8; 4096];
++                let _ = sock.read(&mut buf); // drain the request head
++                let resp = format!(
++                    "HTTP/1.1 {status_line}\r\ncontent-type: text/html\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{body}",
++                    body.len()
++                );
++                if sock.write_all(resp.as_bytes()).is_err() {
++                    break;
++                }
++            }
++        });
++        format!("http://{addr}/token")
++    }
++
++    #[tokio::test]
++    async fn non_json_error_body_keeps_http_status() {
++        let dir = std::env::temp_dir().join(format!("damon-oauth-unit-{}", std::process::id()));
++        std::fs::create_dir_all(&dir).unwrap();
++        let url = serve_raw("500 Internal Server Error", "<html>upstream exploded</html>");
++        // SAFETY: test-only hooks; this is the only test in this binary
++        // touching these vars, and it removes them before returning.
++        unsafe {
++            std::env::set_var("DAMON_TEST_TOKEN_URL", &url);
++            std::env::set_var("DAMON_TEST_TOKEN_DIR", &dir);
++        }
++
++        // exchange: decode failure on an error status must surface the 500.
++        let err = exchange("unit-test", "some-code", "some-verifier")
++            .await
++            .unwrap_err();
++        assert!(err.to_string().contains("500"), "exchange: {err}");
++
++        // refresh: same contract.
++        store(
++            "unit-test",
++            &OAuthTokens {
++                access_token: "a".into(),
++                refresh_token: "r".into(),
++                expires_at: 0,
++            },
++        )
++        .unwrap();
++        let err = force_refresh("unit-test").await.unwrap_err();
++        assert!(err.to_string().contains("500"), "refresh: {err}");
++
++        unsafe {
++            std::env::remove_var("DAMON_TEST_TOKEN_URL");
++            std::env::remove_var("DAMON_TEST_TOKEN_DIR");
++        }
++        std::fs::remove_dir_all(&dir).unwrap();
++    }
++}

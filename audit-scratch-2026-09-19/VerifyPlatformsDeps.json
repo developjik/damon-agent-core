@@ -1,0 +1,31 @@
+{
+  "architecture": "Read-only adversarial verification of Phase 1 candidates across src/{slack,telegram,discord}.rs, .github/workflows/ci.yml, rust-toolchain.toml, scripts/set-version.sh. Each candidate's cited location re-read directly; no edits, no tests run per constraints.",
+  "files": [
+    {
+      "description": "Telegram offset confirm-before-durable-handling verified at L157/L165",
+      "path": "src/telegram.rs"
+    },
+    {
+      "description": "Discord op7/9 reconnect lacks backoff; verified fixed 5s sleep, full re-identify",
+      "path": "src/discord.rs"
+    },
+    {
+      "description": "seen_envelopes wholesale clear at 4096 cap verified",
+      "path": "src/slack.rs"
+    },
+    {
+      "description": "No top-level permissions floor; all action refs are mutable tags",
+      "path": ".github/workflows/ci.yml"
+    },
+    {
+      "description": "channel=\"stable\" floating toolchain verified",
+      "path": "rust-toolchain.toml"
+    },
+    {
+      "description": "sha256 rotation manual-only (reminder echo at end) verified",
+      "path": "scripts/set-version.sh"
+    }
+  ],
+  "report": "All 7 candidates confirmed, severities stand.\n\n1. Telegram offset pre-confirm — CONFIRMED Medium (src/telegram.rs:157,165): offset.fetch_max(id+1) confirms to Telegram server-side (persistent across restarts) while remaining batch items live only in the in-memory pending VecDeque. Crash/restart mid-batch loses unprocessed updates permanently; the local offset resetting to 0 does not rescue them because the server-side ack already happened. Loss window is 'batch confirmed but pending not drained' — realistic under redeploy, so Medium not High stands.\n\n2. Discord op7/9 identify loop — CONFIRMED Medium (src/discord.rs:329-334): op 7/9 → drop conn → fixed 5s sleep → reconnect via connect() which performs a fresh identify; no exponential backoff, jitter, or resume-session reuse in the path. Persistent refusal loop ≈17k identifies/day, exceeding documented limits. Daily quota numbers are docs-based [INFERENCE]; the code-level absence of backoff is verified.\n\n3. Slack seen_envelopes clear — CONFIRMED Low (src/slack.rs:270-277): wholesale clear at 4096 lets a late retry of a pre-clear envelope reprocess — duplicate prompt execution; explicit documented tradeoff, edge-case robustness.\n\n4. CI permissions floor — CONFIRMED Low (ci.yml:1-13): no top-level permissions:; only release declares contents:write; audit passes GITHUB_TOKEN to rustsec/audit-check@v2. Depends on repo-default token policy; defense-in-depth hardening, not exploitable in current config.\n\n5. Actions tag-pinning — CONFIRMED Low (ci.yml:17,21,25,74,95,115,131): checkout@v4, rust-cache@v2, audit-check@v2, rust-toolchain@stable, action-gh-release@v2, setup-node@v4 all mutable tags in a pipeline holding NPM_TOKEN/CARGO_REGISTRY_TOKEN; supply-chain hardening.\n\n6. Floating stable toolchain — CONFIRMED Low (rust-toolchain.toml:2): channel=\"stable\"; builds non-reproducible, future stable can break CI with no code change.\n\n7. Formula sha256 manual rotation — CONFIRMED Low (set-version.sh:49-50): script only prints a reminder; sha256s inherently uncomputable before tarballs exist, and ci.yml's version check gates versions, not hashes — forgotten rotation leaves homebrew install broken.\n\nCitation check: all cited locations matched actual code within ±2 lines (discord op7/9 at 329-334, slack clear at 270-277, telegram fetch_max at 157). No contradictions between candidates; DepsConfig.json 'no Medium+' self-assessment consistent with its Low verdicts.",
+  "summary": "Phase 2 adversarial verification of 7 candidates (3 platform, 4 config/deps): all 7 confirmed at original severities (1 Medium telegram data-loss, 1 Medium discord quota, 5 Low)."
+}

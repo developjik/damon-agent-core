@@ -1,0 +1,23 @@
+{
+  "summary": "Adversarial re-verification of 6 ProvOpenai.json candidates against direct re-reads of src/provider/openai.rs, llm.rs, runtime.rs, provider/mod.rs: 3 confirmed, 2 downgraded, plus provider-wide mangle-collision merge verdict.",
+  "files": [
+    {
+      "description": "Audited file — all six candidate locations re-read at exact lines",
+      "path": "src/provider/openai.rs"
+    },
+    {
+      "description": "ToolCallAccumulator contract (push/finish) checked for slot-0 merge",
+      "path": "src/llm.rs"
+    },
+    {
+      "description": "execute_tool name dispatch traced for wrong-tool execution (High repro path)",
+      "path": "src/runtime.rs"
+    },
+    {
+      "description": "collect_stream unbounded buffer and RateLimited/retry_after cross-provider comparison",
+      "path": "src/provider/mod.rs"
+    }
+  ],
+  "architecture": "chat_stream/chat mangle tool names into a mangled→original HashMap, then unmangle response/streamed names via that map; execute_tool (runtime.rs) dispatches on restored call.name against state.mcp. RateLimited(2s) is fixed because UpstreamResponse carries no headers, unlike anthropic/responses which use retry_after().",
+  "report": "VERDICTS\n1. [High confirmed] Mangle collision → wrong tool executes. mangle_name (openai.rs:299-307) skips map insert when mangled==name, so tools `a.b` and literal `a__b` leave map a__b→a.b; both stream restore (chat_stream closure names.get) and unmangle_tool_calls (334-354) then rewrite a `a__b` call to `a.b`. Runtime trace: runtime.rs:359-361 → execute_tool:686-688 has_tool(&call.name) → actual MCP tool runs with model-chosen args; auto_approve/session_approved also judged on the wrong name. Full repro path verified in code. MERGE: anthropic.rs:446-448 mangle ('.'→\"__\") + names.insert at :185/:219/:267, and gemini.rs:349-351/:186 are the same collision class — merge the separate anthropic Low candidate into this High as 'mangle-name collision (openai/anthropic/gemini)' with one fix (collision detection → hash suffix or error).\n2. [Medium confirmed] index.unwrap_or(0) (openai.rs:585-592) + ToolCallAccumulator::push (llm.rs:62-77) push_str concatenation: index-omitting gateways with parallel calls merge all fragments into slot 0, corrupting arguments. Single call unaffected — conditional, Medium stands.\n3. [Downgraded Low] Multi-line SSE: join(\"\\n\") output is still valid JSON (\\n = whitespace), so spec-legal multi-line data of ONE json value parses fine; breakage requires two JSON values per event — non-typical upstream, Low.\n4. [Medium confirmed] collect_stream (mod.rs:218-221) caps nothing and openai.rs:216/273 call it pre-status-check; fixed 2s RateLimited (:213/:271) vs sibling providers using retry_after (anthropic.rs:358, responses.rs:237) — both real on error paths.\n5. [Downgraded Low] SSE drain O(n²): buf only accumulates within one poll and drains per line, so cost bounds by chunk size; realistic token streams amortize near-linear. Pathological large-chunk/small-line input only — Low.\n6. [Low confirmed] Strict-retry rebuild (:167-176) hardcodes content_type application/json and drops real headers — consumer misclassification only, Low.\n\ncargo test not run (read-only mandate)."
+}

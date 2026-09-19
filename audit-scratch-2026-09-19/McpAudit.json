@@ -1,0 +1,73 @@
+{
+  "architecture": "McpRegistry holds Inner{servers: name→ServerSlot, tools: namespaced→(server,Tool)} under RwLock. ServerSlot has cfg (RwLock), conn (tokio Mutex Option<RunningService>), backoff. ensure_connected dials outside locks via connect_one (30s bound covering spawn, initialize, list_tools) and guards the removal race with an Arc::ptr_eq recheck. call uses a 300s timeout with one reconnect-retry on transport errors; consecutive connect failures back off 1s to 30s.",
+  "clean": [
+    "Command/args/env assembly (src/mcp.rs:360-368): direct exec, no shell interpretation, args literal — no injection; env values are plain strings and parent-env inheritance is acceptable for trusted config",
+    "stdio deadlock: rmcp pipes stdin/stdout and inherits stderr by default, so no stderr pipe saturation deadlock",
+    "Init timeout: CONNECT_TIMEOUT 30s applied to both serve and list_all_tools (src/mcp.rs:365-388)",
+    "Tool-call 300s timeout discards conn to force respawn (src/mcp.rs:348-356); the conn lock is never held across the 300s window (src/mcp.rs:305-312)",
+    "Backoff arithmetic (src/mcp.rs:157-162): shift overflow impossible; Backoff error excluded from the tool-drop trigger (src/mcp.rs:280-288)",
+    "Spawn failure detection: connect_one propagates io errors; child death breaks the pipe, yielding TransportClosed and the reconnect path",
+    "Non-object tool args rejected (src/mcp.rs:289-292), preventing silent no-arg invocation",
+    "Config change invalidates session approvals (src/mcp.rs:95-99); removal race recheck via Arc::ptr_eq exists (src/mcp.rs:169-178), though finding 1's TOCTOU remains"
+  ],
+  "coverage": [
+    "src/mcp.rs:1-395",
+    "src/config.rs:107-117",
+    "rmcp-3.3.0/src/transport/child_process.rs:1-300",
+    "rmcp-3.3.0/src/service.rs:1040-1183"
+  ],
+  "files": [
+    {
+      "description": "MCP registry: child process lifecycle, reconnect, tool cache, approvals",
+      "path": "src/mcp.rs"
+    },
+    {
+      "description": "McpServerConfig: command/args/env/auto_approve, env is plain String",
+      "path": "src/config.rs"
+    }
+  ],
+  "findings": [
+    {
+      "category": "async-concurrency / cache invalidation",
+      "evidence": "src/mcp.rs:171-188: after the still check (Arc::ptr_eq, lines 171-176), a fresh inner.write() runs tools.retain (line 183) then inserts tools (lines 184-189). reload's removal path runs tools.retain at src/mcp.rs:80.",
+      "fix": "Install conn (192-195) and insert tools inside the same inner.write() critical section together with the still recheck, making it atomic.",
+      "location": "src/mcp.rs:169-189 (ensure_connected) vs src/mcp.rs:74-81 (reload removal)",
+      "scenario": "ensure_connected passes the still check, then reload concurrently removes the slot and purges tools (line 80); ensure_connected's tool insertion (183-189) then runs after that purge, resurrecting the removed server's tools in inner.tools. openai_tools/has_tool keep advertising dead tools and call fails with 'MCP server X not running' on every invocation until the same server name is re-added.",
+      "severity": "Medium",
+      "title": "Removal race re-inserts a removed server's tools into the cache permanently"
+    },
+    {
+      "category": "correctness / error handling",
+      "evidence": "src/mcp.rs:324-332: matches!(e, ServiceError::TransportSend(_) | ServiceError::TransportClosed | ServiceError::UnexpectedResponse); if transport, reconnects and re-invokes peer.call_tool at 335-341. The guard comment at 322-323 acknowledges retrying after the server processed a call would double-execute.",
+      "fix": "Remove the automatic retry and return the error so the caller decides; at minimum drop UnexpectedResponse from the retry set.",
+      "location": "src/mcp.rs:324-343",
+      "scenario": "TransportClosed or UnexpectedResponse can occur after the request reached the server and was processed (child died mid-call or response lost). A side-effectful tool (file writes, message sends) executes on the first attempt and again on the retry. UnexpectedResponse means a response was received at all, so classifying it as retryable is itself wrong.",
+      "severity": "Medium",
+      "title": "Transport-error retry can double-execute side-effectful tools"
+    },
+    {
+      "category": "resource leak / process lifetime",
+      "evidence": "src/mcp.rs:77-81: on removal, *slot.conn.lock().await = None with comment 'drops service → kills child'. Cross-checked rmcp-3.3.0 service.rs:1176-1182 (RunningService Drop delegates async close via DropGuard, warning to call close()/cancel()) and child_process.rs:50-60 (ChildWithCleanup::drop kills via tokio::spawn). No cancel()/close() call anywhere in src/mcp.rs.",
+      "fix": "In the daemon shutdown hook, await close_with_timeout() on each slot's RunningService or explicitly cancel while the runtime is alive.",
+      "location": "src/mcp.rs:79, 194, 293, 337 — no cancel()/close() calls anywhere",
+      "scenario": "Kill/close both depend on async tasks. When the daemon exits and the tokio runtime tears down, dropping conn triggers cancellation but the graceful-close task (3s wait then kill) and the tokio::spawn kill task may be dropped before completing, orphaning the MCP child process.",
+      "severity": "Low",
+      "title": "Orphaned MCP children possible at daemon shutdown — relies entirely on Drop"
+    },
+    {
+      "category": "concurrency / resource",
+      "evidence": "src/mcp.rs:130-150: caller checks conn is None under the lock (130-135), then clears the backoff window (b.1 = None, line 147), then dials connect_one outside any per-flight guard; conn is only installed later at 192-195.",
+      "fix": "Guarantee a single in-flight dial per slot (a spawning flag, or hold the conn mutex across the whole dial).",
+      "location": "src/mcp.rs:129-150",
+      "scenario": "After a child dies, N sessions calling tools on the same server concurrently all observe conn None and an empty backoff window, then each spawns a child via connect_one; N-1 fully initialized children are discarded and killed at 192-195. The configured command (e.g. npx) runs N times redundantly, wasting resources and re-triggering any spawn-time side effects.",
+      "severity": "Low",
+      "title": "Concurrent ensure_connected callers both pass the checks and spawn duplicate children"
+    }
+  ],
+  "notes": [
+    "rmcp-3.3.0 sources were read only to substantiate evidence; defects are attributed to damon-core's usage in src/mcp.rs",
+    "Whether session_approvals.clear_session is invoked (leak) belongs to the runtime/rpc scope and was not verified",
+    "Absence of tool-schema revalidation after call/retry was judged accepted reload design and not reported"
+  ],
+  "summary": "Full audit of src/mcp.rs (1-395): 2 Medium (tools-cache TOCTOU resurrection after reload removal; transport retry risking double execution of side-effectful tools) and 2 Low (possible orphaned children at daemon shutdown; duplicate child spawn under concurrent reconnects). Evidence cross-checked against rmcp-3.3.0 transport/service sources."
+}

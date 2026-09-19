@@ -1,0 +1,19 @@
+{
+  "summary": "9건 판정 완료: 승인 5건(Flow#1 Medium, Flow#2 Medium, Flow#4≡Sec#1 Low, Sec#2 Low), 다운그레이드 1건(Flow#3 Low), 폐기 3건(Flow#5≡Sec#3, Flow#6). Critical/High 없음. 병합 2쌍.",
+  "files": [
+    {
+      "description": "판정 근거: promote_or_error 494-548, is_context_overflow 551-565, translate promote 692-695/722-724, rate_limit eviction 784-791, require_token 860-872",
+      "path": "src/api.rs"
+    },
+    {
+      "description": "constant_time_eq 310-321 확인",
+      "path": "src/config.rs"
+    },
+    {
+      "description": "constant_time_eq 제2 호출처 ws_handler 41-45 확인",
+      "path": "src/rpc.rs"
+    }
+  ],
+  "architecture": "검증 범위: api.rs forward/promote_or_error/translate_forward/rate_limit/require_token, config.rs constant_time_eq, Cargo.toml:25(serde_json \"1\", arbitrary_precision 없음).",
+  "report": "verdicts: (1) id='is_context_overflow 오탐 → 무단 모델/프로바이더 promotion' — confirmed, Medium. upstream 4xx 본문이 제네릭 시그니처('request too large','too many tokens') 포함 시 api.rs:511 is_context_overflow(552-562, lowercase substring 매칭) 오판 → context_promotion_target 프로바이더에 원 요청 무단 재전송(514-547). translate 경로 동일(692-695, 722-724: depth==0 && is_context_overflow(format!(\"{e}\"))). 관측 오동작: 미요청 모델 과금·원인 은폐. target 미설정 시 미발동이라 Medium. (2) id='버퍼 >1MB 시 에러 본문·promotion 모두 소실' — confirmed, Medium. api.rs:501-509 가드 실패분이 `_ => error_response(status, \"\")` 빈 본문 반환, promotion target 있어도 재시도 없음. 이 분기는 타임아웃·collect 에러도 함께 삼킴(추가 발견). 실제 위치 501-509. (3) id='forward 재직렬화 시 64비트 초과 정수 정밀도 손실' — downgraded, Low. 인용(440-447)은 일치하나 (a) serde_json arbitrary_precision 없음(Cargo.toml:25)이나 u64::MAX까지 정확 파싱 — '2^63 초과→f64' 주장 오류, snowflake ID(<2^63) 영향 없음. (b) 비객체 바디 무음 폐기는 반증 — model/thinking 모두 v[\"model\"].as_str()(383-385) 파생이라 배열 바디는 재직렬화 분기(437) 진입 불가. 잔여 결함 u64/i64 초과 수 한정 극단 엣지 → Low. (4) id=\"'upstream error: {e}' 클라이언트 응답 직접 반환\" ≡ Sec#1 'Raw upstream errors...' — 병합, confirmed, Low. format!(\"upstream error: {e}\") 4곳(478-482, 543-547, 699-703, 729-733) + SSE Err 분기(~662-668)에서 reqwest Display(URL 포함) 그대로 반환. 전 경로 인증/loopback 뒤라 Low. (5) id='rate_limit eviction이 전역 뮤텍스 점유한 채 O(n) 스캔 반복' ≡ Sec#3 'rate_buckets eviction holds...' — 병합, rejected. 메커니즘(784-791 min_by_key in mutex)은 실재하나 맵 ~1024 캡으로 요청당 스캔 1회 µs 수준, '수백 ms~초' 재구성 불가. 전역 뮤텍스 직렬화는 원래 구조. 관측 오동작 없음. (6) id=\"무효 JSON 요청이 'no provider'/'upstream 400'으로 위장\" — rejected. 정상 경로: 무효 JSON → model=None(383-385) → passthrough 후 upstream 4xx를 원 상태코드로 relay(470-513). translate는 592-597에서 400 'invalid JSON body' 반환. 상태코드 위장 없음, DX 취향. (7) id='constant_time_eq early-return on length mismatch — token-length' — confirmed, Low. config.rs:310-314 조기 반환 확인. 호출처 api.rs:866-871, rpc.rs:41-45 모두 Bearer 비교. XOR 루프는 길이 일치 시만 실행 → 길이 타이밍 스텝 존재(자체 doc 계약 위반). 원격 네트워크에서 ~40B 차이 관측 극히 어려움 + 길이 외 누출 없음 → Low. notes: 병합 Flow#4≡Sec#1(승인), Flow#5≡Sec#3(폐기). 모순 없음. 정정: Flow#2 실제 위치 501-509, Flow#1 사용부 511(스카웃 표기 476-481 오차). 추가 발견: Flow#2의 `_` 분기가 타임아웃·collect 에러도 빈 본문으로 삼킴; SSE Err 분기(~662-668)도 upstream 에러 문자열 방출(정보노출 판정에 포함)."
+}

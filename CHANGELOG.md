@@ -61,6 +61,90 @@
 - Client requests pending on a dead connection now fail fast instead of
   hanging.
 - `set-version.sh` works on BSD/macOS sed.
+- Full-audit remediation (2026-09-19, 67 defects fixed):
+  - Channels: slow platform sends no longer silently drop streamed reply
+    chunks (per-chat event queues are unbounded now); permission prompt
+    timeout follows the configured `permission_timeout_secs` instead of a
+    hardcoded 300s; chat→session mappings evict after 24h idle; the bridge
+    loop backs off when an adapter returns no events.
+  - Providers: tool-name mangling is collision-safe — `a.b` and a literal
+    `a__b` can coexist and each call restores to the right tool (OpenAI,
+    Anthropic, Gemini); unknown tool names are no longer guessed back
+    (visible error instead of silent wrong-tool execution); string `stop`
+    wraps to `stop_sequences`; mid-stream Anthropic `overloaded_error`
+    maps to `RateLimited` backoff; negative/NaN `Retry-After` no longer
+    panics; 429 backoff honors the upstream `Retry-After` on the OpenAI
+    path; Gemini safety blocks report `content_filter`/the block reason
+    instead of an empty reply; multimodal (image) parts translate to the
+    Responses API instead of vanishing; array-form system messages survive
+    in-band tool rendering and compat coalescing; streamed text keeps its
+    original ordering relative to thinking events.
+  - API: context-overflow promotion no longer triggers on generic
+    "request too large"/"too many tokens" bodies; oversized or unreadable
+    upstream error bodies surface a real message instead of an empty one;
+    upstream error details (including internal URLs) are logged, not
+    echoed to clients.
+  - RPC: `live_prompts` bookkeeping no longer holds the session map
+    across store awaits (a slow SQLite delete stalled every client);
+    a single send-timeout no longer permanently disables notifications
+    for a connection; non-canonical numeric JSON-RPC ids resolve.
+  - Runtime: CJK-heavy sessions no longer compact ~2x too early
+    (non-ASCII token estimate corrected); cancelled tool calls report
+    `status: cancelled` instead of `failed`.
+  - Store: search rejects leading `NOT` and handles `x AND NOT y`
+    without FTS5 syntax errors or silently dropped exclusions; the data
+    directory and database are created 0700/0600.
+  - Relay: replacing a daemon no longer strands attached clients on a
+    dead tunnel (sessions close immediately; the new generation is
+    immune); over-capacity connects get an explicit `over_capacity`
+    error frame; duplicate client ids can no longer corrupt slot
+    bookkeeping.
+  - MCP: a config reload can no longer resurrect a removed server's
+    tools; transport retries are limited to send failures (side-effectful
+    tools can't double-execute); concurrent reconnects spawn one child,
+    not N; children are closed explicitly at daemon shutdown.
+  - Client (Rust): a stalled event consumer can no longer deadlock
+    `prompt()` via the pending map; the ws_ticket exchange has a
+    timeout; local WS connections cap frame size like the relay path.
+  - CLI/bins: `damon` exits 141 quietly on a closed pipe instead of
+    panicking; `RUST_LOG` in the config-dir `.env` works; platform
+    binaries warn when `--token` (visible in process lists) is used.
+  - npm: reconnect dials time out (black-hole hosts no longer wedge the
+    client); ticket URLs handle query strings; downloads have timeouts
+    and clean up partial tarballs; Windows gets `.cmd` launchers.
+  - Config/OAuth: config-file `models` globs treat `?` as one character
+    (not one byte); token comparison is length-leak-free; unknown keys
+    under `[models.*]` are rejected like every other section; the starter
+    config is created 0600 atomically; OAuth errors keep the HTTP status
+    when the error body isn't JSON.
+  - CI: workflow-level `permissions: contents: read`; actions pinned to
+    commit SHAs; toolchain pinned to 1.95.0; Homebrew formula sha256s
+    update automatically on release.
+- Re-audit remediation (2026-09-19, 12 defects fixed):
+  - Runtime: the CJK token estimate is weighted to ~1 token/char —
+    Korean-heavy sessions compact at the 85% threshold instead of
+    wedging with context-length 400s past the window.
+  - Providers: a string `reasoning` paired with a `:low|:medium|:high`
+    model suffix no longer panics the Responses translator; array-form
+    system messages coalesce again for single-system endpoints
+    (multimodal parts preserved losslessly).
+  - RPC: oversized `session/messages` / `session/list` responses fail
+    loud with a paging hint instead of sending a frame the client's
+    4 MiB receive cap drops (which killed the link and left the session
+    permanently unreadable).
+  - Relay: a saturated daemon tunnel no longer pins client-session
+    slots — pump sends are bounded and attach/disconnect notices are
+    best-effort, so cleanup can never wait on the tunnel draining.
+  - MCP: daemon shutdown bounds the per-slot lock wait — a reload that
+    is dialing a server can no longer stall exit past the 5s budget and
+    force SIGKILL (which orphaned the children the hook exists to reap).
+  - npm: ticket URLs preserve the path prefix before `/ws` (prefixed
+    proxy deployments work again, matching the Rust client);
+    handshake-timeout sockets are closed instead of abandoned; calls
+    after `close()` fail fast instead of hanging 10s; the reconnect
+    wait and backoff timers no longer keep the process alive.
+  - CI: Windows release tarballs exclude `.pdb` debug symbols (~35% of
+    the payload).
 - **Relay hardening**: per-IP connection cap on unauthenticated
   `/connect` (8), per-tunnel session cap on the daemon (32), a 10s
   registration-auth deadline on the relay, and `session/delete`-style

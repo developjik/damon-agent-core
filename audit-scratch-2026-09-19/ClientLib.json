@@ -1,0 +1,71 @@
+{
+  "architecture": "DamonClient unifies local WS (ws_transport) and relay tunnel (ChannelWriter) behind a TextWriter trait; one Reconnect supervisor task owns the inbound pump, redial backoff (100ms to 5s), and pending drain. Responses route via a pending map keyed by u64 id; prompt results go through the event channel to preserve ordering. The E2E layer in src/relay.rs uses X25519 plus bidirectional AES-256-GCM with sequence-as-nonce.",
+  "clean": [
+    "E2E handshake symmetry (relay.rs daemon_handshake 143-197 vs client_handshake 199-244): proof order client-first matches; client proof sha256(token||cpub||dpub), daemon proof sha256(token||dpub||cpub), both constant-time compared; both bail on e2e_error auth; both check was_contributory; from_shared(false) sends c2d and receives d2c mirroring daemon_side=true; both seq counters start at 0",
+    "examples/client.rs permission auto-approve payload matches daemon contract (runtime.rs:767 reads outcome.optionId; allow-once is a listed optionId)",
+    "request retry semantics: failed send removes pending entry; dropped oneshot on link death gives bounded 3-attempt resend; server error responses never retried",
+    "Reconnect supervisor swaps writer before announcing Connected (client.rs:512-520); backoff resets on successful redial",
+    "ws_transport: Ping/Pong/Binary skipped, Close/Err end the pump; full mpsc breaks the pump",
+    "wait_connected: correct deadline via timeout_at; supervisor-gone distinguished from timeout",
+    "ticketed_url: token only in Authorization header; single-use 60s ticket in URL by design (api.rs:303-322)",
+    "handle_frame: Updates lossy via try_send by design; malformed JSON and non-u64 ids ignored",
+    "No SSE or UTF-8 chunk-boundary exposure: tungstenite delivers complete validated UTF-8 text messages"
+  ],
+  "coverage": [
+    "src/client.rs:1-596 (full)",
+    "examples/client.rs:1-46 (full)",
+    "src/relay.rs:60-260 (E2e, daemon_handshake, client_handshake, from_shared, encrypt/decrypt, proof/derive_key)",
+    "src/relay.rs:283-600 (run_tunnel, tunnel_once, client_connect)",
+    "src/runtime.rs:738-772 (request_permission outcome contract)",
+    "src/api.rs:24-32 and 303-322 (ws_ticket TTL and one-shot)"
+  ],
+  "files": [
+    {
+      "description": "Embedder WS/JSON-RPC client: reconnect supervisor, pending routing, event channel, ticket exchange",
+      "path": "src/client.rs"
+    },
+    {
+      "description": "Minimal usage example: connect, initialize, prompt, event loop",
+      "path": "examples/client.rs"
+    },
+    {
+      "description": "Comparison target: E2e handshake, tunnel, client_connect",
+      "path": "src/relay.rs"
+    }
+  ],
+  "findings": [
+    {
+      "category": "async/concurrency lock-across-await",
+      "evidence": "src/client.rs:585-600: let mut map = pending.lock().await; for (_, p) in map.drain() { let result = Err(json!({message: connection closed})); match p { Pending::Direct(tx) => { drop(tx); } Pending::ToEvents { session_id } => { let _ = event_tx.send(ClientEvent::PromptDone { session_id, result }).await; } } }",
+      "fix": "Collect drained entries into a Vec, drop the lock, then await event_tx.send; or make the ToEvents drain try_send-based.",
+      "location": "src/client.rs:584-604 (drain_pending), 417-446 (prompt), 455-457 (events channel cap 64)",
+      "scenario": "Event consumer is slow or paused and the 64-cap event channel fills; link drops; Reconnect.run blocks in drain_pending on event_tx.send().await while still holding the pending mutex; prompt() (client.rs:419) takes self.pending.lock().await with no wait_connected and no timeout, so it blocks forever. Same root cause: handle_frame blocking send for Request/PromptDone on a full channel freezes the frame pump, halting response routing and reconnect handling.",
+      "severity": "Medium",
+      "title": "drain_pending holds pending mutex across event channel send await, so prompt() can block forever"
+    },
+    {
+      "category": "error handling / missing timeout",
+      "evidence": "src/client.rs:354-362: let resp = reqwest::Client::new().post(format!(url + /v1/ws_ticket)).bearer_auth(token).send().await.context(ws_ticket request failed)?;",
+      "fix": "Set connect_timeout/timeout on the reqwest client or wrap the ticket exchange in tokio::time::timeout.",
+      "location": "src/client.rs:352-373 (ticketed_url)",
+      "scenario": "With a token set, DamonClient::connect POSTs /v1/ws_ticket; if the daemon or a reverse proxy accepts TCP but never responds, reqwest default (no total/read timeout) makes send().await wait forever and connect() never returns regardless of the reconnect supervisor. The relay path bounds its handshake at 15s (relay.rs:529-531) but this path has no bound.",
+      "severity": "Medium",
+      "title": "ticketed_url uses reqwest::Client::new() with no timeout, so connect() can hang indefinitely"
+    },
+    {
+      "category": "boundary/resource limit inconsistency",
+      "evidence": "src/client.rs:469-471: fn ws_transport(ws: Ws) splits without any WebSocketConfig, versus src/relay.rs:513-516 client_connect setting max_message_size(Some(4 << 20)).",
+      "fix": "Use connect_async_with_config in connect()/redial with the same 4MiB cap as the tunnel path.",
+      "location": "src/client.rs:84-91 (connect uses default config), 469-493 (ws_transport)",
+      "scenario": "On a tokenless or ws:// path, a compromised proxy delivers a single 64MiB Text frame; tungstenite default max_message_size buffers it all, amplifying client memory. The relay client (client_connect) explicitly caps at 4MiB for the same threat, so coverage is inconsistent.",
+      "severity": "Low",
+      "title": "Local WS path lacks the max_message_size cap the relay path applies"
+    }
+  ],
+  "notes": [
+    "cargo check/test not run per audit-only read-only constraint.",
+    "examples/client.rs API usage fully checked against contract: permission payload, PromptDone error mapping, event-taken-before-prompt ordering all correct, no API misuse.",
+    "damon-relay binary-side frame protocol left to BinRelaySrv; only client-daemon symmetry verified."
+  ],
+  "summary": "Audit of src/client.rs (1-596) and examples/client.rs against src/relay.rs daemon-side E2E handshake and tunnel. Proof order (client-first), auth-failure handling, seq init 0, and d2c/c2d direction mapping are exactly symmetric. No SSE parsing path exists (tungstenite handles frame boundaries and UTF-8). Three defects: drain_pending deadlock on full event channel (Medium), missing timeout in ticketed_url (Medium), missing max_message_size cap on local WS path (Low)."
+}

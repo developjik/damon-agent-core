@@ -1,0 +1,23 @@
+{
+  "summary": "npm/ 감사 완료 (client.mjs 352줄 전수, install.js 135줄 전수, package.json). 결함 후보 6건 (Medium 1, Low 5). 핵심 확인: client.mjs에는 E2E/X25519/AES-GCM 코드가 전혀 없음 — 로컬 데몬 /ws 직결 임베더 클라이언트이므로 JS↔Rust relay E2E 불일치 결함은 성립하지 않음(src/relay.rs와 직접 대조로 확인). install.js는 sha256 체크섬 검증이 있으나 동일 오리진(GitHub)에서 가져와 서명 부재로 공급망 무결성은 제한적.",
+  "files": [
+    {
+      "path": "npm/client.mjs",
+      "description": "감사 대상: WS JSON-RPC 임베더 클라이언트. F1(redial 핸드셰이크 무한대기), F5(ticketedUrl 쿼리스트링 경계) 발견"
+    },
+    {
+      "path": "npm/install.js",
+      "description": "감사 대상: postinstall 바이너리 다운로더. F2(동일 오리진 체크섬/서명 부재), F3(다운로드 타임아웃 부재), F4(부분파일 잔존), F6(Windows sh 런처) 발견"
+    },
+    {
+      "path": "npm/package.json",
+      "description": "감사 대상: bin 매핑(F6 근거), postinstall 스크립트. 결함 없음"
+    },
+    {
+      "path": "src/relay.rs",
+      "description": "대조 기준(읽기 전용): E2E 프로토콜 사양 확인 — proof=sha256(token||mine||theirs) 클라이언트 선증명, derive_key=sha256(shared||label), 프레임=b64(seq_be8||nonce12||ct), decrypt seq 엄격 순차 검사"
+    }
+  ],
+  "architecture": "client.mjs: 제로 디펜던시 WHATWG WebSocket JSON-RPC 클라이언트. connect() → bearer 토큰을 POST /v1/ws_ticket으로 단회성 티켓 교환 후 ?ticket= 쿼리 전달(토큰이 URL에 노출 안 됨). #pending Map RPC 상관, events() 비동기 이터레이터(8192 큐, request 이벤트 우선 보존), 끊김 시 100ms→5s 백오프 redial, 각 호출은 #ready() 10초 게이트. install.js: postinstall에서 플랫폼별 tar.gz를 curl/fetch로 받아 .sha256 대조 → 추출 → 필수 6바이너리 확인 → chmod 755, Windows용 확장자 없는 sh 런처 생성.",
+  "report": "E2E 대조(지시된 핵심 항목): npm/ 전체 grep(x25519|aes-gcm|e2e|diffie|Gcm|proof) 결과 JS 측 E2E 구현 부재 확인. repo map의 'client.mjs — JS 클라이언트+E2E' 기술은 현재 코드와 불일치(stale). client.mjs는 릴레이 터널/E2E 경로를 전혀 사용하지 않으므로 proof 순서·seq/nonce·AES-GCM 파라미터·키 유도의 JS-Rust 불일치 결함은 성립 불가. 대조 기준 src/relay.rs: proof=sha256(token||mine||theirs) 클라이언트 선증명(218-222), derive_key=sha256(shared||label) 방향 분리(226-231), 프레임=b64(seq_be8||nonce12||ct), nonce=4 zero bytes||seq_be(235-239), decrypt seq 엄격 순차 검사(202-211). --- findings: [F1 Medium | client.mjs:132-152 | #redial의 WebSocket open 대기(140-142)에 타임아웃 부재 — 초기 connect()는 10초 바운드(67-73, 주석 명시)와 불일치. 시나리오: 방화벽 SYN drop 블랙홀 호스트 → 커널 SYN 재전송 수 분간 await 정체 → #connected 미해소로 모든 호출 10초 후 타임아웃, 데몬이 살아나도 redial 루프 진행 불가. fix: 10초 setTimeout 바운드 추가.] [F2 Low | install.js:27-28, 84-96 | 체크섬이 tarball과 동일 오리진의 .sha256 파일 — GitHub 계정/릴리스 침해 시 tarball+.sha256 동시 위조로 검증 통과 → 악성 바이너리 0o755로 설치. 서명 검증 부재(TOFU). 잘림/전송 오류 감지만 제공.] [F3 Low | install.js:52-54, 60-68 | curl에 --max-time/--connect-timeout 없고 Node fetch에 AbortSignal 없음 — 응답 정지 네트워크에서 postinstall 무기한 정체.] [F4 Low | install.js:70-77, 87-90 | 다운로드 실패/체크섬 페치 실패 경로에서 tarball 미삭제(불일치 경로 97줄은 삭제) — 부분 tarball이 bin/에 잔존, 실패 시 진단 혼란.] [F5 Low | client.mjs:338-347 | ticketedUrl에 쿼리스트링이 이미 있는 ws URL('ws://host/ws?x=1') 입력 시 /\\/ws$/ 미매치 → 'http://host/ws?x=1/v1/ws_ticket' 호출 → 404. 엣지 케이스.] [F6 Low | install.js:104-112, package.json:9-15 | Windows용 확장자 없는 런처가 '#!/bin/sh' 스크립트 — npm cmd-shim이 shebang 인터프리터(sh)를 PATH에서 찾지 못하면 shim 실행 실패 [INFERENCE: cmd-shim 동작 기반, darwin 환경으로 Windows 실기 검증 불가].] --- clean: execSync 보간은 상수 기반+따옴표로 셸 주입 여지 없음 / fail-closed 순서(0바이트 가드→체크섬→추출→바이너리 확인) / client.mjs 시크릿 처리(토큰 URL 노출 없음, 로그 유출 경로 없음) / #pending 정리(close-window 가드, onClose 일괄 reject) / 소켓 식별 가드로 이중 redial 루프 방지 / #ready 타임아웃 타이머 미 clear·큐 eviction의 disconnected/reconnected drop은 관측 가능한 오동작 시나리오 부재로 제외. 미조사: Windows cmd-shim 실동작(darwin 환경), tests/client.rs(TestsCore 담당)."
+}

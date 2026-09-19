@@ -1,0 +1,11 @@
+{
+  "summary": "RpcSocket.json 3건 적대적 검증 완료: F1/F2 confirmed(Medium), F3 confirmed with evidence correction(Low) — scout의 \"005\" 파싱 실패 주장은 반증됨(Rust u64 파서는 선행 0 허용).",
+  "files": [
+    {
+      "path": "src/rpc.rs",
+      "description": "검증 대상: 563-596/456-487 (F1 lock-across-await), 162-177/268 (F2 sticky stalled), 286-291 (F3 id 파싱)"
+    }
+  ],
+  "architecture": "해당 없음 — 감사 판정 태스크",
+  "report": "{\"verdicts\":[{\"id\":\"F1 live_prompts 락 across await\",\"verdict\":\"confirmed\",\"severity_final\":\"Medium\",\"reason\":\"코드 추적 완료: session/prompt가 live_prompts 락 보유 중 store.session_exists().await(src/rpc.rs:563-565, 주석도 단일 락 설계 명시), session/delete 스폰 태스크도 락 보유 중 delete_session().await(458-466). 느린 DB(SQLite 락/대형 delete) 시 session/cancel(437), disconnect 정리, 타 커넥션 prompt가 전부 블록되는 컨보이 성립. 완화 요인: delete의 100ms 폴 루프는 반복마다 락 해제, 블로킹은 store 호출 구간에 한정되고 race-close를 위한 의도적 트레이드오프 → Critical/High 아닌 Medium.\"},{\"id\":\"F2 stalled sticky 플래그\",\"verdict\":\"confirmed\",\"severity_final\":\"Medium\",\"reason\":\"전체 src/ grep 재확인: stalled는 store(true)(rpc.rs:173)와 초기화 false(268)뿐, 리셋 경로 부재. request()의 성공 전송도 플래그를 클리어하지 않음. WsClient는 handle_socket당 생성되므로 재연결 없이 회복 불가하며, 이후 notify는 166에서 즉시 드롭 — 클라이언트가 따라잡은 뒤에도 알림/스트림 델타가 조용히 유실됨(관측 오동작: 응답 영구 절단).\"},{\"id\":\"F3 응답 id 파싱\",\"verdict\":\"confirmed\",\"severity_final\":\"Low\",\"reason\":\"결함은 존재하나 scout evidence 부분 반증: \\\"005\\\"는 Rust u64 파싱에 성공(선행 0 허용)하므로 해당 예시는 폐기. 실제 실패 케이스는 5.0(serde_json f64 → as_u64 None)과 \\\" 5\\\"(공백)뿐 — 서버는 항상 정식 u64를 보내고 JS 생태계도 5를 5.0으로 직렬화하지 않아 실현 가능성 낮음. 또한 실패 시 req_timeout 대기 후 턴 오류로 회복 가능(데이터 유실 없음) → Low.\"}],\"notes\":\"F3의 scout 인용 \\\"5.0, 005, ' 5' 모두 두 파싱 실패\\\" 중 \\\"005\\\"는 사실과 다름 — u64::from_str은 선행 0 수용. 나머지 location 인용(563-596, 456-487, 162-177, 286-291)은 실제 코드와 일치. F1의 폴 루프는 락을 매 반복 해제하므로 scout의 \\\"daemon-wide convoy\\\"는 store 호출 지속 구간으로 한정해 해석해야 함.\"}"
+}

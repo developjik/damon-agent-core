@@ -1,0 +1,35 @@
+{
+  "summary": "Config/dependency audit of Cargo.toml, rust-toolchain.toml, .github/workflows/ci.yml, scripts/set-version.sh, Formula/damon.rb, config.example.toml. No Medium+ defects; 4 Low findings (CI token permissions not least-privilege, actions pinned by mutable tags, floating 'stable' toolchain, manual-only Formula sha256 rotation). config.example.toml fully matches the deny_unknown_fields Config schema in src/config.rs — no boot-failure fields.",
+  "files": [
+    {
+      "path": "Cargo.toml",
+      "description": "audited: deps, features, default=[] semantics"
+    },
+    {
+      "path": "rust-toolchain.toml",
+      "description": "audited: toolchain pinning"
+    },
+    {
+      "path": ".github/workflows/ci.yml",
+      "description": "audited: permissions, action pinning, cache, secrets, release pipeline"
+    },
+    {
+      "path": "scripts/set-version.sh",
+      "description": "audited: sed/awk robustness, Formula update path"
+    },
+    {
+      "path": "Formula/damon.rb",
+      "description": "audited: URLs, sha256 rotation, bins"
+    },
+    {
+      "path": "config.example.toml",
+      "description": "cross-checked field-by-field against src/config.rs:1-300 schema structs"
+    },
+    {
+      "path": "npm/package.json",
+      "description": "version cross-check (0.2.0, consistent)"
+    }
+  ],
+  "architecture": "Release pipeline: tag push → ci.yml release job (4-target cross-build, tag↔manifest version check, tar.gz+sha256, gh-release) → publish-npm / publish-crates. set-version.sh syncs version across Cargo.toml, npm/package.json, Formula/damon.rb; sha256 rotation manual by design. config.example.toml mirrors the serde Config surface in src/config.rs.",
+  "report": "coverage: Cargo.toml:1-66 (full); .github/workflows/ci.yml:1-135 (full); rust-toolchain.toml:1-3; scripts/set-version.sh:1-50; Formula/damon.rb:1-42; config.example.toml:1-80; src/config.rs:1-300 (Config/ProviderConfig/ProviderCompat/McpServerConfig/RelayConfig/ModelMeta/SecretRef); npm/package.json:1-28.\n\nFINDINGS (all Low):\n1. [Low|security/CI-permissions] .github/workflows/ci.yml:1-20 — no top-level permissions floor. Evidence: workflow triggers `push` (branches main, tags v*) + `pull_request`; only the `release` job declares `permissions: contents: write`; `test`, `audit`, `publish-npm`, `publish-crates` declare none, and the audit job passes `secrets.GITHUB_TOKEN` to rustsec/audit-check@v2. Scenario: with repo-default read/write token permissions, a supply-chain compromise of a third-party action in the test/audit job (both run on pull_request) exfiltrates a write-scoped GITHUB_TOKEN enabling tag/branch/release tampering. No pull_request_target used → hardening, not open hole. Fix: workflow-level `permissions: contents: read`.\n2. [Low|security/supply-chain] ci.yml:17-20,61,80,89,95 — all actions pinned by mutable tag (actions/checkout@v4, dtolnay/rust-toolchain@stable, Swatinem/rust-cache@v2, rustsec/audit-check@v2, actions/setup-node@v4, softprops/action-gh-release@v2). Scenario: repo compromise or force-moved major tag → release job (contents:write) and publish jobs (CARGO_REGISTRY_TOKEN/NPM_TOKEN) silently execute attacker code on next v* tag push. Task cap Low. Fix: pin to commit SHAs.\n3. [Low|config/reproducibility] rust-toolchain.toml:1-3 — `channel = \"stable\"` pins nothing. Scenario: a new stable release changes rustc behavior (new lints under ci.yml's `clippy -- -D warnings`) and developers plus the tag-push release build silently change compiler between releases; edition-2024 minimum (1.85) not enforced via rust-version key. Fix: pin explicit version or add rust-version = 1.85 to [package].\n4. [Low|config/release-process] scripts/set-version.sh:44-50 — sed rewrites Formula version line + download URLs but only echoes `reminder: update Formula sha256`; release CI never updates digests. Scenario: set-version.sh 0.3.0 + v0.3.0 tag → every `brew install` fails sha256 mismatch until a human hand-edits three digests. Loud failure, not security. Fix: post-release CI step committing digests from the uploaded .sha256 artifacts.\n\nCLEAN (dup-exclusion material): config.example.toml field-by-field matches the deny_unknown_fields structs (no boot failure from copying the example); ci.yml uses pull_request not pull_request_target, secrets only in tag-gated jobs, release permissions correctly scoped; rust-cache per-job keying, no contamination; set-version.sh validates semver before sed/awk (no special-char injection), awk edits table-scoped; Formula URLs match CI artifact names, aarch64-linux odie intentional, 6 bins match package.json; tag↔version grep/cut indices correct; all Cargo.toml features are real upstream features, default=[] inert.\n\nnotes: rmcp 3.3.0 / rusqlite 0.40.2 / tokio-tungstenite 0.30.0 / uuid 1.26.1 resolvability not verified (needs Cargo.lock, excluded); windows `shasum` availability unverified; rustsec/audit-check internals out of scope; src/config.rs:300-593 belongs to ConfigAudit."
+}

@@ -1,0 +1,27 @@
+{
+  "architecture": "Tests build the real damon-core router/AppState on loopback sockets (rpc/api/relay), in-memory mpsc pipes for E2e crypto (relay), a mock axum WS/HTTP server (client, api passthrough), and env-swapped temp-dir token stores (oauth).",
+  "files": [
+    {
+      "description": "Read 1-346: busy-session delete/cancel, WS ticket auth + single-use, client ticket auth, pagination.",
+      "path": "tests/rpc.rs"
+    },
+    {
+      "description": "Read 1-356: health, passthrough key/model rewrite, token gate, 503, metrics auth, ticket hex, bucket, TTL cache.",
+      "path": "tests/api.rs"
+    },
+    {
+      "description": "Read 1-255: relay E2E happy path; E2e handshake replay/reorder/wrong-token rejection.",
+      "path": "tests/relay.rs"
+    },
+    {
+      "description": "Read 1-219: reconnect, request timeout while server down, notification resume.",
+      "path": "tests/client.rs"
+    },
+    {
+      "description": "Read 1-179: refresh+rotate persistence, invalid_grant error, single-flight, fresh-skip.",
+      "path": "tests/oauth.rs"
+    }
+  ],
+  "report": "Findings: none (coverage: tests/rpc.rs:1-346, tests/api.rs:1-356, tests/relay.rs:1-255, tests/client.rs:1-219, tests/oauth.rs:1-179).\n\nEvery prescribed rejection scenario is genuinely asserted:\n- Auth: api.rs token_gate_blocks_and_allows (~L140-181) asserts no-token 401, wrong-token 401, right-token 200; metrics and ws_ticket each get no-token 401 (~L236-300). rpc.rs ws_ticket_is_single_use (~L218-246) asserts the consumed ticket's second upgrade fails with exact HTTP 401 (tungstenite::Error::Http match, not bare is_err); client_connect_uses_ticket_auth (~L249-263) asserts wrong token fails at ticket exchange. Passthrough tests verify body content (Bearer sk-test-123; resolved model gpt-4o present, default/gpt-4o absent), not just status.\n- E2E handshake: relay.rs e2e_replayed_frame_rejected (~L152-159) replays identical ciphertext and asserts second decrypt errors; e2e_reordered_frame_rejected (~L161-170) delivers seq-1 before seq-0, asserts ct1 fails AND ct0 still decrypts; e2e_wrong_token_handshake_fails (~L172-187) asserts both client and daemon sides error on token mismatch.\n- No rcgen/TLS tests exist in scope, so no certificate-validation-skip risk.\n- No assertion-free or tautological tests: every test has value-specific assertions (cancelled stopReason, session row gone, oauth refresh carries grant_type/refresh_token and rotated rt-2 persisted, single-flight hits==1, reconnect greeting counter==2 and elapsed>=9s with error containing 'reconnect').\n- Borderline, NOT reported as defect: api.rs token_bucket_allows_burst_then_throttles (~L316-330) wraps the refill assertion in `if let Some(past) = bucket.1.checked_sub(60s)`, which could silently skip — but bucket.1 is Instant::now() from the same test body, so None is unreachable on a real monotonic clock; dead branch, not a realistic false pass.\n- oauth.rs env mutation is serialized by ENV_LOCK; seed_tokens overwrites stale temp-dir state — no cross-run false-pass vector.\n\nClean (dedup material for next audit): rpc.rs 1-346, api.rs 1-356, relay.rs 1-255, client.rs 1-219, oauth.rs 1-179.",
+  "summary": "False-pass audit of tests/{rpc,api,relay,client,oauth}.rs — no false-passing tests found; all auth/E2E rejection scenarios genuinely assert failure."
+}

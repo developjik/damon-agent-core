@@ -1,0 +1,88 @@
+{
+  "architecture": "responses.rs translates chat-completions requests to the Responses API shape and parses SSE via an unfold state machine (line buffer, terminal-event detection, pending Usage-before-Done, sparse output_index to dense tool index remap). compat.rs mutates an OpenAI body in place from ProviderCompat flags (_thinking to reasoning_effort, store, max_tokens rename, stream_options, extra_body, Mistral id normalization, system-message coalescing). inband.rs renders tool schemas into the system prompt for tool-less models and post-processes buffered streams/responses, extracting tool_call blocks into ToolCallDelta/tool_calls. Downstream aggregation is ToolCallAccumulator (llm.rs, slots keyed by dense index, id+name required for emission).",
+  "clean": [
+    "responses.rs SSE framing: CRLF handling, UTF-8 boundary safety of newline split, DONE handling, pending-Usage-then-Done ordering, EOF-without-terminal-event surfaced as error instead of clean Done",
+    "responses.rs parse_event: response.failed and mid-stream error events surface real errors; incomplete maps to Length matching non-stream path",
+    "responses.rs dense index remap consistent between output_item.added and function_call_arguments.delta",
+    "responses.rs ToolCallAccumulator integration: slots require id AND name; MAX_INDEX 256 OOM guard sound",
+    "responses.rs translate_request: instructions join, tool_choice flattening, response_format to text.format, reasoning merge before _thinking ordering correct",
+    "responses.rs chat(): body read as text before status check; 429 to RateLimited with Retry-After in both paths",
+    "compat.rs apply: flag ordering and _thinking removal correct",
+    "compat.rs requires_tool_result_name id-to-name map and developer-role rewrite correct",
+    "compat.rs mistral_id pairing stays consistent within a request",
+    "inband.rs extract_tool_calls: block_len arithmetic correct; malformed/unterminated/empty-name blocks preserved as text",
+    "inband.rs response_with_tool_calls: no-op when no calls; finish_reason tool_calls only on extraction"
+  ],
+  "coverage": [
+    "src/provider/responses.rs:1-532 (full)",
+    "src/provider/compat.rs:1-166 (full)",
+    "src/provider/inband.rs:1-152 (full)",
+    "src/provider/mod.rs:218-221 (collect_stream signature)",
+    "src/runtime.rs:230-313 (StreamEvent handling, error persistence path)",
+    "src/llm.rs:51-113 (ToolCallAccumulator, parse_partial_json)"
+  ],
+  "findings": [
+    {
+      "category": "정확성·데이터 손실",
+      "evidence": "src/provider/inband.rs:38-44 발췌: 시스템 메시지 발견 시 let prev = sys[\"content\"].as_str().unwrap_or(\"\").to_string(); sys[\"content\"] = Value::String(format!(\"{prev} 두 줄개행 {prompt}\")); — 배열 content는 as_str()이 None이 되어 prev가 빈 문자열이 되고 원본이 대체됨.",
+      "fix": "배열 content인 경우 text part에 prompt를 추가하고, 문자열인 경우에만 문자열 결합을 수행.",
+      "location": "src/provider/inband.rs:38-44",
+      "scenario": "인밴드 프로바이더로 system 메시지가 OpenAI 멀티파트 배열 형태([{type:text,...}])로 들어옴 → as_str()이 None → prev가 빈 문자열 → sys.content가 프롬프트 단독 문자열로 대체 → 원본 시스템 프롬프트가 요청에서 완전히 소실. 관측 오동작: 모델이 페르소나/지침 없이 응답.",
+      "severity": "Medium",
+      "title": "inband render_tools가 배열형 system content를 통째로 파괴"
+    },
+    {
+      "category": "정확성·데이터 손실",
+      "evidence": "src/provider/compat.rs:112-116 발췌: mergeable이면 let prev_text = content_text(&prev[\"content\"]); let cur_text = content_text(&m[\"content\"]); prev[\"content\"] = Value::String(format!(\"{prev_text} 개행 {cur_text}\")); continue;",
+      "fix": "두 content가 모두 문자열일 때만 병합; 하나라도 배열이면 건너뛰거나 text part 배열로 병합.",
+      "location": "src/provider/compat.rs:108-117",
+      "scenario": "supports_multiple_system_messages=false 프로바이더에 system 메시지 2개(하나라도 배열 content) 전송 → content_text가 텍스트만 추출하고 prev.content를 평문으로 대체 → 비텍스트 part가 무음으로 소실.",
+      "severity": "Medium",
+      "title": "compat 시스템 메시지 병합이 구조화 content를 평문으로 평탄화"
+    },
+    {
+      "category": "왕복 손실·API 계약",
+      "evidence": "src/provider/responses.rs:82-86 발췌: Some(\"user\") => input.push(json!({type:\"message\", role:\"user\", content:[{type:\"input_text\", text: super::content_text(&m[\"content\"])}]})) — content 배열의 이미지 part가 content_text로 사라짐.",
+      "fix": "input_image 등 멀티모달 part를 responses content로 번역하거나, 손실 시 오류로 명시.",
+      "location": "src/provider/responses.rs:82-91 (user/assistant 분기)",
+      "scenario": "vision 요청(content 배열에 image_url part 포함)이 responses 경로로 유입 → content_text가 텍스트만 남김 → 이미지가 무음으로 제거된 채 전송. 관측: 에러 없이 모델이 이미지가 없었다는 답변(환각 유발).",
+      "severity": "Medium",
+      "title": "responses 번역에서 멀티모달(이미지) content 무음 손실"
+    },
+    {
+      "category": "정확성·이벤트 순서",
+      "evidence": "src/provider/inband.rs:98-105 발췌: StreamEvent::Text(t) => text.push_str(&t), other => out.push(other) 로 전체 텍스트를 모은 뒤 if !clean.is_empty() { out.insert(0, StreamEvent::Text(clean)); } — index 0 삽입.",
+      "fix": "청크별 즉시 extract 또는 삽입 위치를 원래 Text 청크들의 첫 위치로 유지.",
+      "location": "src/provider/inband.rs:98-105",
+      "scenario": "모델이 thinking 다음 text 다음 thinking 순으로 출력 → 전체 텍스트가 단일 Text 이벤트로 index 0에 삽입되어 첫 Thinking보다 앞섬 → ACP session/update 스트림 소비 클라이언트가 사고 체인 전에 본문 표시.",
+      "severity": "Medium",
+      "title": "inband 스트리밍 후처리가 Text 청크를 단일 이벤트로 뭉쳐 Thinking 앞으로 재배치"
+    },
+    {
+      "category": "설정·API 계약",
+      "evidence": "src/provider/responses.rs:183-185 발췌 passthrough 목록: [\"parallel_tool_calls\", \"user\", \"metadata\", \"include\", \"service_tier\"] — truncation 없음. 196-197 발췌: for key in [\"reasoning\", \"text\", \"truncation\"] { if let Some(v) = body.get(key).filter(|v| v.is_object()) — 문자열 값은 필터에서 탈락.",
+      "fix": "truncation을 passthrough 목록에 추가(문자열 값 전달).",
+      "location": "src/provider/responses.rs:182-191, 196-198",
+      "scenario": "클라이언트가 truncation:\"discontinued\" 문자열 전송 → passthrough 목록에 없고 병합 루프는 is_object 필터 → 키가 무음 폐기 → Responses API의 컨텍스트 잘림 동작이 요청과 다르게 적용.",
+      "severity": "Low",
+      "title": "클라이언트 truncation 문자열이 무음 폐기됨"
+    },
+    {
+      "category": "에러 처리·비대칭",
+      "evidence": "src/provider/responses.rs:304-312 발췌: Some(\"message\") 분기에서 content 중 c[\"type\"] == Some(\"output_text\")인 것만 text에 누적 — 함수 전체에 reasoning 아이템 처리 분기가 없음(_ => {}로 폐기).",
+      "fix": "output의 reasoning 요약 텍스트를 스트리밍 경로와 정렬(Thinking 처리 또는 명시적 생략).",
+      "location": "src/provider/responses.rs:304-312",
+      "scenario": "reasoning 모델을 비스트리밍 chat()으로 호출 → output 배열의 reasoning 아이템(요약 포함)이 버려짐 → 동일 요청이 스트리밍이면 Thinking 이벤트로 노출되는데 비스트리밍에선 소실 → 세션 기록/replay 비대칭.",
+      "severity": "Low",
+      "title": "비스트리밍 응답에서 reasoning 요약이 스트리밍과 달리 완전히 소실"
+    }
+  ],
+  "notes": [
+    "super::content_text 내부 전수 독해는 범위 밖(mod.rs는 타 스카웃 담당); 멀티모달 손실 시나리오 전제는 responses.rs 내 사용 예로 뒷받침.",
+    "openai.rs와의 전수 대칭 비교는 타 스카웃 범위; responses.rs가 chat-completions 셰이프 입력 계약 하에 검사.",
+    "mistral_id 9자 해시 충돌에 의한 call/result 오짝은 확률상 무시 가능해 제외 (억지 발견 배제).",
+    "render_tools에서 messages 배열 부재 시 경로는 런타임이 항상 messages 배열을 구성한다는 계약상 도달 불가로 판단해 제외.",
+    "cargo check/test 미실행 (지시 준수: 순수 정적 독해)."
+  ],
+  "summary": "Audit of src/provider/responses.rs, compat.rs, inband.rs (read-only). 6 defect candidates: inband render_tools destroying array-content system messages (Medium), compat system-message coalescing flattening structured content (Medium), multimodal content silently dropped in Responses translation (Medium), inband buffered streaming collapsing Text chunks ahead of Thinking events (Medium), client truncation string silently dropped (Low), non-streaming path dropping reasoning summaries that streaming surfaces (Low). SSE state machine, index remap, and terminal-event handling verified clean against ToolCallAccumulator semantics."
+}

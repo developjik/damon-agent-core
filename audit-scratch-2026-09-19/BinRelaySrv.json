@@ -1,0 +1,31 @@
+{
+  "summary": "damon-relay.rs(1-432) 및 플랫폼 bins 3개(slack/discord/telegram) 전수 정적 감사. 상수시간 시크릿 비교, per-IP/전역 동시성 캡, 이름 재사용 정책은 양호. 실결함 후보 4건(Medium 1, Low 3).",
+  "files": [
+    {
+      "path": "src/bin/damon-relay.rs",
+      "description": "공개 WS 릴레이 서버 (전체 1-432 읽음)"
+    },
+    {
+      "path": "src/bin/damon-slack.rs",
+      "description": "Slack 부트 (1-53)"
+    },
+    {
+      "path": "src/bin/damon-discord.rs",
+      "description": "Discord 부트 (1-50)"
+    },
+    {
+      "path": "src/bin/damon-telegram.rs",
+      "description": "Telegram 부트 (1-49)"
+    },
+    {
+      "path": "src/relay.rs",
+      "description": "대조 기준: E2E 프로토콜 확인용 발췌"
+    },
+    {
+      "path": "src/telegram.rs",
+      "description": "Bridge 래퍼 확인 (196-213)"
+    }
+  ],
+  "architecture": "damon-relay: 데몬은 /register?name=X로 dial-out, 첫 프레임 {\"auth\": secret} (10s 타임아웃, constant_time_eq). 클라이언트는 /connect?name=X (무인가 by-design, E2E는 파이프 위에서). daemons: name->tunnel tx, clients: u64 id->(owner, tx, abort handle). 프레임 라우팅 {\"client\": id, \"data\": str}. 캡: IP당 8 / 전역 1024, on_upgrade 내 증분+재검사. 플랫폼 bins는 DamonClient::connect 후 Channel/Bridge 부트의 얇은 래퍼.",
+  "report": "coverage: src/bin/damon-relay.rs:1-432(전체), src/bin/damon-slack.rs:1-53, src/bin/damon-discord.rs:1-50, src/bin/damon-telegram.rs:1-49, src/relay.rs:14-15,41-52,75-100,117-153,169-211,233-238,284,361-433,464-496,564-577,625-628(대조 발췌), src/telegram.rs:196-213.\n\nclean: 시크릿 검증 constant_time_eq(131-145), 무시크릿 시 빈 auth만 허용(프루빙 차단), 이름 재사용: is_closed() 정리 + name_taken 명시 거부 + same_channel 검사(225-245, 357-376), 캡 재검사로 pre-upgrade race 보완(106-138, 283-343), valid_name 로그 위조 차단(78-86), release() 맵 무한 성장 없음(377-395), Ping/Pong 유지(247-260, 344-356), select! 정리(418-431), allowlist bail(slack 44-47 등), telegram Bridge는 문서화된 ChannelBridge 래퍼(telegram.rs:197-213).\n\nnotes: ws:// 평문 - 페이로드는 relay.rs의 AES-256-GCM E2E로 암호문이며 시크릿/proof 평문 경고는 데몬 측 relay.rs:284에 존재(문서화된 설계). 무시크릿 릴레이 이름 탈취는 by-design이고 기존 클라이언트 세션은 구세대 tx에 묶여 탈취자에게 유출되지 않음 확인. 미조사: Bridge::run/DamonClient 내부(별도 담당 범위). Cargo.lock/target 제외.\n\nfindings:\n1. [Medium] 데몬 교체 창에서 클라이언트가 죽은 터널 tx에 고착 (동시성/에러처리) - src/bin/damon-relay.rs:401-405(tx clone), 423-428(let _ = daemon_tx2.send). 시나리오: 클라이언트가 daemons 맵에서 tx를 clone한 직후 데몬 터널이 끊기고 새 데몬이 재등록하면, 클라이언트 프레임은 죽은 tx로 send되고 실패가 조용히 버려짐. attach notice도 죽은 tx로 감 - 새 데몬은 클라이언트를 모름. 관측: 재시작 직전 접속 클라이언트가 영구 무응답(좀비) 세션이 되고 전역 캡 1024를 점유해 신규 /connect가 SERVICE_UNAVAILABLE. fix: 전송 실패(Closed) 시 세션 종료 또는 소유자를 터널 식별자로 기록해 구세대 클라이언트 정리.\n2. [Low] clients 맵 등록 전 클라이언트 프레임 중계로 응답 드랍 (레이스) - 351-354(recv_task 즉시 daemon_tx2 전송) vs 400-403(insert). 빠른 요청의 응답 도착 시 clients.get==None -> 데몬 펌프 276행 None => false로 폐기, 클라이언트 hang. 창은 좁으나 '등록 전 알림' 불변식 주석(346-348)과 실제 순서 불일치. fix: insert를 spawn 전으로 이동 또는 미지 id 응답 warn.\n3. [Low] 캡 초과 시 에러 프레임 없이 소켓 조용히 닫음 (에러처리) - 129-136, 332-342. name_taken/unauthorized와 달리 원인 구분 불가 -> 데몬/클라이언트가 네트워크 단절로 오판, 캡 상황에서 재시도 폭주(self-amplifying). fix: {\"error\":\"over_capacity\"} 프레임 또는 upgrade 전 429/503.\n4. [Low] 플랫폼 bins --token CLI 인자가 ps로 데몬 토큰 노출 (보안/시크릿) - slack 18-20, discord 18-20, telegram 18-20 (#[arg(long, env = \"DAMON_TOKEN\")] token: Option<String>). fix: env 전용화 또는 문서 경고."
+}

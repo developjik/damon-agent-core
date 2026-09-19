@@ -1,0 +1,23 @@
+{
+  "architecture": "src/runtime.rs: run_prompt 턴 루프 — in_progress notify(337-350)가 execute_tool join_all(356-361) 전 순차 발행; tool 결과 영속 content 분기(377-387)는 Cancelled 센티널 기반, 이후 status notify(414-427)는 result.is_ok()만 검사. 컴팩션 판정(539-545)은 프로바이더 usage 미사용, 전적으로 estimate_tokens/text_tokens(454-481) 바이트 가중 추산에 의존. execute_tool(684-686)은 cancel 체크 전 unknown-tool bail. src/store.rs: fts5_query(325-365) sanitize는 pending_not/pending_op 상태기로 단항 NOT을 유효식으로 통과시킴.",
+  "files": [
+    {
+      "description": "text_tokens(472-481), 컴팩션 판정(539-545), in_progress notify(337-350), content 분기(377-387), status notify(414-427), execute_tool(684-686) 재독회 완료",
+      "path": "src/runtime.rs"
+    },
+    {
+      "description": "fts5_query sanitize(325-365) 재독회 — 단항 NOT/AND NOT 경로 재추적",
+      "path": "src/store.rs"
+    },
+    {
+      "description": "cancel_mid_tool_loop_repairs_orphan_calls(212-295) 타이밍 재구성 — Cancelled 경로 미실행 확인",
+      "path": "tests/runtime.rs"
+    },
+    {
+      "description": "후보 원문 3개 확인",
+      "path": "audit-scratch-2026-09-19/RuntimeCore.json; StoreAudit.json; TestsRuntime.json"
+    }
+  ],
+  "report": "{\"verdicts\":[{\"id\":\"비ASCII 토큰 추산이 실제보다\",\"verdict\":\"confirmed\",\"severity_final\":\"Medium\",\"reason\":\"재독회 확인: text_tokens(src/runtime.rs:472-481)는 비ASCII 바이트당 가중치 3 → 3바이트 CJK 1자 = 9/4 = 2.25 token. 실제 토크나이저의 CJK는 약 1 token/char이므로 과대 주장 타당. 컴팩션 판정(src/runtime.rs:539-545)이 이 추산에 전적으로 의존(window*85/100, usage 이벤트 미사용)하므로 CJK 세션은 창의 약 38% 사용 시점에 컴팩션 발동 → kept=tail/2 대체로 세부 소실 실관측 가능. 반증 시도(다른 방어 경로, threshold 보정, usage 기반 분기) 모두 실패.\",\"location_final\":\"src/runtime.rs:472-481, 539-545\"},{\"id\":\"취소된 툴 호출이 클라이언트에\",\"verdict\":\"confirmed\",\"severity_final\":\"Low\",\"reason\":\"content 분기(377-387)는 `cancel.is_cancelled() && is::<Cancelled>()`로 정확히 cancelled 기록, 직후 tool_call_update notify(414-427)의 status는 `result.is_ok()`만 검사 → 취소 툴이 failed로 통보. 관측 가능한 표시 불일치이나 데이터 유실/오동작 없음 → Low.\",\"location_final\":\"src/runtime.rs:377-387, 414-427\"},{\"id\":\"fts5_query가 단항 NOT을\",\"verdict\":\"confirmed\",\"severity_final\":\"Medium\",\"reason\":\"두 시나리오 모두 재구성됨. A `NOT urgent`: pending_not=true → out=[NOT,\\\"urgent\\\"] → 단항 NOT, FTS5 문법상 이항 전용이므로 MATCH 파싱 에러 → search Err. B `rust AND NOT gc`: AndOr arm이 pending_op 설정+pending_not 리셋 후 Not arm은 pending_op.is_none()이 거짓 → NOT 무음 삭제 → `rust AND \\\"gc\\\"`로 배제 조건 소실(위 결과 오염). 'result always parses' 계약 위반 확인.\",\"location_final\":\"src/store.rs:325-365\"},{\"id\":\"cancel_mid_tool_loop_repairs_orphan_calls — 이름이\",\"verdict\":\"downgraded\",\"severity_final\":\"Low\",\"reason\":\"타이밍 재구성: in_progress notify(runtime.rs:337-350)가 execute_tool 전에 발행되므로 mock은 첫 in_progress에서 cancel됨. 그러나 execute_tool(684-686)은 cancel 체크 전 unknown-tool bail이므로 두 콜 모두 Err(\\\"unknown tool\\\")로 종료 → is::<Cancelled>() 조건 거짓, Cancelled 마킹/repair 경로 미실행은 사실. 다만 테스트는 '취소가 진짜 툴 에러를 masked cancelled로 덮지 않는다'는 실제 불변식을 검증하며 런타임 동작은 올바름 → 결함은 커버리지 허위 표시에 한정, Medium→Low 하향.\",\"location_final\":\"tests/runtime.rs:212-295 (대조 src/runtime.rs:337-350, 377-387, 684-686)\"}],\"notes\":\"병합/모순 없음. 추가 발견: (1) estimate_tokens의 thinking/tool_calls len/4 추산도 같은 방향 과대이나 후보#1 시나리오에 흡수되어 별도 승격하지 않음. (2) FTS5 입력 B의 무음 삭제는 A(가시 에러)보다 실질 피해가 클 수 있으나 B 기준으로도 Medium. (3) F1 처방은 테스트 삭제가 아닌 이름 변경 또는 Cancelled 경로 도달 테스트 추가.\"}",
+  "summary": "적대적 검증 완료: 4건 중 3건 confirmed(RuntimeCore#1 Medium, RuntimeCore#2 Low, StoreAudit Medium), 1건 downgraded(TestsRuntime F1 Medium→Low)."
+}

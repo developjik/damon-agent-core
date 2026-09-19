@@ -1,0 +1,61 @@
+{
+  "architecture": "테스트 스위트는 전반적으로 실제 검증력이 높음: channels.rs는 진짜 axum 목업 서버와 DamonClient를 통한 end-to-end 응답·세션 매핑·권한 왕복을 검증하고, store.rs는 FTS/paging/cleanup을 구체적 값으로 단언하며, boot.rs·phase4는 실제 damond 바이너리를 spawn해 /v1/models, /health(TLS), 비루프백 거부를 확인한다. bench.rs는 원시 바이트 패스스루(api.rs forward → up.into_response())이므로 목업의 [DONE] 누락이 검증에 영향 없음. 결함은 주로 (a) phase4의 툴 결과 persist 검증이 MCP 결과 봉투의 리터럴 키 존재만 확인하는 tautology에 가까운 단언, (b) bench.rs의 준비 대기 블로킹 read와 RSS 조회 실패의 침묵, (c) mcp_server.py의 ping 위반 정도.",
+  "clean": [
+    "tests/channels.rs 1-641: bridge 응답 전달/세션 매핑, permission 왕복, allowlist 드롭, Discord/Slack 추출 규칙, REST 오류 매핑(ok:false→에러), Discord/Slack WS 핸드셰이크 — 모두 구체적 단언 보유, 거짓 통과 없음",
+    "tests/store.rs 1-164: cleanup/backdate(실제 rusqlite UPDATE로 시간 조작), FTS 연산자·구·메타문자 경계, paged limit/offset — 정합적 단언, 거짓 통과 없음",
+    "tests/service.rs 1-88: launchd/systemd/schtasks 생성물 문자열·순서·섹션 단언 — 실제 출력 고정, 거짓 통과 없음",
+    "tests/boot.rs 1-60: 실제 바이너리 부트 + /v1/models 본문 is_array 단언, 조기 종료 감지 — 유효",
+    "tests/phase4.rs 1-344 중 툴 결과 검증부(239-240)를 제외한 전체: 권한 이벤트 수신/응답, stopReason=end_turn, 텍스트 수신, 비루프백 거부(stderr 'auth_token'), TLS /health — 유효 단언",
+    "examples/bench.rs의 측정 루프 자체(measure_stream: 상태 성공 + 청크 단언, raw passthrough이므로 목업 SSE 비정형은 무해)"
+  ],
+  "coverage": [
+    "tests/channels.rs:1-641 (전체)",
+    "tests/store.rs:1-164 (전체)",
+    "tests/service.rs:1-88 (전체)",
+    "tests/boot.rs:1-60 (전체)",
+    "tests/phase4.rs:1-344 (전체)",
+    "tests/mcp_server.py:1-52 (전체)",
+    "examples/bench.rs:1-211 (전체)",
+    "교차검증: src/config.rs:109-189 (ProviderConfig 기본값), src/api.rs:452-543 (forward 패스스루), src/runtime.rs:339-403 (툴 결과 persist 형식), src/provider/openai.rs:375-379,504-537 (스트림 종결 마커)"
+  ],
+  "findings": [
+    {
+      "category": "거짓 통과 테스트 (tautology 단언)",
+      "evidence": "tests/phase4.rs:239-240:\n```rust\nlet tool_msg = msgs.iter().find(|m| m[\"role\"] == \"tool\").unwrap();\nassert!(tool_msg[\"content\"].as_str().unwrap().contains(\"content\"));\n```\nsrc/runtime.rs:391-397 (persist 형식):\n```rust\nstate.store.append(session_id, \"tool\", &json!({\n    \"role\": \"tool\",\n    \"tool_call_id\": call.id,\n    \"content\": content,\n}))\n```\nruntime.rs:380-382 — Ok(v)면 `serde_json::to_string(v)`, Err면 `\"error: {e:#}\"`가 content가 됨.",
+      "fix": "목업 echo(json.dumps({}) → \"{}\")가 결과 텍스트로 전파되었는지 단언하도록 교체. 예: tool_msg content가 \"{}\"를 포함하고 \"isError\":true를 포함하지 않음을 검증. 에러 경로 문자열(error:) 부정 단언도 가능.",
+      "location": "tests/phase4.rs:239-240",
+      "scenario": "입력: execute_tool이 Ok(에러 봉투)를 반환(예: MCP 서버가 isError:true 결과를 돌려주거나, 런타임이 도구 실패를 Ok(JSON)로 감싸는 모든 경로) → 코드: 런타임이 `serde_json::to_string(result)`를 저장 → 테스트: `contains(\"content\")` 성공. 반대로 args echo가 완전히 유실되어 content가 엉뚱한 JSON 봉투여도 통과. 도구 결과가 실제로 올바르게 persist되었는지는 전혀 검증되지 않음 — 'Tool result persisted' 주석의 검증력이 사실상 0.",
+      "severity": "Medium",
+      "title": "phase4 통합 테스트의 유일한 툴 결과 persist 검증이 에러 봉투에도 통과하는 tautology"
+    },
+    {
+      "category": "거짓 통과 테스트 (에러 경로 우회)",
+      "evidence": "examples/bench.rs:137-146:\n```rust\nlet mut ready = false;\nfor line in BufReader::new(stdout).lines() {\n    if Instant::now() > deadline {\n        break;\n    }\n    if let Ok(l) = line\n        && l.contains(\"listening\")\n    {\n        ready = true;\n        break;\n    }\n}\n```\ndeadline 검사는 `lines()`의 다음 blocking read 전에만 수행됨.",
+      "fix": "deadline 대기를 blocking read와 분리: 라인 읽기를 별도 태스크로 밀어넣고 tokio::time::timeout으로 수신하거나, EOF/타임아웃을 폴링하는 구조로 변경.",
+      "location": "examples/bench.rs:137-146",
+      "scenario": "입력: damond가 부트 중 stdout을 전혀 내지 않고 살아 있는 상태(설정 파싱 후 bind 전 정체, stdout 버퍼링 등) → 코드: 첫 `lines().next()`가 EOF/라인 없이 무기한 블로킹, 139행의 deadline 검사에 도달하지 못함 → 관측: assert!(ready)에 도달하지 못하고 bench가 영구 hang. 타임아웃 실패가 아니라 무응답 정지이므로 CI 타임아웃에 의존하게 됨.",
+      "severity": "Low",
+      "title": "bench.rs 준비 대기가 deadline 검사 후 블로킹 read로 진행되어 hang 가능 — assert가 도달 불가능한 경로"
+    },
+    {
+      "category": "거짓 통과 측정 (침묵 실패)",
+      "evidence": "examples/bench.rs:154-163:\n```rust\nsys.refresh_processes(\n    sysinfo::ProcessesToUpdate::Some(&[sysinfo::Pid::from_u32(pid)]),\n    true,\n);\nsys.process(sysinfo::Pid::from_u32(pid))\n    .map(|p| p.memory())\n    .unwrap_or(0)\n```\n호출부(main): `println!(\"idle RSS:            {:.1} MB\", rss as f64 / 1e6);` — 0 여부 검사 없음.",
+      "fix": "process 조회 실패 시 panic! 또는 최소한 rss가 0이 아님을 단언해 측정 실패를 소리 내어 보고.",
+      "location": "examples/bench.rs:154-163",
+      "scenario": "입력: pid 조회 실패(권한, 이미 끝난 자식, sysinfo 미지원 환경) → 코드: `.unwrap_or(0)` → 관측: 'idle RSS: 0.0 MB' 출력 후 정상 종료. RSS 베이스라인 측정이 무의미했음을 보고 없이 통과 — 이 값으로 회귀 비교를 하면 존재하지 않는 개선/악화를 도출.",
+      "severity": "Low",
+      "title": "bench.rs idle_rss가 프로세스 조회 실패를 0으로 응답해 무효 베이스라인을 침묵 출력"
+    },
+    {
+      "category": "목업-계약 불일치 (rmcp/MCP)",
+      "evidence": "tests/mcp_server.py:44-51:\n```python\n    elif mid is not None:\n        send({\"jsonrpc\": \"2.0\", \"id\": mid,\n              \"error\": {\"code\": -32601, \"message\": \"method not found\"}})\n```\n모든 미지의 id 있는 요청(ping 포함)이 이 분기로 떨어져 error를 돌려줌.",
+      "fix": "`method == \"ping\"` 분기를 추가해 {\"jsonrpc\":\"2.0\",\"id\":mid,\"result\":{}} 로 응답해 MCP 계약과 정렬.",
+      "location": "tests/mcp_server.py:44-51",
+      "scenario": "입력: rmcp 클라이언트가 표준 ping 요청({\"method\":\"ping\",\"id\":N}) 전송 → 코드: elif 체인 어디에도 ping 핸들러가 없어 최종 분기가 -32601 error 응답 → 관측: 스펙상 result를 기대하는 클라이언트는 에러를 수신. 현재 테스트는 ping을 호출하지 않아 통과하지만, rmcp가 ping 기반 liveness를 도입하거나 McpRegistry가 ping을 보내는 순간 목업이 계약 위반으로 동작해 테스트 실패 또는 목업-실서버 이중 기준이 생김.",
+      "severity": "Low",
+      "title": "mcp_server.py가 ping 요청에 method-not-found 오류로 응답 — MCP 스펙의 빈 result 응답 의무와 불일치"
+    }
+  ],
+  "notes": "cargo test는 동시 락 충돌 금지 지시로 미실행 — 모든 판정은 정적 독해 + 교차 소스 대조에 근거. phase4:239-240의 단언은 runtime.rs persist 형식과 mcp_server.py echo(json.dumps({}) = \"{}\")를 대조해 isError:true/에러 봉투에도 통과함을 확인한 것으로, 실행 검증은 메인 에이전트의 전역 검증 단계에서 가능. 검토 후 결함 미해당으로 배제한 후보: (1) channels.rs discord/slack WS 테스트가 Authorization 헤더 전송을 검증하지 않음 — 커버리지 갭이라 지시상 배제; (2) boot.rs free_port의 bind-후-drop TOCTOU — flakiness이지 거짓 통과 아님; (3) bench 목업 SSE의 [DONE]/finish_reason 누락 — openai.rs collect_stream은 종결 마커를 요구하지만 /v1 경로는 raw 바이트 패스스루(api.rs:456-482 up.into_response())라 해당 없음; (4) service.rs schtasks_escapes_paths의 이름 대비 느슨한 단언 — 별도 테스트(schtasks_command_is_well_formed)가 escaping을 실제 검증. 미조사: tests/*가 참조하는 channel.rs/mcp.rs 본체 로직의 심층 감사(별도 담당자 추정); phase4 tls 테스트의 일반 HTTP 폴백 미검증은 커버리지 갭으로 배제.",
+  "summary": "거짓 통과 테스트 감사 완료: 담당 범위(tests/channels.rs, store.rs, service.rs, boot.rs, phase4.rs, mcp_server.py, examples/bench.rs) 전수 정적 독해 + 교차 소스 대조. 결함 후보 4건(Medium 1, Low 3). 핵심은 phase4.rs:239-240의 툴 결과 persist 단언이 'content' 리터럴 키 존재만 확인해 에러 봉투/유실된 echo에도 통과하는 것(Medium)."
+}
