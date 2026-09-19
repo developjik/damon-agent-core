@@ -116,8 +116,24 @@ jobs:
 
           sed -i "s/^  version \".*\"/  version \"$version\"/" Formula/damon.rb
           for target in $targets; do
-            curl --proto '=https' --tlsv1.2 --retry 5 --retry-all-errors -fsSL "$base/damon-$target.tar.gz" -o "$tmp/$target.tar.gz"
-            sha256sum "$tmp/$target.tar.gz" | cut -d' ' -f1 > "$tmp/$target.sha256"
+            # The release CDN can serve a stale tarball right after the
+            # assets are replaced (observed on v0.2.0). The published
+            # .sha256 asset is computed by the build leg from the exact
+            # artifact it uploaded, so a mismatch means we cached a
+            # previous build — wait and re-download.
+            curl --proto '=https' --tlsv1.2 --retry 5 --retry-all-errors -fsSL "$base/damon-$target.tar.gz.sha256" -o "$tmp/$target.published"
+            for attempt in 1 2 3 4 5; do
+              curl --proto '=https' --tlsv1.2 --retry 5 --retry-all-errors -fsSL "$base/damon-$target.tar.gz" -o "$tmp/$target.tar.gz"
+              computed="$(sha256sum "$tmp/$target.tar.gz" | cut -d' ' -f1)"
+              published="$(cut -d' ' -f1 < "$tmp/$target.published")"
+              [ "$computed" = "$published" ] && break
+              echo "sha256 mismatch for $target (attempt $attempt): CDN served a stale asset, retrying" >&2
+              sleep 20
+            done
+            [ "$computed" = "$published" ] || {
+              echo "computed $computed != published $published for $target after 5 attempts" >&2; exit 1;
+            }
+            echo "$computed" > "$tmp/$target.sha256"
           done
           for target in $targets; do
             awk -v t="$target" -v s="$(cat "$tmp/$target.sha256")" '
