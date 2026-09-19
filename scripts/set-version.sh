@@ -45,4 +45,4 @@ sed_i \
 
 echo "version set to $VERSION in:"
 echo "  Cargo.toml, npm/package.json, Formula/damon.rb"
-echo "reminder: update Formula sha256 after the release tarballs exist"
+echo "note: the ci.yml release job rewrites Formula sha256 from the published tarballs"
