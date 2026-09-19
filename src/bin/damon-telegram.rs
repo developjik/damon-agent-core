@@ -1,7 +1,7 @@
 use std::sync::Arc;
 
 use anyhow::Context;
-use clap::Parser;
+use clap::{CommandFactory, FromArgMatches, Parser};
 use damon_core::client::DamonClient;
 use damon_core::telegram::{BotApi, Bridge};
 
@@ -33,7 +33,14 @@ async fn main() -> anyhow::Result<()> {
         )
         .init();
 
-    let args = Args::parse();
+    let matches = Args::command().get_matches();
+    let args = Args::from_arg_matches(&matches).expect("clap-validated matches");
+    // A --token on argv is readable by any local user via the process
+    // list; the DAMON_TOKEN env alternative is not. Keep the flag for
+    // scripts, but warn once so the exposure is at least visible.
+    if matches.value_source("token") == Some(clap::parser::ValueSource::CommandLine) {
+        eprintln!("warning: --token is visible in process lists; prefer DAMON_TOKEN env");
+    }
     let client = DamonClient::connect(&args.url, args.token.as_deref())
         .await
         .context("cannot connect to damond")?;

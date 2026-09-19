@@ -35,14 +35,25 @@ impl std::fmt::Display for RateLimited {
 impl std::error::Error for RateLimited {}
 
 /// Extract a Retry-After hint (seconds) from a response, capped at 60s.
-pub(crate) fn retry_after(resp: &reqwest::Response) -> std::time::Duration {
+/// `None` when the header is absent, unparsable, or not a positive finite
+/// number — callers decide their own default.
+pub(crate) fn retry_after_opt(resp: &reqwest::Response) -> Option<std::time::Duration> {
     let secs = resp
         .headers()
         .get("retry-after")
         .and_then(|v| v.to_str().ok())
         .and_then(|v| v.parse::<f64>().ok())
-        .unwrap_or(2.0);
-    std::time::Duration::from_secs_f64(secs.min(60.0))
+        // from_secs_f64 panics on negative/NaN/infinite input — a
+        // broken upstream hint falls back to the default instead of
+        // taking the turn down.
+        .filter(|s| s.is_finite() && *s > 0.0)?;
+    Some(std::time::Duration::from_secs_f64(secs.min(60.0)))
+}
+
+/// Extract a Retry-After hint (seconds), capped at 60s, defaulting to 2s
+/// when the header is missing or malformed.
+pub(crate) fn retry_after(resp: &reqwest::Response) -> std::time::Duration {
+    retry_after_opt(resp).unwrap_or(std::time::Duration::from_secs(2))
 }
 
 /// Idle budget per read on a provider response — covers time-to-first-byte
@@ -184,6 +195,10 @@ impl Provider {
 pub struct UpstreamResponse {
     pub status: reqwest::StatusCode,
     pub content_type: String,
+    /// Server-provided backoff hint (HTTP 429/529 `Retry-After`), captured
+    /// before the body stream takes over. `None` when the upstream sent no
+    /// usable hint — callers pick their own short default then.
+    pub retry_after: Option<std::time::Duration>,
     pub stream: std::pin::Pin<Box<dyn futures::Stream<Item = std::io::Result<Bytes>> + Send>>,
 }
 
@@ -214,13 +229,24 @@ pub fn build_providers(cfg: &Config) -> (HashMap<String, Arc<Provider>>, Vec<any
     (providers, errors)
 }
 
-/// Collect a byte stream into a Vec.
+/// Hard cap for `collect_stream` — bodies collected here are complete
+/// JSON responses, never bulk transfers. Beyond this the stream is
+/// runaway and must fail instead of exhausting memory.
+const COLLECT_STREAM_MAX: usize = 64 * 1024 * 1024;
+
+/// Collect a byte stream into a Vec, bounded by `COLLECT_STREAM_MAX`.
 pub async fn collect_stream(
     mut s: std::pin::Pin<Box<dyn futures::Stream<Item = std::io::Result<Bytes>> + Send>>,
 ) -> std::io::Result<Vec<u8>> {
     let mut buf = Vec::new();
     while let Some(chunk) = s.next().await {
         buf.extend_from_slice(&chunk?);
+        if buf.len() > COLLECT_STREAM_MAX {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                "upstream response exceeds the 64MiB collect_stream cap",
+            ));
+        }
     }
     Ok(buf)
 }
@@ -248,4 +274,55 @@ pub fn content_text(content: &Value) -> String {
                 .join("")
         })
         .unwrap_or_default()
+}
+
+/// Register an original tool name and return the wire name to send.
+/// `a.b` mangles to `a__b` — which a tool may also be literally named,
+/// so when the mangled form is already claimed by a DIFFERENT original
+/// the wire name becomes `<mangled>__<sha256[:8]>` (within the 64-char
+/// provider limit). The returned name is exactly what the map restores,
+/// so what goes on the wire and what comes back never disagree.
+pub(crate) fn mangled_for(
+    names: &mut std::collections::HashMap<String, String>,
+    orig: &str,
+) -> String {
+    let base = orig.replace('.', "__");
+    if names.get(&base).is_none_or(|claimed| claimed == orig) {
+        names.insert(base.clone(), orig.to_string());
+        return base;
+    }
+    use sha2::Digest;
+    let digest = sha2::Sha256::digest(orig.as_bytes());
+    let hash: String = digest[..4].iter().map(|b| format!("{b:02x}")).collect();
+    let prefix: String = base.chars().take(54).collect();
+    let variant = format!("{prefix}__{hash}");
+    names.insert(variant.clone(), orig.to_string());
+    variant
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn collect_stream_allows_normal_bodies() {
+        let s = Box::pin(futures::stream::iter(vec![
+            Ok::<_, std::io::Error>(Bytes::from_static(b"hello")),
+            Ok(Bytes::from_static(b" world")),
+        ]));
+        assert_eq!(
+            futures::executor::block_on(collect_stream(s)).unwrap(),
+            b"hello world"
+        );
+    }
+
+    /// A stream beyond the 64MiB cap must fail, not buffer without
+    /// bound — a runaway upstream otherwise exhausts memory.
+    #[test]
+    fn collect_stream_enforces_cap() {
+        let chunk = Bytes::from(vec![0u8; 1024 * 1024]);
+        let s = futures::stream::repeat_with(move || Ok(chunk.clone())).take(70);
+        let err = futures::executor::block_on(collect_stream(Box::pin(s))).unwrap_err();
+        assert_eq!(err.kind(), std::io::ErrorKind::InvalidData);
+    }
 }

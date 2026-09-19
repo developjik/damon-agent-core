@@ -120,13 +120,22 @@ impl TelegramApi for BotApi {
     }
 }
 
+/// One buffered update in delivery order. `msg` is what the bridge gets —
+/// None for updates with nothing deliverable (edits, reactions), which
+/// queue as markers so confirmation stays in update_id order and can
+/// never jump past an un-handed message.
+struct PendingUpdate {
+    update_id: Option<i64>,
+    msg: Option<Incoming>,
+}
+
 /// Telegram transport for the generic bridge. Owns the long-poll offset
 /// and a buffer for the rest of each poll batch — getUpdates returns a
 /// Vec, so recv must drain it one message per call or updates are lost.
 pub struct TelegramChannel {
     tg: Arc<dyn TelegramApi>,
     offset: AtomicI64,
-    pending: tokio::sync::Mutex<std::collections::VecDeque<Incoming>>,
+    pending: tokio::sync::Mutex<std::collections::VecDeque<PendingUpdate>>,
 }
 
 impl TelegramChannel {
@@ -137,12 +146,31 @@ impl TelegramChannel {
             pending: tokio::sync::Mutex::new(std::collections::VecDeque::new()),
         }
     }
+
+    /// Pop the next buffered entry, confirming each update's offset as
+    /// it is handed toward the bridge. Bridge::handle_message cannot
+    /// fail (it logs its own errors), so handout is the commit point:
+    /// a crash before it leaves the tail unconfirmed and Telegram
+    /// redelivers — at-least-once, with only the single in-flight
+    /// message as the loss window.
+    async fn take_confirmed(&self) -> Option<Incoming> {
+        let mut pending = self.pending.lock().await;
+        while let Some(next) = pending.pop_front() {
+            if let Some(id) = next.update_id {
+                self.offset.fetch_max(id + 1, Ordering::Relaxed);
+            }
+            if let Some(msg) = next.msg {
+                return Some(msg);
+            }
+        }
+        None
+    }
 }
 
 #[async_trait::async_trait]
 impl ChannelApi for TelegramChannel {
     async fn recv(&self) -> anyhow::Result<Option<Incoming>> {
-        if let Some(msg) = self.pending.lock().await.pop_front() {
+        if let Some(msg) = self.take_confirmed().await {
             return Ok(Some(msg));
         }
         let updates = self
@@ -150,20 +178,26 @@ impl ChannelApi for TelegramChannel {
             .get_updates(self.offset.load(Ordering::Relaxed), 30)
             .await?;
         let mut batch = Vec::new();
+        // Updates arrive in ascending update_id order, and a batch is
+        // only polled when pending is empty — every earlier message was
+        // already handed out.
         for u in updates {
-            // Only advance the offset on a parsed update_id — a
-            // malformed entry must not confirm updates we never saw.
-            if let Some(id) = u["update_id"].as_i64() {
-                self.offset.fetch_max(id + 1, Ordering::Relaxed);
+            let id = u["update_id"].as_i64();
+            // Idempotent by update_id: a redelivered update at or below
+            // the confirmed offset was already handed to the bridge.
+            if id.is_some_and(|i| i < self.offset.load(Ordering::Relaxed)) {
+                continue;
             }
-            if let Some(msg) = incoming_from_update(&u) {
-                batch.push(msg);
+            let msg = incoming_from_update(&u);
+            // A malformed entry has no id to confirm — its message, if
+            // any, is delivered once and Telegram is never told it was
+            // seen.
+            if msg.is_some() || id.is_some() {
+                batch.push(PendingUpdate { update_id: id, msg });
             }
         }
-        let mut it = batch.into_iter();
-        let first = it.next();
-        self.pending.lock().await.extend(it);
-        Ok(first)
+        self.pending.lock().await.extend(batch);
+        Ok(self.take_confirmed().await)
     }
 
     async fn send(&self, chat_id: &str, text: &str) -> anyhow::Result<()> {
@@ -232,5 +266,99 @@ impl Bridge {
                 .handle_message(msg.chat_id, msg.sender_id, msg.text)
                 .await;
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use parking_lot::Mutex as StdMutex;
+    use serde_json::json;
+
+    /// Queue of poll responses; records the offset each poll requested —
+    /// the commit point is observable as the offset the NEXT poll asks for.
+    struct MockTg {
+        batches: StdMutex<Vec<Vec<Value>>>,
+        requested: StdMutex<Vec<i64>>,
+    }
+
+    #[async_trait::async_trait]
+    impl TelegramApi for MockTg {
+        async fn get_updates(&self, offset: i64, _t: u64) -> anyhow::Result<Vec<Value>> {
+            self.requested.lock().push(offset);
+            let mut batches = self.batches.lock();
+            if batches.is_empty() {
+                Ok(Vec::new())
+            } else {
+                Ok(batches.remove(0))
+            }
+        }
+        async fn send_message(&self, _chat_id: i64, _text: &str) -> anyhow::Result<()> {
+            Ok(())
+        }
+    }
+
+    fn msg_update(id: i64, text: &str) -> Value {
+        json!({"update_id": id, "message": {"chat": {"id": 42}, "text": text}})
+    }
+
+    #[tokio::test]
+    async fn offset_advances_only_as_messages_are_handed_out() {
+        // Batch: a message, a non-message update behind it, another
+        // message. The committed offset may never run ahead of the
+        // oldest un-handed message — a crash mid-batch must leave the
+        // tail unconfirmed so Telegram redelivers it.
+        let tg = Arc::new(MockTg {
+            batches: StdMutex::new(vec![vec![
+                msg_update(100, "hi"),
+                json!({"update_id": 101, "edited_message": {"chat": {"id": 42}}}),
+                msg_update(102, "yo"),
+            ]]),
+            requested: StdMutex::new(vec![]),
+        });
+        let ch = TelegramChannel::new(tg.clone());
+        let requested = || tg.requested.lock().clone();
+
+        assert_eq!(ch.recv().await.unwrap().unwrap().text, "hi");
+        // Only 100 confirmed by its handout — 101/102 stay unconfirmed.
+        assert_eq!(ch.offset.load(Ordering::Relaxed), 101);
+        // The edit queues as a marker; handing "yo" confirms through it.
+        assert_eq!(ch.recv().await.unwrap().unwrap().text, "yo");
+        assert_eq!(ch.offset.load(Ordering::Relaxed), 103);
+        assert_eq!(requested(), [0]); // no poll between handouts
+        // The next poll resumes after the whole confirmed batch.
+        assert!(ch.recv().await.unwrap().is_none());
+        assert_eq!(requested(), [0, 103]);
+    }
+
+    #[tokio::test]
+    async fn updates_below_confirmed_offset_are_deduped() {
+        let tg = Arc::new(MockTg {
+            batches: StdMutex::new(vec![
+                vec![msg_update(300, "a")],
+                // A resend of already-confirmed updates ahead of a new one.
+                vec![msg_update(300, "a"), msg_update(301, "b")],
+            ]),
+            requested: StdMutex::new(vec![]),
+        });
+        let ch = TelegramChannel::new(tg);
+        assert_eq!(ch.recv().await.unwrap().unwrap().text, "a");
+        // 300 is below the confirmed offset (301) — only "b" survives.
+        assert_eq!(ch.recv().await.unwrap().unwrap().text, "b");
+    }
+
+    #[tokio::test]
+    async fn update_without_id_delivers_once() {
+        let tg = Arc::new(MockTg {
+            batches: StdMutex::new(vec![vec![
+                json!({"message": {"chat": {"id": 42}, "text": "no id"}}),
+                msg_update(400, "after"),
+            ]]),
+            requested: StdMutex::new(vec![]),
+        });
+        let ch = TelegramChannel::new(tg);
+        assert_eq!(ch.recv().await.unwrap().unwrap().text, "no id");
+        assert_eq!(ch.recv().await.unwrap().unwrap().text, "after");
+        assert_eq!(ch.offset.load(Ordering::Relaxed), 401);
     }
 }

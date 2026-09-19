@@ -366,9 +366,12 @@ async fn tunnel_once(
     let mut sessions: HashMap<u64, (mpsc::Sender<String>, tokio::task::AbortHandle)> =
         HashMap::new();
     let (out_tx, mut out_rx) = mpsc::channel::<String>(256);
-    // Session tasks report their exit here so the map entry is freed even
-    // when the client stays connected (handshake fail, decrypt fail).
-    let (done_tx, mut done_rx) = mpsc::channel::<u64>(64);
+    // Session tasks report their exit here as (client id, task id) so
+    // the map entry is freed even when the client stays connected
+    // (handshake fail, decrypt fail). The task id lets the done branch
+    // skip a REPLACED session's late exit — it must not free the entry
+    // that replaced it.
+    let (done_tx, mut done_rx) = mpsc::channel::<(u64, tokio::task::Id)>(64);
 
     loop {
         tokio::select! {
@@ -496,13 +499,24 @@ async fn tunnel_once(
                         });
                         crate::rpc::handle_socket(plain_in_rx, plain_out_tx, state).await;
                     });
-                    sessions.insert(client_id, (in_tx, task.abort_handle()));
+                    // A hostile or buggy relay can re-send the connect
+                    // notice for an id whose session is still live.
+                    // Abort the stale task and replace its entry — a
+                    // plain overwrite would orphan the old task, and its
+                    // exit notification would later free THIS new entry.
+                    let old = sessions.insert(client_id, (in_tx, task.abort_handle()));
+                    if let Some((_, old_abort)) = old {
+                        warn!(client = client_id,
+                              "relay re-sent connect for a live session; replacing it");
+                        old_abort.abort();
+                    }
                     // Free the slot when the task exits for ANY reason —
                     // only the relay's disconnect notice freed it before,
                     // so a failed handshake leaked the slot forever.
+                    let task_id = task.id();
                     tokio::spawn(async move {
                         let _ = task.await;
-                        let _ = done_tx.send(client_id).await;
+                        let _ = done_tx.send((client_id, task_id)).await;
                     });
                 }
             }
@@ -514,8 +528,12 @@ async fn tunnel_once(
             }
             done = done_rx.recv() => {
                 // A session task exited (handshake fail/timeout, decrypt
-                // fail, or socket end) — free its slot.
-                if let Some(client_id) = done {
+                // fail, or socket end) — free its slot, but only if the
+                // map still holds THAT task: an aborted (replaced)
+                // session's late exit must not free its replacement.
+                if let Some((client_id, task_id)) = done
+                    && sessions.get(&client_id).is_some_and(|(_, h)| h.id() == task_id)
+                {
                     sessions.remove(&client_id);
                 }
             }
@@ -552,7 +570,7 @@ pub async fn client_connect(
 
     let (raw_in_tx, mut raw_in_rx) = mpsc::channel::<String>(64);
     let (raw_out_tx, mut raw_out_rx) = mpsc::channel::<String>(64);
-    tokio::spawn(async move {
+    let read_pump = tokio::spawn(async move {
         // Ping/Pong/Binary keep the link alive — a keepalive proxy's ping
         // must not end the pump (tungstenite answers pings itself).
         while let Some(msg) = reader.next().await {
@@ -588,8 +606,22 @@ pub async fn client_connect(
         HANDSHAKE_TIMEOUT,
         E2e::client_handshake(&raw_out_tx, &mut raw_in_rx, token),
     )
-    .await
-    .context("E2E handshake timed out")??;
+    .await;
+    let e2e = match e2e {
+        Ok(Ok(e)) => e,
+        r => {
+            // Kill the reader pump: it owns the socket's read half, so
+            // leaving it alive keeps the TCP connection (and the relay's
+            // per-IP session slot) open after every failed attempt —
+            // repeated bad-token redials would wedge the relay cap.
+            read_pump.abort();
+            match r {
+                Ok(Err(e)) => return Err(e),
+                Err(_) => return Err(anyhow::anyhow!("E2E handshake timed out")),
+                Ok(Ok(_)) => unreachable!(),
+            }
+        }
+    };
     let e2e = Arc::new(e2e);
 
     let (plain_in_tx, plain_in_rx) = mpsc::channel::<String>(64);

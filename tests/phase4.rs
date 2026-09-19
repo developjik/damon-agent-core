@@ -62,7 +62,7 @@ async fn mock_llm_tool_then_text() -> String {
                 let n = calls.fetch_add(1, Ordering::SeqCst);
                 let sse = if n == 0 {
                     concat!(
-                        "data: {\"choices\":[{\"delta\":{\"tool_calls\":[{\"index\":0,\"id\":\"c1\",\"function\":{\"name\":\"test.ping\",\"arguments\":\"{}\"}}]}}]}\n\n",
+                        "data: {\"choices\":[{\"delta\":{\"tool_calls\":[{\"index\":0,\"id\":\"c1\",\"function\":{\"name\":\"test.ping\",\"arguments\":\"{\\\"msg\\\":\\\"hi\\\"}\"}}]}}]}\n\n",
                         "data: [DONE]\n\n"
                     )
                 } else {
@@ -234,10 +234,21 @@ async fn mcp_tool_call_with_permission() {
     assert!(got_permission, "no permission request received");
     assert!(got_text, "no final text received");
 
-    // Tool result persisted.
+    // Tool result persisted: the mock sent {"msg":"hi"} and the server
+    // echoes json.dumps(args), so the row must carry that payload wrapped
+    // in the MCP result envelope — not an error envelope, and not merely
+    // the "content" key every MCP result serializes with.
     let msgs = store.messages(&session).await.unwrap();
     let tool_msg = msgs.iter().find(|m| m["role"] == "tool").unwrap();
-    assert!(tool_msg["content"].as_str().unwrap().contains("content"));
+    let content = tool_msg["content"].as_str().unwrap();
+    assert!(
+        content.contains(r#"{\"msg\": \"hi\"}"#),
+        "echo payload missing from tool row: {content}"
+    );
+    assert!(
+        !content.contains(r#""isError":true"#),
+        "tool row is an error envelope: {content}"
+    );
 }
 
 // --- Remote access safety -------------------------------------------------

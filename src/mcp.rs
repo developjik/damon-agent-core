@@ -124,18 +124,77 @@ impl McpRegistry {
         );
     }
 
+    /// Close every server connection, awaiting each child's graceful
+    /// shutdown under a bounded timeout: SHUTDOWN_TIMEOUT caps both the
+    /// per-slot conn-lock wait and each close, so daemon exit stays within
+    /// a few seconds per slot even while a dial (up to ~60s) holds the
+    /// lock — a slot taken over mid-dial is skipped, not awaited. Dropping
+    /// a `RunningService` only *schedules* an async close (its DropGuard
+    /// fires cancellation but nothing awaits the child), so a daemon
+    /// relying on Drop alone can orphan stdio children — call this from
+    /// the daemon shutdown hook.
+    pub async fn shutdown(&self) {
+        // A child that ignores shutdown — or a dial holding the conn
+        // lock — must not hang daemon exit.
+        const SHUTDOWN_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
+        let slots: Vec<(String, Arc<ServerSlot>)> = {
+            let inner = self.inner.read();
+            inner
+                .servers
+                .iter()
+                .map(|(n, s)| (n.clone(), s.clone()))
+                .collect()
+        };
+        for (name, slot) in slots {
+            // take() empties the slot: a call racing shutdown fails fast
+            // with "MCP server not connected" instead of using a dying
+            // child. The lock wait itself carries the same bound: tokio
+            // mutex lock futures are cancellation-safe, so an elapsed
+            // timer just dequeues this waiter. Losing the wait means a
+            // dial is in flight (ensure_connected holds the lock across
+            // the whole dial, up to ~60s) — skip this slot's graceful
+            // close rather than stalling exit behind it. Cleanup stays
+            // with the dialer's own completion path: on dial failure the
+            // half-built RunningService drops and rmcp's ChildWithCleanup
+            // drop guard kills the child; on success the conn is
+            // installed and the RunningService drop guard closes it when
+            // the registry is dropped at daemon exit (kill is scheduled,
+            // not awaited — the Drop-path caveat in this doc comment).
+            let Ok(mut conn) = tokio::time::timeout(SHUTDOWN_TIMEOUT, slot.conn.lock()).await
+            else {
+                warn!(
+                    server = %name,
+                    "MCP server dial in progress at shutdown; skipping graceful close"
+                );
+                continue;
+            };
+            let Some(mut svc) = conn.take() else {
+                continue;
+            };
+            // close_with_timeout cancels the service and awaits the
+            // background task (incl. transport/child teardown), returning
+            // Ok(None) when the child overstays the timeout — it logs
+            // that case itself, so only the join error surfaces here.
+            if let Err(e) = svc.close_with_timeout(SHUTDOWN_TIMEOUT).await {
+                warn!(server = %name, error = %e, "MCP server shutdown failed");
+            }
+        }
+    }
+
     /// Connect a server if its slot is empty, then refresh its tool map.
     /// Consecutive failures back off exponentially (1s → 30s cap) so a
     /// permanently-broken server isn't respawned on every tool call.
     async fn ensure_connected(&self, name: &str, slot: &Arc<ServerSlot>) -> anyhow::Result<()> {
-        // Check state under the lock, but connect OUTSIDE it — a 60s
-        // connect_one under the conn mutex would stall reload()'s
-        // slot.conn.lock() for the whole dial.
-        {
-            let conn = slot.conn.lock().await;
-            if conn.is_some() {
-                return Ok(());
-            }
+        // Hold the conn mutex across the WHOLE dial. Concurrent callers
+        // (e.g. N sessions racing to revive a freshly crashed server)
+        // block here and then reuse whichever conn the dialer installs —
+        // waiting out a CONNECT_TIMEOUT (30s) dial is the intended
+        // behavior, and cheaper than N duplicate child spawns. Holding it
+        // also serializes this dial against reload()'s teardown, which
+        // takes the same lock to drop the conn.
+        let mut conn = slot.conn.lock().await;
+        if conn.is_some() {
+            return Ok(());
         }
         {
             let mut b = slot.backoff.lock();
@@ -163,34 +222,34 @@ impl McpRegistry {
                 return Err(e);
             }
         };
-        // A reload() may have removed this server while we dialed —
-        // installing its tools would resurrect a dead server's entries.
-        // Re-check the slot is still registered before touching the map.
+        // Publish atomically: re-verify the slot is still THIS slot (a
+        // reload may have removed it while we dialed) and install the conn
+        // and its tools in ONE write critical section. Splitting the
+        // recheck from the tools insert let a reload landing between the
+        // two lock windows purge the server and have this insert
+        // resurrect its tools — advertised by has_tool/openai_tools but
+        // uncallable ("MCP server X not running" on every call). No .await
+        // inside: the write guard must not be held across an await point.
         {
-            let inner = self.inner.read();
+            let mut inner = self.inner.write();
             let still = inner
                 .servers
                 .get(name)
                 .is_some_and(|cur| Arc::ptr_eq(cur, slot));
             if !still {
+                // svc drops here, killing the child; the slot stays empty.
                 return Err(anyhow::anyhow!(
                     "MCP server {name} was removed during connect"
                 ));
             }
-        }
-        {
-            let mut inner = self.inner.write();
             inner.tools.retain(|_, (s, _)| s != name);
             for t in tools {
                 inner
                     .tools
                     .insert(format!("{name}.{}", t.name), (name.to_string(), t));
             }
-        }
-        // Install the connection — a concurrent ensure_connected may have
-        // beaten us; keep whichever is already there and drop ours.
-        let mut conn = slot.conn.lock().await;
-        if conn.is_none() {
+            // We have held the conn lock since observing None, and only
+            // ensure_connected ever installs a conn — still empty here.
             *conn = Some(svc);
         }
         Ok(())
@@ -318,20 +377,24 @@ impl McpRegistry {
         match result {
             Ok(Ok(r)) => Ok(serde_json::to_value(r)?),
             Ok(Err(e)) => {
-                // A JSON-RPC error means the server processed the call —
-                // retrying would double-execute a side-effectful tool.
-                // Only transport failures (child died mid-call) retry.
                 use rmcp::service::ServiceError;
-                let transport = matches!(
-                    e,
-                    ServiceError::TransportSend(_)
-                        | ServiceError::TransportClosed
-                        | ServiceError::UnexpectedResponse
-                );
-                if !transport {
+                // Retry ONLY TransportSend: the request failed before it
+                // could reach the child, so re-running cannot re-execute
+                // a tool. TransportClosed (child died mid-call — the
+                // request may have already run) and UnexpectedResponse
+                // (a response WAS received) both mean the server may
+                // have processed the call; retrying could double-execute
+                // a side-effectful tool, so those return the error.
+                if !matches!(e, ServiceError::TransportSend(_)) {
+                    if matches!(e, ServiceError::TransportClosed) {
+                        // The conn is a corpse — drop it so the next call
+                        // respawns a fresh child instead of erroring on
+                        // the dead one forever.
+                        *slot.conn.lock().await = None;
+                    }
                     return Err(e.into());
                 }
-                warn!(server = %server, error = %e, "tool call transport failed; reconnecting");
+                warn!(server = %server, error = %e, "tool call send failed; reconnecting");
                 *slot.conn.lock().await = None;
                 self.ensure_connected(&server, &slot).await?;
                 let peer = {
@@ -392,4 +455,56 @@ async fn connect_one(
     };
     info!(server = %name, tools = tools.len(), "MCP server connected");
     Ok((service, tools))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Regression: shutdown() once awaited `slot.conn.lock()` with NO
+    /// timeout. ensure_connected holds that lock across a whole dial
+    /// (initialize 30s + tools/list 30s), so a SIGTERM landing mid-dial
+    /// stalled daemon exit ~60s per slot — far past the documented 5s
+    /// exit bound. The lock wait must carry the same SHUTDOWN_TIMEOUT
+    /// bound and skip the slot instead.
+    #[tokio::test]
+    async fn shutdown_lock_wait_is_bounded_behind_inflight_dial() {
+        let registry = McpRegistry::connect_all(&HashMap::new()).await;
+        let slot = Arc::new(ServerSlot {
+            // Never dialed — the config only has to type-check.
+            cfg: parking_lot::RwLock::new(McpServerConfig {
+                command: "true".to_string(),
+                args: Vec::new(),
+                env: HashMap::new(),
+                auto_approve: false,
+            }),
+            conn: tokio::sync::Mutex::new(None),
+            backoff: parking_lot::Mutex::new((0, None)),
+        });
+        registry
+            .inner
+            .write()
+            .servers
+            .insert("slow".to_string(), slot.clone());
+
+        // Simulate an in-flight dial: ensure_connected parks holding the
+        // conn mutex for the entire dial. Hold it here and never release —
+        // pre-fix, shutdown blocked on this lock forever.
+        let _dial_guard = slot.conn.lock().await;
+
+        let started = std::time::Instant::now();
+        // Outer guard keeps a regression a bounded 15s failure, not a
+        // hung test binary.
+        let completed =
+            tokio::time::timeout(std::time::Duration::from_secs(15), registry.shutdown()).await;
+        let elapsed = started.elapsed();
+        assert!(
+            completed.is_ok(),
+            "shutdown blocked {elapsed:?} on a slot whose conn lock was held by a dial"
+        );
+        // It waited out the SHUTDOWN_TIMEOUT window before skipping (not
+        // an instant return) and stayed well inside the outer guard.
+        assert!(elapsed >= std::time::Duration::from_secs(4));
+        assert!(elapsed < std::time::Duration::from_secs(15));
+    }
 }

@@ -81,9 +81,9 @@ pub async fn run_prompt(
     // before taking the config lock so no lock is held across .await.
     let session_model = state.store.session_model(session_id).await?;
     let requested = model.or(session_model.as_deref()).map(String::from);
-    // Compaction is re-evaluated only after the turn appends messages —
-    // see the maybe_compact call inside the loop.
-    let mut check_compaction = true;
+    // Compaction is re-evaluated every iteration — every pass through the
+    // loop appends messages (assistant row + one tool row per call), so
+    // history can only grow within a turn.
 
     for _ in 0..MAX_ITERATIONS {
         if cancel.is_cancelled() {
@@ -140,14 +140,10 @@ pub async fn run_prompt(
             (provider, model, thinking)
         };
 
-        // Compact before loading messages, but only when history grew
-        // since the last check — maybe_compact loads the full message log
-        // to estimate tokens, which is wasted work on every tool-loop
-        // iteration that appended nothing.
-        if check_compaction {
-            maybe_compact(state, session_id, &provider, &model, &cancel).await;
-            check_compaction = false;
-        }
+        // Compact before loading messages — every iteration appends, so
+        // this runs each pass. maybe_compact itself early-returns cheaply
+        // when the uncompacted tail is under 85% of the window.
+        maybe_compact(state, session_id, &provider, &model, &cancel).await;
 
         let messages = state.store.messages(session_id).await?;
         let mut body = serde_json::json!({
@@ -414,7 +410,16 @@ pub async fn run_prompt(
                         "update": {
                             "sessionUpdate": "tool_call_update",
                             "toolCallId": call.id,
-                            "status": if result.is_ok() { "completed" } else { "failed" },
+                            // Same cancelled test as the persisted row
+                            // above — a user cancellation must not render
+                            // as a tool failure in the client.
+                            "status": if cancelled {
+                                "cancelled"
+                            } else if result.is_ok() {
+                                "completed"
+                            } else {
+                                "failed"
+                            },
                         }
                     }),
                 )
@@ -442,16 +447,19 @@ pub async fn run_prompt(
         if cancel.is_cancelled() {
             return Ok(llm::StopReason::Other);
         }
+        // This iteration appended the assistant tool_calls row plus one
+        // tool row per call — history grew, so compaction re-evaluates
+        // at the top of the next iteration.
     }
     warn!(session_id, "hit max tool iterations");
     Ok(llm::StopReason::MaxTurnRequests)
 }
 
-/// Rough token estimate. ASCII text runs ~4 chars/token; non-ASCII bytes
-/// (Korean, CJK, emoji) tokenize far denser, so they count ~3/4 token per
-/// byte. Image/binary content parts cost a fixed 1100 tokens regardless of
-/// their serialized size; thinking blocks and tool_calls count by their
-/// serialized length.
+/// Rough token estimate. Text runs ~4 chars/token for ASCII; non-ASCII
+/// bytes are weighted so a 3-byte CJK char costs ~1 token (see
+/// `text_tokens`). Image/binary content parts cost a fixed
+/// 1100 tokens regardless of their serialized size; thinking blocks and
+/// tool_calls count by their serialized length.
 fn estimate_tokens<'a>(messages: impl Iterator<Item = &'a Value>) -> u64 {
     messages
         .map(|m| {
@@ -477,12 +485,13 @@ fn estimate_tokens<'a>(messages: impl Iterator<Item = &'a Value>) -> u64 {
         .sum()
 }
 
-/// ~4 chars/token for ASCII, ~3/4 token per byte for non-ASCII.
+/// ~4 chars/token for ASCII; non-ASCII bytes are weighted so a 3-byte
+/// CJK char ≈ 1 token (its real per-char cost — the old 0.75 undershot
+/// and delayed compaction past the context window). ASCII stays exactly
+/// len/4.
 fn text_tokens(s: &str) -> u64 {
-    s.bytes()
-        .map(|b| if b.is_ascii() { 1 } else { 3 })
-        .sum::<u64>()
-        / 4
+    let non_ascii = s.bytes().filter(|b| !b.is_ascii()).count();
+    ((s.len() + non_ascii / 3) / 4) as u64
 }
 
 /// Tokens for one content part. Image/binary payloads are priced at a

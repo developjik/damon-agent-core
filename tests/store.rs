@@ -64,6 +64,60 @@ async fn cleanup_older_than_removes_old_sessions_and_messages() {
 }
 
 #[tokio::test]
+async fn search_tokenizes_terms_phrases_and_operators() {
+    let store = Store::in_memory().await.unwrap();
+    store.create_session("s", "/tmp", None).await.unwrap();
+    store
+        .append("s", "user", &json!({"content": "error timeout in relay"}))
+        .await
+        .unwrap();
+    store
+        .append("s", "user", &json!({"content": "error without timeout"}))
+        .await
+        .unwrap();
+    store
+        .append("s", "user", &json!({"content": "unrelated message"}))
+        .await
+        .unwrap();
+
+    // Bare terms AND together — both words required, order-free.
+    let hits = store.search("error timeout", 10).await.unwrap();
+    assert_eq!(hits.len(), 2);
+
+    // Explicit operators pass through.
+    let hits = store.search("error AND timeout", 10).await.unwrap();
+    assert_eq!(hits.len(), 2);
+    let hits = store.search("timeout OR unrelated", 10).await.unwrap();
+    assert_eq!(hits.len(), 3);
+    let hits = store.search("error NOT timeout", 10).await.unwrap();
+    assert_eq!(hits.len(), 0);
+
+    // Quoted phrase matches the exact sequence only.
+    let hits = store.search("\"timeout in relay\"", 10).await.unwrap();
+    assert_eq!(hits.len(), 1);
+    let hits = store.search("\"in timeout\"", 10).await.unwrap();
+    assert_eq!(hits.len(), 0);
+
+    // FTS5 metacharacters in terms stay literal — no parse error. Inside
+    // quotes FTS5 tokenizes `*`/`:`/`,` away, so these degrade to the
+    // contained terms rather than matching operators.
+    assert_eq!(store.search("error*", 10).await.unwrap().len(), 2);
+    assert!(store.search("content:error", 10).await.unwrap().is_empty());
+    assert!(
+        store
+            .search("NEAR(error, timeout)", 10)
+            .await
+            .unwrap()
+            .is_empty()
+    );
+
+    // Operator-only or empty queries return nothing instead of erroring.
+    assert!(store.search("AND OR", 10).await.unwrap().is_empty());
+    assert!(store.search("NOT", 10).await.unwrap().is_empty());
+    assert!(store.search("\"\"", 10).await.unwrap().is_empty());
+}
+
+#[tokio::test]
 async fn list_sessions_paged_applies_limit_and_offset() {
     let store = Store::in_memory().await.unwrap();
     for i in 0..5 {
@@ -113,4 +167,58 @@ async fn messages_paged_applies_limit_and_offset() {
     assert_eq!(page[0].id, all[4].id);
 
     assert!(store.messages_paged("s", 2, 10).await.unwrap().is_empty());
+}
+
+#[tokio::test]
+async fn search_handles_unary_and_exclusion_not() {
+    let store = Store::in_memory().await.unwrap();
+    store.create_session("s", "/tmp", None).await.unwrap();
+    store
+        .append("s", "user", &json!({"content": "rust memory safe"}))
+        .await
+        .unwrap();
+    store
+        .append("s", "user", &json!({"content": "rust gc pressure"}))
+        .await
+        .unwrap();
+
+    // `X AND NOT Y` must keep the exclusion, not silently drop the NOT
+    // and invert the result set.
+    let hits = store.search("rust AND NOT gc", 10).await.unwrap();
+    assert_eq!(hits.len(), 1);
+    let all = store.messages_full("s").await.unwrap();
+    let hit = all.iter().find(|m| m.id == hits[0].1).unwrap();
+    assert_eq!(hit.data["content"], "rust memory safe");
+
+    // Leading NOT: FTS5 has no unary NOT, so the query degrades to the
+    // bare term — a parseable MATCH, not an error.
+    let hits = store.search("NOT safe", 10).await.unwrap();
+    assert_eq!(hits.len(), 1);
+
+    // Trailing NOT dies without an operand; the term still matches.
+    let hits = store.search("gc NOT", 10).await.unwrap();
+    assert_eq!(hits.len(), 1);
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn open_tightens_dir_and_db_permissions() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let dir = std::env::temp_dir().join(format!("damon-store-perms-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    let path = dir.join("sessions.db");
+    let mode = |p: &std::path::Path| std::fs::metadata(p).unwrap().permissions().mode() & 0o777;
+
+    let store = Store::open(&path).await.unwrap();
+    assert_eq!(mode(&dir), 0o700);
+    assert_eq!(mode(&path), 0o600);
+
+    // A pre-existing looser file is tightened again on the next open.
+    drop(store);
+    std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o666)).unwrap();
+    Store::open(&path).await.unwrap();
+    assert_eq!(mode(&path), 0o600);
+
+    let _ = std::fs::remove_dir_all(&dir);
 }

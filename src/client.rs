@@ -104,9 +104,10 @@ impl DamonClient {
     /// `request()` waits for the link instead of failing outright.
     pub async fn connect(url: &str, token: Option<&str>) -> anyhow::Result<Self> {
         let ws_url = ticketed_url(url, token).await?;
-        let (ws, _) = tokio_tungstenite::connect_async(&ws_url)
-            .await
-            .with_context(|| format!("cannot connect to {url}"))?;
+        let (ws, _) =
+            tokio_tungstenite::connect_async_with_config(&ws_url, Some(ws_connect_config()), false)
+                .await
+                .with_context(|| format!("cannot connect to {url}"))?;
         let (writer, rx) = ws_transport(ws);
 
         // Redial closure: fresh ticket + WS → (writer, inbound-text channel).
@@ -116,7 +117,12 @@ impl DamonClient {
             let (url, tok) = (base_url.clone(), tok.clone());
             Box::pin(async move {
                 let u = ticketed_url(&url, tok.as_deref()).await?;
-                let (ws, _) = tokio_tungstenite::connect_async(&u).await?;
+                let (ws, _) = tokio_tungstenite::connect_async_with_config(
+                    &u,
+                    Some(ws_connect_config()),
+                    false,
+                )
+                .await?;
                 Ok(ws_transport(ws))
             })
         });
@@ -405,7 +411,14 @@ async fn ticketed_url(ws_url: &str, token: Option<&str>) -> anyhow::Result<Strin
         .unwrap_or(ws_url.trim_end_matches('/'))
         .replacen("wss://", "https://", 1)
         .replacen("ws://", "http://", 1);
-    let resp = reqwest::Client::new()
+    // Fresh client per call, but bounded: without explicit timeouts a
+    // hung daemon would stall connect() — and every redial, which shares
+    // this helper — forever.
+    let resp = reqwest::Client::builder()
+        .connect_timeout(Duration::from_secs(10))
+        .timeout(Duration::from_secs(15))
+        .build()
+        .context("ws_ticket http client build failed")?
         .post(format!("{http}/v1/ws_ticket"))
         .bearer_auth(token)
         .send()
@@ -420,6 +433,15 @@ async fn ticketed_url(ws_url: &str, token: Option<&str>) -> anyhow::Result<Strin
         .to_string();
     let sep = if ws_url.contains('?') { '&' } else { '?' };
     Ok(format!("{ws_url}{sep}ticket={ticket}"))
+}
+
+/// WS dial config: cap inbound messages/frames at 4 MiB — the same
+/// budget the daemon and relay enforce (the default ~64 MiB lets a
+/// hostile peer force huge allocations into the session channels).
+fn ws_connect_config() -> tokio_tungstenite::tungstenite::protocol::WebSocketConfig {
+    tokio_tungstenite::tungstenite::protocol::WebSocketConfig::default()
+        .max_message_size(Some(4 << 20))
+        .max_frame_size(Some(4 << 20))
 }
 
 /// A redial attempt: produce a fresh (writer, inbound-text channel) pair.
@@ -579,16 +601,27 @@ async fn drain_pending(
     pending: &Mutex<HashMap<u64, Pending>>,
     event_tx: &mpsc::Sender<ClientEvent>,
 ) {
-    let mut map = pending.lock().await;
-    for (_, p) in map.drain() {
-        let result = Err(json!({"message": "connection closed"}));
+    // Take the waiters out under the lock, then send without it: the
+    // event channel is bounded, and a slow consumer must not pin the
+    // pending mutex across that await — request()/prompt()/response
+    // routing all contend on it. Waiters that race in after the
+    // snapshot either fail their send on the dead sink (the caller
+    // removes the entry) or resolve on the reconnected link.
+    let drained: Vec<Pending> = {
+        let mut map = pending.lock().await;
+        map.drain().map(|(_, p)| p).collect()
+    };
+    for p in drained {
         match p {
             Pending::Direct(tx) => {
                 drop(tx);
             }
             Pending::ToEvents { session_id } => {
                 let _ = event_tx
-                    .send(ClientEvent::PromptDone { session_id, result })
+                    .send(ClientEvent::PromptDone {
+                        session_id,
+                        result: Err(json!({"message": "connection closed"})),
+                    })
                     .await;
             }
         }

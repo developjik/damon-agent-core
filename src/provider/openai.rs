@@ -68,33 +68,16 @@ impl OpenAiCompat {
     /// not a textual reverse — because hash-shortened names don't invert.
     /// In-band tools render as text, so callers skip this entirely.
     fn mangle_tool_names(body: &mut Value) -> std::collections::HashMap<String, String> {
+        // Collision detection needs every original name up front, so walk
+        // the name sites read-only first.
+        let mut originals = std::collections::HashSet::new();
+        each_tool_name(body, &mut |n| {
+            if let Some(s) = n.as_str() {
+                originals.insert(s.to_string());
+            }
+        });
         let mut map = std::collections::HashMap::new();
-        if let Some(tools) = body.get_mut("tools").and_then(|t| t.as_array_mut()) {
-            for t in tools {
-                if let Some(n) = t.get_mut("function").and_then(|f| f.get_mut("name")) {
-                    mangle_name(n, &mut map);
-                }
-            }
-        }
-        // Replayed assistant tool_calls and an explicit tool_choice carry
-        // the same names — upstream validates them too.
-        if let Some(msgs) = body.get_mut("messages").and_then(|m| m.as_array_mut()) {
-            for m in msgs {
-                if let Some(calls) = m.get_mut("tool_calls").and_then(|c| c.as_array_mut()) {
-                    for c in calls {
-                        if let Some(n) = c.get_mut("function").and_then(|f| f.get_mut("name")) {
-                            mangle_name(n, &mut map);
-                        }
-                    }
-                }
-            }
-        }
-        if let Some(tc) = body.get_mut("tool_choice")
-            && tc["type"].as_str() == Some("function")
-            && let Some(n) = tc.get_mut("function").and_then(|f| f.get_mut("name"))
-        {
-            mangle_name(n, &mut map);
-        }
+        each_tool_name(body, &mut |n| mangle_name(n, &mut map, &originals));
         map
     }
 
@@ -147,6 +130,15 @@ impl OpenAiCompat {
                 .is_some_and(|tools| tools.iter().any(|t| t["strict"].as_bool() == Some(true)));
             if has_strict {
                 let status = resp.status();
+                // Capture before text() consumes the response — the rebuilt
+                // error must carry the real content-type, not a fabricated
+                // one (a text/plain error would be misclassified as JSON).
+                let content_type = resp
+                    .headers()
+                    .get("content-type")
+                    .and_then(|v| v.to_str().ok())
+                    .unwrap_or("application/json")
+                    .to_string();
                 let err = resp.text().await.unwrap_or_default();
                 if err.contains("strict") {
                     let mut retry = v.clone();
@@ -162,7 +154,8 @@ impl OpenAiCompat {
                     // Rebuild a response carrying the buffered error body.
                     return Ok(UpstreamResponse {
                         status,
-                        content_type: "application/json".into(),
+                        content_type,
+                        retry_after: None,
                         stream: Box::pin(futures::stream::once(
                             async move { Ok(Bytes::from(err)) },
                         )),
@@ -173,6 +166,7 @@ impl OpenAiCompat {
 
         Ok(UpstreamResponse {
             status: resp.status(),
+            retry_after: crate::provider::retry_after_opt(&resp),
             content_type: resp
                 .headers()
                 .get("content-type")
@@ -208,9 +202,10 @@ impl OpenAiCompat {
             )
             .await?;
         if up.status == reqwest::StatusCode::TOO_MANY_REQUESTS {
-            // UpstreamResponse carries no headers — use a fixed short
-            // backoff; the caller retries once.
-            return Err(crate::provider::RateLimited(std::time::Duration::from_secs(2)).into());
+            // Honor the upstream's Retry-After when it sent one; otherwise
+            // a short fixed backoff — the caller retries once.
+            let hint = up.retry_after.unwrap_or(std::time::Duration::from_secs(2));
+            return Err(crate::provider::RateLimited(hint).into());
         }
         if !up.status.is_success() {
             let buf = crate::provider::collect_stream(up.stream).await?;
@@ -268,7 +263,8 @@ impl OpenAiCompat {
             )
             .await?;
         if up.status == reqwest::StatusCode::TOO_MANY_REQUESTS {
-            return Err(crate::provider::RateLimited(std::time::Duration::from_secs(2)).into());
+            let hint = up.retry_after.unwrap_or(std::time::Duration::from_secs(2));
+            return Err(crate::provider::RateLimited(hint).into());
         }
         let buf = crate::provider::collect_stream(up.stream).await?;
         if !up.status.is_success() {
@@ -295,15 +291,90 @@ impl OpenAiCompat {
     }
 }
 
+/// Visit every tool-name site in a chat-completions body:
+/// `tools[].function.name`, replayed `messages[].tool_calls[].function.name`
+/// and an explicit `tool_choice.function.name`.
+fn each_tool_name(body: &mut Value, f: &mut impl FnMut(&mut Value)) {
+    if let Some(tools) = body.get_mut("tools").and_then(|t| t.as_array_mut()) {
+        for t in tools {
+            if let Some(n) = t.get_mut("function").and_then(|x| x.get_mut("name")) {
+                f(n);
+            }
+        }
+    }
+    // Replayed assistant tool_calls and an explicit tool_choice carry
+    // the same names — upstream validates them too.
+    if let Some(msgs) = body.get_mut("messages").and_then(|m| m.as_array_mut()) {
+        for m in msgs {
+            if let Some(calls) = m.get_mut("tool_calls").and_then(|c| c.as_array_mut()) {
+                for c in calls {
+                    if let Some(n) = c.get_mut("function").and_then(|x| x.get_mut("name")) {
+                        f(n);
+                    }
+                }
+            }
+        }
+    }
+    if let Some(tc) = body.get_mut("tool_choice")
+        && tc["type"].as_str() == Some("function")
+        && let Some(n) = tc.get_mut("function").and_then(|x| x.get_mut("name"))
+    {
+        f(n);
+    }
+}
+
 /// Mangle one name value in place; record the mapping when it changed.
-fn mangle_name(v: &mut Value, map: &mut std::collections::HashMap<String, String>) {
+/// When the mangled form is claimed by a different original name — a
+/// literal `server__tool` defined next to an MCP `server.tool` — the
+/// wire name gets a `__<sha256[:8]>` variant instead, so both stay
+/// distinct and every response name restores to its own original.
+fn mangle_name(
+    v: &mut Value,
+    map: &mut std::collections::HashMap<String, String>,
+    originals: &std::collections::HashSet<String>,
+) {
     let Some(name) = v.as_str() else {
         return;
     };
-    let mangled = mangle(name);
-    if mangled != name {
-        map.insert(mangled.clone(), name.to_string());
-        *v = Value::String(mangled);
+    let name = name.to_string();
+    let base = mangle(&name);
+    let sent = if (base != name && originals.contains(&base))
+        || map.get(&base).is_some_and(|orig| orig != &name)
+    {
+        variant_name(&base, &name, map, originals)
+    } else {
+        base
+    };
+    if sent != name {
+        map.insert(sent.clone(), name);
+        *v = Value::String(sent);
+    }
+}
+
+/// A wire name unique across this request: `base` with a `__<sha256[:8]>`
+/// suffix of `name`, re-hashed until neither another original nor an
+/// already-assigned wire name claims it. Trimmed to the same 64-char cap
+/// `mangle` enforces.
+fn variant_name(
+    base: &str,
+    name: &str,
+    map: &std::collections::HashMap<String, String>,
+    originals: &std::collections::HashSet<String>,
+) -> String {
+    use sha2::Digest;
+    let taken = |candidate: &str| {
+        (originals.contains(candidate) && candidate != name)
+            || map.get(candidate).is_some_and(|orig| orig != name)
+    };
+    let prefix: String = base.chars().take(54).collect();
+    let mut digest = sha2::Sha256::digest(name.as_bytes());
+    loop {
+        let hash: String = digest[..4].iter().map(|b| format!("{b:02x}")).collect();
+        let candidate = format!("{prefix}__{hash}");
+        if !taken(&candidate) {
+            return candidate;
+        }
+        digest = sha2::Sha256::digest(candidate.as_bytes());
     }
 }
 
@@ -377,6 +448,7 @@ pub fn sse_events(
             // completed stream from a truncated one — EOF without it is an
             // error, not a clean Done.
             false,
+            Slots::default(),
         ),
         |(
             mut stream,
@@ -386,6 +458,7 @@ pub fn sse_events(
             mut done,
             mut finish,
             mut saw_terminal,
+            mut slots,
         )| async move {
             // Drain queued events from a multi-event chunk first.
             if let Some(res) = pending.pop_front() {
@@ -394,7 +467,16 @@ pub fn sse_events(
                 }
                 return Some((
                     res,
-                    (stream, buf, data_lines, pending, done, finish, saw_terminal),
+                    (
+                        stream,
+                        buf,
+                        data_lines,
+                        pending,
+                        done,
+                        finish,
+                        saw_terminal,
+                        slots,
+                    ),
                 ));
             }
             if done {
@@ -409,7 +491,12 @@ pub fn sse_events(
                         .to_string();
                     buf.drain(..=pos);
                     if line.is_empty() {
-                        match flush_event(&mut data_lines, &mut finish, &mut saw_terminal) {
+                        match flush_event(
+                            &mut data_lines,
+                            &mut finish,
+                            &mut saw_terminal,
+                            &mut slots,
+                        ) {
                             Some(Ok(evs)) => {
                                 let mut it = evs.into_iter();
                                 if let Some(first) = it.next() {
@@ -429,6 +516,7 @@ pub fn sse_events(
                                             done,
                                             finish,
                                             saw_terminal,
+                                            slots,
                                         ),
                                     ));
                                 }
@@ -436,7 +524,16 @@ pub fn sse_events(
                             Some(Err(e)) => {
                                 return Some((
                                     Err(e),
-                                    (stream, buf, data_lines, pending, done, finish, saw_terminal),
+                                    (
+                                        stream,
+                                        buf,
+                                        data_lines,
+                                        pending,
+                                        done,
+                                        finish,
+                                        saw_terminal,
+                                        slots,
+                                    ),
                                 ));
                             }
                             None => {}
@@ -454,7 +551,16 @@ pub fn sse_events(
                         done = true;
                         return Some((
                             Err(e.into()),
-                            (stream, buf, data_lines, pending, done, finish, saw_terminal),
+                            (
+                                stream,
+                                buf,
+                                data_lines,
+                                pending,
+                                done,
+                                finish,
+                                saw_terminal,
+                                slots,
+                            ),
                         ));
                     }
                     None => {
@@ -469,7 +575,12 @@ pub fn sse_events(
                                 data_lines.push(data.trim().to_string());
                             }
                         }
-                        match flush_event(&mut data_lines, &mut finish, &mut saw_terminal) {
+                        match flush_event(
+                            &mut data_lines,
+                            &mut finish,
+                            &mut saw_terminal,
+                            &mut slots,
+                        ) {
                             Some(Ok(evs)) => {
                                 let mut it = evs.into_iter();
                                 if let Some(first) = it.next() {
@@ -489,6 +600,7 @@ pub fn sse_events(
                                             done,
                                             finish,
                                             saw_terminal,
+                                            slots,
                                         ),
                                     ));
                                 }
@@ -496,7 +608,16 @@ pub fn sse_events(
                             Some(Err(e)) => {
                                 return Some((
                                     Err(e),
-                                    (stream, buf, data_lines, pending, done, finish, saw_terminal),
+                                    (
+                                        stream,
+                                        buf,
+                                        data_lines,
+                                        pending,
+                                        done,
+                                        finish,
+                                        saw_terminal,
+                                        slots,
+                                    ),
                                 ));
                             }
                             None => {}
@@ -509,12 +630,30 @@ pub fn sse_events(
                         if !saw_terminal {
                             return Some((
                                 Err(anyhow::anyhow!("stream ended without terminal event")),
-                                (stream, buf, data_lines, pending, done, finish, saw_terminal),
+                                (
+                                    stream,
+                                    buf,
+                                    data_lines,
+                                    pending,
+                                    done,
+                                    finish,
+                                    saw_terminal,
+                                    slots,
+                                ),
                             ));
                         }
                         return Some((
                             Ok(StreamEvent::Done(finish)),
-                            (stream, buf, data_lines, pending, done, finish, saw_terminal),
+                            (
+                                stream,
+                                buf,
+                                data_lines,
+                                pending,
+                                done,
+                                finish,
+                                saw_terminal,
+                                slots,
+                            ),
                         ));
                     }
                 }
@@ -522,10 +661,42 @@ pub fn sse_events(
         },
     ))
 }
+/// Stream state for tool-call slot assignment. OpenAI keys parallel calls
+/// by `index`, but some gateways (llama.cpp) omit it and identify calls by
+/// `id` — without this map every delta would land in slot 0 and splice
+/// parallel arguments together.
+#[derive(Default)]
+struct Slots {
+    ids: std::collections::HashMap<String, usize>,
+    next: usize,
+}
+
+impl Slots {
+    fn slot(&mut self, call: &Value) -> usize {
+        if let Some(i) = call["index"].as_u64() {
+            let i = i as usize;
+            if let Some(id) = call["id"].as_str() {
+                self.ids.insert(id.to_string(), i);
+            }
+            self.next = self.next.max(i + 1);
+            return i;
+        }
+        if let Some(id) = call["id"].as_str() {
+            if !self.ids.contains_key(id) {
+                self.ids.insert(id.to_string(), self.next);
+                self.next += 1;
+            }
+            return self.ids[id];
+        }
+        0
+    }
+}
+
 fn flush_event(
     data_lines: &mut Vec<String>,
     finish: &mut crate::llm::StopReason,
     saw_terminal: &mut bool,
+    slots: &mut Slots,
 ) -> Option<anyhow::Result<Vec<StreamEvent>>> {
     let data = data_lines.join("\n");
     data_lines.clear();
@@ -536,19 +707,54 @@ fn flush_event(
         *saw_terminal = true;
         return Some(Ok(vec![StreamEvent::Done(*finish)]));
     }
-    match parse_chunk(&data) {
-        Ok(parsed) => {
-            if let Some(r) = parsed.finish {
-                *finish = r;
-                *saw_terminal = true;
+    match parse_chunk(&data, slots) {
+        Ok(parsed) => emit_parsed(parsed, finish, saw_terminal),
+        Err(e) => {
+            // SSE joins multi-line data with \n — one JSON value survives
+            // the join (\n is JSON whitespace), but a non-typical upstream
+            // can pack two complete values into one event. Re-parse line
+            // by line: keep what parses, log and skip the rest instead of
+            // failing the whole stream. All lines failing keeps the join
+            // error — that is genuinely corrupt data.
+            let mut merged = Parsed::default();
+            let mut any = false;
+            for line in data.split('\n') {
+                if line.is_empty() {
+                    continue;
+                }
+                match parse_chunk(line, slots) {
+                    Ok(p) => {
+                        any = true;
+                        if let Some(r) = p.finish {
+                            merged.finish = Some(r);
+                        }
+                        merged.events.extend(p.events);
+                    }
+                    Err(_) => tracing::debug!("skipping unparsable SSE data line: {line:?}"),
+                }
             }
-            if parsed.events.is_empty() {
-                None
-            } else {
-                Some(Ok(parsed.events))
+            if !any {
+                return Some(Err(e));
             }
+            emit_parsed(merged, finish, saw_terminal)
         }
-        Err(e) => Some(Err(e)),
+    }
+}
+
+/// Apply a successfully parsed chunk to the stream state.
+fn emit_parsed(
+    parsed: Parsed,
+    finish: &mut crate::llm::StopReason,
+    saw_terminal: &mut bool,
+) -> Option<anyhow::Result<Vec<StreamEvent>>> {
+    if let Some(r) = parsed.finish {
+        *finish = r;
+        *saw_terminal = true;
+    }
+    if parsed.events.is_empty() {
+        None
+    } else {
+        Some(Ok(parsed.events))
     }
 }
 
@@ -560,7 +766,7 @@ struct Parsed {
     finish: Option<crate::llm::StopReason>,
 }
 
-fn parse_chunk(data: &str) -> anyhow::Result<Parsed> {
+fn parse_chunk(data: &str, slots: &mut Slots) -> anyhow::Result<Parsed> {
     use crate::llm::StopReason;
     let v: Value = serde_json::from_str(data).context("invalid SSE JSON")?;
     let mut out = Parsed::default();
@@ -595,7 +801,7 @@ fn parse_chunk(data: &str) -> anyhow::Result<Parsed> {
     }
     if let Some(calls) = delta["tool_calls"].as_array() {
         for call in calls {
-            let index = call["index"].as_u64().unwrap_or(0) as usize;
+            let index = slots.slot(call);
             let f = &call["function"];
             out.events.push(StreamEvent::ToolCallDelta {
                 index,
@@ -617,4 +823,117 @@ fn parse_chunk(data: &str) -> anyhow::Result<Parsed> {
         });
     }
     Ok(out)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use serde_json::json;
+
+    /// A literal tool whose name equals another tool's mangled form must
+    /// keep working: the colliding pair gets distinct wire names and each
+    /// response name restores to its own original.
+    #[test]
+    fn mangle_collision_keeps_both_tools_distinct() {
+        let mut body = json!({
+            "tools": [
+                {"type": "function", "function": {"name": "fs.read", "parameters": {}}},
+                {"type": "function", "function": {"name": "fs__read", "parameters": {}}},
+            ],
+            "tool_choice": {"type": "function", "function": {"name": "fs__read"}},
+            "messages": [
+                {"role": "assistant", "content": null, "tool_calls": [{
+                    "id": "call_x", "type": "function",
+                    "function": {"name": "fs.read", "arguments": "{}"}
+                }]},
+            ],
+        });
+        let names = OpenAiCompat::mangle_tool_names(&mut body);
+
+        let wire_read = body["tools"][0]["function"]["name"].as_str().unwrap();
+        let wire_literal = body["tools"][1]["function"]["name"].as_str().unwrap();
+        assert_ne!(
+            wire_read, wire_literal,
+            "colliding tools must diverge on the wire"
+        );
+        assert_eq!(wire_literal, "fs__read");
+        // Every site carrying the same original shares one wire name.
+        assert_eq!(
+            body["messages"][0]["tool_calls"][0]["function"]["name"],
+            wire_read
+        );
+        assert_eq!(body["tool_choice"]["function"]["name"], wire_literal);
+        for w in [wire_read, wire_literal] {
+            assert!(w.chars().count() <= 64);
+            assert!(
+                w.chars()
+                    .all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '-')
+            );
+        }
+
+        // Both directions restore to the right original.
+        let mut resp = json!({"choices": [{"message": {"tool_calls": [
+            {"function": {"name": wire_read, "arguments": "{}"}},
+            {"function": {"name": wire_literal, "arguments": "{}"}},
+        ]}}]});
+        unmangle_tool_calls(&mut resp, &names);
+        let restored: Vec<&str> = resp["choices"][0]["message"]["tool_calls"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|c| c["function"]["name"].as_str().unwrap())
+            .collect();
+        assert!(restored.contains(&"fs.read"), "got {restored:?}");
+        assert!(restored.contains(&"fs__read"), "got {restored:?}");
+    }
+
+    /// Gateways that omit `index` and identify calls by `id` (llama.cpp)
+    /// must not have every delta collapse into slot 0.
+    #[test]
+    fn parse_chunk_keys_slots_by_id_when_index_absent() {
+        let mut slots = Slots::default();
+        let chunk = |id: &str, args: &str| {
+            format!(
+                r#"{{"choices":[{{"delta":{{"tool_calls":[{{"id":"{id}","function":{{"arguments":"{args}"}}}}]}}}}]}}"#
+            )
+        };
+        let idx = |p: &Parsed| match &p.events[0] {
+            StreamEvent::ToolCallDelta { index, .. } => *index,
+            other => panic!("expected tool call delta, got {other:?}"),
+        };
+
+        let a1 = parse_chunk(&chunk("call_a", "{"), &mut slots).unwrap();
+        let b1 = parse_chunk(&chunk("call_b", "["), &mut slots).unwrap();
+        let a2 = parse_chunk(&chunk("call_a", "}"), &mut slots).unwrap();
+        assert_eq!(idx(&a1), 0);
+        assert_eq!(idx(&b1), 1);
+        assert_eq!(idx(&a2), 0, "same id returns to its own slot");
+
+        // Explicit index still wins — normal streams are untouched.
+        let with_index = parse_chunk(
+            r#"{"choices":[{"delta":{"tool_calls":[{"index":5,"function":{"arguments":"x"}}]}}]}"#,
+            &mut slots,
+        )
+        .unwrap();
+        assert_eq!(idx(&with_index), 5);
+    }
+
+    /// Two JSON values packed into one multi-line SSE event must not fail
+    /// the whole stream — line-wise reparse keeps both.
+    #[test]
+    fn flush_event_keeps_two_json_values_in_one_event() {
+        let mut lines = vec![
+            r#"{"choices":[{"delta":{"content":"a"}}]}"#.to_string(),
+            r#"{"choices":[{"delta":{"content":"b"}}]}"#.to_string(),
+        ];
+        let mut finish = crate::llm::StopReason::Other;
+        let mut saw_terminal = false;
+        let mut slots = Slots::default();
+        let evs = flush_event(&mut lines, &mut finish, &mut saw_terminal, &mut slots)
+            .unwrap()
+            .unwrap();
+        assert_eq!(evs.len(), 2);
+        assert!(matches!(&evs[0], StreamEvent::Text(t) if t == "a"));
+        assert!(matches!(&evs[1], StreamEvent::Text(t) if t == "b"));
+    }
 }

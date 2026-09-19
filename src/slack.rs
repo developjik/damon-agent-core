@@ -17,6 +17,9 @@ use crate::channel::{ChannelApi, Incoming};
 
 const API_BASE: &str = "https://slack.com/api";
 
+/// Dedup memory for retried Socket Mode envelopes.
+const SEEN_ENVELOPE_CAP: usize = 4096;
+
 /// Slack Web API surface — injectable base URL for tests.
 pub struct SlackApi {
     base: String,
@@ -174,6 +177,34 @@ struct SocketConn {
     write: Arc<Mutex<futures::stream::SplitSink<WsStream, Message>>>,
 }
 
+/// FIFO-bounded dedup for processed envelope_ids: at the cap the OLDEST
+/// id is evicted, so hitting the cap reprocesses at most one late retry
+/// instead of clearing every recently seen envelope.
+#[derive(Default)]
+struct SeenEnvelopes {
+    /// Envelope ids, oldest first — eviction order.
+    order: std::collections::VecDeque<String>,
+    /// Same ids as `order`, for membership tests.
+    set: std::collections::HashSet<String>,
+}
+
+impl SeenEnvelopes {
+    /// Records an id; false means it was already seen (a retried
+    /// envelope that must not run twice).
+    fn insert(&mut self, eid: String) -> bool {
+        if !self.set.insert(eid.clone()) {
+            return false;
+        }
+        if self.order.len() >= SEEN_ENVELOPE_CAP
+            && let Some(oldest) = self.order.pop_front()
+        {
+            self.set.remove(&oldest);
+        }
+        self.order.push_back(eid);
+        true
+    }
+}
+
 /// Slack transport for the generic bridge.
 pub struct SlackChannel {
     api: Arc<SlackApi>,
@@ -182,7 +213,7 @@ pub struct SlackChannel {
     /// Bounded dedup of processed envelope_ids — Slack retries an
     /// envelope when our ack is late, and a retry we never received
     /// must not be dropped as a duplicate.
-    seen_envelopes: Mutex<std::collections::HashSet<String>>,
+    seen_envelopes: Mutex<SeenEnvelopes>,
 }
 
 impl SlackChannel {
@@ -191,7 +222,7 @@ impl SlackChannel {
             api,
             bot_id: Mutex::new(None),
             conn: Mutex::new(None),
-            seen_envelopes: Mutex::new(std::collections::HashSet::new()),
+            seen_envelopes: Mutex::new(SeenEnvelopes::default()),
         }
     }
 
@@ -266,12 +297,6 @@ impl ChannelApi for SlackChannel {
                                 // not run twice.
                                 if let Some(eid) = v["envelope_id"].as_str() {
                                     let mut seen = self.seen_envelopes.lock().await;
-                                    // Bound the set — clear at the cap rather
-                                    // than grow forever (a cleared entry just
-                                    // reprocesses one late retry).
-                                    if seen.len() >= 4096 {
-                                        seen.clear();
-                                    }
                                     if !seen.insert(eid.to_string()) {
                                         continue;
                                     }
@@ -302,5 +327,27 @@ impl ChannelApi for SlackChannel {
 
     async fn send(&self, chat_id: &str, text: &str) -> anyhow::Result<()> {
         self.api.post_message(chat_id, text).await
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn seen_envelopes_evicts_oldest_at_cap() {
+        let mut seen = SeenEnvelopes::default();
+        for i in 0..SEEN_ENVELOPE_CAP {
+            assert!(seen.insert(format!("e{i}")));
+        }
+        // Still full: the oldest id is retained until a new one arrives.
+        assert!(!seen.insert("e0".into()));
+        assert!(seen.insert(format!("e{SEEN_ENVELOPE_CAP}")));
+        // Exactly one entry was evicted — the oldest.
+        assert_eq!(seen.order.len(), SEEN_ENVELOPE_CAP);
+        assert!(!seen.set.contains("e0"));
+        assert!(seen.set.contains(&format!("e{SEEN_ENVELOPE_CAP}")));
+        // Retained ids still dedup.
+        assert!(!seen.insert("e1".into()));
     }
 }

@@ -210,7 +210,15 @@ pub async fn exchange(provider: &str, code_and_state: &str, verifier: &str) -> a
         .await
         .context("token exchange request failed")?;
     let status = resp.status();
-    let v: serde_json::Value = resp.json().await?;
+    // A non-JSON body (HTML error page, empty 5xx) must not bury the HTTP
+    // status; on success statuses keep the plain decode error.
+    let v: serde_json::Value = match resp.json().await {
+        Ok(v) => v,
+        Err(_) if !status.is_success() => {
+            bail!("token exchange failed ({status}): non-JSON response body");
+        }
+        Err(e) => return Err(e.into()),
+    };
     if !status.is_success() {
         bail!("token exchange failed ({status}): {v}");
     }
@@ -279,7 +287,13 @@ async fn refresh(provider: &str, refresh_token: &str) -> anyhow::Result<String> 
         .await
         .context("token refresh request failed")?;
     let status = resp.status();
-    let v: serde_json::Value = resp.json().await?;
+    let v: serde_json::Value = match resp.json().await {
+        Ok(v) => v,
+        Err(_) if !status.is_success() => {
+            bail!("token refresh failed ({status}): non-JSON response body");
+        }
+        Err(e) => return Err(e.into()),
+    };
     if !status.is_success() {
         bail!("token refresh failed ({status}): {v}");
     }
@@ -312,4 +326,75 @@ fn urlencoding(s: &str) -> String {
             _ => format!("%{:02X}", c as u32),
         })
         .collect()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Serve raw, non-JSON HTTP responses on an ephemeral port.
+    fn serve_raw(status_line: &str, body: &str) -> String {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        let status_line = status_line.to_string();
+        let body = body.to_string();
+        std::thread::spawn(move || {
+            use std::io::{Read, Write};
+            // One response per connection — exchange and refresh each open
+            // their own.
+            while let Ok((mut sock, _)) = listener.accept() {
+                let mut buf = [0u8; 4096];
+                let _ = sock.read(&mut buf); // drain the request head
+                let resp = format!(
+                    "HTTP/1.1 {status_line}\r\ncontent-type: text/html\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{body}",
+                    body.len()
+                );
+                if sock.write_all(resp.as_bytes()).is_err() {
+                    break;
+                }
+            }
+        });
+        format!("http://{addr}/token")
+    }
+
+    #[tokio::test]
+    async fn non_json_error_body_keeps_http_status() {
+        let dir = std::env::temp_dir().join(format!("damon-oauth-unit-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let url = serve_raw(
+            "500 Internal Server Error",
+            "<html>upstream exploded</html>",
+        );
+        // SAFETY: test-only hooks; this is the only test in this binary
+        // touching these vars, and it removes them before returning.
+        unsafe {
+            std::env::set_var("DAMON_TEST_TOKEN_URL", &url);
+            std::env::set_var("DAMON_TEST_TOKEN_DIR", &dir);
+        }
+
+        // exchange: decode failure on an error status must surface the 500.
+        let err = exchange("unit-test", "some-code", "some-verifier")
+            .await
+            .unwrap_err();
+        assert!(err.to_string().contains("500"), "exchange: {err}");
+
+        // refresh: same contract.
+        store(
+            "unit-test",
+            &OAuthTokens {
+                access_token: "a".into(),
+                refresh_token: "r".into(),
+                expires_at: 0,
+            },
+        )
+        .unwrap();
+        let err = force_refresh("unit-test").await.unwrap_err();
+        assert!(err.to_string().contains("500"), "refresh: {err}");
+
+        unsafe {
+            std::env::remove_var("DAMON_TEST_TOKEN_URL");
+            std::env::remove_var("DAMON_TEST_TOKEN_DIR");
+        }
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
 }

@@ -70,6 +70,28 @@ impl Gemini {
         // Gemini rejects the functionResponse for a name mismatch.
         let mut call_names: std::collections::HashMap<String, String> =
             std::collections::HashMap::new();
+        // Tools register their wire names BEFORE the message history is
+        // walked: a replayed functionCall/functionResponse must resolve
+        // to the same name the declaration sent, so collision variants
+        // are assigned from the declaration set first, not by history
+        // order.
+        let tools: Vec<Value> = body["tools"]
+            .as_array()
+            .cloned()
+            .unwrap_or_default()
+            .into_iter()
+            .map(|t| {
+                let f = &t["function"];
+                let orig = f["name"].as_str().unwrap_or("");
+                let mangled = super::mangled_for(&mut names, orig);
+                json!({
+                    "name": mangled,
+                    "description": f["description"].as_str().unwrap_or(""),
+                    "parameters": f["parameters"].clone(),
+                })
+            })
+            .collect();
+
         // OpenAI histories store one role:"tool" row per call. Gemini
         // rejects consecutive same-role contents with a 400, so fold
         // each run of user/tool rows into ONE user turn — functionResponse
@@ -124,7 +146,7 @@ impl Gemini {
                             })?;
                         cur_results.push(json!({
                             "functionResponse": {
-                                "name": mangle(&name),
+                                "name": super::mangled_for(&mut names, &name),
                                 "response": {"result": super::content_text(&m["content"])},
                             }
                         }));
@@ -152,7 +174,7 @@ impl Gemini {
                         }
                         parts.push(json!({
                             "functionCall": {
-                                "name": mangle(name),
+                                "name": super::mangled_for(&mut names, name),
                                 "args": match &f["arguments"] {
                                     // arguments may arrive as a JSON
                                     // string (OpenAI wire) or an object.
@@ -173,24 +195,6 @@ impl Gemini {
             }
         }
         flush(&mut contents, cur_role, &mut cur_results, &mut cur_others);
-
-        let tools: Vec<Value> = body["tools"]
-            .as_array()
-            .cloned()
-            .unwrap_or_default()
-            .into_iter()
-            .map(|t| {
-                let f = &t["function"];
-                let orig = f["name"].as_str().unwrap_or("");
-                let mangled = mangle(orig);
-                names.insert(mangled.clone(), orig.to_string());
-                json!({
-                    "name": mangled,
-                    "description": f["description"].as_str().unwrap_or(""),
-                    "parameters": f["parameters"].clone(),
-                })
-            })
-            .collect();
 
         let mut out = json!({"contents": contents});
         if !system.is_empty() {
@@ -264,8 +268,7 @@ impl Gemini {
                 let orig = body["tool_choice"]["function"]["name"]
                     .as_str()
                     .unwrap_or("");
-                let mangled = mangle(orig);
-                names.insert(mangled.clone(), orig.to_string());
+                let mangled = super::mangled_for(&mut names, orig);
                 out["toolConfig"] = json!({
                     "functionCallingConfig": {"mode": "ANY", "allowedFunctionNames": [mangled]}
                 });
@@ -346,18 +349,13 @@ impl Gemini {
     }
 }
 
-fn mangle(name: &str) -> String {
-    name.replace('.', "__")
-}
-
-/// Restore the original tool name via this request's mangle map; fall
-/// back to the single-dot heuristic for names this request never
-/// mangled (e.g. upstream-invented calls).
+/// Restore the original tool name via this request's mangle map. A
+/// name the map doesn't know returns unchanged: upstream-invented
+/// names were never mangled, and guessing a substitution could route
+/// a call to a silently wrong tool — a visible unknown-tool error is
+/// better than quiet misexecution.
 fn unmangle(name: &str, names: &std::collections::HashMap<String, String>) -> String {
-    names
-        .get(name)
-        .cloned()
-        .unwrap_or_else(|| name.replacen("__", ".", 1))
+    names.get(name).cloned().unwrap_or_else(|| name.to_string())
 }
 
 /// Gemini response JSON → OpenAI-shaped response.
@@ -390,11 +388,19 @@ fn gemini_to_openai(v: &Value, names: &std::collections::HashMap<String, String>
         msg["tool_calls"] = json!(tool_calls);
     }
     // Map the real finishReason — a hardcoded "stop" would break
-    // tool-loop detection for /v1 clients.
-    let finish_reason = match v["candidates"][0]["finishReason"].as_str() {
-        Some("STOP") if !tool_calls.is_empty() => "tool_calls",
-        Some("MAX_TOKENS") => "length",
-        _ => "stop",
+    // tool-loop detection for /v1 clients. A safety block drops
+    // `candidates` entirely and reports only promptFeedback.blockReason
+    // — surface it as content_filter instead of a silent empty stop.
+    let finish_reason = if v["candidates"][0]["finishReason"].is_null()
+        && v["promptFeedback"]["blockReason"].is_string()
+    {
+        "content_filter"
+    } else {
+        match v["candidates"][0]["finishReason"].as_str() {
+            Some("STOP") if !tool_calls.is_empty() => "tool_calls",
+            Some("MAX_TOKENS") => "length",
+            _ => "stop",
+        }
     };
     // Gemini usage → OpenAI field names; upstream reports no
     // prompt/completion split under those keys.
@@ -420,13 +426,23 @@ fn gemini_events(
     use std::collections::VecDeque;
     // Events parsed from one chunk queue up; we drain one per poll.
     Box::pin(futures::stream::unfold(
-        (stream, Vec::<u8>::new(), false, 0usize, VecDeque::new()),
-        move |(mut stream, mut buf, mut done, mut call_idx, mut queue)| {
+        (
+            stream,
+            Vec::<u8>::new(),
+            false,
+            0usize,
+            VecDeque::new(),
+            // promptFeedback.blockReason from the last chunk — a safety
+            // block ends the stream with no finishReason, so EOF needs
+            // it to explain why.
+            String::new(),
+        ),
+        move |(mut stream, mut buf, mut done, mut call_idx, mut queue, mut block_reason)| {
             let names = names.clone();
             async move {
                 loop {
                     if let Some(ev) = queue.pop_front() {
-                        return Some((Ok(ev), (stream, buf, done, call_idx, queue)));
+                        return Some((Ok(ev), (stream, buf, done, call_idx, queue, block_reason)));
                     }
                     if done {
                         return None;
@@ -454,8 +470,13 @@ fn gemini_events(
                             let msg = e["message"].as_str().unwrap_or("upstream stream error");
                             return Some((
                                 Err(anyhow::anyhow!("gemini stream error: {msg}")),
-                                (stream, buf, done, call_idx, queue),
+                                (stream, buf, done, call_idx, queue, block_reason),
                             ));
+                        }
+                        // A safety block rides promptFeedback — no candidates,
+                        // no finishReason. Remember it for the EOF error.
+                        if let Some(br) = v["promptFeedback"]["blockReason"].as_str() {
+                            block_reason = br.to_string();
                         }
                         // Each SSE data is a full GenerateContentResponse chunk.
                         for part in v["candidates"][0]["content"]["parts"]
@@ -507,7 +528,10 @@ fn gemini_events(
                         Some(Ok(chunk)) => buf.extend_from_slice(&chunk),
                         Some(Err(e)) => {
                             done = true;
-                            return Some((Err(e.into()), (stream, buf, done, call_idx, queue)));
+                            return Some((
+                                Err(e.into()),
+                                (stream, buf, done, call_idx, queue, block_reason),
+                            ));
                         }
                         None => {
                             // A proxy may deliver the last SSE line without a
@@ -521,10 +545,21 @@ fn gemini_events(
                             // Reaching EOF without a finishReason means the
                             // stream was truncated — surface an error so the
                             // caller can retry, not a clean Done that
-                            // persists partial text as finished.
+                            // persists partial text as finished. A safety
+                            // block also ends the stream without a
+                            // finishReason — name the blockReason so
+                            // callers see why.
+                            if block_reason.is_empty() {
+                                return Some((
+                                    Err(anyhow::anyhow!("stream ended without finishReason")),
+                                    (stream, buf, done, call_idx, queue, block_reason),
+                                ));
+                            }
                             return Some((
-                                Err(anyhow::anyhow!("stream ended without finishReason")),
-                                (stream, buf, done, call_idx, queue),
+                                Err(anyhow::anyhow!(
+                                    "stream ended without finishReason (safety block: {block_reason})"
+                                )),
+                                (stream, buf, done, call_idx, queue, block_reason),
                             ));
                         }
                     }
@@ -532,4 +567,119 @@ fn gemini_events(
             }
         },
     ))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn prov() -> Gemini {
+        Gemini::new("g", "http://localhost", None, &Default::default()).unwrap()
+    }
+
+    #[test]
+    fn mangle_collision_assigns_distinct_names() {
+        let p = prov();
+        let body = json!({
+            "model": "g",
+            "messages": [
+                {"role": "user", "content": "hi"},
+                {"role": "assistant", "content": "", "tool_calls": [
+                    {"id": "c1", "type": "function",
+                     "function": {"name": "a.b", "arguments": "{}"}}
+                ]},
+                {"role": "tool", "tool_call_id": "c1", "content": "ok"},
+            ],
+            "tools": [
+                {"type": "function", "function": {"name": "a.b", "parameters": {}}},
+                {"type": "function", "function": {"name": "a__b", "parameters": {}}},
+            ],
+        });
+        let (out, names) = p.translate_request(&body).unwrap();
+        let sent: Vec<&str> = out["tools"][0]["functionDeclarations"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|t| t["name"].as_str().unwrap())
+            .collect();
+        assert_ne!(sent[0], sent[1], "collision must not merge two tools");
+        for n in &sent {
+            assert!(n.len() <= 64, "wire name {n} exceeds the 64-char limit");
+        }
+        assert_eq!(names.get(sent[0]).unwrap(), "a.b");
+        assert_eq!(names.get(sent[1]).unwrap(), "a__b");
+        // Declarations register first: the replayed functionCall AND the
+        // functionResponse resolve to the name the declaration sent.
+        let call = out["contents"][1]["parts"][0]["functionCall"]["name"]
+            .as_str()
+            .unwrap();
+        let resp = out["contents"][2]["parts"][0]["functionResponse"]["name"]
+            .as_str()
+            .unwrap();
+        assert_eq!(call, sent[0]);
+        assert_eq!(resp, sent[0]);
+    }
+
+    #[test]
+    fn unmangle_unknown_name_returns_unchanged() {
+        let mut names = std::collections::HashMap::new();
+        names.insert("a__b".to_string(), "a.b".to_string());
+        assert_eq!(unmangle("a__b", &names), "a.b");
+        // Map miss: no guessed substitution — an upstream-invented
+        // x__y must not silently become x.y.
+        assert_eq!(unmangle("x__y", &names), "x__y");
+    }
+
+    #[test]
+    fn safety_block_reports_content_filter() {
+        // A blocked response has no candidates at all — the reason only
+        // lives in promptFeedback.
+        let blocked = json!({"promptFeedback": {"blockReason": "SAFETY"}});
+        let out = gemini_to_openai(&blocked, &Default::default());
+        assert_eq!(out["choices"][0]["finish_reason"], "content_filter");
+        let ok = json!({
+            "candidates": [
+                {"content": {"parts": [{"text": "hi"}]}, "finishReason": "STOP"}
+            ]
+        });
+        let out = gemini_to_openai(&ok, &Default::default());
+        assert_eq!(out["choices"][0]["finish_reason"], "stop");
+    }
+
+    /// Drive `gemini_events` over one static SSE payload.
+    fn drive(sse: &'static str) -> Vec<anyhow::Result<StreamEvent>> {
+        let stream: std::pin::Pin<
+            Box<dyn futures::Stream<Item = std::io::Result<bytes::Bytes>> + Send>,
+        > = Box::pin(futures::stream::once(async {
+            Ok(bytes::Bytes::from_static(sse.as_bytes()))
+        }));
+        let names = std::sync::Arc::new(std::collections::HashMap::new());
+        let mut s = gemini_events(stream, names);
+        futures::executor::block_on(async {
+            let mut out = Vec::new();
+            while let Some(ev) = s.next().await {
+                out.push(ev);
+            }
+            out
+        })
+    }
+
+    #[test]
+    fn stream_safety_block_names_reason_at_eof() {
+        let evs = drive("data: {\"promptFeedback\":{\"blockReason\":\"SAFETY\"}}\n\n");
+        let err = evs.iter().filter_map(|e| e.as_ref().err()).next().unwrap();
+        assert!(
+            err.to_string().contains("SAFETY"),
+            "block reason must surface at EOF: {err}"
+        );
+    }
+
+    #[test]
+    fn stream_truncated_eof_keeps_bare_message() {
+        let evs = drive(
+            "data: {\"candidates\":[{\"content\":{\"parts\":[{\"text\":\"partial\"}]}}]}\n\n",
+        );
+        let err = evs.iter().filter_map(|e| e.as_ref().err()).next().unwrap();
+        assert_eq!(err.to_string(), "stream ended without finishReason");
+    }
 }

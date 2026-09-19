@@ -37,8 +37,17 @@ pub fn render_tools(body: &mut Value) {
             .iter_mut()
             .find(|m| m["role"].as_str() == Some("system"))
         {
-            let prev = sys["content"].as_str().unwrap_or("").to_string();
-            sys["content"] = Value::String(format!("{prev}\n\n{prompt}"));
+            if sys["content"].is_array() {
+                // Multimodal array content: append a text part — replacing
+                // it with a flat string would destroy the original parts.
+                sys["content"]
+                    .as_array_mut()
+                    .unwrap()
+                    .push(json!({"type": "text", "text": prompt}));
+            } else {
+                let prev = sys["content"].as_str().unwrap_or("").to_string();
+                sys["content"] = Value::String(format!("{prev}\n\n{prompt}"));
+            }
         } else {
             msgs.insert(0, json!({"role": "system", "content": prompt}));
         }
@@ -94,17 +103,25 @@ pub fn events_with_tool_calls(
     use crate::llm::StreamEvent;
     let mut text = String::new();
     let mut out = Vec::new();
+    // Output position of the first Text chunk — the cleaned text must be
+    // re-inserted there, not at index 0, or events that arrived earlier
+    // (thinking, usage) end up after the response body.
+    let mut text_pos: Option<usize> = None;
     for ev in events {
         match ev {
-            StreamEvent::Text(t) => text.push_str(&t),
+            StreamEvent::Text(t) => {
+                if text_pos.is_none() {
+                    text_pos = Some(out.len());
+                }
+                text.push_str(&t);
+            }
             other => out.push(other),
         }
     }
     let (clean, calls) = extract_tool_calls(&text);
     if !clean.is_empty() {
-        out.insert(0, StreamEvent::Text(clean));
+        out.insert(text_pos.unwrap_or(0), StreamEvent::Text(clean));
     }
-    // Insert tool-call deltas before the terminal Done.
     let done_pos = out
         .iter()
         .position(|e| matches!(e, StreamEvent::Done(_)))
@@ -149,4 +166,61 @@ pub fn response_with_tool_calls(v: &mut Value) {
             .collect::<Vec<_>>()
     );
     v["choices"][0]["finish_reason"] = json!("tool_calls");
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::llm::StreamEvent;
+    use serde_json::json;
+
+    /// An array (multimodal) system message keeps its parts — the tool
+    /// prompt is appended as one more text part, never a flat replacement.
+    #[test]
+    fn render_tools_appends_text_part_to_array_system() {
+        let mut body = json!({
+            "tools": [{"function": {"name": "t", "description": "d", "parameters": {}}}],
+            "messages": [
+                {"role": "system", "content": [{"type": "text", "text": "orig"}]},
+                {"role": "user", "content": "hi"},
+            ],
+        });
+        render_tools(&mut body);
+        let content = body["messages"][0]["content"].as_array().unwrap();
+        assert_eq!(content[0]["text"], "orig", "original part preserved");
+        assert_eq!(content[1]["type"], "text");
+        assert!(
+            content[1]["text"]
+                .as_str()
+                .unwrap()
+                .contains("Available tools:")
+        );
+        assert_eq!(body.get("tools"), None, "tools stripped from the wire body");
+    }
+
+    /// The cleaned text re-enters at the first Text chunk's position, so
+    /// earlier events (thinking) stay ahead of the response body.
+    #[test]
+    fn clean_text_inserted_at_first_text_position() {
+        let events = vec![
+            StreamEvent::Thinking("hmm".into()),
+            StreamEvent::Text(
+                "hello <tool_call>{\"name\": \"f\", \"arguments\": {}}</tool_call>".into(),
+            ),
+            StreamEvent::Usage {
+                input: 1,
+                output: 1,
+            },
+            StreamEvent::Done(crate::llm::StopReason::Stop),
+        ];
+        let out = events_with_tool_calls(events);
+        assert!(matches!(&out[0], StreamEvent::Thinking(t) if t == "hmm"));
+        assert!(matches!(&out[1], StreamEvent::Text(t) if t == "hello"));
+        assert!(matches!(&out[2], StreamEvent::Usage { .. }));
+        assert!(matches!(
+            &out[3],
+            StreamEvent::ToolCallDelta { name: Some(n), .. } if n == "f"
+        ));
+        assert!(matches!(&out[4], StreamEvent::Done(_)));
+    }
 }

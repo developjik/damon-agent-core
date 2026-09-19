@@ -94,6 +94,26 @@ impl Anthropic {
         let mut system = Vec::new();
         let mut messages = Vec::new();
         let mut names = std::collections::HashMap::new();
+        // Tools register their wire names BEFORE the message history is
+        // walked: a replayed tool_use must resolve to the same name the
+        // declaration sent, so collision variants are assigned from the
+        // declaration set first, not by history order.
+        let tools: Vec<Value> = body["tools"]
+            .as_array()
+            .cloned()
+            .unwrap_or_default()
+            .into_iter()
+            .map(|t| {
+                let f = &t["function"];
+                let orig = f["name"].as_str().unwrap_or("");
+                let mangled = super::mangled_for(&mut names, orig);
+                json!({
+                    "name": mangled,
+                    "description": f["description"].as_str().unwrap_or(""),
+                    "input_schema": f["parameters"].clone(),
+                })
+            })
+            .collect();
 
         // Set when an assistant tool-use turn arrives without its
         // thinking blocks (OpenAI-wire clients can't carry them).
@@ -181,8 +201,7 @@ impl Anthropic {
                     for tc in tool_calls {
                         let f = &tc["function"];
                         let orig = f["name"].as_str().unwrap_or("");
-                        let mangled = mangle(orig);
-                        names.insert(mangled.clone(), orig.to_string());
+                        let mangled = super::mangled_for(&mut names, orig);
                         content.push(json!({
                             "type": "tool_use",
                             "id": tc["id"],
@@ -207,24 +226,6 @@ impl Anthropic {
         }
         flush(&mut messages, cur_role, &mut cur_results, &mut cur_others);
 
-        let tools: Vec<Value> = body["tools"]
-            .as_array()
-            .cloned()
-            .unwrap_or_default()
-            .into_iter()
-            .map(|t| {
-                let f = &t["function"];
-                let orig = f["name"].as_str().unwrap_or("");
-                let mangled = mangle(orig);
-                names.insert(mangled.clone(), orig.to_string());
-                json!({
-                    "name": mangled,
-                    "description": f["description"].as_str().unwrap_or(""),
-                    "input_schema": f["parameters"].clone(),
-                })
-            })
-            .collect();
-
         let mut out = json!({
             "model": model,
             "max_tokens": body["max_tokens"].as_u64().unwrap_or(8192),
@@ -243,7 +244,12 @@ impl Anthropic {
             .or_else(|| body.get("stop"))
             .filter(|v| !v.is_null())
         {
-            out["stop_sequences"] = stop.clone();
+            // OpenAI allows a bare-string stop; Anthropic's
+            // stop_sequences is always an array.
+            out["stop_sequences"] = match stop.as_str() {
+                Some(s) => json!([s]),
+                None => stop.clone(),
+            };
         }
         // OpenAI tool_choice → Anthropic tool_choice. A function pick
         // names a mangled tool, so record it in the name map too.
@@ -263,8 +269,7 @@ impl Anthropic {
                 let orig = body["tool_choice"]["function"]["name"]
                     .as_str()
                     .unwrap_or("");
-                let mangled = mangle(orig);
-                names.insert(mangled.clone(), orig.to_string());
+                let mangled = super::mangled_for(&mut names, orig);
                 out["tool_choice"] = json!({"type": "tool", "name": mangled});
             }
             _ => {}
@@ -442,19 +447,13 @@ impl Anthropic {
     }
 }
 
-/// `server.tool` → `server__tool` (Anthropic forbids dots in tool names).
-fn mangle(name: &str) -> String {
-    name.replace('.', "__")
-}
-
-/// Restore the original tool name. `mangle` replaces every `.`, so the
-/// per-request map is authoritative; the `replacen` fallback only covers
-/// names this request never mangled (e.g. upstream-invented calls).
+/// Restore the original tool name via this request's mangle map. A
+/// name the map doesn't know returns unchanged: upstream-invented
+/// names were never mangled, and guessing a substitution could route
+/// a call to a silently wrong tool — a visible unknown-tool error is
+/// better than quiet misexecution.
 fn unmangle(name: &str, names: &std::collections::HashMap<String, String>) -> String {
-    names
-        .get(name)
-        .cloned()
-        .unwrap_or_else(|| name.replacen("__", ".", 1))
+    names.get(name).cloned().unwrap_or_else(|| name.to_string())
 }
 
 /// Parse Anthropic SSE into normalized StreamEvents.
@@ -655,6 +654,33 @@ fn anthropic_events(
                             // ending the turn as if it completed.
                             Some("error") => {
                                 done = true;
+                                // overloaded_error/rate_limit_error mid-stream map
+                                // to the same RateLimited error an HTTP 429/529
+                                // head produces, so the runtime/api backoff paths
+                                // treat both identically.
+                                if matches!(
+                                    v["error"]["type"].as_str(),
+                                    Some("overloaded_error") | Some("rate_limit_error")
+                                ) {
+                                    return Some((
+                                        Err(anyhow::Error::new(crate::provider::RateLimited(
+                                            std::time::Duration::from_secs(2),
+                                        ))),
+                                        (
+                                            stream,
+                                            buf,
+                                            done,
+                                            cur_tool,
+                                            tool_index,
+                                            tool_count,
+                                            finish,
+                                            think_text,
+                                            think_sig,
+                                            cur_is_thinking,
+                                            start_output,
+                                        ),
+                                    ));
+                                }
                                 let msg = v["error"]["message"]
                                     .as_str()
                                     .unwrap_or("upstream stream error");
@@ -753,4 +779,140 @@ fn anthropic_events(
             }
         },
     ))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn prov() -> Anthropic {
+        Anthropic::new(
+            "claude",
+            "http://localhost",
+            None,
+            &Default::default(),
+            false,
+        )
+        .unwrap()
+    }
+
+    #[test]
+    fn mangle_collision_assigns_distinct_names() {
+        let p = prov();
+        let body = json!({
+            "model": "claude-sonnet-4",
+            "messages": [
+                {"role": "user", "content": "hi"},
+                {"role": "assistant", "content": "", "tool_calls": [
+                    {"id": "t1", "type": "function",
+                     "function": {"name": "a.b", "arguments": "{}"}}
+                ]},
+            ],
+            "tools": [
+                {"type": "function", "function": {"name": "a.b", "parameters": {}}},
+                {"type": "function", "function": {"name": "a__b", "parameters": {}}},
+            ],
+        });
+        let (out, names) = p.translate_request(&body, false).unwrap();
+        let sent: Vec<&str> = out["tools"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|t| t["name"].as_str().unwrap())
+            .collect();
+        assert_ne!(sent[0], sent[1], "collision must not merge two tools");
+        for n in &sent {
+            assert!(n.len() <= 64, "wire name {n} exceeds the 64-char limit");
+            assert_eq!(
+                names.get(*n).unwrap(),
+                if *n == "a__b" { "a.b" } else { "a__b" },
+                "map must restore the original for {n}"
+            );
+        }
+        // Declarations register first: the replayed tool_use resolves to
+        // the same wire name the declaration sent.
+        let replay = out["messages"][1]["content"][0]["name"].as_str().unwrap();
+        assert_eq!(replay, sent[0]);
+    }
+
+    #[test]
+    fn unmangle_unknown_name_returns_unchanged() {
+        let mut names = std::collections::HashMap::new();
+        names.insert("a__b".to_string(), "a.b".to_string());
+        assert_eq!(unmangle("a__b", &names), "a.b");
+        // Map miss: no guessed substitution — an upstream-invented
+        // x__y must not silently become x.y.
+        assert_eq!(unmangle("x__y", &names), "x__y");
+    }
+
+    #[test]
+    fn stop_string_wraps_to_array() {
+        let p = prov();
+        let (out, _) = p
+            .translate_request(&json!({"model": "m", "messages": [], "stop": "foo"}), false)
+            .unwrap();
+        assert_eq!(out["stop_sequences"], json!(["foo"]));
+        let (out, _) = p
+            .translate_request(
+                &json!({"model": "m", "messages": [], "stop": ["foo", "bar"]}),
+                false,
+            )
+            .unwrap();
+        assert_eq!(out["stop_sequences"], json!(["foo", "bar"]));
+        let (out, _) = p
+            .translate_request(
+                &json!({"model": "m", "messages": [], "stop_sequences": ["a"], "stop": "b"}),
+                false,
+            )
+            .unwrap();
+        assert_eq!(out["stop_sequences"], json!(["a"]));
+        let (out, _) = p
+            .translate_request(&json!({"model": "m", "messages": [], "stop": null}), false)
+            .unwrap();
+        assert!(out.get("stop_sequences").is_none());
+    }
+
+    /// Drive `anthropic_events` over one static SSE payload.
+    fn drive(sse: &'static str) -> Vec<anyhow::Result<StreamEvent>> {
+        let stream: std::pin::Pin<Box<dyn futures::Stream<Item = std::io::Result<Bytes>> + Send>> =
+            Box::pin(futures::stream::once(async {
+                Ok(Bytes::from_static(sse.as_bytes()))
+            }));
+        let names = std::sync::Arc::new(std::collections::HashMap::new());
+        let mut s = anthropic_events(stream, names);
+        futures::executor::block_on(async {
+            let mut out = Vec::new();
+            while let Some(ev) = s.next().await {
+                out.push(ev);
+            }
+            out
+        })
+    }
+
+    #[test]
+    fn midstream_overloaded_error_maps_to_rate_limited() {
+        let evs = drive(concat!(
+            "data: {\"type\":\"content_block_delta\",\"index\":0,\"delta\":{\"type\":\"text_delta\",\"text\":\"partial\"}}\n\n",
+            "data: {\"type\":\"error\",\"error\":{\"type\":\"overloaded_error\",\"message\":\"Overloaded\"}}\n\n",
+        ));
+        let err = evs
+            .iter()
+            .filter_map(|e| e.as_ref().err())
+            .next()
+            .expect("overloaded_error must surface as Err");
+        let rl = err
+            .downcast_ref::<crate::provider::RateLimited>()
+            .expect("overloaded_error must downcast to RateLimited");
+        assert_eq!(rl.0, std::time::Duration::from_secs(2));
+    }
+
+    #[test]
+    fn midstream_generic_error_stays_generic() {
+        let evs = drive(
+            "data: {\"type\":\"error\",\"error\":{\"type\":\"api_error\",\"message\":\"boom\"}}\n\n",
+        );
+        let err = evs.iter().filter_map(|e| e.as_ref().err()).next().unwrap();
+        assert!(err.downcast_ref::<crate::provider::RateLimited>().is_none());
+        assert!(err.to_string().contains("boom"), "got {err}");
+    }
 }

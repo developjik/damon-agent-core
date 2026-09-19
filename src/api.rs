@@ -447,6 +447,11 @@ async fn forward(
         }
         bytes::Bytes::from(v.to_string())
     } else {
+        // Original bytes verbatim: nothing to rewrite, and re-serializing
+        // would round integers beyond u64::MAX/i64::MIN to f64. The rewrite
+        // arm above keeps that extreme-boundary loss as an accepted residual
+        // edge (serde_json stays exact up to those bounds) — avoiding it
+        // entirely would need byte-level splicing.
         body
     };
 
@@ -475,11 +480,12 @@ async fn forward(
             }
             up.into_response()
         }
-        Err(e) => openai_error(
-            StatusCode::BAD_GATEWAY,
-            &format!("upstream error: {e}"),
-            "server_error",
-        ),
+        Err(e) => {
+            // reqwest's Display embeds the full upstream URL — echoing it
+            // back would disclose internal topology; log it, return fixed text.
+            warn!("upstream forward failed: {e}");
+            openai_error(StatusCode::BAD_GATEWAY, "upstream error", "server_error")
+        }
     }
 }
 
@@ -496,18 +502,29 @@ async fn promote_or_error(
     up: crate::provider::UpstreamResponse,
 ) -> Response {
     let status = up.status;
-    // Cap the buffered error body — a hostile/broken upstream could
-    // otherwise force unbounded allocation on every error response.
     let buf = match tokio::time::timeout(
         std::time::Duration::from_secs(30),
         crate::provider::collect_stream(up.stream),
     )
     .await
     {
-        Ok(Ok(b)) if b.len() <= (1 << 20) => b,
-        _ => return error_response(status, ""),
+        Ok(Ok(b)) => b,
+        // Timeout and stream failure used to collapse into the same arm and
+        // return an empty body — name the cause so a client can tell a dead
+        // read apart from a real upstream error body.
+        Err(_) => return error_response(status, "upstream error body read timed out"),
+        Ok(Err(e)) => {
+            return error_response(status, &format!("upstream error body read failed: {e}"));
+        }
     };
-    let text = String::from_utf8_lossy(&buf);
+    // An oversized body (>1 MiB) is judged and echoed from its first 64 KiB —
+    // plenty for any overflow signature — instead of being discarded whole.
+    // Promotion below still fires only on an overflow match.
+    let text = if buf.len() > (1 << 20) {
+        String::from_utf8_lossy(&buf[..64 * 1024])
+    } else {
+        String::from_utf8_lossy(&buf)
+    };
     if !is_context_overflow(&text) {
         return error_response(status, &text);
     }
@@ -540,25 +557,28 @@ async fn promote_or_error(
     }
     match tprovider.forward(method, path, body).await {
         Ok(up) => up.into_response(),
-        Err(e) => openai_error(
-            StatusCode::BAD_GATEWAY,
-            &format!("upstream error: {e}"),
-            "server_error",
-        ),
+        Err(e) => {
+            // Same disclosure rule as `forward`: cause to the log, fixed
+            // text to the client.
+            warn!("upstream promotion request failed: {e}");
+            openai_error(StatusCode::BAD_GATEWAY, "upstream error", "server_error")
+        }
     }
 }
 
 /// Common context-overflow signatures across providers.
 fn is_context_overflow(text: &str) -> bool {
     let t = text.to_lowercase();
+    // Deliberately narrow: generic phrasings like "request too large" or
+    // "too many tokens" also show up in ordinary 413/4xx proxy bodies, and
+    // a false positive re-sends the request to context_promotion_target —
+    // billing an unrequested model while masking the real cause.
     [
         "context_length_exceeded",
         "context length",
         "context window",
-        "too many tokens",
         "maximum context",
         "prompt is too long",
-        "request too large",
     ]
     .iter()
     .any(|s| t.contains(s))
@@ -659,10 +679,15 @@ async fn translate_forward(
                         // A mid-stream provider error still terminates the
                         // SSE stream — clients waiting on [DONE] would
                         // otherwise hang on a truncated response.
-                        Err(e) => format!(
-                            "data: {}\n\ndata: [DONE]\n\n",
-                            serde_json::json!({"error":{"message":e.to_string()}})
-                        ),
+                        Err(e) => {
+                            // Fixed message — same disclosure rule as the
+                            // 502 paths; the real cause goes to the log.
+                            warn!("upstream stream failed: {e}");
+                            format!(
+                                "data: {}\n\ndata: [DONE]\n\n",
+                                serde_json::json!({"error":{"message":"upstream stream error"}})
+                            )
+                        }
                     };
                     Ok::<_, std::io::Error>(bytes::Bytes::from(chunk))
                 });
@@ -696,11 +721,10 @@ async fn translate_forward(
                 {
                     return resp;
                 }
-                openai_error(
-                    StatusCode::BAD_GATEWAY,
-                    &format!("upstream error: {e}"),
-                    "server_error",
-                )
+                // Fixed client message — the Display may embed the upstream
+                // URL; the cause goes to the log instead.
+                warn!("upstream translate request failed: {e}");
+                openai_error(StatusCode::BAD_GATEWAY, "upstream error", "server_error")
             }
         }
     } else {
@@ -725,11 +749,10 @@ async fn translate_forward(
                 {
                     return resp;
                 }
-                openai_error(
-                    StatusCode::BAD_GATEWAY,
-                    &format!("upstream error: {e}"),
-                    "server_error",
-                )
+                // Fixed client message — the Display may embed the upstream
+                // URL; the cause goes to the log instead.
+                warn!("upstream translate request failed: {e}");
+                openai_error(StatusCode::BAD_GATEWAY, "upstream error", "server_error")
             }
         }
     }

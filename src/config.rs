@@ -66,6 +66,7 @@ pub struct RelayConfig {
 /// Per-model metadata. User config (`[models."<id-or-glob>"]`) overrides
 /// the built-in hints; unknown models get None → no context-aware features.
 #[derive(Clone, Debug, Default, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct ModelMeta {
     /// Total context window in tokens.
     pub context_window: Option<u64>,
@@ -309,12 +310,14 @@ fn resolve_command(cmd: &str) -> anyhow::Result<String> {
 /// Constant-time byte equality for token/proof comparisons — a remote
 /// endpoint must not get a timing oracle on the secret.
 pub fn constant_time_eq(a: &[u8], b: &[u8]) -> bool {
-    if a.len() != b.len() {
-        return false;
-    }
-    let mut diff = 0u8;
-    for (x, y) in a.iter().zip(b.iter()) {
-        diff |= x ^ y;
+    // Length difference folds into the accumulator and every byte slot is
+    // visited either way, so short-vs-long inputs take the same path —
+    // no early return to leak the length via timing.
+    let mut diff = a.len() ^ b.len();
+    for i in 0..a.len().max(b.len()) {
+        let x = a.get(i).copied().unwrap_or(0);
+        let y = b.get(i).copied().unwrap_or(0);
+        diff |= (x ^ y) as usize;
     }
     diff == 0
 }
@@ -455,7 +458,7 @@ impl Config {
     }
 }
 
-/// Minimal glob: `*` matches any suffix/infix, `?` one char.
+/// Minimal glob: `*` matches any suffix/infix, `?` one char (UTF-8 scalar).
 /// Iterative two-pointer with single-star backtracking — linear time, so
 /// a `*`-heavy pattern can't pin a worker thread on a long model name.
 pub fn glob_match(pattern: &str, s: &str) -> bool {
@@ -464,7 +467,14 @@ pub fn glob_match(pattern: &str, s: &str) -> bool {
     // Last `*` position and the string index it resumes from.
     let (mut star, mut star_si) = (usize::MAX, 0usize);
     while si < s.len() {
-        if pi < p.len() && (p[pi] == b'?' || p[pi] == s[si]) {
+        if pi < p.len() && p[pi] == b'?' {
+            // `?` consumes one whole UTF-8 scalar, not one byte.
+            pi += 1;
+            si += 1;
+            while si < s.len() && (s[si] & 0xC0) == 0x80 {
+                si += 1;
+            }
+        } else if pi < p.len() && p[pi] == s[si] {
             pi += 1;
             si += 1;
         } else if pi < p.len() && p[pi] == b'*' {
@@ -508,11 +518,29 @@ pub fn ensure_config(path: &Path) -> anyhow::Result<PathBuf> {
     if let Some(parent) = path.parent() {
         std::fs::create_dir_all(parent)?;
     }
-    std::fs::write(path, STARTER_CONFIG)?;
     #[cfg(unix)]
     {
-        use std::os::unix::fs::PermissionsExt;
-        std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600))?;
+        use std::io::Write;
+        use std::os::unix::fs::OpenOptionsExt;
+        // create_new + mode creates the file 0600 atomically — no window
+        // where the starter config sits world-readable before the chmod.
+        match std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .mode(0o600)
+            .open(path)
+        {
+            Ok(mut f) => f.write_all(STARTER_CONFIG.as_bytes())?,
+            // Lost a create race — same outcome as the exists() check.
+            Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {
+                return Ok(path.to_path_buf());
+            }
+            Err(e) => return Err(e.into()),
+        }
+    }
+    #[cfg(not(unix))]
+    {
+        std::fs::write(path, STARTER_CONFIG)?;
     }
     info!(path = %path.display(), "wrote starter config");
     Ok(path.to_path_buf())
@@ -590,4 +618,68 @@ pub fn watch(path: PathBuf, shared: SharedConfig) -> Option<tokio::sync::mpsc::R
         }
     });
     Some(reload_rx)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn glob_question_mark_matches_one_utf8_scalar() {
+        // `?` consumes one whole scalar — not one byte of a multibyte char.
+        assert!(glob_match("ollama-?", "ollama-é"));
+        assert!(glob_match("??", "日本"));
+        // ASCII behavior unchanged.
+        assert!(glob_match("ollama-?", "ollama-a"));
+        assert!(glob_match("gpt-4?", "gpt-4o"));
+        // `?` must not match two scalars or zero.
+        assert!(!glob_match("ollama-?", "ollama-ae"));
+        assert!(!glob_match("ollama-?", "ollama-"));
+        assert!(!glob_match("???", "日本"));
+    }
+
+    #[test]
+    fn glob_star_and_literals_unchanged() {
+        assert!(glob_match("claude-*", "claude-sonnet-4"));
+        assert!(glob_match("*", "anything"));
+        assert!(glob_match("gpt-*", "gpt-4o-mini"));
+        assert!(!glob_match("claude-*", "gpt-4o"));
+        assert!(glob_match("", ""));
+        assert!(!glob_match("gpt-4", "gpt-4o"));
+    }
+
+    #[test]
+    fn constant_time_eq_accepts_equal_rejects_unequal() {
+        assert!(constant_time_eq(b"secret", b"secret"));
+        assert!(constant_time_eq(b"", b""));
+        assert!(!constant_time_eq(b"secret", b"secreT"));
+        assert!(!constant_time_eq(b"secret", b"secre"));
+        assert!(!constant_time_eq(b"", b"x"));
+        assert!(!constant_time_eq(b"short", b"a-longer-secret"));
+    }
+
+    #[test]
+    fn model_meta_rejects_unknown_fields() {
+        assert!(toml::from_str::<ModelMeta>("context_window = 200000").is_ok());
+        assert!(toml::from_str::<ModelMeta>("bogus = 1").is_err());
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn ensure_config_atomic_0600_and_existing_untouched() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = std::env::temp_dir().join(format!("damon-config-test-{}", std::process::id()));
+        let path = dir.join("config.toml");
+
+        ensure_config(&path).unwrap();
+        let mode = std::fs::metadata(&path).unwrap().permissions().mode();
+        assert_eq!(mode & 0o777, 0o600, "starter config must be 0600 at rest");
+
+        // Existing file: returned as-is, content left alone.
+        std::fs::write(&path, "# custom").unwrap();
+        ensure_config(&path).unwrap();
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), "# custom");
+
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
 }

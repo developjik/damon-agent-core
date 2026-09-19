@@ -305,6 +305,61 @@ async fn session_list_paginates() {
     assert_eq!(all["result"]["sessions"].as_array().unwrap().len(), 2);
 }
 
+/// An unpaged session/messages response that would exceed the client's
+/// 4 MiB receive cap must come back as an explicit JSON-RPC error (telling
+/// the client to page) instead of an oversized frame that kills the link —
+/// and the connection must stay usable afterwards.
+#[tokio::test]
+async fn oversized_messages_response_fails_loud_and_link_survives() {
+    let (_state, store, addr) = serve(test_config(None, None)).await;
+    store.create_session("s1", "/a", None).await.unwrap();
+    // One prompt larger than the 4 MiB frame cap.
+    store
+        .append(
+            "s1",
+            "user",
+            &json!({"role":"user","content":"x".repeat(5 << 20)}),
+        )
+        .await
+        .unwrap();
+    store.create_session("s2", "/b", None).await.unwrap();
+    store
+        .append("s2", "user", &json!({"role":"user","content":"small"}))
+        .await
+        .unwrap();
+
+    let (mut ws, _) = tokio_tungstenite::connect_async(format!("ws://{addr}/ws"))
+        .await
+        .unwrap();
+
+    rpc_send(
+        &mut ws,
+        json!({"jsonrpc":"2.0","id":1,"method":"session/messages","params":{"sessionId":"s1"}}),
+    )
+    .await;
+    let resp: Value = read_json(&mut ws).await;
+    assert_eq!(resp["id"], 1, "unexpected frame: {resp}");
+    assert!(
+        resp["error"].is_object(),
+        "oversized response must be an error: {resp}"
+    );
+    assert!(
+        resp["error"]["message"]
+            .as_str()
+            .unwrap()
+            .contains("limit/offset")
+    );
+    rpc_send(
+        &mut ws,
+        json!({"jsonrpc":"2.0","id":2,"method":"session/messages",
+               "params":{"sessionId":"s2","limit":1}}),
+    )
+    .await;
+    let page: Value = read_json(&mut ws).await;
+    assert_eq!(page["id"], 2);
+    assert!(page["result"]["messages"].as_array().unwrap().len() == 1);
+}
+
 /// session/messages honors limit/offset and returns OpenAI-shaped rows.
 #[tokio::test]
 async fn session_messages_paginates() {

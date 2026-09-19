@@ -63,7 +63,7 @@ enum Cmd {
     },
     /// Full-text search over all session history
     Search {
-        /// FTS5 query (e.g. 'error AND timeout', '"exact phrase"')
+        /// Search query — terms AND together; "exact phrase" and AND/OR/NOT supported
         query: String,
         /// Max results
         #[arg(long, default_value = "10")]
@@ -92,7 +92,7 @@ async fn main() -> anyhow::Result<()> {
             .timeout(std::time::Duration::from_secs(5))
             .build()?;
         let resp = http.get(&url).send().await?.error_for_status()?;
-        println!("{}", resp.text().await?);
+        outln(resp.text().await?);
         return Ok(());
     }
 
@@ -109,7 +109,7 @@ async fn main() -> anyhow::Result<()> {
         Cmd::Health => unreachable!(),
         Cmd::Sessions => {
             for (id, created, model) in client.list_sessions().await? {
-                println!("{id}\t{created}\t{model}");
+                outln(format!("{id}\t{created}\t{model}"));
             }
         }
         Cmd::Chat { session, model } => {
@@ -127,11 +127,11 @@ async fn main() -> anyhow::Result<()> {
         }
         Cmd::Delete { id } => {
             client.delete_session(&id).await?;
-            println!("deleted {id}");
+            outln(format!("deleted {id}"));
         }
         Cmd::Search { query, limit } => {
             for (sid, mid, snippet) in client.search(&query, limit).await? {
-                println!("{sid}:{mid}\t{snippet}");
+                outln(format!("{sid}:{mid}\t{snippet}"));
             }
         }
         Cmd::Prompt {
@@ -156,7 +156,7 @@ async fn main() -> anyhow::Result<()> {
                 &mut stdin,
             )
             .await?;
-            println!();
+            outln("");
         }
     }
     Ok(())
@@ -166,6 +166,27 @@ fn cwd() -> String {
     std::env::current_dir()
         .map(|p| p.display().to_string())
         .unwrap_or_default()
+}
+
+/// Write one line to stdout, exiting quietly with 141 (128+SIGPIPE, the
+/// killed-by-SIGPIPE convention) when the pipe is gone. Rust ignores
+/// SIGPIPE, so `damon sessions | head -1` would otherwise panic inside
+/// println! with a noisy exit 101.
+fn outln(s: impl std::fmt::Display) {
+    use std::io::Write;
+    if writeln!(std::io::stdout(), "{s}").is_err() {
+        std::process::exit(141);
+    }
+}
+
+/// Like `outln` but without a trailing newline and with an explicit
+/// flush — streamed turn text must reach the terminal immediately.
+fn out(s: impl std::fmt::Display) {
+    use std::io::Write;
+    let mut stdout = std::io::stdout();
+    if write!(stdout, "{s}").is_err() || stdout.flush().is_err() {
+        std::process::exit(141);
+    }
 }
 
 /// Interactive chat REPL over an existing session. The event receiver is
@@ -238,9 +259,7 @@ async fn run_turn(
                 match u["sessionUpdate"].as_str() {
                     Some("agent_message_chunk") => {
                         if let Some(t) = u["content"]["text"].as_str() {
-                            print!("{t}");
-                            use std::io::Write;
-                            let _ = std::io::stdout().flush();
+                            out(t);
                         }
                     }
                     Some("tool_call_update") => {

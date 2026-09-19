@@ -82,7 +82,7 @@ impl OpenAiResponses {
                 Some("user") => input.push(json!({
                     "type": "message",
                     "role": "user",
-                    "content": [{"type": "input_text", "text": super::content_text(&m["content"])}],
+                    "content": input_content_parts(&m["content"]),
                 })),
                 Some("assistant") => {
                     let t = super::content_text(&m["content"]);
@@ -193,17 +193,31 @@ impl OpenAiResponses {
         }
         // Client-sent reasoning/text/truncation merge — a caller's
         // reasoning config must not be silently replaced by _thinking.
+        // Objects merge field-wise; strings pass through verbatim (e.g.
+        // truncation: "auto" — the old object-only filter dropped them).
         for key in ["reasoning", "text", "truncation"] {
-            if let Some(v) = body.get(key).filter(|v| v.is_object()) {
-                for (k, val) in v.as_object().unwrap() {
-                    out[key][k] = val.clone();
+            match body.get(key) {
+                Some(v) if v.is_object() => {
+                    for (k, val) in v.as_object().unwrap() {
+                        out[key][k] = val.clone();
+                    }
                 }
+                Some(v) if v.is_string() => out[key] = v.clone(),
+                _ => {}
             }
         }
         // Thinking level → reasoning.effort (merges into any client
-        // reasoning object set above).
+        // reasoning object set above). The merge above may have left a
+        // non-object there (string passthrough, e.g. reasoning: "high");
+        // indexing it would panic, so drop non-objects and vivify —
+        // the pre-merge-filter semantics.
         if let Some(level) = body["_thinking"].as_str() {
-            out["reasoning"]["effort"] = json!(level);
+            let mut r = out["reasoning"].take();
+            if !r.is_object() {
+                r = Value::Object(Default::default());
+            }
+            r["effort"] = json!(level);
+            out["reasoning"] = r;
         }
         // Compat: store + extra_body.
         if self.compat.supports_store {
@@ -280,6 +294,39 @@ impl OpenAiResponses {
     }
 }
 
+/// Translate an OpenAI chat-completions user content into Responses input
+/// parts: text → input_text, image_url → input_image (url from the string
+/// or `{url}` form). Other part types are logged and dropped — loudly, so
+/// a vision request never degrades to a silent text-only one.
+fn input_content_parts(content: &Value) -> Vec<Value> {
+    match content {
+        Value::Array(parts) => parts
+            .iter()
+            .filter_map(|p| match p["type"].as_str() {
+                Some("text") => p["text"]
+                    .as_str()
+                    .map(|t| json!({"type": "input_text", "text": t})),
+                Some("image_url") => {
+                    let img = &p["image_url"];
+                    img.as_str()
+                        .map(String::from)
+                        .or_else(|| img["url"].as_str().map(String::from))
+                        .map(|u| json!({"type": "input_image", "image_url": u}))
+                }
+                other => {
+                    tracing::warn!(
+                        "dropping unsupported content part in responses translation: {other:?}"
+                    );
+                    None
+                }
+            })
+            .collect(),
+        // Plain string content.
+        Value::String(s) => vec![json!({"type": "input_text", "text": s})],
+        _ => vec![],
+    }
+}
+
 /// Responses JSON → OpenAI chat-completions response. `status` is
 /// checked first: a `failed` response must surface as an error and an
 /// `incomplete` one as finish_reason "length" — returning them as a
@@ -293,6 +340,7 @@ fn responses_to_openai(v: &Value) -> anyhow::Result<Value> {
         anyhow::bail!("upstream response failed: {msg}");
     }
     let mut text = String::new();
+    let mut reasoning = String::new();
     let mut tool_calls = Vec::new();
     for item in v["output"].as_array().cloned().unwrap_or_default() {
         match item["type"].as_str() {
@@ -311,10 +359,23 @@ fn responses_to_openai(v: &Value) -> anyhow::Result<Value> {
                     "arguments": item["arguments"].as_str().unwrap_or("{}"),
                 }
             })),
+            // Reasoning summaries map to the same reasoning_content the
+            // streaming path emits as Thinking — dropping them made
+            // non-streaming calls the silent lossy one.
+            Some("reasoning") => {
+                for s in item["summary"].as_array().cloned().unwrap_or_default() {
+                    if let Some(t) = s["text"].as_str() {
+                        reasoning.push_str(t);
+                    }
+                }
+            }
             _ => {}
         }
     }
     let mut msg = json!({"role": "assistant", "content": text});
+    if !reasoning.is_empty() {
+        msg["reasoning_content"] = json!(reasoning);
+    }
     if !tool_calls.is_empty() {
         msg["tool_calls"] = json!(tool_calls);
     }
@@ -528,5 +589,113 @@ fn parse_event(data: &str) -> anyhow::Result<Option<StreamEvent>> {
             anyhow::bail!("responses api: {msg}");
         }
         _ => Ok(None),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use serde_json::json;
+
+    fn provider() -> OpenAiResponses {
+        OpenAiResponses::new(
+            "t",
+            "http://localhost:1",
+            None,
+            &std::collections::HashMap::new(),
+            Default::default(),
+        )
+        .unwrap()
+    }
+
+    /// Multimodal user content must translate, not vanish: text →
+    /// input_text, image_url (string or {url}) → input_image.
+    #[test]
+    fn translate_maps_multimodal_user_content() {
+        let p = provider();
+        let body = json!({
+            "model": "m",
+            "messages": [{"role": "user", "content": [
+                {"type": "text", "text": "what is this"},
+                {"type": "image_url", "image_url": {"url": "https://x/y.png"}},
+                {"type": "image_url", "image_url": "data:image/png;base64,AAA"},
+                {"type": "audio_url", "audio_url": {"url": "https://x/a.mp3"}},
+            ]}],
+        });
+        let req = p.translate_request(&body, false).unwrap();
+        let content = req["input"][0]["content"].as_array().unwrap();
+        assert_eq!(
+            content[0],
+            json!({"type": "input_text", "text": "what is this"})
+        );
+        assert_eq!(
+            content[1],
+            json!({"type": "input_image", "image_url": "https://x/y.png"})
+        );
+        assert_eq!(
+            content[2],
+            json!({"type": "input_image", "image_url": "data:image/png;base64,AAA"})
+        );
+        assert_eq!(
+            content.len(),
+            3,
+            "unsupported part is dropped loudly, not kept"
+        );
+    }
+
+    /// A string merge value (truncation: "auto") must survive the
+    /// client-sent reasoning/text/truncation merge.
+    #[test]
+    fn translate_passes_string_truncation_through() {
+        let p = provider();
+        let body = json!({
+            "model": "m",
+            "messages": [{"role": "user", "content": "hi"}],
+            "truncation": "auto",
+        });
+        let req = p.translate_request(&body, false).unwrap();
+        assert_eq!(req["truncation"], "auto");
+    }
+
+    /// A string reasoning value merged above must not panic the
+    /// _thinking → effort index: the string drops and the effort
+    /// vivifies into a fresh object; the rest of the request is
+    /// untouched.
+    #[test]
+    fn translate_string_reasoning_with_thinking_does_not_panic() {
+        let p = provider();
+        let body = json!({
+            "model": "m",
+            "messages": [{"role": "user", "content": "hi"}],
+            "reasoning": "high",
+            "_thinking": "medium",
+        });
+        let req = p.translate_request(&body, false).unwrap();
+        assert_eq!(req["reasoning"], json!({"effort": "medium"}));
+        assert_eq!(req["model"], "m");
+        assert_eq!(req["stream"], false);
+        assert_eq!(req["input"][0]["content"][0]["text"], "hi");
+    }
+
+    /// Non-streaming reasoning items surface as reasoning_content — the
+    /// same field the streaming path emits as Thinking events.
+    #[test]
+    fn nonstream_reasoning_summary_becomes_reasoning_content() {
+        let v = json!({
+            "status": "completed",
+            "output": [
+                {"type": "reasoning", "summary": [
+                    {"type": "summary_text", "text": "thinking hard"}
+                ]},
+                {"type": "message", "content": [{"type": "output_text", "text": "answer"}]},
+            ],
+            "usage": {"input_tokens": 1, "output_tokens": 1, "total_tokens": 2},
+        });
+        let out = responses_to_openai(&v).unwrap();
+        assert_eq!(
+            out["choices"][0]["message"]["reasoning_content"],
+            "thinking hard"
+        );
+        assert_eq!(out["choices"][0]["message"]["content"], "answer");
     }
 }

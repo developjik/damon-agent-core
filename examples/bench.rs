@@ -131,22 +131,29 @@ fn spawn_damond(upstream: SocketAddr) -> (Child, SocketAddr) {
         .spawn()
         .expect("spawn damond");
 
-    // Wait for the "listening" log line.
+    // Wait for readiness: drain stdout on a side thread (a chatty child
+    // must not block on a full pipe), then poll the reserved port until
+    // damond accepts connections — no dependency on log output — with a
+    // 10s deadline and a loud panic instead of an unbounded hang.
     let stdout = child.stdout.take().unwrap();
+    std::thread::spawn(move || for _ in BufReader::new(stdout).lines() {});
     let deadline = Instant::now() + Duration::from_secs(10);
-    let mut ready = false;
-    for line in BufReader::new(stdout).lines() {
+    loop {
+        if let Some(status) = child.try_wait().expect("poll damond status") {
+            panic!("damond exited before accepting connections: {status}");
+        }
+        if std::net::TcpStream::connect(damon_addr).is_ok() {
+            break;
+        }
         if Instant::now() > deadline {
-            break;
+            // Kill before panicking — an abandoned damond would linger on
+            // its port.
+            let _ = child.kill();
+            let _ = child.wait();
+            panic!("damond did not accept connections on {damon_addr} within 10s");
         }
-        if let Ok(l) = line
-            && l.contains("listening")
-        {
-            ready = true;
-            break;
-        }
+        std::thread::sleep(Duration::from_millis(50));
     }
-    assert!(ready, "damond did not become ready");
     (child, damon_addr)
 }
 
@@ -159,7 +166,10 @@ fn idle_rss(pid: u32) -> u64 {
     );
     sys.process(sysinfo::Pid::from_u32(pid))
         .map(|p| p.memory())
-        .unwrap_or(0)
+        .filter(|&m| m > 0)
+        .unwrap_or_else(|| {
+            panic!("idle_rss: no RSS reading for pid {pid} (process lookup failed or RSS reported as 0)")
+        })
 }
 
 /// Returns (time to first byte, total time). `url` is the full endpoint.

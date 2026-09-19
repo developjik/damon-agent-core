@@ -110,9 +110,18 @@ fn shape_messages(messages: &mut Vec<Value>, compat: &ProviderCompat) {
             let cur_role = m["role"].as_str().unwrap_or("");
             let mergeable = matches!(prev_role, "system" | "developer") && prev_role == cur_role;
             if mergeable {
-                let prev_text = crate::provider::content_text(&prev["content"]);
-                let cur_text = crate::provider::content_text(&m["content"]);
-                prev["content"] = Value::String(format!("{prev_text}\n{cur_text}"));
+                if prev["content"].is_string() && m["content"].is_string() {
+                    let prev_text = crate::provider::content_text(&prev["content"]);
+                    let cur_text = crate::provider::content_text(&m["content"]);
+                    prev["content"] = Value::String(format!("{prev_text}\n{cur_text}"));
+                } else {
+                    // Array (multimodal) or mixed contents: normalize both to
+                    // part arrays and append cur's parts to prev's — lossless,
+                    // and the pair still collapses to a single message.
+                    let mut parts = content_parts(&prev["content"]);
+                    parts.extend(content_parts(&m["content"]));
+                    prev["content"] = Value::Array(parts);
+                }
                 continue;
             }
         }
@@ -120,6 +129,16 @@ fn shape_messages(messages: &mut Vec<Value>, compat: &ProviderCompat) {
         out.push(m);
     }
     *messages = out;
+}
+
+/// Normalize message content to its part-array form: a plain string becomes
+/// a single text part, an array passes through as-is, anything else
+/// (null/missing) contributes no parts.
+fn content_parts(content: &Value) -> Vec<Value> {
+    if let Some(s) = content.as_str() {
+        return vec![serde_json::json!({"type": "text", "text": s})];
+    }
+    content.as_array().cloned().unwrap_or_default()
 }
 
 /// Rewrite every tool_call id and tool_call_id to a 9-char alphanumeric
@@ -163,4 +182,72 @@ fn mistral_id(id: &str) -> String {
         out.push(ALNUM[(h as usize + i * 7) % ALNUM.len()] as char);
     }
     out
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use serde_json::json;
+
+    /// Consecutive system messages coalesce into one even when contents
+    /// are arrays (multimodal) or mixed string/array — every part survives,
+    /// in order.
+    #[test]
+    fn system_merge_coalesces_array_content() {
+        let compat = ProviderCompat {
+            supports_multiple_system_messages: false,
+            ..Default::default()
+        };
+
+        // string + array: one system message; the string becomes a text part.
+        let mut messages = vec![
+            json!({"role": "system", "content": "be brief"}),
+            json!({"role": "system", "content": [{"type": "text", "text": "be terse"}]}),
+            json!({"role": "user", "content": "hi"}),
+        ];
+        shape_messages(&mut messages, &compat);
+        assert_eq!(messages.len(), 2, "string+array pair must merge");
+        assert_eq!(messages[0]["role"], "system");
+        assert_eq!(
+            messages[0]["content"],
+            json!([
+                {"type": "text", "text": "be brief"},
+                {"type": "text", "text": "be terse"},
+            ])
+        );
+        assert_eq!(messages[1]["content"], "hi");
+
+        // array + array: parts concatenate in order; non-text parts survive.
+        let mut messages = vec![
+            json!({"role": "system", "content": [
+                {"type": "text", "text": "a"},
+                {"type": "image_url", "image_url": {"url": "u"}},
+            ]}),
+            json!({"role": "system", "content": [{"type": "text", "text": "b"}]}),
+        ];
+        shape_messages(&mut messages, &compat);
+        assert_eq!(messages.len(), 1, "array+array pair must merge");
+        let parts = messages[0]["content"].as_array().unwrap();
+        assert_eq!(parts.len(), 3, "no part may be lost");
+        assert_eq!(parts[0]["text"], "a");
+        assert_eq!(parts[1]["type"], "image_url");
+        assert_eq!(parts[2]["text"], "b");
+    }
+
+    /// Plain string system pairs still merge into one string content.
+    #[test]
+    fn system_merge_plain_strings() {
+        let compat = ProviderCompat {
+            supports_multiple_system_messages: false,
+            ..Default::default()
+        };
+
+        let mut messages = vec![
+            json!({"role": "system", "content": "one"}),
+            json!({"role": "system", "content": "two"}),
+        ];
+        shape_messages(&mut messages, &compat);
+        assert_eq!(messages.len(), 1);
+        assert_eq!(messages[0]["content"], "one\ntwo");
+    }
 }

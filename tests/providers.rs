@@ -1275,7 +1275,15 @@ async fn anthropic_text_before_tool_use_yields_single_call() {
     .await;
     let p = damon_core::provider::Provider::new("claude", &provider("anthropic-messages", &base))
         .unwrap();
-    let body = json!({"model": "claude-sonnet-4", "messages": [{"role":"user","content":"hi"}]});
+    // The upstream echoes the mangled name — the request must declare
+    // the tool so the mangle map restores `fs.read`. An unknown name is
+    // no longer guessed (a visible unknown-tool error beats a silent
+    // wrong call).
+    let body = json!({
+        "model": "claude-sonnet-4",
+        "messages": [{"role":"user","content":"hi"}],
+        "tools": [{"type":"function","function":{"name":"fs.read","parameters":{}}}],
+    });
     let mut stream = std::pin::pin!(p.chat_stream(body).await.unwrap());
     let mut acc = ToolCallAccumulator::default();
     let mut saw_text = false;
@@ -1321,7 +1329,13 @@ async fn anthropic_midstream_error_propagates() {
     let mut saw_err = false;
     while let Some(ev) = stream.next().await {
         if let Err(e) = ev {
-            assert!(e.to_string().contains("Overloaded"), "got {e}");
+            // overloaded_error mid-stream maps to RateLimited so the
+            // runtime's backoff path engages, same as an HTTP 429/529.
+            assert!(
+                e.downcast_ref::<damon_core::provider::RateLimited>()
+                    .is_some(),
+                "got {e}"
+            );
             saw_err = true;
         }
     }
@@ -1472,7 +1486,13 @@ async fn anthropic_nonstream_tool_call_finish_reason() {
         &provider("anthropic-messages", &format!("http://{addr}")),
     )
     .unwrap();
-    let body = json!({"model": "claude-sonnet-4", "messages": [{"role":"user","content":"hi"}]});
+    // The upstream echoes the mangled name — the request must declare
+    // the tool so the mangle map restores `fs.read`.
+    let body = json!({
+        "model": "claude-sonnet-4",
+        "messages": [{"role":"user","content":"hi"}],
+        "tools": [{"type":"function","function":{"name":"fs.read","parameters":{}}}],
+    });
     let resp = p.chat(body).await.unwrap();
     assert_eq!(resp["choices"][0]["finish_reason"], "tool_calls");
     assert_eq!(

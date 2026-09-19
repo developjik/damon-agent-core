@@ -50,17 +50,29 @@ pub trait ChannelApi: Send + Sync {
 /// Routes daemon events to the chat that owns the session.
 struct Demux {
     /// session_id -> channel to that chat's turn handler
-    sessions: HashMap<String, mpsc::Sender<ClientEvent>>,
+    sessions: HashMap<String, mpsc::UnboundedSender<ClientEvent>>,
     /// chat_id -> (requester sender_id, answer channel). The sender id
     /// binds the reply to whoever triggered the tool call.
     pending_permissions: HashMap<String, (Option<String>, oneshot::Sender<bool>)>,
 }
+/// Cached chat→session mapping entry. `last_used` drives eviction:
+/// entries idle for over 24h are dropped when session_for misses, so
+/// the map stays bounded on long-lived bots serving many chats. Only
+/// the map entry is dropped — daemon-side session retention (the
+/// daemon's own sweep) is unchanged.
+struct ChatSession {
+    session_id: String,
+    last_used: std::time::Instant,
+}
+
+/// Idle age at which a chat→session mapping entry is evicted.
+const SESSION_IDLE_EVICTION: std::time::Duration = std::time::Duration::from_secs(24 * 60 * 60);
 
 pub struct Bridge {
     ch: Arc<dyn ChannelApi>,
     client: DamonClient,
     /// chat_id -> session_id
-    chat_sessions: Mutex<HashMap<String, String>>,
+    chat_sessions: Mutex<HashMap<String, ChatSession>>,
     /// chat_ids with a turn in flight — serializes turns per chat.
     active_turns: Mutex<std::collections::HashSet<String>>,
     /// Sender/chat ids allowed to drive the agent. `None` = open (the
@@ -106,7 +118,11 @@ impl Bridge {
                     self.handle_message(msg.chat_id, msg.sender_id, msg.text)
                         .await
                 }
-                Ok(None) => {}
+                Ok(None) => {
+                    // Same backoff as Err — a channel polling empty in
+                    // a tight loop must not spin the CPU.
+                    tokio::time::sleep(std::time::Duration::from_secs(5)).await;
+                }
                 Err(e) => {
                     warn!(error = %e, "channel recv failed; retrying in 5s");
                     tokio::time::sleep(std::time::Duration::from_secs(5)).await;
@@ -122,6 +138,7 @@ impl Bridge {
 
     /// Single consumer of client.events(); fans out to per-session channels.
     /// PromptDone arrives through the same stream, ordered after that
+    /// session's Updates; per-chat channels are unbounded (see below).
     pub async fn spawn_event_router(self: &Arc<Self>) {
         // events() is single-consumer: a second call gets a dead
         // receiver whose router exits instantly and hangs every turn.
@@ -146,21 +163,19 @@ impl Bridge {
                 if let Some(sid) = session_id {
                     let tx = me.demux.lock().await.sessions.get(&sid).cloned();
                     if let Some(tx) = tx {
-                        // A slow chat (rate-limited send, hung HTTP) fills
-                        // its 64-slot channel and would otherwise block
-                        // this router — stalling EVERY session's events.
-                        // Streamed Update chunks are droppable (the final
-                        // flush happens on PromptDone); PromptDone and
-                        // Request are always awaited — they can't pile up
-                        // once Updates stop queueing.
-                        match &ev {
-                            ClientEvent::Update(_) => {
-                                let _ = tx.try_send(ev);
-                            }
-                            _ => {
-                                let _ = tx.send(ev).await;
-                            }
-                        }
+                        // Per-chat channels are unbounded: a slow chat
+                        // (rate-limited send, hung HTTP) can no longer
+                        // stall this router and freeze every session's
+                        // events. No slot cap is needed — memory stays
+                        // finite because a demux entry lives only while
+                        // that chat's turn is in flight, and a turn's
+                        // Update stream is finite (bounded by the model
+                        // reply, ending at PromptDone), so run_turn
+                        // drains the queue.
+                        // Send never blocks; failure only means the
+                        // turn handler already dropped its receiver
+                        // (turn ended) — those events are stale.
+                        let _ = tx.send(ev);
                     }
                 }
             }
@@ -280,13 +295,49 @@ impl Bridge {
     /// Get or create the damon session for this chat. A creation failure
     /// propagates — caching a fabricated id would brick the chat forever.
     async fn session_for(&self, chat_id: &str) -> anyhow::Result<String> {
-        let mut map = self.chat_sessions.lock().await;
-        if let Some(s) = map.get(chat_id) {
-            return Ok(s.clone());
+        // Fast path: an existing entry is checked, refreshed, and
+        // returned with the lock held — no await under the lock.
+        {
+            let mut map = self.chat_sessions.lock().await;
+            if let Some(e) = map.get_mut(chat_id) {
+                e.last_used = std::time::Instant::now();
+                return Ok(e.session_id.clone());
+            }
+            // Evict entries idle for over 24h so the map can't grow
+            // without bound. Only the map entry goes — the daemon
+            // session itself stays under the daemon's own retention
+            // sweep (policy unchanged).
+            map.retain(|_, e| e.last_used.elapsed() < SESSION_IDLE_EVICTION);
         }
+        // Slow path: create outside the lock (new_session must not
+        // hold it), then re-acquire to insert.
         let sid = self.client.new_session("", None).await?;
-        map.insert(chat_id.to_string(), sid.clone());
-        Ok(sid)
+        let mut map = self.chat_sessions.lock().await;
+        match map.get(chat_id) {
+            // Double-create: another task won the race while we
+            // awaited. Prefer the existing entry; delete our orphaned
+            // daemon session so its history doesn't leak.
+            Some(existing) => {
+                let existing = existing.session_id.clone();
+                drop(map);
+                if let Err(e) = self.client.delete_session(&sid).await {
+                    // Leaving the orphan is safe — the daemon's
+                    // retention sweep collects it.
+                    warn!(error = %e, session = %sid, "orphan session delete failed");
+                }
+                Ok(existing)
+            }
+            None => {
+                map.insert(
+                    chat_id.to_string(),
+                    ChatSession {
+                        session_id: sid.clone(),
+                        last_used: std::time::Instant::now(),
+                    },
+                );
+                Ok(sid)
+            }
+        }
     }
 
     /// One prompt turn for a chat: forward events to the channel until done.
@@ -297,7 +348,7 @@ impl Bridge {
         sender_id: Option<String>,
         text: &str,
     ) -> anyhow::Result<()> {
-        let (tx, mut rx) = mpsc::channel(64);
+        let (tx, mut rx) = mpsc::unbounded_channel();
         let mut session_id = session_id.to_string();
         self.demux
             .lock()
@@ -409,7 +460,7 @@ impl Bridge {
                                 // permission timeout — a late "allow"
                                 // after the daemon already denied the
                                 // call must not print ✅ for a dead ask.
-                                let timeout = std::time::Duration::from_secs(300);
+                                let timeout = crate::runtime::PERMISSION_TIMEOUT;
                                 let allow = match tokio::time::timeout(timeout, prx).await {
                                     Ok(a) => a.unwrap_or(false),
                                     Err(_) => {

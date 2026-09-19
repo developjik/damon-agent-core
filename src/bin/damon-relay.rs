@@ -24,11 +24,18 @@ use futures::{SinkExt, StreamExt};
 use serde::Deserialize;
 use serde_json::{Value, json};
 use tokio::sync::{Mutex, mpsc};
-use tracing::{info, warn};
+use tracing::{debug, info, warn};
 
 /// (owning daemon name, writer to that client's socket, abort handle
-/// for its inbound pump — used to drop laggard clients)
-type ClientEntry = (String, mpsc::Sender<String>, tokio::task::AbortHandle);
+/// for its inbound pump — used to drop laggard clients, owning tunnel's
+/// sender — its `same_channel` marks the tunnel GENERATION a session
+/// belongs to, so a dead tunnel's cleanup ends exactly its own sessions)
+type ClientEntry = (
+    String,
+    mpsc::Sender<String>,
+    tokio::task::AbortHandle,
+    mpsc::Sender<String>,
+);
 
 #[derive(Clone)]
 struct RelayState {
@@ -53,6 +60,10 @@ const MAX_CONNS_PER_IP: usize = 8;
 /// Max concurrent sockets across all sources — bounds task/map memory
 /// on a public relay no matter how the flood is distributed.
 const MAX_CONNS_TOTAL: u64 = 1024;
+
+/// How long a client→daemon pump send may wait on a full daemon
+/// channel before the session ends and frees its slot.
+const DAEMON_SEND_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
 
 /// Daemon names are map keys and log fields — restrict to a printable
 /// charset so an unauthenticated caller can't forge log lines with
@@ -158,6 +169,14 @@ async fn register(
             if over || t > MAX_CONNS_TOTAL {
                 release(conns, peer.ip()).await;
                 total.fetch_sub(1, Ordering::Relaxed);
+                // Tell the peer why instead of a bare close — a silent
+                // drop reads as a network fault and feeds retry storms.
+                let (mut writer, _reader) = socket.split();
+                let _ = writer
+                    .send(Message::Text(
+                        json!({"error": "over_capacity"}).to_string().into(),
+                    ))
+                    .await;
                 return;
             }
             register_session(socket, name, state).await;
@@ -258,8 +277,8 @@ async fn register_session(socket: axum::extract::ws::WebSocket, name: String, st
                 let mut map = clients.lock().await;
                 let drop_client = match map.get(&client_id) {
                     // Only deliver to clients this daemon owns.
-                    Some((owner, _, _)) if owner != &name2 => false,
-                    Some((_, tx, _)) => match tx.try_send(json!({"data": data}).to_string()) {
+                    Some((owner, ..)) if owner != &name2 => false,
+                    Some((_, tx, ..)) => match tx.try_send(json!({"data": data}).to_string()) {
                         Ok(()) => false,
                         // A full queue means the client's socket is
                         // backpressured — dropping frames would hang
@@ -269,8 +288,27 @@ async fn register_session(socket: axum::extract::ws::WebSocket, name: String, st
                     },
                     None => false,
                 };
-                if drop_client && let Some((_, _, abort)) = map.remove(&client_id) {
+                if drop_client && let Some((_, _, abort, _)) = map.remove(&client_id) {
                     warn!(client = client_id, "dropping backpressured client");
+                    abort.abort();
+                }
+            }
+        }
+        // The tunnel is ending. Sessions still holding THIS tunnel's
+        // sender would zombie — their frames vanish and no rebuilt
+        // tunnel ever sees them — so end them now. same_channel keeps
+        // a successor tunnel's sessions (new registration ⇒ new
+        // sender) safe.
+        {
+            let mut cs = clients.lock().await;
+            let stale: Vec<u64> = cs
+                .iter()
+                .filter(|(_, (owner, .., dtx))| owner == &name2 && dtx.same_channel(&tx2))
+                .map(|(id, _)| *id)
+                .collect();
+            for id in stale {
+                if let Some((_, _, abort, _)) = cs.remove(&id) {
+                    warn!(client = id, "ending session of dead tunnel");
                     abort.abort();
                 }
             }
@@ -332,6 +370,14 @@ async fn connect(
             if over || t > MAX_CONNS_TOTAL {
                 release(conns, peer.ip()).await;
                 total.fetch_sub(1, Ordering::Relaxed);
+                // Tell the peer why instead of a bare close — a silent
+                // drop reads as a network fault and feeds retry storms.
+                let (mut writer, _reader) = socket.split();
+                let _ = writer
+                    .send(Message::Text(
+                        json!({"error": "over_capacity"}).to_string().into(),
+                    ))
+                    .await;
                 return;
             }
             relay_client_session(socket, name, state).await;
@@ -378,41 +424,86 @@ async fn relay_client_session(
             }
         }
     });
-    // Pump: client socket → daemon. Registered before the daemon is
-    // notified below, so a response can never arrive for an unknown id.
-    let daemon_tx2 = daemon_tx.clone();
-    let recv_task = tokio::spawn(async move {
-        // Ping/Pong/Binary keep the link alive — axum yields them to us,
-        // so a keepalive ping must not end the pump and drop the client.
-        while let Some(msg) = reader.next().await {
-            let text = match msg {
-                Ok(Message::Text(t)) => t,
-                Ok(Message::Close(_)) | Err(_) => break,
-                Ok(_) => continue,
-            };
-            let Ok(v) = serde_json::from_str::<Value>(&text) else {
-                continue;
-            };
-            if let Some(data) = v["data"].as_str() {
-                let _ = daemon_tx2
-                    .send(json!({"client": client_id, "data": data}).to_string())
-                    .await;
+    // Pump: client socket → daemon.
+    let recv_task = {
+        // Lock BEFORE spawning: the pump can only ever look up a client
+        // under this same lock, so holding it across the spawn makes the
+        // entry visible before any response for this id — an early frame
+        // forwarded by the pump can never have its reply dropped as
+        // unknown. No await between lock and insert, so the hold is
+        // momentary.
+        let mut clients = state.clients.lock().await;
+        let daemon_tx2 = daemon_tx.clone();
+        let recv_task = tokio::spawn(async move {
+            // Ping/Pong/Binary keep the link alive — axum yields them to
+            // us, so a keepalive ping must not end the pump and drop the
+            // client.
+            while let Some(msg) = reader.next().await {
+                let text = match msg {
+                    Ok(Message::Text(t)) => t,
+                    Ok(Message::Close(_)) | Err(_) => break,
+                    Ok(_) => continue,
+                };
+                let Ok(v) = serde_json::from_str::<Value>(&text) else {
+                    continue;
+                };
+                if let Some(data) = v["data"].as_str() {
+                    // A send error means the daemon tunnel's receiver
+                    // is gone (crashed, or its name taken over by a new
+                    // registration); a timeout means the daemon channel
+                    // is saturated — an unbounded wait would couple
+                    // that saturation to this session's cleanup, fixing
+                    // the slot until the daemon drains. Either way the
+                    // frame would vanish silently forever, so end the
+                    // session: the select! below then closes the socket
+                    // and frees the clients slot.
+                    match tokio::time::timeout(
+                        DAEMON_SEND_TIMEOUT,
+                        daemon_tx2.send(json!({"client": client_id, "data": data}).to_string()),
+                    )
+                    .await
+                    {
+                        Ok(Ok(())) => {}
+                        Ok(Err(_)) | Err(_) => break,
+                    }
+                }
             }
-        }
-    });
-    // The map entry carries the recv task's abort handle so the daemon
-    // pump can disconnect a client whose send queue is backpressured.
-    state
-        .clients
-        .lock()
-        .await
-        .insert(client_id, (name.clone(), tx, recv_task.abort_handle()));
+        });
+        // The map entry carries the recv task's abort handle so the
+        // daemon pump can disconnect a client whose send queue is
+        // backpressured.
+        clients.insert(
+            client_id,
+            (
+                name.clone(),
+                tx,
+                recv_task.abort_handle(),
+                daemon_tx.clone(),
+            ),
+        );
+        recv_task
+    };
     info!(daemon = %name, client = client_id, "client connected");
 
-    // Tell the daemon a new client attached.
-    let _ = daemon_tx
-        .send(json!({"client": client_id}).to_string())
-        .await;
+    // Tell the daemon a new client attached. Best-effort: a saturated
+    // channel drops the notice (the tunnel's laggard-drop ends clients
+    // it can't serve) instead of pinning this slot on an unbounded
+    // await. A closed channel still means the daemon tunnel died before
+    // the attach was even announced — tear the session down now instead
+    // of pinning a zombie slot a rebuilt tunnel will never see.
+    match daemon_tx.try_send(json!({"client": client_id}).to_string()) {
+        Err(mpsc::error::TrySendError::Full(_)) => {
+            debug!(daemon = %name, client = client_id,
+                "attach notice dropped: daemon channel saturated");
+        }
+        Err(mpsc::error::TrySendError::Closed(_)) => {
+            recv_task.abort();
+            send_task.abort();
+            state.clients.lock().await.remove(&client_id);
+            return;
+        }
+        Ok(()) => {}
+    }
 
     // Either pump ending ends the connection — abort the other so a
     // socket stuck on write can't hang the cleanup (and the daemon's
@@ -425,8 +516,14 @@ async fn relay_client_session(
     }
     state.clients.lock().await.remove(&client_id);
     // Tell the daemon this client is gone so it can prune the session.
-    let _ = daemon_tx
-        .send(json!({"client": client_id, "disconnect": true}).to_string())
-        .await;
+    // Best-effort: saturation drops the notice rather than holding the
+    // slot — the daemon's laggard-drop already reaps clients it can't
+    // deliver to.
+    if let Err(mpsc::error::TrySendError::Full(_)) =
+        daemon_tx.try_send(json!({"client": client_id, "disconnect": true}).to_string())
+    {
+        debug!(daemon = %name, client = client_id,
+            "disconnect notice dropped: daemon channel saturated");
+    }
     info!(client = client_id, "client disconnected");
 }

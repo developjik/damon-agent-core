@@ -196,6 +196,10 @@ pub struct DiscordChannel {
     conn: Mutex<Option<GatewayConn>>,
     /// Last dispatched sequence number, shared with the heartbeat task.
     seq: Arc<AtomicI64>,
+    /// Reconnect backoff for paths that re-IDENTIFY (op 9 invalid
+    /// session, connect failure): doubles from 5s, caps at 300s, resets
+    /// when the gateway accepts the identify (READY).
+    backoff: Mutex<std::time::Duration>,
 }
 
 impl DiscordChannel {
@@ -205,7 +209,22 @@ impl DiscordChannel {
             bot_id: Mutex::new(None),
             conn: Mutex::new(None),
             seq: Arc::new(AtomicI64::new(-1)),
+            backoff: Mutex::new(std::time::Duration::from_secs(5)),
         }
+    }
+
+    /// Next reconnect delay for paths that re-IDENTIFY: doubles from 5s
+    /// to a 300s cap. Reset once identify is accepted (READY).
+    async fn next_backoff(&self) -> std::time::Duration {
+        let mut b = self.backoff.lock().await;
+        let delay = *b;
+        *b = ((*b) * 2).min(std::time::Duration::from_secs(300));
+        delay
+    }
+
+    /// READY — identify accepted; back to the initial reconnect cadence.
+    async fn reset_backoff(&self) {
+        *self.backoff.lock().await = std::time::Duration::from_secs(5);
     }
 
     async fn connect(&self) -> anyhow::Result<GatewayConn> {
@@ -291,8 +310,9 @@ impl ChannelApi for DiscordChannel {
                 match self.connect().await {
                     Ok(c) => *self.conn.lock().await = Some(c),
                     Err(e) => {
-                        warn!(error = %e, "discord gateway connect failed; retry in 5s");
-                        tokio::time::sleep(std::time::Duration::from_secs(5)).await;
+                        let delay = self.next_backoff().await;
+                        warn!(error = %e, delay_secs = delay.as_secs(), "discord gateway connect failed; retrying");
+                        tokio::time::sleep(delay).await;
                         continue;
                     }
                 }
@@ -323,13 +343,27 @@ impl ChannelApi for DiscordChannel {
                                 return Ok(Some(msg));
                             }
                         }
-                        // op 7 reconnect / op 9 invalid session → drop and
-                        // reconnect. A tight loop here would burn Discord's
-                        // daily identify limit if the gateway keeps refusing.
+                        // READY: identify accepted — the backoff that
+                        // throttled re-identifies served its purpose.
+                        if v["op"] == 0 && v["t"] == "READY" {
+                            self.reset_backoff().await;
+                        }
+                        // op 7 is the server asking for a normal reconnect —
+                        // keep the fixed 5s. op 9 invalid session means the
+                        // gateway refused the session and the next connect
+                        // IDENTIFYs from scratch: exponential backoff (5s →
+                        // ×2, 300s cap, reset on READY) so a gateway that
+                        // keeps refusing cannot burn the identify quota
+                        // (token-bucketed, ~1000/day per bot).
                         if v["op"] == 7 || v["op"] == 9 {
+                            let delay = if v["op"] == 9 {
+                                self.next_backoff().await
+                            } else {
+                                std::time::Duration::from_secs(5)
+                            };
                             *guard = None;
                             drop(guard);
-                            tokio::time::sleep(std::time::Duration::from_secs(5)).await;
+                            tokio::time::sleep(delay).await;
                             continue;
                         }
                     }
@@ -354,5 +388,24 @@ impl ChannelApi for DiscordChannel {
 
     fn flush_threshold(&self) -> usize {
         1800
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn op9_backoff_doubles_caps_and_resets_on_identify() {
+        let ch = DiscordChannel::new(Arc::new(DiscordApi::new("t")));
+        for want in [5u64, 10, 20, 40, 80, 160, 300, 300] {
+            assert_eq!(
+                ch.next_backoff().await,
+                std::time::Duration::from_secs(want)
+            );
+        }
+        // READY (identify accepted) returns to the initial cadence.
+        ch.reset_backoff().await;
+        assert_eq!(ch.next_backoff().await, std::time::Duration::from_secs(5));
     }
 }

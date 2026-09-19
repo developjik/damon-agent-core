@@ -124,7 +124,9 @@ struct WsClient {
     pending: Arc<Mutex<HashMap<u64, PendingReply>>>,
     next_id: AtomicU64,
     /// Set once a send times out — later notifications drop immediately
-    /// instead of each paying the full SEND_TIMEOUT again.
+    /// instead of each paying the full SEND_TIMEOUT again. Cleared by the
+    /// next successful request/response send: the client is draining, so
+    /// notifications resume without a reconnect.
     stalled: std::sync::atomic::AtomicBool,
     /// Response wait bound — permission_timeout_secs + slack, so the
     /// configured permission budget is never silently capped here.
@@ -162,7 +164,9 @@ impl ClientChannel for WsClient {
     async fn notify(&self, method: &str, params: Value) {
         // Once a send has timed out the client is stalled — drop later
         // notifications immediately instead of paying SEND_TIMEOUT per
-        // chunk for the rest of the turn.
+        // chunk. A later successful request()/respond() send clears the
+        // flag (unstall), so a client that catches up recovers without
+        // reconnecting.
         if self.stalled.load(Ordering::Relaxed) {
             return;
         }
@@ -192,6 +196,7 @@ impl ClientChannel for WsClient {
             self.pending.lock().await.remove(&id);
             bail!("client connection stalled or closed");
         }
+        self.unstall();
         // A client that never answers must not hang the turn forever or
         // leak the pending entry. The bound is the caller's request_timeout
         // (e.g. permission_timeout_secs + slack) — a fixed cap here would
@@ -223,16 +228,27 @@ impl ClientChannel for WsClient {
 }
 
 impl WsClient {
+    /// Clear the stalled flag after a successful send — swap fires the
+    /// recovery log exactly once, on the true→false edge.
+    fn unstall(&self) {
+        if self.stalled.swap(false, Ordering::Relaxed) {
+            info!("client resumed reading; notifications re-enabled");
+        }
+    }
+
     async fn respond(&self, id: Value, result: Result<Value, Value>) {
         let msg = match result {
             Ok(r) => json!({"jsonrpc": "2.0", "id": id, "result": r}),
             Err(e) => json!({"jsonrpc": "2.0", "id": id, "error": e}),
         };
-        if tokio::time::timeout(SEND_TIMEOUT, self.tx.send(msg.to_string()))
-            .await
-            .is_err()
-        {
-            warn!("dropping response to stalled client");
+        // Unstall only on a SUCCESSFUL send. `timeout` yields
+        // Ok(Err(SendError)) when the connection is already gone —
+        // treating that as success cleared `stalled` on a dead client
+        // and logged a false "resumed reading".
+        match tokio::time::timeout(SEND_TIMEOUT, self.tx.send(msg.to_string())).await {
+            Ok(Ok(())) => self.unstall(),
+            Ok(Err(_)) => {} // connection closed — nothing to deliver
+            Err(_elapsed) => warn!("dropping response to stalled client"),
         }
     }
 }
@@ -285,7 +301,17 @@ pub async fn handle_socket(
             // pending waiter or the request waits out its full timeout.
             let resp_id = v["id"]
                 .as_u64()
-                .or_else(|| v["id"].as_str().and_then(|s| s.parse::<u64>().ok()));
+                .or_else(|| v["id"].as_str().and_then(|s| s.parse::<u64>().ok()))
+                // Some encoders emit integral ids as JSON floats ("id":5.0),
+                // which as_u64 rejects. Accept only exact integers below
+                // 2^64 — an f64 cannot represent u64::MAX, and `<= u64::MAX
+                // as f64` would admit 2^64, whose saturating cast is a
+                // different id.
+                .or_else(|| {
+                    v["id"].as_f64().and_then(|f| {
+                        (f.fract() == 0.0 && f >= 0.0 && f < u64::MAX as f64).then_some(f as u64)
+                    })
+                });
             if let Some(id) = resp_id
                 && let Some(tx) = client.pending.lock().await.remove(&id)
             {
@@ -382,7 +408,9 @@ pub async fn handle_socket(
                                 json!({"sessionId": sid, "createdAt": created, "model": model})
                             })
                             .collect();
-                        client.respond(id, Ok(json!({"sessions": list}))).await;
+                        client
+                            .respond(id, frame_capped_response(json!({"sessions": list})))
+                            .await;
                     }
                     Err(e) => {
                         client
@@ -412,7 +440,9 @@ pub async fn handle_socket(
                 };
                 match result {
                     Ok(messages) => {
-                        client.respond(id, Ok(json!({"messages": messages}))).await;
+                        client
+                            .respond(id, frame_capped_response(json!({"messages": messages})))
+                            .await;
                     }
                     Err(e) => {
                         client
@@ -455,23 +485,29 @@ pub async fn handle_socket(
                     }
                     // Re-check under the lock: a session/prompt may have
                     // registered between our busy poll and this acquisition.
-                    let map = state.live_prompts.lock().await;
-                    if map.contains_key(&session_id) {
-                        drop(map);
-                        client
-                            .respond(id, Err(rpc_error(-32603, "session busy")))
-                            .await;
-                        return;
+                    // The lock is released before the row delete — holding
+                    // it across that store await would stall every
+                    // connection's cancel/prompt. The residual window (a
+                    // prompt registering after this check) is backstopped
+                    // by the store: its first append violates the
+                    // messages→sessions foreign key and the turn errors.
+                    {
+                        let map = state.live_prompts.lock().await;
+                        if map.contains_key(&session_id) {
+                            drop(map);
+                            client
+                                .respond(id, Err(rpc_error(-32603, "session busy")))
+                                .await;
+                            return;
+                        }
                     }
                     match state.store.delete_session(&session_id).await {
                         Ok(()) => {
                             // Session-scoped tool approvals die with the session.
                             state.mcp.clear_session(&session_id);
-                            drop(map);
                             client.respond(id, Ok(json!({"deleted": true}))).await;
                         }
                         Err(e) => {
-                            drop(map);
                             client
                                 .respond(id, Err(rpc_error(-32603, &e.to_string())))
                                 .await;
@@ -556,29 +592,26 @@ pub async fn handle_socket(
                         .await;
                     continue;
                 };
-                // Exists-check + live_prompts insert under ONE lock: a
-                // concurrent session/delete holds the same lock across
-                // its row delete, so a prompt can never register into a
-                // session that is being removed.
+                // Exists-check OUTSIDE the live_prompts lock: holding that
+                // lock across a store await would make every connection's
+                // cancel/disconnect/prompt wait on one SQLite round-trip.
+                match state.store.session_exists(&session_id).await {
+                    Ok(true) => {}
+                    Ok(false) => {
+                        client
+                            .respond(id, Err(rpc_error(-32602, "session not found")))
+                            .await;
+                        continue;
+                    }
+                    Err(e) => {
+                        client
+                            .respond(id, Err(rpc_error(-32603, &e.to_string())))
+                            .await;
+                        continue;
+                    }
+                }
                 {
                     let mut map = state.live_prompts.lock().await;
-                    match state.store.session_exists(&session_id).await {
-                        Ok(true) => {}
-                        Ok(false) => {
-                            drop(map);
-                            client
-                                .respond(id, Err(rpc_error(-32602, "session not found")))
-                                .await;
-                            continue;
-                        }
-                        Err(e) => {
-                            drop(map);
-                            client
-                                .respond(id, Err(rpc_error(-32603, &e.to_string())))
-                                .await;
-                            continue;
-                        }
-                    }
                     // One live prompt per session across ALL connections:
                     // a second prompt would interleave writes into the
                     // same persisted history. The entry stays until the
@@ -598,6 +631,12 @@ pub async fn handle_socket(
                             .await;
                         continue;
                     }
+                    // The session may have been deleted between the
+                    // exists-check above and this insert — a concurrent
+                    // session/delete no longer excludes us under one lock.
+                    // The store is the backstop: messages.session_id
+                    // foreign-keys sessions(id), so the turn's first
+                    // append fails and the client sees the error.
                     map.insert(session_id.clone(), (conn_id, cancel.clone()));
                 }
                 let (state, client) = (state.clone(), client.clone());
@@ -693,6 +732,30 @@ pub async fn handle_socket(
     info!("ws client disconnected");
 }
 
+/// Outbound JSON-RPC response frame cap — matches the inbound WS
+/// `max_frame_size(4 << 20)`. An unpaged session/list or session/messages
+/// response larger than this would be dropped by the client's receive
+/// cap and kill the link, so it is replaced by an explicit error instead.
+pub(crate) const MAX_RESPONSE_BYTES: usize = 4 << 20;
+
+/// Pass the result through, unless the serialized response would exceed
+/// [`MAX_RESPONSE_BYTES`] — then return a fail-loud error telling the
+/// client to page with limit/offset rather than sending an oversized
+/// frame the client cannot receive.
+fn frame_capped_response(result: Value) -> Result<Value, Value> {
+    let size = serde_json::to_vec(&result)
+        .map(|v| v.len())
+        .unwrap_or(usize::MAX);
+    if size > MAX_RESPONSE_BYTES {
+        Err(rpc_error(
+            -32602,
+            "response exceeds the 4 MiB frame cap; re-request with limit/offset",
+        ))
+    } else {
+        Ok(result)
+    }
+}
+
 fn rpc_error(code: i64, message: &str) -> Value {
     json!({"code": code, "message": message})
 }
@@ -712,4 +775,27 @@ pub(crate) fn is_localhost_origin(origin: &str) -> bool {
     host.trim_matches(|c| c == '[' || c == ']')
         .parse::<std::net::IpAddr>()
         .is_ok_and(|ip| ip.is_loopback())
+}
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn small_response_passes_through() {
+        let r = frame_capped_response(json!({"messages": ["m1"]}));
+        assert!(r.is_ok());
+    }
+
+    #[test]
+    fn oversized_response_becomes_paging_error() {
+        let big = "x".repeat(MAX_RESPONSE_BYTES + 1);
+        let r = frame_capped_response(json!({"messages": [big]})).unwrap_err();
+        assert_eq!(r["code"], -32602);
+        assert!(
+            r["message"]
+                .as_str()
+                .unwrap()
+                .contains("re-request with limit/offset")
+        );
+    }
 }

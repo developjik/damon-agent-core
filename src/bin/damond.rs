@@ -55,14 +55,24 @@ enum ServiceAction {
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
+    let args = Args::parse();
+    let path = args.config.unwrap_or_else(config::default_config_path);
+    // Pre-load .env BEFORE tracing init: RUST_LOG from the same .env
+    // files Config::load reads must shape the EnvFilter — it used to be
+    // built first and silently ignored RUST_LOG. Same precedence as
+    // Config::load (config dir first, cwd only in debug); dotenvy never
+    // overrides already-set vars, so the later load there stays a no-op.
+    if let Some(dir) = path.parent() {
+        let _ = dotenvy::from_path(dir.join(".env"));
+    }
+    #[cfg(debug_assertions)]
+    let _ = dotenvy::from_path(Path::new(".env"));
     tracing_subscriber::fmt()
         .with_env_filter(EnvFilter::try_from_default_env().unwrap_or_else(|_| "damon=info".into()))
         .init();
     // rustls needs an explicit process-level crypto provider.
     let _ = rustls::crypto::ring::default_provider().install_default();
 
-    let args = Args::parse();
-    let path = args.config.unwrap_or_else(config::default_config_path);
     if args.print_config_path {
         println!("{}", path.display());
         return Ok(());
@@ -207,6 +217,9 @@ async fn main() -> anyhow::Result<()> {
         }
         _ => anyhow::bail!("tls_cert and tls_key must be set together"),
     }
+    // Tear down MCP children explicitly — rmcp's Drop only *schedules* an
+    // async close, so relying on it at process exit can orphan servers.
+    state.mcp.shutdown().await;
     info!("damond stopped");
     Ok(())
 }

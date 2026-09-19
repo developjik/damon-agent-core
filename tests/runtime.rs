@@ -209,8 +209,44 @@ async fn mock_llm_two_tools() -> String {
     addr.to_string()
 }
 
+/// Mock LLM: first call emits a tool call to the registered test.sleep
+/// tool; later calls return text (unreached when the cancel lands as
+/// expected).
+async fn mock_llm_registered_tool() -> String {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    let calls = Arc::new(AtomicUsize::new(0));
+    let app = Router::new().route(
+        "/chat/completions",
+        post(move |_body: String| {
+            let calls = calls.clone();
+            async move {
+                let n = calls.fetch_add(1, Ordering::SeqCst);
+                let sse = if n == 0 {
+                    concat!(
+                        "data: {\"choices\":[{\"delta\":{\"tool_calls\":[{\"index\":0,\"id\":\"call_1\",\"function\":{\"name\":\"test.sleep\",\"arguments\":\"{\\\"secs\\\":5}\"}}]}}]}\n\n",
+                        "data: [DONE]\n\n"
+                    )
+                } else {
+                    "data: {\"choices\":[{\"delta\":{\"content\":\"ok\"}}]}\n\ndata: [DONE]\n\n"
+                };
+                Response::builder()
+                    .header("content-type", "text/event-stream")
+                    .body(Body::from(sse))
+                    .unwrap()
+            }
+        }),
+    );
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    tokio::spawn(async move {
+        axum::serve(listener, app).await.unwrap();
+    });
+    addr.to_string()
+}
+
 /// ClientChannel that cancels the turn on the first tool_call_update
-/// notification — after call_1's result is persisted, before call_2 runs.
+/// notification — the in_progress notify fires before any call executes,
+/// so the token is already set when the tool loop starts.
 struct CancelOnToolUpdate {
     cancel: tokio_util::sync::CancellationToken,
 }
@@ -228,7 +264,7 @@ impl damon_core::runtime::ClientChannel for CancelOnToolUpdate {
 }
 
 #[tokio::test]
-async fn cancel_mid_tool_loop_repairs_orphan_calls() {
+async fn cancel_does_not_mask_real_tool_errors() {
     let upstream = mock_llm_two_tools().await;
 
     let mut providers = BTreeMap::new();
@@ -276,10 +312,15 @@ async fn cancel_mid_tool_loop_repairs_orphan_calls() {
         cancel: cancel.clone(),
     });
 
-    // call_1 executes (fails: unknown tool), its tool_call_update fires
-    // cancel → call_2 still runs execute_tool but its real error
-    // ("unknown tool b") is persisted — a cancelled turn must not mask
-    // a genuine tool failure as "cancelled".
+    // The cancel token is set by the first tool_call_update notification,
+    // before either call executes. Both calls fail with genuine
+    // unknown-tool errors, and the assertions prove those real errors are
+    // persisted verbatim — a cancelled turn must not rewrite genuine tool
+    // failures as "cancelled". Not covered here: the Cancelled-sentinel
+    // path (a call in flight when the token fires → row says
+    // "cancelled"), reached by
+    // cancel_reaches_inflight_tool_and_persists_cancelled below, nor the
+    // append-failure repair loop that backfills orphan tool_calls.
     let _ = damon_core::runtime::run_prompt(&state, session_id, "hi", None, &client, cancel).await;
 
     let msgs = store.messages(session_id).await.unwrap();
@@ -292,6 +333,87 @@ async fn cancel_mid_tool_loop_repairs_orphan_calls() {
     assert_eq!(msgs[3]["role"], "tool");
     assert_eq!(msgs[3]["tool_call_id"], "call_2");
     assert_eq!(msgs[3]["content"], "error: unknown tool b");
+}
+
+#[tokio::test]
+async fn cancel_reaches_inflight_tool_and_persists_cancelled() {
+    let upstream = mock_llm_registered_tool().await;
+
+    let mut providers = BTreeMap::new();
+    providers.insert(
+        "default".to_string(),
+        ProviderConfig {
+            api: "openai-completions".to_string(),
+            base_url: Some(format!("http://{upstream}")),
+            api_key: None,
+            models: vec![],
+            default_model: None,
+            headers: Default::default(),
+            compat: Default::default(),
+            discovery: None,
+            context_promotion_target: None,
+        },
+    );
+    let server_py = concat!(env!("CARGO_MANIFEST_DIR"), "/tests/mcp_server.py");
+    let mut mcp_servers = HashMap::new();
+    mcp_servers.insert(
+        "test".to_string(),
+        damon_core::config::McpServerConfig {
+            command: "python3".to_string(),
+            args: vec![server_py.to_string()],
+            env: HashMap::new(),
+            auto_approve: true,
+        },
+    );
+    let shared: damon_core::config::SharedConfig = Arc::new(parking_lot::RwLock::new(Config {
+        bind: "127.0.0.1:0".parse().unwrap(),
+        auth_token: None,
+        tls_cert: None,
+        tls_key: None,
+        data_dir: None,
+        mcp_servers,
+        providers,
+        models: BTreeMap::new(),
+        relay: None,
+        permission_timeout_secs: None,
+        max_tool_output: None,
+        summary_model: None,
+        session_retention_days: None,
+    }));
+    let store = Store::in_memory().await.unwrap();
+    let mcp = {
+        let servers = shared.read().mcp_servers.clone();
+        McpRegistry::connect_all(&servers).await
+    };
+    assert!(mcp.has_tool("test.sleep"), "MCP tool not registered");
+    let state = AppState::new(shared, store.clone(), mcp).await;
+
+    let session_id = "test-session";
+    store
+        .create_session(session_id, "/tmp", None)
+        .await
+        .unwrap();
+
+    let cancel = tokio_util::sync::CancellationToken::new();
+    let client: Arc<dyn damon_core::runtime::ClientChannel> = Arc::new(CancelOnToolUpdate {
+        cancel: cancel.clone(),
+    });
+
+    // The in_progress tool_call_update sets the token before execute_tool
+    // runs, so the registered call bails with the Cancelled sentinel and
+    // is persisted as "cancelled" — a cancel must still leave a
+    // well-formed tool row, not drop it (a missing row would orphan the
+    // assistant tool_calls and 400 every later turn).
+    let _ = damon_core::runtime::run_prompt(&state, session_id, "hi", None, &client, cancel).await;
+
+    let msgs = store.messages(session_id).await.unwrap();
+    // user + assistant(tool_calls) + tool(cancelled); the cancelled turn
+    // stops before a second LLM call.
+    assert_eq!(msgs.len(), 3, "got {msgs:?}");
+    assert_eq!(msgs[1]["tool_calls"].as_array().unwrap().len(), 1);
+    assert_eq!(msgs[2]["role"], "tool");
+    assert_eq!(msgs[2]["tool_call_id"], "call_1");
+    assert_eq!(msgs[2]["content"], "cancelled");
 }
 
 /// Mock LLM: first call emits one SSE chunk then stalls forever;
@@ -860,6 +982,120 @@ async fn compaction_failure_keeps_full_history() {
     );
 }
 
+/// Regression: the old token estimate priced a 3-byte CJK char at 0.75
+/// tokens (len/4), so a Korean session only reached the 85% compaction
+/// threshold at ~1.13× the real window and 400ed before ever
+/// compacting. Weighting non-ASCII bytes puts a CJK char at ~1 token:
+/// the same history that stayed under the threshold with the old
+/// formula must now trigger compaction.
+#[tokio::test]
+async fn compaction_triggers_on_cjk_history() {
+    use damon_core::runtime::{self, ClientChannel};
+
+    // Mock upstream: non-streaming (the summarizer) returns a summary,
+    // streaming (the actual turn) succeeds.
+    let app = Router::new().route(
+        "/chat/completions",
+        post(|body: String| async move {
+            let v: Value = serde_json::from_str(&body).unwrap();
+            if v["stream"].as_bool() == Some(true) {
+                Response::builder()
+                    .header("content-type", "text/event-stream")
+                    .body(Body::from(
+                        "data: {\"choices\":[{\"delta\":{\"content\":\"ok\"}}]}\n\ndata: [DONE]\n\n",
+                    ))
+                    .unwrap()
+            } else {
+                Response::builder()
+                    .header("content-type", "application/json")
+                    .body(Body::from(
+                        "{\"choices\":[{\"message\":{\"content\":\"cjk summary\"}}]}",
+                    ))
+                    .unwrap()
+            }
+        }),
+    );
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    tokio::spawn(async move {
+        axum::serve(listener, app).await.unwrap();
+    });
+
+    let mut providers = BTreeMap::new();
+    providers.insert(
+        "default".to_string(),
+        ProviderConfig {
+            api: "openai-completions".to_string(),
+            base_url: Some(format!("http://{addr}")),
+            api_key: None,
+            models: vec![],
+            default_model: Some("m".into()),
+            headers: Default::default(),
+            compat: Default::default(),
+            discovery: None,
+            context_promotion_target: None,
+        },
+    );
+    // Window sits between the old and new estimates of the CJK history:
+    // 100 Korean chars = 300 bytes → old 300/4 = 75 tokens, weighted
+    // (300 + 300/3)/4 = 100 tokens. Threshold 85% of 100 = 85: the old
+    // formula (75) must NOT compact, the weighted one (100) must.
+    let mut models = BTreeMap::new();
+    models.insert(
+        "m".to_string(),
+        damon_core::config::ModelMeta {
+            context_window: Some(100),
+            ..Default::default()
+        },
+    );
+    let shared: damon_core::config::SharedConfig = Arc::new(parking_lot::RwLock::new(Config {
+        bind: "127.0.0.1:0".parse().unwrap(),
+        auth_token: None,
+        tls_cert: None,
+        tls_key: None,
+        data_dir: None,
+        mcp_servers: HashMap::new(),
+        providers,
+        models,
+        relay: None,
+        permission_timeout_secs: None,
+        max_tool_output: None,
+        summary_model: None,
+        session_retention_days: None,
+    }));
+    let store = Store::in_memory().await.unwrap();
+    let mcp = McpRegistry::connect_all(&HashMap::new()).await;
+    let state = AppState::new(shared, store.clone(), mcp).await;
+
+    store.create_session("s1", "", None).await.unwrap();
+    store
+        .append(
+            "s1",
+            "user",
+            &json!({"role":"user","content":"한".repeat(100)}),
+        )
+        .await
+        .unwrap();
+
+    struct Noop;
+    #[async_trait::async_trait]
+    impl ClientChannel for Noop {
+        async fn notify(&self, _m: &str, _p: Value) {}
+        async fn request(&self, _m: &str, _p: Value) -> anyhow::Result<Value> {
+            anyhow::bail!("no client")
+        }
+    }
+    let client: Arc<dyn ClientChannel> = Arc::new(Noop);
+    let cancel = tokio_util::sync::CancellationToken::new();
+    runtime::run_prompt(&state, "s1", "hi", None, &client, cancel)
+        .await
+        .unwrap();
+
+    let (through, summary) = store.compaction("s1").await.unwrap();
+    assert!(through > 0, "CJK history did not trigger compaction");
+    assert_eq!(summary.as_deref(), Some("cjk summary"));
+}
+
 /// Mock LLM: the first `tool_turns` calls each emit one tool call for
 /// `tool`, later calls return text. Used to drive the permission and
 /// iteration-cap paths against a real MCP tool.
@@ -1063,4 +1299,113 @@ async fn max_iterations_returns_max_turn_requests() {
         .await
         .unwrap();
     assert_eq!(stop, damon_core::llm::StopReason::MaxTurnRequests);
+}
+
+#[tokio::test]
+async fn compaction_reevaluates_after_tool_results_grow_history() {
+    use damon_core::runtime::{self, ClientChannel};
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    // Mock upstream: streaming calls emit one tool call then text;
+    // non-streaming calls are the compaction summarizer — counted, and
+    // answered with a summary large enough to keep the tail over the
+    // (tiny) context window so compaction must re-trigger next iteration.
+    let summarize_calls = Arc::new(AtomicUsize::new(0));
+    let stream_calls = Arc::new(AtomicUsize::new(0));
+    let app = Router::new().route(
+        "/chat/completions",
+        post({
+            let summarize_calls = summarize_calls.clone();
+            let stream_calls = stream_calls.clone();
+            move |body: String| {
+                let summarize_calls = summarize_calls.clone();
+                let stream_calls = stream_calls.clone();
+                async move {
+                    let v: Value = serde_json::from_str(&body).unwrap();
+                    if v["stream"].as_bool() == Some(true) {
+                        let n = stream_calls.fetch_add(1, Ordering::SeqCst);
+                        let sse = if n == 0 {
+                            "data: {\"choices\":[{\"delta\":{\"tool_calls\":[{\"index\":0,\"id\":\"call_1\",\"function\":{\"name\":\"test.ping\",\"arguments\":\"{}\"}}]}}]}\n\ndata: [DONE]\n\n"
+                        } else {
+                            "data: {\"choices\":[{\"delta\":{\"content\":\"done\"}}]}\n\ndata: [DONE]\n\n"
+                        };
+                        Response::builder()
+                            .header("content-type", "text/event-stream")
+                            .body(Body::from(sse))
+                            .unwrap()
+                    } else {
+                        summarize_calls.fetch_add(1, Ordering::SeqCst);
+                        Response::builder()
+                            .header("content-type", "application/json")
+                            .body(Body::from(
+                                json!({"choices":[{"message":{"content": "x".repeat(2000)}}]})
+                                    .to_string(),
+                            ))
+                            .unwrap()
+                    }
+                }
+            }
+        }),
+    );
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    tokio::spawn(async move {
+        axum::serve(listener, app).await.unwrap();
+    });
+
+    // Real MCP tool so the call executes and its result row appends.
+    let (state, store) = mcp_state(&addr.to_string(), true, None).await;
+    // Tiny context window: compaction triggers on every evaluation.
+    {
+        let mut models = BTreeMap::new();
+        models.insert(
+            "default".to_string(),
+            damon_core::config::ModelMeta {
+                context_window: Some(1),
+                ..Default::default()
+            },
+        );
+        state.config.write().models = models;
+    }
+    store.create_session("s1", "", None).await.unwrap();
+    store
+        .append(
+            "s1",
+            "user",
+            &json!({"role":"user","content":"earlier message"}),
+        )
+        .await
+        .unwrap();
+    store
+        .append(
+            "s1",
+            "assistant",
+            &json!({"role":"assistant","content":"earlier reply"}),
+        )
+        .await
+        .unwrap();
+
+    struct Noop;
+    #[async_trait::async_trait]
+    impl ClientChannel for Noop {
+        async fn notify(&self, _m: &str, _p: Value) {}
+        async fn request(&self, _m: &str, _p: Value) -> anyhow::Result<Value> {
+            anyhow::bail!("no client")
+        }
+    }
+    let client: Arc<dyn ClientChannel> = Arc::new(Noop);
+    let cancel = tokio_util::sync::CancellationToken::new();
+    runtime::run_prompt(&state, "s1", "new question", None, &client, cancel)
+        .await
+        .unwrap();
+
+    // Two model iterations ran (tool call, then text). The tool result
+    // appended between them grew the history, so compaction must have
+    // been evaluated twice — once per iteration. The old flag stayed
+    // false after the first check and summarized only once.
+    assert_eq!(
+        summarize_calls.load(Ordering::SeqCst),
+        2,
+        "compaction did not re-evaluate after tool results grew history"
+    );
 }

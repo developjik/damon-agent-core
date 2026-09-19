@@ -38,9 +38,12 @@ fn xml_escape(s: &str) -> String {
         .replace('"', "&quot;")
 }
 
-/// Escape `"` and `\` for a double-quoted systemd ExecStart argument.
+/// Escape `"`, `\`, and `%` for a double-quoted systemd ExecStart
+/// argument — `%` starts a specifier, so a literal percent is `%%`.
 fn systemd_escape(s: &str) -> String {
-    s.replace('\\', "\\\\").replace('"', "\\\"")
+    s.replace('\\', "\\\\")
+        .replace('"', "\\\"")
+        .replace('%', "%%")
 }
 
 /// systemd user unit.
@@ -63,8 +66,40 @@ pub fn systemd_unit(exe: &str, config: &str) -> String {
     )
 }
 
+/// Escape a path for the /TR command line: `"` becomes `\"`, and
+/// backslashes immediately preceding a generated quote are doubled, so
+/// an embedded quote or a trailing `\` can't break out of the task's
+/// quoted command line.
+fn schtasks_escape(s: &str) -> String {
+    let mut out = String::with_capacity(s.len() + 8);
+    let mut slashes = 0usize;
+    for c in s.chars() {
+        if c == '\\' {
+            slashes += 1;
+        } else if c == '"' {
+            for _ in 0..slashes * 2 {
+                out.push('\\');
+            }
+            out.push_str("\\\"");
+            slashes = 0;
+        } else {
+            for _ in 0..slashes {
+                out.push('\\');
+            }
+            out.push(c);
+            slashes = 0;
+        }
+    }
+    // The path ends right before our generated closing quote.
+    for _ in 0..slashes * 2 {
+        out.push('\\');
+    }
+    out
+}
+
 /// schtasks command for Windows logon start.
 pub fn schtasks_command(exe: &str, config: &str) -> String {
+    let (exe, config) = (schtasks_escape(exe), schtasks_escape(config));
     format!(
         "schtasks /Create /TN damond /SC ONLOGON /TR \"\\\"{exe}\\\" --config \\\"{config}\\\"\" /F"
     )
@@ -138,8 +173,13 @@ pub fn install(exe: &str, config: &str) -> anyhow::Result<String> {
 pub fn print_definition(exe: &str, config: &str) -> String {
     #[cfg(target_os = "macos")]
     {
-        let log = "~/Library/Logs/damond.log";
-        return launchd_plist(exe, config, log);
+        // Mirror install(): absolute home from BaseDirs — launchd does
+        // not expand a literal `~` in StandardOutPath.
+        let home = directories::BaseDirs::new()
+            .map(|d| d.home_dir().to_path_buf())
+            .unwrap_or_else(|| PathBuf::from("."));
+        let log = format!("{}/Library/Logs/damond.log", home.display());
+        return launchd_plist(exe, config, &log);
     }
     #[cfg(target_os = "linux")]
     {

@@ -66,6 +66,26 @@ fn schtasks_command_is_well_formed() {
 }
 
 #[test]
+fn systemd_unit_escapes_percent() {
+    let unit = systemd_unit("/usr/bin/da%mond", "/etc/da%mon.toml");
+    // `%` starts a specifier — a literal percent must be doubled.
+    assert!(unit.contains("da%%mond"), "{unit}");
+    assert!(unit.contains("da%%mon.toml"), "{unit}");
+}
+
+#[test]
+fn schtasks_escapes_embedded_quote_and_trailing_backslash() {
+    let cmd = schtasks_command("C:\\da\"mon\\damond.exe\\", "C:\\c.toml");
+    // An embedded quote becomes \" inside the /TR value…
+    assert!(cmd.contains("\\\"C:\\da\\\"mon\\damond.exe"), "{cmd}");
+    // …and the trailing backslash is doubled so it can't escape the
+    // generated closing quote.
+    assert!(cmd.contains("damond.exe\\\\\\\""), "{cmd}");
+    // Segments with nothing to escape stay byte-identical.
+    assert!(cmd.contains("\\\"C:\\c.toml\\\""), "{cmd}");
+}
+
+#[test]
 fn install_paths_have_expected_filenames() {
     assert_eq!(
         launchd_plist_path().file_name().unwrap(),
