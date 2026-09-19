@@ -154,7 +154,7 @@ pub fn install(exe: &str, config: &str) -> anyhow::Result<String> {
             .args(["--user", "enable", "--now", "damond"])
             .status()?;
         anyhow::ensure!(status.success(), "systemctl enable failed");
-        return Ok(format!("installed systemd user unit: {}", path.display()));
+        Ok(format!("installed systemd user unit: {}", path.display()))
     }
     #[cfg(target_os = "windows")]
     {
@@ -163,7 +163,7 @@ pub fn install(exe: &str, config: &str) -> anyhow::Result<String> {
             .args(["/C", &cmd])
             .status()?;
         anyhow::ensure!(status.success(), "schtasks failed");
-        return Ok("registered Task Scheduler task: damond".to_string());
+        Ok("registered Task Scheduler task: damond".to_string())
     }
     #[cfg(not(any(target_os = "macos", target_os = "linux", target_os = "windows")))]
     anyhow::bail!("service install not supported on this platform")
