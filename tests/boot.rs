@@ -21,9 +21,11 @@ async fn damond_boots_and_serves_models() {
     let port = free_port();
     let cfg_path = dir.join("config.toml");
     let mut f = std::fs::File::create(&cfg_path).unwrap();
+    // Literal string (single quotes): a Windows temp path is full of
+    // backslashes, which TOML basic strings would read as escapes.
     write!(
         f,
-        "bind = \"127.0.0.1:{port}\"\ndata_dir = \"{}\"\n",
+        "bind = \"127.0.0.1:{port}\"\ndata_dir = '{}'\n",
         dir.display()
     )
     .unwrap();
