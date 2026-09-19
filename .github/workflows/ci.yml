@@ -32,15 +32,16 @@ jobs:
       - run: cargo check --release --all-targets
 
   audit:
-    # audit-check reports findings by creating a failing check run.
-    permissions:
-      checks: write
+    # Direct cargo-audit instead of rustsec/audit-check: that image pins a
+    # rustc older than current cargo-audit dependency MSRVs (kstring 2.0.5
+    # requires 1.96), so its unlocked install cannot compile. --locked uses
+    # cargo-audit's own lockfile, which is 1.95-compatible.
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
-      - uses: rustsec/audit-check@69366f33c96575abad1ee0dba8212993eecbe998 # v2
-        with:
-          token: ${{ secrets.GITHUB_TOKEN }}
+      - uses: dtolnay/rust-toolchain@46817827a5bfabe028bf34e1cce71fd40e2ff697 # 1.95.0
+      - run: cargo install cargo-audit --locked
+      - run: cargo audit
 
   release:
     if: startsWith(github.ref, 'refs/tags/v')
