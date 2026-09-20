@@ -7,7 +7,7 @@ use std::collections::HashMap;
 use std::sync::Arc;
 
 use anyhow::bail;
-use serde_json::json;
+use serde_json::{Value, json};
 use tokio::sync::{Mutex, mpsc, oneshot};
 use tracing::warn;
 
@@ -22,6 +22,17 @@ pub struct Incoming {
     pub sender_id: Option<String>,
     /// Message text with any bot mention already stripped.
     pub text: String,
+    /// Attachments referenced by the message — fetched lazily by the
+    /// channel at prompt time so a dropped turn never downloads them.
+    pub attachments: Vec<Attachment>,
+}
+
+/// An attachment on an inbound message. `TelegramFile` is a Bot API
+/// file_id resolved via getFile + download; `Bytes` is already-fetched
+/// content for channels that inline media.
+pub enum Attachment {
+    TelegramFile { file_id: String },
+    Bytes { data: Vec<u8>, mime: String },
 }
 
 /// A chat channel's transport surface — injectable for tests.
@@ -44,6 +55,11 @@ pub trait ChannelApi: Send + Sync {
     /// so `send` stays under the channel cap.
     fn flush_threshold(&self) -> usize {
         3500
+    }
+    /// Resolve an attachment to bytes. Channels that never produce
+    /// attachments keep the default (error) implementation.
+    async fn fetch(&self, _att: &Attachment) -> anyhow::Result<(Vec<u8>, String)> {
+        anyhow::bail!("this channel does not support attachments")
     }
 }
 
@@ -115,7 +131,7 @@ impl Bridge {
         loop {
             match self.ch.recv().await {
                 Ok(Some(msg)) => {
-                    self.handle_message(msg.chat_id, msg.sender_id, msg.text)
+                    self.handle_message(msg.chat_id, msg.sender_id, msg.text, msg.attachments)
                         .await
                 }
                 Ok(None) => {
@@ -166,12 +182,6 @@ impl Bridge {
                         // Per-chat channels are unbounded: a slow chat
                         // (rate-limited send, hung HTTP) can no longer
                         // stall this router and freeze every session's
-                        // events. No slot cap is needed — memory stays
-                        // finite because a demux entry lives only while
-                        // that chat's turn is in flight, and a turn's
-                        // Update stream is finite (bounded by the model
-                        // reply, ending at PromptDone), so run_turn
-                        // drains the queue.
                         // Send never blocks; failure only means the
                         // turn handler already dropped its receiver
                         // (turn ended) — those events are stale.
@@ -181,12 +191,14 @@ impl Bridge {
             }
         });
     }
-    /// Handle one inbound message: permission reply, or a new prompt turn.
+    /// Handle one inbound message: permission reply, `!` command, or a
+    /// new prompt turn. `attachments` are fetched lazily inside the turn.
     pub async fn handle_message(
         self: &Arc<Self>,
         chat_id: String,
         sender_id: Option<String>,
         text: String,
+        attachments: Vec<Attachment>,
     ) {
         // Allowlist gate: an unlisted sender/chat must not reach the
         // agent at all — no session, no prompt, no permission reply.
@@ -244,6 +256,13 @@ impl Bridge {
             drop(demux);
         }
 
+        // `!` commands are chat-local control messages — they never
+        // reach the model and never occupy a turn slot.
+        if let Some(cmd) = text.trim().strip_prefix('!') {
+            self.handle_command(&chat_id, cmd.trim()).await;
+            return;
+        }
+
         // One live turn per chat — a second prompt would overwrite the
         // demux entry and starve the first turn's events.
         {
@@ -284,12 +303,100 @@ impl Bridge {
             }
             let _guard = TurnGuard {
                 bridge: &me,
+
                 chat_id: chat_id.clone(),
             };
-            if let Err(e) = me.run_turn(&chat_id, &session_id, sender_id, &text).await {
+            if let Err(e) = me
+                .run_turn(&chat_id, &session_id, sender_id, &text, attachments)
+                .await
+            {
                 let _ = me.ch.send(&chat_id, &format!("error: {e:#}")).await;
             }
         });
+    }
+    /// `!`-prefixed chat commands. Unknown commands get a hint, not a
+    /// prompt — a typo'd command must not silently reach the model.
+    async fn handle_command(self: &Arc<Self>, chat_id: &str, cmd: &str) {
+        let (verb, arg) = match cmd.split_once(char::is_whitespace) {
+            Some((v, a)) => (v, a.trim()),
+            None => (cmd, ""),
+        };
+        let reply = match verb {
+            "new" => {
+                self.chat_sessions.lock().await.remove(chat_id);
+                Some("session reset — next message starts a fresh session".to_string())
+            }
+            "model" => match self.session_for(chat_id).await {
+                Ok(sid) => {
+                    let model = if arg.is_empty() { None } else { Some(arg) };
+                    match self.client.set_session_model(&sid, model).await {
+                        Ok(()) => Some(match model {
+                            Some(m) => format!("model set to {m}"),
+                            None => "model override cleared".to_string(),
+                        }),
+                        Err(e) => Some(format!("error: {e:#}")),
+                    }
+                }
+                Err(e) => Some(format!("error: {e:#}")),
+            },
+            "compact" => match self.session_for(chat_id).await {
+                Ok(sid) => match self.client.compact_session(&sid).await {
+                    Ok((true, through, _)) => Some(format!(
+                        "compacted through message {}",
+                        through.unwrap_or(0)
+                    )),
+                    Ok((false, _, reason)) => Some(format!(
+                        "not compacted: {}",
+                        reason.unwrap_or_else(|| "below threshold".to_string())
+                    )),
+                    Err(e) => Some(format!("error: {e:#}")),
+                },
+                Err(e) => Some(format!("error: {e:#}")),
+            },
+            "usage" => {
+                let sid = self
+                    .chat_sessions
+                    .lock()
+                    .await
+                    .get(chat_id)
+                    .map(|e| e.session_id.clone());
+                match self.client.usage(sid.as_deref()).await {
+                    Ok(v) => {
+                        if let Some(models) = v["models"].as_array() {
+                            let mut lines = vec!["token usage:".to_string()];
+                            for m in models {
+                                lines.push(format!(
+                                    "  {} — in {} / out {} / {} turns",
+                                    m["model"].as_str().unwrap_or("?"),
+                                    m["inputTokens"].as_u64().unwrap_or(0),
+                                    m["outputTokens"].as_u64().unwrap_or(0),
+                                    m["turns"].as_u64().unwrap_or(0),
+                                ));
+                            }
+                            Some(lines.join("\n"))
+                        } else {
+                            Some(format!(
+                                "this session: in {} / out {} / {} turns",
+                                v["inputTokens"].as_u64().unwrap_or(0),
+                                v["outputTokens"].as_u64().unwrap_or(0),
+                                v["turns"].as_u64().unwrap_or(0),
+                            ))
+                        }
+                    }
+                    Err(e) => Some(format!("error: {e:#}")),
+                }
+            }
+            "help" => Some(
+                "commands: !new (reset session) · !model <name> (set/clear model) · \
+                 !compact (compact context) · !usage (token totals) · \
+                 allow/deny (answer a permission prompt)"
+                    .to_string(),
+            ),
+            _ => Some(format!("unknown command '!{verb}' — try !help")),
+        };
+        if let Some(text) = reply {
+            let _ = self.ch.send(chat_id, &text).await;
+        }
     }
 
     /// Get or create the damon session for this chat. A creation failure
@@ -347,6 +454,7 @@ impl Bridge {
         session_id: &str,
         sender_id: Option<String>,
         text: &str,
+        attachments: Vec<Attachment>,
     ) -> anyhow::Result<()> {
         let (tx, mut rx) = mpsc::unbounded_channel();
         let mut session_id = session_id.to_string();
@@ -362,17 +470,48 @@ impl Bridge {
         // error — prompt() itself only fails on send. Drop the mapping
         // and retry once on a fresh session instead of bricking the
         // chat until restart.
+        // Resolve attachments once per turn — a fetched photo is reused
+        // if the stale-session retry re-prompts. Fetch failures degrade
+        // to a text note rather than killing the turn: the user still
+        // gets an answer about the caption.
+        let mut blocks: Vec<Value> = Vec::new();
+        if !text.is_empty() {
+            blocks.push(json!({"type": "text", "text": text}));
+        }
+        for att in &attachments {
+            match self.ch.fetch(att).await {
+                Ok((data, mime)) => {
+                    use base64::Engine;
+                    blocks.push(json!({
+                        "type": "image",
+                        "data": base64::engine::general_purpose::STANDARD.encode(data),
+                        "mimeType": mime,
+                    }));
+                }
+                Err(e) => {
+                    warn!(error = %e, "attachment fetch failed");
+                    blocks.push(json!({
+                        "type": "text",
+                        "text": "[attachment could not be downloaded]"
+                    }));
+                }
+            }
+        }
+        if blocks.is_empty() {
+            blocks.push(json!({"type": "text", "text": ""}));
+        }
         let mut buf = String::new();
         let mut retried = false;
         'turn: loop {
             {
                 let client = self.client.clone();
                 let sid = session_id.clone();
-                let text = text.to_string();
-                if let Err(e) = tokio::spawn(async move { client.prompt(&sid, &text, None).await })
-                    .await
-                    .map_err(anyhow::Error::from)
-                    .and_then(|r| r)
+                let blocks = blocks.clone();
+                if let Err(e) =
+                    tokio::spawn(async move { client.prompt_blocks(&sid, blocks, None).await })
+                        .await
+                        .map_err(anyhow::Error::from)
+                        .and_then(|r| r)
                 {
                     self.end_turn(chat_id, &session_id).await;
                     return Err(e);

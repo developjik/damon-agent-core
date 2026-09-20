@@ -160,12 +160,14 @@ pub fn incoming_from_message(d: &Value, bot_id: &str) -> Option<Incoming> {
             chat_id: channel_id,
             sender_id: d["author"]["id"].as_str().map(String::from),
             text: stripped,
+            attachments: Vec::new(),
         });
     }
     Some(Incoming {
         chat_id: channel_id,
         sender_id: d["author"]["id"].as_str().map(String::from),
         text,
+        attachments: Vec::new(),
     })
 }
 

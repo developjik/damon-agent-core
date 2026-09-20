@@ -52,6 +52,7 @@ fn test_config(upstream: &str) -> Config {
         max_tool_output: None,
         summary_model: None,
         session_retention_days: None,
+        builtin_tools: Default::default(),
     }
 }
 
@@ -179,10 +180,10 @@ async fn bridge_delivers_response_and_maps_sessions() {
 
     // Two different chats → two different sessions.
     bridge
-        .handle_message("chat-a".into(), None, "hi".into())
+        .handle_message("chat-a".into(), None, "hi".into(), Vec::new())
         .await;
     bridge
-        .handle_message("chat-b".into(), None, "hi".into())
+        .handle_message("chat-b".into(), None, "hi".into(), Vec::new())
         .await;
 
     // Wait until BOTH chats got their reply.
@@ -264,13 +265,13 @@ async fn bridge_permission_reply_allows_tool() {
     bridge.spawn_event_router().await;
 
     bridge
-        .handle_message("42".into(), None, "use the tool".into())
+        .handle_message("42".into(), None, "use the tool".into(), Vec::new())
         .await;
     // Permission prompt lands in the chat…
     wait_for_sent(&ch.sent, "🔐").await;
     // …and "allow" approves it, letting the turn finish.
     bridge
-        .handle_message("42".into(), None, "allow".into())
+        .handle_message("42".into(), None, "allow".into(), Vec::new())
         .await;
     wait_for_sent(&ch.sent, "✅ allowed").await;
     wait_for_sent(&ch.sent, "tool done").await;
@@ -621,7 +622,12 @@ async fn bridge_allowlist_drops_unlisted_senders() {
 
     // Unlisted sender: dropped before any session is created.
     bridge
-        .handle_message("chat-evil".into(), Some("user-evil".into()), "hi".into())
+        .handle_message(
+            "chat-evil".into(),
+            Some("user-evil".into()),
+            "hi".into(),
+            Vec::new(),
+        )
         .await;
     tokio::time::sleep(std::time::Duration::from_millis(300)).await;
     assert!(
@@ -635,7 +641,12 @@ async fn bridge_allowlist_drops_unlisted_senders() {
 
     // Listed sender: works normally.
     bridge
-        .handle_message("chat-ok".into(), Some("user-ok".into()), "hi".into())
+        .handle_message(
+            "chat-ok".into(),
+            Some("user-ok".into()),
+            "hi".into(),
+            Vec::new(),
+        )
         .await;
     wait_for_sent(&ch.sent, "hello back").await;
 }

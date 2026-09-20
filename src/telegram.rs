@@ -15,6 +15,11 @@ pub trait TelegramApi: Send + Sync {
     /// Long-poll for updates. Returns raw update objects.
     async fn get_updates(&self, offset: i64, timeout_secs: u64) -> anyhow::Result<Vec<Value>>;
     async fn send_message(&self, chat_id: i64, text: &str) -> anyhow::Result<()>;
+    /// Resolve a Bot API file_id to (bytes, mime). Default errors —
+    /// test doubles that never see photos don't implement it.
+    async fn fetch_file(&self, _file_id: &str) -> anyhow::Result<(Vec<u8>, String)> {
+        anyhow::bail!("file download not supported")
+    }
 }
 
 /// Real Bot API over HTTPS. The token lives in the request URL (the Bot
@@ -118,6 +123,49 @@ impl TelegramApi for BotApi {
         }
         Ok(())
     }
+    async fn fetch_file(&self, file_id: &str) -> anyhow::Result<(Vec<u8>, String)> {
+        // getFile → file_path → download from the file host. The file
+        // URL embeds the token too, so errors are sanitized the same way.
+        let meta: Value = self
+            .http
+            .get(format!("{}/getFile", self.base))
+            .query(&[("file_id", file_id)])
+            .send()
+            .await
+            .map_err(|e| self.sanitize(e))?
+            .json()
+            .await
+            .map_err(|e| self.sanitize(e))?;
+        anyhow::ensure!(
+            meta["ok"].as_bool().unwrap_or(false),
+            "getFile failed: {}",
+            meta["description"].as_str().unwrap_or("unknown")
+        );
+        let path = meta["result"]["file_path"]
+            .as_str()
+            .ok_or_else(|| anyhow::anyhow!("getFile returned no file_path"))?;
+        let mime = match path.rsplit('.').next() {
+            Some("png") => "image/png",
+            Some("jpg") | Some("jpeg") => "image/jpeg",
+            Some("gif") => "image/gif",
+            Some("webp") => "image/webp",
+            _ => "image/jpeg",
+        }
+        .to_string();
+        let bytes = self
+            .http
+            .get(format!(
+                "https://api.telegram.org/file/bot{}/{}",
+                self.token, path
+            ))
+            .send()
+            .await
+            .map_err(|e| self.sanitize(e))?
+            .bytes()
+            .await
+            .map_err(|e| self.sanitize(e))?;
+        Ok((bytes.to_vec(), mime))
+    }
 }
 
 /// One buffered update in delivery order. `msg` is what the bridge gets —
@@ -159,6 +207,7 @@ impl TelegramChannel {
             if let Some(id) = next.update_id {
                 self.offset.fetch_max(id + 1, Ordering::Relaxed);
             }
+
             if let Some(msg) = next.msg {
                 return Some(msg);
             }
@@ -206,6 +255,15 @@ impl ChannelApi for TelegramChannel {
             .map_err(|_| anyhow::anyhow!("invalid telegram chat_id: {chat_id}"))?;
         self.tg.send_message(id, text).await
     }
+
+    async fn fetch(&self, att: &crate::channel::Attachment) -> anyhow::Result<(Vec<u8>, String)> {
+        match att {
+            crate::channel::Attachment::TelegramFile { file_id } => {
+                self.tg.fetch_file(file_id).await
+            }
+            crate::channel::Attachment::Bytes { data, mime } => Ok((data.clone(), mime.clone())),
+        }
+    }
 }
 
 /// Extract (chat_id, text) from a Telegram update. Non-message updates
@@ -218,11 +276,27 @@ pub fn incoming_from_update(u: &Value) -> Option<Incoming> {
         return None;
     }
     let chat_id = u["message"]["chat"]["id"].as_i64()?;
-    let text = u["message"]["text"].as_str()?;
+    let sender_id = u["message"]["from"]["id"].as_i64().map(|id| id.to_string());
+    if let Some(text) = u["message"]["text"].as_str() {
+        return Some(Incoming {
+            chat_id: chat_id.to_string(),
+            sender_id,
+            text: text.to_string(),
+            attachments: Vec::new(),
+        });
+    }
+    // Photo message: take the largest size (last in the array), caption
+    // becomes the prompt text. The file_id is resolved lazily at prompt
+    // time — a message that never becomes a turn never downloads.
+    let photos = u["message"]["photo"].as_array()?;
+    let file_id = photos.last()?["file_id"].as_str()?;
     Some(Incoming {
         chat_id: chat_id.to_string(),
-        sender_id: u["message"]["from"]["id"].as_i64().map(|id| id.to_string()),
-        text: text.to_string(),
+        sender_id,
+        text: u["message"]["caption"].as_str().unwrap_or("").to_string(),
+        attachments: vec![crate::channel::Attachment::TelegramFile {
+            file_id: file_id.to_string(),
+        }],
     })
 }
 
@@ -263,7 +337,7 @@ impl Bridge {
     pub async fn handle_update(self: &Arc<Self>, u: Value) {
         if let Some(msg) = incoming_from_update(&u) {
             self.inner
-                .handle_message(msg.chat_id, msg.sender_id, msg.text)
+                .handle_message(msg.chat_id, msg.sender_id, msg.text, msg.attachments)
                 .await;
         }
     }

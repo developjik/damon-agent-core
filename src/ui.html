@@ -112,6 +112,26 @@
     width: 130px; background: var(--panel); color: var(--fg);
     border: 1px solid var(--border); border-radius: 8px; padding: 9px 10px; font: 12px inherit;
   }
+  #search {
+    margin: 0 10px 8px; padding: 7px 9px; background: var(--bg); color: var(--fg);
+    border: 1px solid var(--border); border-radius: 6px; font-size: 12px;
+  }
+  #search:focus { outline: none; border-color: var(--accent); }
+  #attachBtn {
+    background: var(--panel); color: var(--muted); border: 1px solid var(--border);
+    border-radius: 8px; padding: 9px 10px; cursor: pointer; font-size: 14px;
+  }
+  #attachBtn:hover { color: var(--fg); }
+  #attachBar { display: flex; gap: 8px; padding: 0 14px; }
+  #attachBar .thumb { position: relative; }
+  #attachBar img { height: 48px; border-radius: 6px; border: 1px solid var(--border); }
+  #attachBar .rm {
+    position: absolute; top: -6px; right: -6px; width: 16px; height: 16px;
+    border-radius: 50%; border: 0; background: var(--err); color: #fff;
+    font-size: 10px; line-height: 1; cursor: pointer;
+  }
+  .msg img.att { max-width: 320px; border-radius: 8px; display: block; margin-top: 6px; }
+  .hit { color: var(--muted); font-size: 11px; }
   #sendBtn, #cancelBtn {
     padding: 9px 18px; border-radius: 8px; border: 0; cursor: pointer; font-size: 13px;
   }
@@ -143,6 +163,7 @@
   <div id="sidebar">
     <h1>damon</h1>
     <button id="newBtn">+ New session</button>
+    <input id="search" placeholder="search history…" title="Full-text search over all sessions">
     <div id="sessions"></div>
   </div>
   <div id="main">
@@ -155,10 +176,13 @@
     </div>
     <div id="composer">
       <input id="model" placeholder="model (optional)" title="Model override sent with each prompt">
+      <input id="attach" type="file" accept="image/*" style="display:none">
+      <button id="attachBtn" title="Attach an image">📎</button>
       <textarea id="input" rows="1" placeholder="Message — Enter to send, Shift+Enter for newline"></textarea>
       <button id="sendBtn">Send</button>
       <button id="cancelBtn">Cancel</button>
     </div>
+    <div id="attachBar"></div>
   </div>
   <div id="auth">
     <div id="authCard">
@@ -436,7 +460,7 @@ async function refreshSessions() {
       row.className = "sess" + (s.sessionId === activeSession ? " active" : "");
       const label = document.createElement("span");
       label.className = "sid";
-      label.textContent = s.sessionId.slice(0, 8);
+      label.textContent = s.title || s.sessionId.slice(0, 8);
       label.title = s.sessionId + (s.createdAt ? " — " + s.createdAt : "");
       row.appendChild(label);
       if (s.model) {
@@ -514,9 +538,21 @@ function msgText(m) {
 function renderStored(m) {
   const text = msgText(m);
   switch (m.role) {
-    case "user":
-      if (text.trim()) bubble("user", esc(text));
+    case "user": {
+      const ub = text.trim() ? bubble("user", esc(text)) : bubble("user", "");
+      // Image parts persist as OpenAI image_url data URLs — render them.
+      if (Array.isArray(m.content))
+        for (const p of m.content) {
+          const u = p && p.image_url && (p.image_url.url || p.image_url);
+          if (typeof u === "string" && u.startsWith("data:")) {
+            const im = document.createElement("img");
+            im.className = "att";
+            im.src = u;
+            ub.appendChild(im);
+          }
+        }
       break;
+    }
     case "assistant": {
       if (Array.isArray(m.tool_calls)) {
         for (const tc of m.tool_calls) {
@@ -547,16 +583,27 @@ function renderStored(m) {
 // ---------- prompt ----------
 async function sendPrompt() {
   const text = input.value;
-  if (!text.trim() || busy) return;
+  if ((!text.trim() && !attachments.length) || busy) return;
   if (!activeSession) await newSession();
   if (!activeSession) return;
+  const imgs = attachments.splice(0);
   input.value = "";
   input.style.height = "auto";
-  bubble("user", esc(text));
+  const ub = bubble("user", esc(text));
+  for (const a of imgs) {
+    const im = document.createElement("img");
+    im.className = "att";
+    im.src = "data:" + a.mimeType + ";base64," + a.data;
+    ub.appendChild(im);
+  }
+  renderAttachBar();
   setBusy(true);
   streamEl = thoughtEl = null; streamText = thoughtText = "";
   toolEls.clear();
-  const params = { sessionId: activeSession, prompt: [{ type: "text", text }] };
+  const blocks = [{ type: "text", text }];
+  for (const a of imgs)
+    blocks.push({ type: "image", data: a.data, mimeType: a.mimeType });
+  const params = { sessionId: activeSession, prompt: blocks };
   const model = $("model").value.trim();
   if (model) params.model = model;
   try {
@@ -611,6 +658,76 @@ input.addEventListener("input", () => {
   input.style.height = "auto";
   input.style.height = Math.min(input.scrollHeight, 160) + "px";
 });
+
+// ---------- search ----------
+let searchTimer = null;
+$("search").addEventListener("input", () => {
+  clearTimeout(searchTimer);
+  searchTimer = setTimeout(runSearch, 300);
+});
+async function runSearch() {
+  const q = $("search").value.trim();
+  if (!q) { refreshSessions(); return; }
+  try {
+    const r = await request("session/search", { query: q, limit: 20 });
+    const list = $("sessions");
+    list.textContent = "";
+    for (const hit of (r.results || [])) {
+      const row = document.createElement("div");
+      row.className = "sess" + (hit.sessionId === activeSession ? " active" : "");
+      const label = document.createElement("span");
+      label.className = "sid";
+      label.textContent = hit.sessionId.slice(0, 8);
+      row.appendChild(label);
+      const snip = document.createElement("span");
+      snip.className = "hit";
+      snip.textContent = hit.snippet || "";
+      row.appendChild(snip);
+      row.onclick = () => selectSession(hit.sessionId);
+      list.appendChild(row);
+    }
+    if (!(r.results || []).length) {
+      const d = document.createElement("div");
+      d.className = "hit";
+      d.style.padding = "8px";
+      d.textContent = "no matches";
+      list.appendChild(d);
+    }
+  } catch (e) { errBubble("search failed: " + e.message); }
+}
+
+// ---------- image attachments ----------
+const attachments = []; // {data, mimeType, name}
+$("attachBtn").onclick = () => $("attach").click();
+$("attach").addEventListener("change", async ev => {
+  for (const f of ev.target.files || []) {
+    const buf = await f.arrayBuffer();
+    let bin = "";
+    const bytes = new Uint8Array(buf);
+    for (let i = 0; i < bytes.length; i += 8192)
+      bin += String.fromCharCode.apply(null, bytes.subarray(i, i + 8192));
+    attachments.push({ data: btoa(bin), mimeType: f.type || "image/png", name: f.name });
+  }
+  ev.target.value = "";
+  renderAttachBar();
+});
+function renderAttachBar() {
+  const bar = $("attachBar");
+  bar.textContent = "";
+  attachments.forEach((a, i) => {
+    const wrap = document.createElement("div");
+    wrap.className = "thumb";
+    const img = document.createElement("img");
+    img.src = "data:" + a.mimeType + ";base64," + a.data;
+    img.title = a.name;
+    const rm = document.createElement("button");
+    rm.className = "rm";
+    rm.textContent = "×";
+    rm.onclick = () => { attachments.splice(i, 1); renderAttachBar(); };
+    wrap.appendChild(img); wrap.appendChild(rm);
+    bar.appendChild(wrap);
+  });
+}
 connect();
 </script>
 </body>
