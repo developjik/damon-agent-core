@@ -4,6 +4,34 @@
 
 ### Added
 
+- **Builtin fs/shell tools** — `[builtin_tools]` config adds `fs.read`,
+  `fs.write`, `fs.edit`, `fs.list`, `fs.search`, and `shell.exec` to every
+  session's tool list without an MCP server. Relative paths resolve
+  against the session's cwd; `allowed_paths` sandboxes the fs tools
+  (not `shell.exec` — the permission prompt is the primary gate).
+  Permission flow is identical to MCP tools, including "always allow"
+  session grants; rebuilt on config reload.
+- **Token usage accounting** — `session/usage` RPC, `damon usage
+  [--session ID]`, and `!usage` in chat channels report per-model
+  input/output token totals and turn counts, persisted in a new `usage`
+  table. Usage is recorded on every turn exit path — including errors
+  and cancellations, which still cost money.
+- **Session titles + rename** — `session/rename` RPC, `damon rename`,
+  and auto-derived titles from the first user message; `session/list`
+  and the web UI sidebar show titles instead of bare ids.
+- **`/v1/responses` endpoint** — OpenAI Responses API passthrough:
+  requests translate to chat-completions internally and the response
+  (JSON or SSE) is re-shaped to Responses format, so Responses-only
+  clients work against any configured provider.
+- **Image prompts** — `session/prompt` accepts `image` content blocks;
+  the web UI has an attach button with thumbnails, and Telegram photos
+  are fetched via getFile and sent as image blocks.
+- **Channel `!` commands** — `!new`, `!model`, `!compact`, `!usage`,
+  `!help` in Telegram/Slack/Discord chats; unknown `!` commands get a
+  hint instead of silently reaching the model.
+- **Web UI search** — sidebar search box runs `session/search` (FTS5)
+  and jumps to the matching session.
+
 - **omp-parity provider presets** — `damond presets` lists ~26 hosted and
   local providers (Groq, OpenRouter, Mistral, xAI, DeepSeek, Fireworks,
   Together, Cerebras, NVIDIA, Moonshot/Kimi, Z.AI, BigModel, MiniMax,

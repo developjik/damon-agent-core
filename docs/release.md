@@ -16,8 +16,10 @@ npm + crates.io publish. The items below are manual.
 
 ## 2. Choose the npm publish method
 
-### A. Token (current workflow as-is)
-Register `NPM_TOKEN` and you're done.
+### A. Token + provenance (current workflow)
+Register `NPM_TOKEN` and you're done — the job publishes with
+`--provenance` (Sigstore attestation via `id-token: write`), so
+`npm audit signatures` verifies the package.
 
 ### B. Trusted Publishing (OIDC, no token) — recommended
 1. **Publish the first version manually** (the package must exist on npm

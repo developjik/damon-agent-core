@@ -173,13 +173,21 @@ Client → daemon requests:
   down on session/delete and daemon shutdown, and cap at 8 per session /
   64 live overlays; a name colliding with a configured server is
   rejected.
-- `session/list {limit?, offset?}` → `{sessions: [{sessionId, createdAt, model}]}`
+- `session/list {limit?, offset?}` → `{sessions: [{sessionId, createdAt, model, title}]}`
 - `session/resume {sessionId}` → `{sessionId}` (error if unknown)
+- `session/rename {sessionId, title}` → `{renamed: true}` — empty titles
+  rejected with `-32602`; unknown session → `-32602`
+- `session/usage {sessionId?}` → `{models: [{model, inputTokens, outputTokens, turns}]}`
+  when `sessionId` is omitted (per-model rollup across all sessions), or
+  `{inputTokens, outputTokens, turns}` for one session
 - `session/delete {sessionId}` → `{deleted: true}` — cancels a live turn
   first; `-32603 "session busy"` if it is still winding down after 10s
 - `session/messages {sessionId, limit?, offset?}` → `{messages: [...]}`
 - `session/search {query, limit}` → `{results: [{sessionId, messageId, snippet}]}`
 - `session/prompt {sessionId, prompt: [{type:"text", text}], model?}` → `{stopReason, model?}` — `model` overrides the session default for this turn; the response arrives when the turn ends. The result's `model` is the upstream model string actually sent to the provider — with default-provider fallback the request name passes through, with `provider/model` or glob routing it is the remapped upstream id, so clients can badge the real route taken. Absent only when the turn was cancelled before the first model resolution. Unknown `sessionId` → `-32602`.
+- `session/prompt` content blocks: `{type:"text", text}` and
+  `{type:"image", data: <base64>, mimeType}` — images are forwarded to
+  vision-capable providers as `image_url` data URLs.
 - `session/cancel {sessionId}` — notification; if sent with an `id` it gets an empty `{}` result
 - `session/compact {sessionId}` → `{compacted, compactedThrough?, reason?}` —
   force a context compaction now, ignoring the 85% estimate threshold.
