@@ -399,3 +399,92 @@ async fn session_messages_paginates() {
     let all: Value = read_json(&mut ws).await;
     assert_eq!(all["result"]["messages"].as_array().unwrap().len(), 3);
 }
+
+/// session/load replays persisted history as session/update notifications
+/// in live-turn shapes (user chunk → agent chunk → tool_call →
+/// tool_call_update), then answers the request. The replay must carry the
+/// real stored content — a client rendering it sees the same transcript
+/// the live turn produced.
+#[tokio::test]
+async fn session_load_replays_history() {
+    let (_state, store, addr) = serve(test_config(None, None)).await;
+    store.create_session("s1", "/a", None).await.unwrap();
+    store
+        .append("s1", "user", &json!({"role":"user","content":"hi there"}))
+        .await
+        .unwrap();
+    store
+        .append(
+            "s1",
+            "assistant",
+            &json!({"role":"assistant","content":"working on it",
+                    "tool_calls":[{"id":"c1","type":"function",
+                        "function":{"name":"fs.read","arguments":"{\"path\":\"/x\"}"}}]}),
+        )
+        .await
+        .unwrap();
+    store
+        .append(
+            "s1",
+            "tool",
+            &json!({"role":"tool","tool_call_id":"c1","content":"file body"}),
+        )
+        .await
+        .unwrap();
+    store
+        .append("s1", "assistant", &json!({"role":"assistant","content":"done"}))
+        .await
+        .unwrap();
+
+    let (mut ws, _) = tokio_tungstenite::connect_async(format!("ws://{addr}/ws"))
+        .await
+        .unwrap();
+    rpc_send(
+        &mut ws,
+        json!({"jsonrpc":"2.0","id":1,"method":"session/load","params":{"sessionId":"s1"}}),
+    )
+    .await;
+
+    // Notifications precede the response; collect until id=1 answers.
+    let mut updates = Vec::new();
+    let reply = loop {
+        let v: Value = read_json(&mut ws).await;
+        if v["id"] == 1 {
+            break v;
+        }
+        assert_eq!(v["method"], "session/update", "unexpected frame: {v}");
+        updates.push(v["params"]["update"].clone());
+    };
+    assert!(reply.get("error").is_none(), "load failed: {reply}");
+
+    let kinds: Vec<&str> = updates
+        .iter()
+        .filter_map(|u| u["sessionUpdate"].as_str())
+        .collect();
+    assert_eq!(
+        kinds,
+        vec![
+            "user_message_chunk",
+            "agent_message_chunk",
+            "tool_call",
+            "tool_call_update",
+            "agent_message_chunk"
+        ],
+        "replay order/shape wrong: {updates:?}"
+    );
+    assert_eq!(updates[0]["content"]["text"], "hi there");
+    assert_eq!(updates[1]["content"]["text"], "working on it");
+    assert_eq!(updates[2]["title"], "fs.read");
+    assert_eq!(updates[3]["status"], "completed");
+    assert_eq!(updates[4]["content"]["text"], "done");
+
+    // Unknown session → error, no replay.
+    rpc_send(
+        &mut ws,
+        json!({"jsonrpc":"2.0","id":2,"method":"session/load","params":{"sessionId":"nope"}}),
+    )
+    .await;
+    let err: Value = read_json(&mut ws).await;
+    assert_eq!(err["id"], 2);
+    assert!(err["error"].is_object(), "expected error: {err}");
+}

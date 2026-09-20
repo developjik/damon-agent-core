@@ -118,17 +118,19 @@ async fn main() -> anyhow::Result<()> {
             }
         }
         Cmd::Chat { session, model } => {
+            let mut events = client.events().await;
             let session_id = match session {
-                // Verify the id exists up front — prompting into a dead
-                // session would only fail on the first turn.
-                Some(s) => client.resume_session(&s).await?,
+                // Load replays the history as session/update events —
+                // verify the id exists up front the same way.
+                Some(s) => load_and_replay(&client, &mut events, &s).await?,
                 None => client.new_session(&cwd(), model.as_deref()).await?,
             };
-            chat_loop(&client, &session_id, model.as_deref()).await?;
+            chat_loop(&client, &mut events, &session_id, model.as_deref()).await?;
         }
         Cmd::Resume { id, model } => {
-            let session_id = client.resume_session(&id).await?;
-            chat_loop(&client, &session_id, model.as_deref()).await?;
+            let mut events = client.events().await;
+            let session_id = load_and_replay(&client, &mut events, &id).await?;
+            chat_loop(&client, &mut events, &session_id, model.as_deref()).await?;
         }
         Cmd::Delete { id } => {
             client.delete_session(&id).await?;
@@ -203,16 +205,76 @@ fn out(s: impl std::fmt::Display) {
     }
 }
 
+/// Attach to an existing session via session/load and render the replayed
+/// history. The event receiver must already be taken — replay updates
+/// arrive on it while the load request is in flight.
+async fn load_and_replay(
+    client: &DamonClient,
+    events: &mut mpsc::Receiver<ClientEvent>,
+    session_id: &str,
+) -> anyhow::Result<String> {
+    let load = {
+        let client = client.clone();
+        let id = session_id.to_string();
+        tokio::spawn(async move { client.load_session(&id).await })
+    };
+    tokio::pin!(load);
+    loop {
+        tokio::select! {
+            r = &mut load => {
+                r.context("load task panicked")??;
+                return Ok(session_id.to_string());
+            }
+            ev = events.recv() => match ev {
+                Some(ClientEvent::Update(params)) => render_replay(&params["update"]),
+                Some(ClientEvent::PromptDone { .. }) | Some(ClientEvent::Request { .. }) => {}
+                None => anyhow::bail!("connection closed"),
+            }
+        }
+    }
+}
+
+/// Render one replayed session/update from session/load. Live turns
+/// stream text without a role prefix; replay marks user turns so the
+/// transcript stays readable.
+fn render_replay(u: &serde_json::Value) {
+    match u["sessionUpdate"].as_str() {
+        Some("user_message_chunk") => {
+            if let Some(t) = u["content"]["text"].as_str() {
+                out(format!("> {t}\n"));
+            }
+        }
+        Some("agent_message_chunk") => {
+            if let Some(t) = u["content"]["text"].as_str() {
+                out(t);
+            }
+        }
+        Some("tool_call") => {
+            eprintln!(
+                "[tool {}]",
+                u["title"].as_str().unwrap_or("")
+            );
+        }
+        Some("tool_call_update") => {
+            let status = u["status"].as_str().unwrap_or("");
+            if status != "completed" {
+                eprintln!("[tool {} → {status}]", u["toolCallId"].as_str().unwrap_or(""));
+            }
+        }
+        _ => {}
+    }
+}
+
 /// Interactive chat REPL over an existing session. The event receiver is
 /// taken once — `events()` hands out the only consumer, so re-taking it
 /// per turn would starve every turn after the first.
 async fn chat_loop(
     client: &DamonClient,
+    events: &mut mpsc::Receiver<ClientEvent>,
     session_id: &str,
     model: Option<&str>,
 ) -> anyhow::Result<()> {
     eprintln!("session: {session_id}  (Ctrl-D to quit)");
-    let mut events = client.events().await;
     let mut stdin = tokio::io::BufReader::new(tokio::io::stdin()).lines();
     loop {
         eprint!("> ");
@@ -225,7 +287,7 @@ async fn chat_loop(
         // A failed turn (provider error, "session not found", "prompt in
         // progress") must not kill the REPL — only a dead event stream
         // means the connection is gone for good.
-        if let Err(e) = run_turn(client, &mut events, session_id, &line, model, &mut stdin).await {
+        if let Err(e) = run_turn(client, events, session_id, &line, model, &mut stdin).await {
             if events.is_closed() {
                 return Err(e);
             }

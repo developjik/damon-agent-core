@@ -283,6 +283,13 @@ export class DamonClient {
     return r.sessionId;
   }
 
+  /** ACP session/load: attach to an existing session — the daemon replays
+   *  its history as session/update notifications on the events() stream,
+   *  so consumers should already be iterating events. */
+  async loadSession(sessionId) {
+    return this.#call("session/load", { sessionId });
+  }
+
   async deleteSession(sessionId) {
     return this.#call("session/delete", { sessionId });
   }

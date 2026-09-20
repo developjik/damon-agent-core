@@ -379,6 +379,15 @@ impl DamonClient {
             .context("no sessionId in response")
     }
 
+    /// ACP session/load: attach to an existing session — the daemon
+    /// replays its history as session/update notifications on the event
+    /// stream, so callers should already be draining events.
+    pub async fn load_session(&self, id: &str) -> anyhow::Result<()> {
+        self.request("session/load", json!({"sessionId": id}))
+            .await?;
+        Ok(())
+    }
+
     /// Full-text search over all session history.
     /// Returns `(sessionId, messageId, snippet)` triples.
     pub async fn search(

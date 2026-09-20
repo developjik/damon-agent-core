@@ -15,6 +15,7 @@ use tokio_util::sync::CancellationToken;
 use tracing::{info, warn};
 
 use crate::api::AppState;
+use crate::llm;
 use crate::runtime::{self, ClientChannel};
 
 #[derive(Deserialize)]
@@ -338,7 +339,7 @@ pub async fn handle_socket(
                         Ok(json!({
                             "protocolVersion": 1,
                             "agentCapabilities": {
-                                "loadSession": false,
+                                "loadSession": true,
                                 "promptCapabilities": {"text": true}
                             },
                             "agentInfo": {"name": "damond", "version": env!("CARGO_PKG_VERSION")}
@@ -555,6 +556,62 @@ pub async fn handle_socket(
                         client
                             .respond(id, Err(rpc_error(-32602, "session not found")))
                             .await;
+                    }
+                    Err(e) => {
+                        client
+                            .respond(id, Err(rpc_error(-32603, &e.to_string())))
+                            .await;
+                    }
+                }
+            }
+            ("session/load", Some(id)) => {
+                // ACP session/load: attach to an existing session and replay
+                // its history as session/update notifications so the client
+                // renders prior turns exactly like live ones. mcpServers get
+                // the same overlay treatment as session/new.
+                let session_id = params["sessionId"].as_str().unwrap_or("").to_string();
+                let overlay = match parse_session_mcp(&params["mcpServers"], &state).await {
+                    Ok(o) => o,
+                    Err(e) => {
+                        client.respond(id, Err(rpc_error(-32602, &e))).await;
+                        continue;
+                    }
+                };
+                match state.store.session_exists(&session_id).await {
+                    Ok(true) => {}
+                    Ok(false) => {
+                        client
+                            .respond(id, Err(rpc_error(-32602, "session not found")))
+                            .await;
+                        continue;
+                    }
+                    Err(e) => {
+                        client
+                            .respond(id, Err(rpc_error(-32603, &e.to_string())))
+                            .await;
+                        continue;
+                    }
+                }
+                if let Some(reg) = overlay {
+                    state
+                        .session_mcp
+                        .lock()
+                        .await
+                        .insert(session_id.clone(), reg);
+                }
+                match state.store.messages_full(&session_id).await {
+                    Ok(msgs) => {
+                        for m in &msgs {
+                            for update in replay_updates(&m.data) {
+                                client
+                                    .notify(
+                                        "session/update",
+                                        json!({"sessionId": session_id, "update": update}),
+                                    )
+                                    .await;
+                            }
+                        }
+                        client.respond(id, Ok(json!({}))).await;
                     }
                     Err(e) => {
                         client
@@ -947,6 +1004,101 @@ async fn parse_session_mcp(
         crate::mcp::McpRegistry::connect_all(&cfgs).await,
     )))
 }
+
+/// Convert one persisted message into the session/update shapes a live
+/// turn would have emitted, for session/load replay. Order within a
+/// message mirrors the live emit order (thought → text → tool calls).
+fn replay_updates(m: &Value) -> Vec<Value> {
+    let mut out = Vec::new();
+    match m["role"].as_str() {
+        Some("user") => {
+            for block in content_blocks(&m["content"]) {
+                out.push(json!({
+                    "sessionUpdate": "user_message_chunk",
+                    "content": block,
+                }));
+            }
+        }
+        Some("assistant") => {
+            for b in m["thinking"].as_array().cloned().unwrap_or_default() {
+                if let Some(t) = b["thinking"].as_str().or_else(|| b["text"].as_str()) {
+                    out.push(json!({
+                        "sessionUpdate": "agent_thought_chunk",
+                        "content": {"type": "text", "text": t},
+                    }));
+                }
+            }
+            for block in content_blocks(&m["content"]) {
+                out.push(json!({
+                    "sessionUpdate": "agent_message_chunk",
+                    "content": block,
+                }));
+            }
+            for tc in m["tool_calls"].as_array().cloned().unwrap_or_default() {
+                let f = &tc["function"];
+                out.push(json!({
+                    "sessionUpdate": "tool_call",
+                    "toolCallId": tc["id"],
+                    "title": f["name"].as_str().unwrap_or("tool"),
+                    "rawInput": llm::parse_partial_json(
+                        f["arguments"].as_str().unwrap_or("")
+                    ),
+                    "status": "in_progress",
+                }));
+            }
+        }
+        Some("tool") => {
+            let content = m["content"].as_str().unwrap_or("");
+            let status = if content == "cancelled" {
+                "cancelled"
+            } else if content.starts_with("error:") {
+                "failed"
+            } else {
+                "completed"
+            };
+            out.push(json!({
+                "sessionUpdate": "tool_call_update",
+                "toolCallId": m["tool_call_id"],
+                "status": status,
+                "content": [{"type": "content", "content": {"type": "text", "text": content}}],
+            }));
+        }
+        _ => {}
+    }
+    out
+}
+
+/// Normalize stored message content (string or part array) into ACP
+/// content blocks for replay. Non-text parts the client can't render
+/// degrade to a placeholder instead of vanishing.
+fn content_blocks(content: &Value) -> Vec<Value> {
+    match content {
+        Value::String(s) if !s.is_empty() => vec![json!({"type": "text", "text": s})],
+        Value::Array(parts) => parts
+            .iter()
+            .filter_map(|p| match p["type"].as_str() {
+                Some("text") => Some(p.clone()),
+                Some("image_url") => {
+                    let url = p["image_url"]["url"]
+                        .as_str()
+                        .or_else(|| p["image_url"].as_str())
+                        .unwrap_or("");
+                    url.strip_prefix("data:")
+                        .and_then(|rest| rest.split_once(";base64,"))
+                        .map(|(mime, data)| {
+                            json!({"type": "image", "data": data, "mimeType": mime})
+                        })
+                        .or_else(|| {
+                            Some(json!({"type": "text", "text": format!("[image: {url}]")}))
+                        })
+                }
+                Some(other) => Some(json!({"type": "text", "text": format!("[{other}]")})),
+                None => None,
+            })
+            .collect(),
+        _ => vec![],
+    }
+}
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -970,3 +1122,4 @@ mod tests {
         );
     }
 }
+
