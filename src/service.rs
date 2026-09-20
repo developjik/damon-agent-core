@@ -192,3 +192,100 @@ pub fn print_definition(exe: &str, config: &str) -> String {
     #[allow(unreachable_code)]
     "unsupported platform".to_string()
 }
+
+/// Remove the service registration for the current platform.
+/// Best-effort on the stop/unload step — a service that isn't running
+/// must not block removal of its definition file.
+pub fn uninstall() -> anyhow::Result<String> {
+    #[cfg(target_os = "macos")]
+    {
+        let path = launchd_plist_path();
+        if path.exists() {
+            // Unload first (ignore failure — may not be loaded), then
+            // remove the plist so it can't come back on next login.
+            let _ = std::process::Command::new("launchctl")
+                .args(["unload", "-w"])
+                .arg(&path)
+                .status();
+            std::fs::remove_file(&path)?;
+            Ok(format!("removed launchd agent: {}", path.display()))
+        } else {
+            Ok("no launchd agent installed".to_string())
+        }
+    }
+    #[cfg(target_os = "linux")]
+    {
+        let path = systemd_unit_path();
+        if path.exists() {
+            let _ = std::process::Command::new("systemctl")
+                .args(["--user", "disable", "--now", "damond"])
+                .status();
+            std::fs::remove_file(&path)?;
+            let _ = std::process::Command::new("systemctl")
+                .args(["--user", "daemon-reload"])
+                .status();
+            Ok(format!("removed systemd user unit: {}", path.display()))
+        } else {
+            Ok("no systemd unit installed".to_string())
+        }
+    }
+    #[cfg(target_os = "windows")]
+    {
+        let status = std::process::Command::new("cmd")
+            .args(["/C", "schtasks /Delete /TN damond /F"])
+            .status()?;
+        anyhow::ensure!(status.success(), "schtasks /Delete failed");
+        Ok("removed Task Scheduler task: damond".to_string())
+    }
+    #[cfg(not(any(target_os = "macos", target_os = "linux", target_os = "windows")))]
+    anyhow::bail!("service uninstall not supported on this platform")
+}
+
+/// Whether a service definition exists and (best-effort) whether the
+/// service manager considers it running. Never fails — status is a
+/// diagnostic, not a gate.
+pub fn status() -> String {
+    #[cfg(target_os = "macos")]
+    {
+        let path = launchd_plist_path();
+        if !path.exists() {
+            return "not installed".to_string();
+        }
+        // launchctl list exits 0 and prints the job when loaded.
+        let loaded = std::process::Command::new("launchctl")
+            .args(["list", "dev.damon.damond"])
+            .output()
+            .map(|o| o.status.success())
+            .unwrap_or(false);
+        return format!(
+            "installed: {}\nloaded: {}",
+            path.display(),
+            if loaded { "yes" } else { "no" }
+        );
+    }
+    #[cfg(target_os = "linux")]
+    {
+        let path = systemd_unit_path();
+        if !path.exists() {
+            return "not installed".to_string();
+        }
+        let active = std::process::Command::new("systemctl")
+            .args(["--user", "is-active", "damond"])
+            .output()
+            .map(|o| String::from_utf8_lossy(&o.stdout).trim().to_string())
+            .unwrap_or_else(|_| "unknown".to_string());
+        return format!("installed: {}\nactive: {}", path.display(), active);
+    }
+    #[cfg(target_os = "windows")]
+    {
+        let out = std::process::Command::new("cmd")
+            .args(["/C", "schtasks /Query /TN damond"])
+            .output();
+        return match out {
+            Ok(o) if o.status.success() => "installed: damond task".to_string(),
+            _ => "not installed".to_string(),
+        };
+    }
+    #[allow(unreachable_code)]
+    "unsupported platform".to_string()
+}

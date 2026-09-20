@@ -47,15 +47,32 @@ enum Cmd {
     },
     /// List omp-parity provider presets and which are active right now
     Presets,
+    /// Show the resolved config path or print the loaded config
+    Config {
+        #[command(subcommand)]
+        action: ConfigAction,
+    },
 }
+
 #[derive(clap::Subcommand)]
 enum ServiceAction {
     /// Write the service definition and enable it
     Install,
     /// Print the service definition without installing
     Print,
+    /// Remove the service registration
+    Uninstall,
+    /// Show whether the service is installed and running
+    Status,
 }
 
+#[derive(clap::Subcommand)]
+enum ConfigAction {
+    /// Print the resolved config file path
+    Path,
+    /// Print the loaded config (secrets shown as references, never resolved)
+    Show,
+}
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
     let args = Args::parse();
@@ -92,6 +109,12 @@ async fn main() -> anyhow::Result<()> {
                 ServiceAction::Print => {
                     print!("{}", damon_core::service::print_definition(&exe, &cfg_path));
                 }
+                ServiceAction::Uninstall => {
+                    println!("{}", damon_core::service::uninstall()?);
+                }
+                ServiceAction::Status => {
+                    println!("{}", damon_core::service::status());
+                }
             }
             return Ok(());
         }
@@ -103,6 +126,18 @@ async fn main() -> anyhow::Result<()> {
         }
         Some(Cmd::Presets) => {
             return presets_table();
+        }
+        Some(Cmd::Config { action }) => {
+            match action {
+                ConfigAction::Path => println!("{}", path.display()),
+                ConfigAction::Show => {
+                    // Print the file verbatim — secret refs stay
+                    // unresolved, so this never leaks credentials.
+                    let p = config::ensure_config(&path)?;
+                    print!("{}", std::fs::read_to_string(p)?);
+                }
+            }
+            return Ok(());
         }
         Some(Cmd::Doctor) => return doctor(&path).await,
         None => {}
