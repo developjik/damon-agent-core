@@ -74,6 +74,21 @@ enum Cmd {
         /// Session id to compact
         id: String,
     },
+    /// Rename a session (sets its display title)
+    Rename {
+        /// Session id
+        id: String,
+        /// New title
+        title: String,
+    },
+    /// Set or clear a session's default model
+    Model {
+        /// Session id
+        id: String,
+        /// Model override (provider/model, glob id, or model:level); omit to clear
+        #[arg(long)]
+        model: Option<String>,
+    },
 }
 
 #[tokio::main]
@@ -113,8 +128,20 @@ async fn main() -> anyhow::Result<()> {
     match args.cmd {
         Cmd::Health => unreachable!(),
         Cmd::Sessions => {
-            for (id, created, model) in client.list_sessions().await? {
-                outln(format!("{id}\t{created}\t{model}"));
+            for (id, created, model, title) in client.list_sessions().await? {
+                let label = if title.is_empty() { &id } else { &title };
+                outln(format!("{id}\t{created}\t{model}\t{label}"));
+            }
+        }
+        Cmd::Rename { id, title } => {
+            client.rename_session(&id, &title).await?;
+            outln(format!("renamed {id}"));
+        }
+        Cmd::Model { id, model } => {
+            client.set_session_model(&id, model.as_deref()).await?;
+            match &model {
+                Some(m) => outln(format!("{id} model → {m}")),
+                None => outln(format!("{id} model override cleared")),
             }
         }
         Cmd::Chat { session, model } => {

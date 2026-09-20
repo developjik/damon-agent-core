@@ -294,6 +294,16 @@ export class DamonClient {
     return this.#call("session/delete", { sessionId });
   }
 
+  /** Rename a session (sets its display title). */
+  async renameSession(sessionId, title) {
+    return this.#call("session/rename", { sessionId, title });
+  }
+
+  /** Set or clear (null) the session's default model override. */
+  async setSessionModel(sessionId, model) {
+    return this.#call("session/set_model", { sessionId, model });
+  }
+
   /** Full-text search over all history: [{sessionId, messageId, snippet}]. */
   async search(query, limit = 10) {
     const r = await this.#call("session/search", { query, limit });
@@ -327,7 +337,7 @@ export class DamonClient {
     try {
       this.#ws.send(JSON.stringify({
         jsonrpc: "2.0", id, method: "session/prompt",
-        params: { sessionId, model, prompt: [{ type: "text", text }] },
+        params: { sessionId, model, prompt: Array.isArray(text) ? text : [{ type: "text", text }] },
       }));
     } catch (e) {
       this.#pending.delete(id);

@@ -163,10 +163,10 @@ impl Gemini {
                     } else {
                         // Gemini rejects empty text parts — a user
                         // message with no text (or only non-text parts)
-                        // must not emit one.
-                        let t = super::content_text(&m["content"]);
-                        if !t.is_empty() {
-                            cur_others.push(json!({"text": t}));
+                        // must not emit one. Image parts translate to
+                        // inlineData/fileData.
+                        for p in gemini_content_parts(&m["content"]) {
+                            cur_others.push(p);
                         }
                     }
                 }
@@ -288,6 +288,7 @@ impl Gemini {
         Ok((out, names))
     }
 
+
     pub async fn chat_stream(
         &self,
         body: Value,
@@ -356,6 +357,42 @@ impl Gemini {
         }
         let v: Value = serde_json::from_str(&text).context("invalid upstream JSON")?;
         Ok(gemini_to_openai(&v, &names))
+    }
+}
+/// Translate OpenAI user content (string or parts array) into Gemini
+/// `parts`. `image_url` parts become `inlineData` (data: URLs) or
+/// `fileData` (http(s) URLs); unknown part types degrade to a text
+/// placeholder rather than vanishing.
+fn gemini_content_parts(content: &Value) -> Vec<Value> {
+    match content {
+        Value::String(s) if !s.is_empty() => vec![json!({"text": s})],
+        Value::Array(parts) => parts
+            .iter()
+            .filter_map(|p| match p["type"].as_str() {
+                Some("text") => {
+                    let t = p["text"].as_str().unwrap_or("");
+                    (!t.is_empty()).then(|| json!({"text": t}))
+                }
+                Some("image_url") => {
+                    let url = p["image_url"]["url"]
+                        .as_str()
+                        .or_else(|| p["image_url"].as_str())
+                        .unwrap_or("");
+                    if let Some(rest) = url.strip_prefix("data:") {
+                        rest.split_once(";base64,").map(|(mime, data)| {
+                            json!({"inlineData": {"mimeType": mime, "data": data}})
+                        })
+                    } else if url.starts_with("http") {
+                        Some(json!({"fileData": {"mimeType": "image/*", "fileUri": url}}))
+                    } else {
+                        Some(json!({"text": format!("[image: {url}]")}))
+                    }
+                }
+                Some(other) => Some(json!({"text": format!("[{other}]")})),
+                None => None,
+            })
+            .collect(),
+        _ => vec![],
     }
 }
 

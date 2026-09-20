@@ -175,13 +175,10 @@ impl Anthropic {
                     } else {
                         // Anthropic 400s on empty text blocks — a user
                         // message with no text (or only non-text parts)
-                        // must not emit one.
-                        let t = super::content_text(&m["content"]);
-                        if !t.is_empty() {
-                            cur_others.push(json!({
-                                "type": "text",
-                                "text": t,
-                            }));
+                        // must not emit one. Image parts translate to
+                        // native image blocks (base64 or URL source).
+                        for p in anthropic_content_parts(&m["content"]) {
+                            cur_others.push(p);
                         }
                     }
                 }
@@ -453,6 +450,46 @@ impl Anthropic {
                 "total_tokens": prompt + completion,
             },
         }))
+    }
+}
+
+/// Translate OpenAI user content (string or parts array) into Anthropic
+/// content blocks. `image_url` parts become native `image` blocks —
+/// `data:` URLs map to base64 sources, http(s) URLs to url sources.
+/// Unknown part types degrade to a text placeholder rather than
+/// vanishing, so a vision request never silently becomes text-only.
+fn anthropic_content_parts(content: &Value) -> Vec<Value> {
+    match content {
+        Value::String(s) if !s.is_empty() => vec![json!({"type": "text", "text": s})],
+        Value::Array(parts) => parts
+            .iter()
+            .filter_map(|p| match p["type"].as_str() {
+                Some("text") => {
+                    let t = p["text"].as_str().unwrap_or("");
+                    (!t.is_empty()).then(|| json!({"type": "text", "text": t}))
+                }
+                Some("image_url") => {
+                    let url = p["image_url"]["url"]
+                        .as_str()
+                        .or_else(|| p["image_url"].as_str())
+                        .unwrap_or("");
+                    if let Some(rest) = url.strip_prefix("data:") {
+                        rest.split_once(";base64,").map(|(mime, data)| {
+                            json!({"type": "image", "source": {
+                                "type": "base64", "media_type": mime, "data": data,
+                            }})
+                        })
+                    } else if url.starts_with("http") {
+                        Some(json!({"type": "image", "source": {"type": "url", "url": url}}))
+                    } else {
+                        Some(json!({"type": "text", "text": format!("[image: {url}]")}))
+                    }
+                }
+                Some(other) => Some(json!({"type": "text", "text": format!("[{other}]")})),
+                None => None,
+            })
+            .collect(),
+        _ => vec![],
     }
 }
 

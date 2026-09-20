@@ -342,8 +342,9 @@ impl DamonClient {
             .context("no sessionId in response")
     }
 
-    /// All sessions as `(sessionId, createdAt, model)` triples.
-    pub async fn list_sessions(&self) -> anyhow::Result<Vec<(String, String, String)>> {
+    /// All sessions as `(sessionId, createdAt, model, title)` tuples —
+    /// model/title are empty strings when unset.
+    pub async fn list_sessions(&self) -> anyhow::Result<Vec<(String, String, String, String)>> {
         let v = self.request("session/list", json!({})).await?;
         Ok(v["sessions"]
             .as_array()
@@ -354,11 +355,29 @@ impl DamonClient {
                             s["sessionId"].as_str().unwrap_or("").to_string(),
                             s["createdAt"].as_str().unwrap_or("").to_string(),
                             s["model"].as_str().unwrap_or("").to_string(),
+                            s["title"].as_str().unwrap_or("").to_string(),
                         )
                     })
                     .collect()
             })
             .unwrap_or_default())
+    }
+
+    /// Rename a session (sets its title).
+    pub async fn rename_session(&self, id: &str, title: &str) -> anyhow::Result<()> {
+        self.request("session/rename", json!({"sessionId": id, "title": title}))
+            .await?;
+        Ok(())
+    }
+
+    /// Set or clear (None) the session's default model override.
+    pub async fn set_session_model(&self, id: &str, model: Option<&str>) -> anyhow::Result<()> {
+        self.request(
+            "session/set_model",
+            json!({"sessionId": id, "model": model}),
+        )
+        .await?;
+        Ok(())
     }
 
     /// Delete a session and its history.
@@ -438,6 +457,33 @@ impl DamonClient {
         if let Err(e) = sent {
             // Mirror request(): a failed send must not leave a stale
             // pending entry that can never resolve.
+            self.pending.lock().await.remove(&id);
+            return Err(e).context("send failed");
+        }
+        Ok(())
+    }
+
+    /// Like `prompt`, but sends raw ACP content blocks — use for
+    /// multimodal prompts (image/resource blocks alongside text).
+    pub async fn prompt_blocks(
+        &self,
+        session_id: &str,
+        blocks: Vec<Value>,
+        model: Option<&str>,
+    ) -> anyhow::Result<()> {
+        let id = self.next_id.fetch_add(1, Ordering::Relaxed);
+        self.pending.lock().await.insert(
+            id,
+            Pending::ToEvents {
+                session_id: session_id.to_string(),
+            },
+        );
+        let msg = json!({
+            "jsonrpc": "2.0", "id": id, "method": "session/prompt",
+            "params": {"sessionId": session_id, "model": model, "prompt": blocks},
+        });
+        let sent = self.writer.lock().await.send_text(msg.to_string()).await;
+        if let Err(e) = sent {
             self.pending.lock().await.remove(&id);
             return Err(e).context("send failed");
         }

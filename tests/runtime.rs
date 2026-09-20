@@ -321,7 +321,7 @@ async fn cancel_does_not_mask_real_tool_errors() {
     // "cancelled"), reached by
     // cancel_reaches_inflight_tool_and_persists_cancelled below, nor the
     // append-failure repair loop that backfills orphan tool_calls.
-    let _ = damon_core::runtime::run_prompt(&state, session_id, "hi", None, &client, cancel).await;
+    let _ = damon_core::runtime::run_prompt(&state, session_id, &json!("hi"), None, &client, cancel).await;
 
     let msgs = store.messages(session_id).await.unwrap();
     // user + assistant(tool_calls) + tool(error) + tool(error)
@@ -404,7 +404,7 @@ async fn cancel_reaches_inflight_tool_and_persists_cancelled() {
     // is persisted as "cancelled" — a cancel must still leave a
     // well-formed tool row, not drop it (a missing row would orphan the
     // assistant tool_calls and 400 every later turn).
-    let _ = damon_core::runtime::run_prompt(&state, session_id, "hi", None, &client, cancel).await;
+    let _ = damon_core::runtime::run_prompt(&state, session_id, &json!("hi"), None, &client, cancel).await;
 
     let msgs = store.messages(session_id).await.unwrap();
     // user + assistant(tool_calls) + tool(cancelled); the cancelled turn
@@ -980,15 +980,15 @@ async fn compaction_failure_keeps_full_history() {
 
     struct Noop;
     #[async_trait::async_trait]
-    impl ClientChannel for Noop {
+    impl damon_core::runtime::ClientChannel for Noop {
         async fn notify(&self, _m: &str, _p: Value) {}
         async fn request(&self, _m: &str, _p: Value) -> anyhow::Result<Value> {
             anyhow::bail!("no client")
         }
     }
-    let client: Arc<dyn ClientChannel> = Arc::new(Noop);
+    let client: Arc<dyn damon_core::runtime::ClientChannel> = Arc::new(Noop);
     let cancel = tokio_util::sync::CancellationToken::new();
-    runtime::run_prompt(&state, "s1", "new question", None, &client, cancel)
+    damon_core::runtime::run_prompt(&state, "s1", &json!("new question"), None, &client, cancel)
         .await
         .unwrap();
 
@@ -1101,15 +1101,15 @@ async fn compaction_triggers_on_cjk_history() {
 
     struct Noop;
     #[async_trait::async_trait]
-    impl ClientChannel for Noop {
+    impl damon_core::runtime::ClientChannel for Noop {
         async fn notify(&self, _m: &str, _p: Value) {}
         async fn request(&self, _m: &str, _p: Value) -> anyhow::Result<Value> {
             anyhow::bail!("no client")
         }
     }
-    let client: Arc<dyn ClientChannel> = Arc::new(Noop);
+    let client: Arc<dyn damon_core::runtime::ClientChannel> = Arc::new(Noop);
     let cancel = tokio_util::sync::CancellationToken::new();
-    runtime::run_prompt(&state, "s1", "hi", None, &client, cancel)
+    damon_core::runtime::run_prompt(&state, "s1", &json!("hi"), None, &client, cancel)
         .await
         .unwrap();
 
@@ -1232,7 +1232,7 @@ async fn permission_prompt_timeout_denies_tool() {
     let client: Arc<dyn damon_core::runtime::ClientChannel> = Arc::new(SilentClient);
     let cancel = tokio_util::sync::CancellationToken::new();
     // The client never answers; without the timeout this hangs forever.
-    damon_core::runtime::run_prompt(&state, "s1", "hi", None, &client, cancel)
+    damon_core::runtime::run_prompt(&state, "s1", &json!("hi"), None, &client, cancel)
         .await
         .unwrap();
 
@@ -1275,7 +1275,7 @@ async fn always_allow_skips_later_prompts() {
         requests: requests.clone(),
     });
     let cancel = tokio_util::sync::CancellationToken::new();
-    damon_core::runtime::run_prompt(&state, "s1", "hi", None, &client, cancel)
+    damon_core::runtime::run_prompt(&state, "s1", &json!("hi"), None, &client, cancel)
         .await
         .unwrap();
 
@@ -1317,7 +1317,7 @@ async fn max_iterations_returns_max_turn_requests() {
     }
     let client: Arc<dyn damon_core::runtime::ClientChannel> = Arc::new(Noop);
     let cancel = tokio_util::sync::CancellationToken::new();
-    let stop = damon_core::runtime::run_prompt(&state, "s1", "hi", None, &client, cancel)
+    let stop = damon_core::runtime::run_prompt(&state, "s1", &json!("hi"), None, &client, cancel)
         .await
         .unwrap();
     assert_eq!(
@@ -1412,15 +1412,15 @@ async fn compaction_reevaluates_after_tool_results_grow_history() {
 
     struct Noop;
     #[async_trait::async_trait]
-    impl ClientChannel for Noop {
+    impl damon_core::runtime::ClientChannel for Noop {
         async fn notify(&self, _m: &str, _p: Value) {}
         async fn request(&self, _m: &str, _p: Value) -> anyhow::Result<Value> {
             anyhow::bail!("no client")
         }
     }
-    let client: Arc<dyn ClientChannel> = Arc::new(Noop);
+    let client: Arc<dyn damon_core::runtime::ClientChannel> = Arc::new(Noop);
     let cancel = tokio_util::sync::CancellationToken::new();
-    runtime::run_prompt(&state, "s1", "new question", None, &client, cancel)
+    damon_core::runtime::run_prompt(&state, "s1", &json!("new question"), None, &client, cancel)
         .await
         .unwrap();
 
@@ -1499,4 +1499,100 @@ async fn session_compact_forces_summarization() {
     .await;
     let resp = read_json(&mut ws).await;
     assert_eq!(resp["error"]["code"], -32602, "got {resp}");
+}
+
+/// The first user prompt becomes the session title; a second prompt must
+/// not overwrite it, and an explicit rename survives later prompts.
+#[tokio::test]
+async fn first_prompt_sets_title_and_rename_sticks() {
+    let upstream = mock_llm_tool("noop.never", 0).await; // always text reply
+    let mut providers = BTreeMap::new();
+    providers.insert(
+        "default".to_string(),
+        ProviderConfig {
+            api: "openai-completions".to_string(),
+            base_url: Some(format!("http://{upstream}")),
+            api_key: None,
+            models: vec![],
+            default_model: None,
+            headers: Default::default(),
+            compat: Default::default(),
+            discovery: None,
+            context_promotion_target: None,
+        },
+    );
+    let shared: damon_core::config::SharedConfig = Arc::new(parking_lot::RwLock::new(Config {
+        bind: "127.0.0.1:0".parse().unwrap(),
+        auth_token: None,
+        tls_cert: None,
+        tls_key: None,
+        data_dir: None,
+        mcp_servers: HashMap::new(),
+        providers,
+        models: BTreeMap::new(),
+        relay: None,
+        permission_timeout_secs: None,
+        max_tool_output: None,
+        summary_model: None,
+        session_retention_days: None,
+    }));
+    let store = Store::in_memory().await.unwrap();
+    let mcp = McpRegistry::connect_all(&HashMap::new()).await;
+    let state = AppState::new(shared, store.clone(), mcp).await;
+
+    struct Noop;
+    #[async_trait::async_trait]
+    impl damon_core::runtime::ClientChannel for Noop {
+        async fn notify(&self, _m: &str, _p: Value) {}
+        async fn request(&self, _m: &str, _p: Value) -> anyhow::Result<Value> {
+            anyhow::bail!("no client")
+        }
+    }
+    let client: Arc<dyn damon_core::runtime::ClientChannel> = Arc::new(Noop);
+
+    store.create_session("s1", "", None).await.unwrap();
+    damon_core::runtime::run_prompt(
+        &state,
+        "s1",
+        &json!("summarize this repository please"),
+        None,
+        &client,
+        tokio_util::sync::CancellationToken::new(),
+    )
+    .await
+    .unwrap();
+    assert_eq!(
+        store.list_sessions().await.unwrap()[0].3,
+        "summarize this repository please"
+    );
+
+    // Second prompt must not overwrite the title.
+    damon_core::runtime::run_prompt(
+        &state,
+        "s1",
+        &json!("a different question entirely"),
+        None,
+        &client,
+        tokio_util::sync::CancellationToken::new(),
+    )
+    .await
+    .unwrap();
+    assert_eq!(
+        store.list_sessions().await.unwrap()[0].3,
+        "summarize this repository please"
+    );
+
+    // Explicit rename survives subsequent prompts.
+    store.rename_session("s1", "repo work").await.unwrap();
+    damon_core::runtime::run_prompt(
+        &state,
+        "s1",
+        &json!("third question"),
+        None,
+        &client,
+        tokio_util::sync::CancellationToken::new(),
+    )
+    .await
+    .unwrap();
+    assert_eq!(store.list_sessions().await.unwrap()[0].3, "repo work");
 }

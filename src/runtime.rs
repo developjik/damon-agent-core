@@ -73,7 +73,7 @@ pub struct PromptOutcome {
 pub async fn run_prompt(
     state: &Arc<AppState>,
     session_id: &str,
-    text: &str,
+    content: &Value,
     model: Option<&str>,
     client: &Arc<dyn ClientChannel>,
     cancel: CancellationToken,
@@ -84,9 +84,16 @@ pub async fn run_prompt(
         .append(
             session_id,
             "user",
-            &json!({"role": "user", "content": text}),
+            &json!({"role": "user", "content": content}),
         )
         .await?;
+
+    // First user message becomes the session title (deterministic —
+    // no extra model call). set_title_if_empty no-ops once a title
+    // exists, so renames and later prompts never overwrite it.
+    if let Some(title) = derive_title(content) {
+        let _ = state.store.set_title_if_empty(session_id, &title).await;
+    }
 
     // Model resolution order: per-prompt param → session default (stored
     // by session/new) → provider's default_model. Read the session row
@@ -466,6 +473,29 @@ pub async fn run_prompt(
         stop_reason: llm::StopReason::MaxTurnRequests,
         model: model_used,
     })
+}
+
+/// Derive a session title from the first user message: first non-empty
+/// line, truncated to 60 chars on a char boundary. Returns None when the
+/// prompt has no usable text (image-only prompts keep a NULL title until
+/// a text turn arrives).
+fn derive_title(content: &Value) -> Option<String> {
+    let text = match content {
+        Value::String(s) => s.clone(),
+        Value::Array(parts) => parts
+            .iter()
+            .filter(|p| p["type"] == "text")
+            .filter_map(|p| p["text"].as_str())
+            .collect::<Vec<_>>()
+            .join(" "),
+        _ => return None,
+    };
+    let first_line = text.lines().find(|l| !l.trim().is_empty())?.trim();
+    let mut t: String = first_line.chars().take(60).collect();
+    if first_line.chars().count() > 60 {
+        t.push('…');
+    }
+    Some(t)
 }
 
 /// Rough token estimate. Text runs ~4 chars/token for ASCII; non-ASCII

@@ -222,3 +222,30 @@ async fn open_tightens_dir_and_db_permissions() {
 
     let _ = std::fs::remove_dir_all(&dir);
 }
+
+#[tokio::test]
+async fn session_title_and_model_overrides() {
+    let path = temp_db("title");
+    let store = Store::open(&path).await.unwrap();
+    store.create_session("s1", "/tmp", None).await.unwrap();
+
+    // First title wins; a second set_title_if_empty is a no-op.
+    store.set_title_if_empty("s1", "first").await.unwrap();
+    store.set_title_if_empty("s1", "second").await.unwrap();
+    let sessions = store.list_sessions().await.unwrap();
+    assert_eq!(sessions[0].3, "first");
+
+    // Explicit rename overwrites.
+    assert!(store.rename_session("s1", "renamed").await.unwrap());
+    assert!(!store.rename_session("ghost", "x").await.unwrap());
+    assert_eq!(store.list_sessions().await.unwrap()[0].3, "renamed");
+
+    // Model override set/clear round-trips through session_model.
+    assert!(store.set_session_model("s1", Some("gpt-4o")).await.unwrap());
+    assert_eq!(store.session_model("s1").await.unwrap().as_deref(), Some("gpt-4o"));
+    assert!(store.set_session_model("s1", None).await.unwrap());
+    assert_eq!(store.session_model("s1").await.unwrap(), None);
+    assert!(!store.set_session_model("ghost", Some("m")).await.unwrap());
+
+    let _ = std::fs::remove_file(&path);
+}

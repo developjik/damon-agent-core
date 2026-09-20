@@ -340,7 +340,7 @@ pub async fn handle_socket(
                             "protocolVersion": 1,
                             "agentCapabilities": {
                                 "loadSession": true,
-                                "promptCapabilities": {"text": true}
+                                "promptCapabilities": {"text": true, "image": true}
                             },
                             "agentInfo": {"name": "damond", "version": env!("CARGO_PKG_VERSION")}
                         })),
@@ -405,8 +405,8 @@ pub async fn handle_socket(
                     Ok(sessions) => {
                         let list: Vec<Value> = sessions
                             .into_iter()
-                            .map(|(sid, created, model)| {
-                                json!({"sessionId": sid, "createdAt": created, "model": model})
+                            .map(|(sid, created, model, title)| {
+                                json!({"sessionId": sid, "createdAt": created, "model": model, "title": title})
                             })
                             .collect();
                         client
@@ -564,6 +564,48 @@ pub async fn handle_socket(
                     }
                 }
             }
+            ("session/rename", Some(id)) => {
+                let session_id = params["sessionId"].as_str().unwrap_or("").to_string();
+                let title = params["title"].as_str().unwrap_or("").trim().to_string();
+                if title.is_empty() {
+                    client
+                        .respond(id, Err(rpc_error(-32602, "empty title")))
+                        .await;
+                    continue;
+                }
+                match state.store.rename_session(&session_id, &title).await {
+                    Ok(true) => client.respond(id, Ok(json!({}))).await,
+                    Ok(false) => {
+                        client
+                            .respond(id, Err(rpc_error(-32602, "session not found")))
+                            .await;
+                    }
+                    Err(e) => {
+                        client
+                            .respond(id, Err(rpc_error(-32603, &e.to_string())))
+                            .await;
+                    }
+                }
+            }
+            ("session/set_model", Some(id)) => {
+                let session_id = params["sessionId"].as_str().unwrap_or("").to_string();
+                // null/absent model clears the override — the session
+                // falls back to the provider's default_model.
+                let model = params["model"].as_str().map(String::from);
+                match state.store.set_session_model(&session_id, model.as_deref()).await {
+                    Ok(true) => client.respond(id, Ok(json!({}))).await,
+                    Ok(false) => {
+                        client
+                            .respond(id, Err(rpc_error(-32602, "session not found")))
+                            .await;
+                    }
+                    Err(e) => {
+                        client
+                            .respond(id, Err(rpc_error(-32603, &e.to_string())))
+                            .await;
+                    }
+                }
+            }
             ("session/load", Some(id)) => {
                 // ACP session/load: attach to an existing session and replay
                 // its history as session/update notifications so the client
@@ -622,21 +664,16 @@ pub async fn handle_socket(
             }
             ("session/prompt", Some(id)) => {
                 let session_id = params["sessionId"].as_str().unwrap_or("").to_string();
-                let text = params["prompt"]
-                    .as_array()
-                    .map(|blocks| {
-                        blocks
-                            .iter()
-                            .filter_map(|b| b["text"].as_str())
-                            .collect::<Vec<_>>()
-                            // Adjacent text blocks joined with "" merge
-                            // words — separate them with a newline.
-                            .join("\n")
-                    })
-                    .unwrap_or_default();
+                // ACP prompt blocks → OpenAI content parts. Text stays a
+                // plain string when it's the only content (the common
+                // case); any non-text block upgrades content to an array.
+                let content = prompt_content(&params["prompt"]);
                 // An empty prompt would persist an empty user message and
                 // burn a full upstream turn — reject it up front.
-                if text.trim().is_empty() {
+                if content.is_null()
+                    || content.as_str().is_some_and(|s| s.trim().is_empty())
+                    || content.as_array().is_some_and(|a| a.is_empty())
+                {
                     client
                         .respond(id, Err(rpc_error(-32602, "empty prompt")))
                         .await;
@@ -712,7 +749,7 @@ pub async fn handle_socket(
                     let result = std::panic::AssertUnwindSafe(Box::pin(runtime::run_prompt(
                         &state,
                         &session_id,
-                        &text,
+                        &content,
                         model.as_deref(),
                         &(client.clone() as Arc<dyn ClientChannel>),
                         cancel.clone(),
@@ -1098,6 +1135,66 @@ fn content_blocks(content: &Value) -> Vec<Value> {
             .collect(),
         _ => vec![],
     }
+}
+
+/// Convert ACP prompt blocks into the OpenAI content shape persisted as
+/// the user message: a lone text block stays a plain string; anything
+/// else becomes a parts array. ACP `image` blocks carry base64 data +
+/// mimeType → OpenAI `image_url` data URLs; `resource`/`resource_link`
+/// degrade to text (their bytes aren't fetched here — a remote URI the
+/// daemon never dereferences must not become a silent fetch).
+fn prompt_content(prompt: &Value) -> Value {
+    let blocks = match prompt.as_array() {
+        Some(b) => b,
+        None => return Value::Null,
+    };
+    let mut parts: Vec<Value> = Vec::new();
+    for b in blocks {
+        match b["type"].as_str() {
+            Some("text") => {
+                if let Some(t) = b["text"].as_str() {
+                    parts.push(json!({"type": "text", "text": t}));
+                }
+            }
+            Some("image") => {
+                let data = b["data"].as_str().unwrap_or("");
+                let mime = b["mimeType"].as_str().unwrap_or("image/png");
+                if !data.is_empty() {
+                    parts.push(json!({
+                        "type": "image_url",
+                        "image_url": {"url": format!("data:{mime};base64,{data}")},
+                    }));
+                }
+            }
+            // resource_link: surface the URI as text — the model sees the
+            // reference even though the daemon doesn't fetch it.
+            Some("resource_link") => {
+                let uri = b["uri"].as_str().unwrap_or("");
+                let name = b["name"].as_str().unwrap_or("resource");
+                if !uri.is_empty() {
+                    parts.push(json!({"type": "text", "text": format!("[{name}: {uri}]")}));
+                }
+            }
+            // Embedded resource with inline text content.
+            Some("resource") => {
+                if let Some(t) = b["resource"]["text"].as_str() {
+                    parts.push(json!({"type": "text", "text": t}));
+                }
+            }
+            _ => {}
+        }
+    }
+    // Text-only input collapses back to the string form every existing
+    // consumer (providers, FTS, titles) already handles.
+    if parts.iter().all(|p| p["type"] == "text") {
+        let text = parts
+            .iter()
+            .filter_map(|p| p["text"].as_str())
+            .collect::<Vec<_>>()
+            .join("\n");
+        return json!(text);
+    }
+    Value::Array(parts)
 }
 #[cfg(test)]
 mod tests {

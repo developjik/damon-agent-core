@@ -76,7 +76,8 @@ impl Store {
                      cwd TEXT NOT NULL DEFAULT '',
                      model TEXT,
                      compacted_through INTEGER NOT NULL DEFAULT 0,
-                     summary TEXT
+                     summary TEXT,
+                     title TEXT
                  );
                  CREATE TABLE IF NOT EXISTS messages (
                      id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -110,6 +111,7 @@ impl Store {
                     "last_active_at",
                     "ALTER TABLE sessions ADD COLUMN last_active_at TEXT",
                 ),
+                ("title", "ALTER TABLE sessions ADD COLUMN title TEXT"),
             ] {
                 if !cols.contains(col)
                     && let Err(e) = c.execute_batch(ddl)
@@ -159,7 +161,8 @@ impl Store {
                      cwd TEXT NOT NULL DEFAULT '',
                      model TEXT,
                      compacted_through INTEGER NOT NULL DEFAULT 0,
-                     summary TEXT
+                     summary TEXT,
+                     title TEXT
                  );
                  CREATE TABLE messages (
                      id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -527,18 +530,74 @@ impl Store {
             .map_err(Into::into)
     }
 
-    /// All sessions as `(id, created_at, model)` — model is the stored
-    /// session default override, empty string when unset.
-    pub async fn list_sessions(&self) -> anyhow::Result<Vec<(String, String, String)>> {
+    /// All sessions as `(id, created_at, model, title)` — model/title are
+    /// empty strings when unset.
+    pub async fn list_sessions(&self) -> anyhow::Result<Vec<(String, String, String, String)>> {
         self.conn
             .call(|c| {
                 let mut stmt = c.prepare(
-                    "SELECT id, created_at, COALESCE(model, '') FROM sessions ORDER BY created_at",
+                    "SELECT id, created_at, COALESCE(model, ''), COALESCE(title, '')
+                     FROM sessions ORDER BY created_at",
                 )?;
                 let rows = stmt
-                    .query_map([], |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)))?
+                    .query_map([], |row| {
+                        Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?))
+                    })?
                     .collect::<Result<Vec<_>, _>>()?;
-                Ok::<Vec<(String, String, String)>, tokio_rusqlite::Error>(rows)
+                Ok::<Vec<(String, String, String, String)>, tokio_rusqlite::Error>(rows)
+            })
+            .await
+            .map_err(Into::into)
+    }
+
+    /// Set the session title only when none exists — the first user
+    /// message wins, later prompts and explicit renames are untouched.
+    pub async fn set_title_if_empty(&self, session_id: &str, title: &str) -> anyhow::Result<()> {
+        let sid = session_id.to_string();
+        let title = title.to_string();
+        self.conn
+            .call(move |c| {
+                c.execute(
+                    "UPDATE sessions SET title = ?2 WHERE id = ?1 AND title IS NULL",
+                    rusqlite::params![sid, title],
+                )?;
+                Ok::<(), tokio_rusqlite::Error>(())
+            })
+            .await
+            .map_err(Into::into)
+    }
+
+    /// Explicit rename — overwrites any existing title.
+    pub async fn rename_session(&self, session_id: &str, title: &str) -> anyhow::Result<bool> {
+        let sid = session_id.to_string();
+        let title = title.to_string();
+        self.conn
+            .call(move |c| {
+                let n = c.execute(
+                    "UPDATE sessions SET title = ?2 WHERE id = ?1",
+                    rusqlite::params![sid, title],
+                )?;
+                Ok::<bool, tokio_rusqlite::Error>(n > 0)
+            })
+            .await
+            .map_err(Into::into)
+    }
+
+    /// Update the session's stored default model (None clears it).
+    pub async fn set_session_model(
+        &self,
+        session_id: &str,
+        model: Option<&str>,
+    ) -> anyhow::Result<bool> {
+        let sid = session_id.to_string();
+        let model = model.map(String::from);
+        self.conn
+            .call(move |c| {
+                let n = c.execute(
+                    "UPDATE sessions SET model = ?2 WHERE id = ?1",
+                    rusqlite::params![sid, model],
+                )?;
+                Ok::<bool, tokio_rusqlite::Error>(n > 0)
             })
             .await
             .map_err(Into::into)
@@ -638,24 +697,25 @@ impl Store {
             .map_err(Into::into)
     }
 
-    /// Like `list_sessions`, but paginated.
+
+    /// Like `list_sessions`, but paginated — same 4-tuple shape.
     pub async fn list_sessions_paged(
         &self,
         limit: u32,
         offset: u32,
-    ) -> anyhow::Result<Vec<(String, String, String)>> {
+    ) -> anyhow::Result<Vec<(String, String, String, String)>> {
         self.conn
             .call(move |c| {
                 let mut stmt = c.prepare(
-                    "SELECT id, created_at, COALESCE(model, '') FROM sessions
-                     ORDER BY created_at LIMIT ?1 OFFSET ?2",
+                    "SELECT id, created_at, COALESCE(model, ''), COALESCE(title, '')
+                     FROM sessions ORDER BY created_at LIMIT ?1 OFFSET ?2",
                 )?;
                 let rows = stmt
                     .query_map(rusqlite::params![limit, offset], |row| {
-                        Ok((row.get(0)?, row.get(1)?, row.get(2)?))
+                        Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?))
                     })?
                     .collect::<Result<Vec<_>, _>>()?;
-                Ok::<Vec<(String, String, String)>, tokio_rusqlite::Error>(rows)
+                Ok::<Vec<(String, String, String, String)>, tokio_rusqlite::Error>(rows)
             })
             .await
             .map_err(Into::into)
