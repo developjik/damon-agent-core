@@ -41,6 +41,7 @@ fn test_config(base_url: &str, auth_token: Option<&str>) -> damon_core::config::
         max_tool_output: None,
         summary_model: None,
         session_retention_days: None,
+        builtin_tools: Default::default(),
     };
     Arc::new(parking_lot::RwLock::new(cfg))
 }
@@ -207,6 +208,7 @@ async fn no_provider_returns_503_openai_error() {
         max_tool_output: None,
         summary_model: None,
         session_retention_days: None,
+        builtin_tools: Default::default(),
     }));
     let store = damon_core::store::Store::in_memory().await.unwrap();
     let mcp = damon_core::mcp::McpRegistry::connect_all(&HashMap::new()).await;
@@ -369,4 +371,204 @@ async fn auth_token_cache_re_resolves_after_ttl() {
     tokio::time::sleep(ttl * 20).await;
     let tok4 = state.auth_token_cached(ttl).await.unwrap().unwrap();
     assert_eq!(tok4, "third");
+}
+
+/// Mock upstream that answers /chat/completions in both modes: stream
+/// requests get real chat-completions SSE chunks (text + usage), others
+/// get a JSON completion whose message content echoes the translated
+/// request body — tests read the wire shape back out of it.
+async fn mock_responses_upstream() -> String {
+    let app = Router::new().route(
+        "/chat/completions",
+        post(|req: Request<Body>| async move {
+            let bytes = req.into_body().collect().await.unwrap().to_bytes();
+            let v: serde_json::Value =
+                serde_json::from_slice(&bytes).unwrap_or(serde_json::json!({}));
+            if v["stream"].as_bool() == Some(true) {
+                let sse = concat!(
+                    "data: {\"choices\":[{\"delta\":{\"content\":\"Hello\"}}]}\n\n",
+                    "data: {\"choices\":[{\"delta\":{\"content\":\" world\"}}]}\n\n",
+                    "data: {\"choices\":[{\"delta\":{},\"finish_reason\":\"stop\"}]}\n\n",
+                    "data: {\"choices\":[],\"usage\":{\"prompt_tokens\":3,\"completion_tokens\":2,\"total_tokens\":5}}\n\n",
+                    "data: [DONE]\n\n",
+                );
+                return Response::builder()
+                    .header("content-type", "text/event-stream")
+                    .body(Body::from(sse))
+                    .unwrap();
+            }
+            Response::builder()
+                .header("content-type", "application/json")
+                .body(Body::from(
+                    serde_json::json!({
+                        "id": "chatcmpl-1",
+                        "object": "chat.completion",
+                        "created": 1234,
+                        "model": "gpt-4o",
+                        "choices": [{
+                            "index": 0,
+                            "message": {"role": "assistant", "content": v.to_string()},
+                            "finish_reason": "stop",
+                        }],
+                        "usage": {"prompt_tokens": 10, "completion_tokens": 5, "total_tokens": 15},
+                    })
+                    .to_string(),
+                ))
+                .unwrap()
+        }),
+    );
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    tokio::spawn(async move {
+        axum::serve(listener, app).await.unwrap();
+    });
+    addr.to_string()
+}
+
+#[tokio::test]
+async fn responses_nonstream_returns_responses_shape() {
+    unsafe { std::env::set_var("DAMON_TEST_KEY", "sk-test-123") };
+    let upstream = mock_responses_upstream().await;
+    let app = app(&format!("http://{upstream}"), None).await;
+
+    let resp = app
+        .oneshot(
+            Request::post("/v1/responses")
+                .header(header::CONTENT_TYPE, "application/json")
+                .body(Body::from(r#"{"model":"gpt-4o","input":"hi"}"#))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    let body = resp.into_body().collect().await.unwrap().to_bytes();
+    let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+    assert_eq!(json["object"], "response");
+    assert_eq!(json["status"], "completed");
+    assert_eq!(json["model"], "gpt-4o");
+    assert!(json["id"].as_str().unwrap().starts_with("resp_"));
+    assert_eq!(json["output"][0]["type"], "message");
+    assert_eq!(json["output"][0]["role"], "assistant");
+    assert_eq!(json["output"][0]["content"][0]["type"], "output_text");
+    assert_eq!(json["usage"]["input_tokens"], 10);
+    assert_eq!(json["usage"]["output_tokens"], 5);
+    assert_eq!(json["usage"]["total_tokens"], 15);
+}
+
+/// Responses input items must land as chat-completions messages:
+/// instructions → system, function_call → assistant tool_calls,
+/// function_call_output → role:"tool". reasoning.effort rides as
+/// _thinking and max_output_tokens as max_tokens.
+#[tokio::test]
+async fn responses_translates_input_items() {
+    unsafe { std::env::set_var("DAMON_TEST_KEY", "sk-test-123") };
+    let upstream = mock_responses_upstream().await;
+    let app = app(&format!("http://{upstream}"), None).await;
+
+    let resp = app
+        .oneshot(
+            Request::post("/v1/responses")
+                .header(header::CONTENT_TYPE, "application/json")
+                .body(Body::from(
+                    r#"{
+                        "model": "gpt-4o",
+                        "instructions": "be terse",
+                        "max_output_tokens": 64,
+                        "reasoning": {"effort": "high"},
+                        "input": [
+                            {"type": "message", "role": "user",
+                             "content": [{"type": "input_text", "text": "weather?"}]},
+                            {"type": "function_call", "call_id": "call_1",
+                             "name": "get_weather", "arguments": "{\"city\":\"sf\"}"},
+                            {"type": "function_call_output", "call_id": "call_1",
+                             "output": "sunny"}
+                        ]
+                    }"#,
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    let body = resp.into_body().collect().await.unwrap().to_bytes();
+    let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+    // The mock echoes the translated request inside message.content.
+    let echoed: serde_json::Value =
+        serde_json::from_str(json["output"][0]["content"][0]["text"].as_str().unwrap()).unwrap();
+    let msgs = echoed["messages"].as_array().unwrap();
+    assert_eq!(msgs[0]["role"], "system");
+    assert_eq!(msgs[0]["content"], "be terse");
+    assert_eq!(msgs[1]["role"], "user");
+    assert_eq!(msgs[1]["content"][0]["type"], "text");
+    assert_eq!(msgs[1]["content"][0]["text"], "weather?");
+    assert_eq!(msgs[2]["role"], "assistant");
+    assert_eq!(msgs[2]["tool_calls"][0]["id"], "call_1");
+    assert_eq!(msgs[2]["tool_calls"][0]["function"]["name"], "get_weather");
+    assert_eq!(
+        msgs[2]["tool_calls"][0]["function"]["arguments"],
+        "{\"city\":\"sf\"}"
+    );
+    assert_eq!(msgs[3]["role"], "tool");
+    assert_eq!(msgs[3]["tool_call_id"], "call_1");
+    assert_eq!(msgs[3]["content"], "sunny");
+    assert_eq!(echoed["max_tokens"], 64);
+    // _thinking is internal — the openai-completions compat layer maps
+    // it to reasoning_effort on the wire.
+    assert_eq!(echoed["reasoning_effort"], "high");
+}
+
+#[tokio::test]
+async fn responses_stream_emits_responses_sse() {
+    unsafe { std::env::set_var("DAMON_TEST_KEY", "sk-test-123") };
+    let upstream = mock_responses_upstream().await;
+    let app = app(&format!("http://{upstream}"), None).await;
+
+    let resp = app
+        .oneshot(
+            Request::post("/v1/responses")
+                .header(header::CONTENT_TYPE, "application/json")
+                .body(Body::from(
+                    r#"{"model":"gpt-4o","input":"hi","stream":true}"#,
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    assert_eq!(
+        resp.headers()
+            .get(header::CONTENT_TYPE)
+            .and_then(|v| v.to_str().ok()),
+        Some("text/event-stream")
+    );
+    let body = resp.into_body().collect().await.unwrap().to_bytes();
+    let text = String::from_utf8(body.to_vec()).unwrap();
+    assert!(text.contains("event: response.created"), "got: {text}");
+    assert!(
+        text.contains("event: response.output_item.added"),
+        "got: {text}"
+    );
+    assert!(
+        text.contains("event: response.output_text.delta"),
+        "got: {text}"
+    );
+    assert!(
+        text.contains("event: response.output_item.done"),
+        "got: {text}"
+    );
+    assert!(text.contains("event: response.completed"), "got: {text}");
+    // The terminal event carries the full response object incl. usage.
+    let completed = text
+        .split("\n\n")
+        .find(|ev| ev.starts_with("event: response.completed"))
+        .expect("response.completed event");
+    let data = completed
+        .lines()
+        .find_map(|l| l.strip_prefix("data: "))
+        .unwrap();
+    let v: serde_json::Value = serde_json::from_str(data).unwrap();
+    assert_eq!(v["status"], "completed");
+    assert_eq!(v["usage"]["input_tokens"], 3);
+    assert_eq!(v["usage"]["output_tokens"], 2);
+    assert_eq!(v["output"][0]["content"][0]["text"], "Hello world");
 }

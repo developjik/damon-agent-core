@@ -288,7 +288,6 @@ impl Gemini {
         Ok((out, names))
     }
 
-
     pub async fn chat_stream(
         &self,
         body: Value,
@@ -379,9 +378,9 @@ fn gemini_content_parts(content: &Value) -> Vec<Value> {
                         .or_else(|| p["image_url"].as_str())
                         .unwrap_or("");
                     if let Some(rest) = url.strip_prefix("data:") {
-                        rest.split_once(";base64,").map(|(mime, data)| {
-                            json!({"inlineData": {"mimeType": mime, "data": data}})
-                        })
+                        rest.split_once(";base64,").map(
+                            |(mime, data)| json!({"inlineData": {"mimeType": mime, "data": data}}),
+                        )
                     } else if url.starts_with("http") {
                         Some(json!({"fileData": {"mimeType": "image/*", "fileUri": url}}))
                     } else {

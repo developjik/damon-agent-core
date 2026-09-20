@@ -1,4 +1,5 @@
 pub mod api;
+pub mod builtin;
 pub mod channel;
 pub mod client;
 pub mod config;
@@ -9,6 +10,7 @@ pub mod mcp;
 pub mod oauth;
 pub mod provider;
 pub mod relay;
+pub mod responses_api;
 pub mod rpc;
 pub mod runtime;
 pub mod service;

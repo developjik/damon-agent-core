@@ -40,6 +40,7 @@ fn test_config() -> Config {
         max_tool_output: None,
         summary_model: None,
         session_retention_days: None,
+        builtin_tools: Default::default(),
     }
 }
 

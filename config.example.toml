@@ -98,6 +98,21 @@ default_model = "gpt-4o"           # used by the agent runtime
 # args = ["-y", "@modelcontextprotocol/server-filesystem", "/tmp"]
 # auto_approve = false
 
+# Builtin tools — fs.read/fs.write/fs.edit/fs.list/fs.search + shell.exec,
+# always available without MCP config. On by default.
+# [builtin_tools]
+# enabled = true              # false removes every builtin tool
+# auto_approve = false        # true skips the permission prompt for ALL
+#                             # builtin tools — they run with the daemon's
+#                             # privileges, so prefer leaving this off
+# shell = true                # false removes shell.exec
+# allowed_paths = []          # fs.* sandbox: canonicalized targets must
+#                             # stay under one of these roots; empty =
+#                             # unrestricted. Does NOT confine shell.exec —
+#                             # set shell = false when confinement matters
+# shell_timeout_secs = 120    # default shell.exec timeout (per-call
+#                             # timeout_secs overrides; hard ceiling 3600)
+
 # Remote relay: dial out to a public damon-relay so clients can reach this
 # daemon without an inbound port. E2E encrypted — the relay sees only
 # ciphertext. Run your own relay: `damon-relay` (binds 0.0.0.0:8080).

@@ -310,6 +310,12 @@ export class DamonClient {
     return r.results;
   }
 
+  /** Token usage: per-model rollup without sessionId, or one session's
+   *  totals ({inputTokens, outputTokens, turns}) with it. */
+  async usage(sessionId) {
+    return this.#call("session/usage", { sessionId });
+  }
+
   /** Send a prompt. `model` (optional) overrides the session's default for
    *  this turn. Resolves with {stopReason} when the turn ends; the same
    *  outcome is also delivered as a {type:"promptDone"} event on the

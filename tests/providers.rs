@@ -57,6 +57,7 @@ fn route_model_prefix_and_glob() {
         max_tool_output: None,
         summary_model: None,
         session_retention_days: None,
+        builtin_tools: Default::default(),
     };
 
     // Explicit prefix wins.
@@ -337,6 +338,7 @@ async fn v1_routes_to_anthropic_by_model() {
         max_tool_output: None,
         summary_model: None,
         session_retention_days: None,
+        builtin_tools: Default::default(),
     }));
     let store = damon_core::store::Store::in_memory().await.unwrap();
     let mcp = damon_core::mcp::McpRegistry::connect_all(&HashMap::new()).await;
@@ -392,6 +394,7 @@ async fn v1_tool_history_without_thinking_disables_thinking() {
         max_tool_output: None,
         summary_model: None,
         session_retention_days: None,
+        builtin_tools: Default::default(),
     }));
     let store = damon_core::store::Store::in_memory().await.unwrap();
     let mcp = damon_core::mcp::McpRegistry::connect_all(&HashMap::new()).await;
@@ -453,6 +456,7 @@ async fn v1_stream_emits_finish_reason_before_done() {
         max_tool_output: None,
         summary_model: None,
         session_retention_days: None,
+        builtin_tools: Default::default(),
     }));
     let store = damon_core::store::Store::in_memory().await.unwrap();
     let mcp = damon_core::mcp::McpRegistry::connect_all(&HashMap::new()).await;
@@ -736,6 +740,7 @@ async fn discovered_model_routes_to_provider() {
         max_tool_output: None,
         summary_model: None,
         session_retention_days: None,
+        builtin_tools: Default::default(),
     }));
     let store = damon_core::store::Store::in_memory().await.unwrap();
     let mcp = damon_core::mcp::McpRegistry::connect_all(&HashMap::new()).await;
@@ -795,6 +800,7 @@ async fn ollama_discovery_reads_tags() {
         max_tool_output: None,
         summary_model: None,
         session_retention_days: None,
+        builtin_tools: Default::default(),
     };
     let mut built: std::collections::HashMap<
         String,
@@ -1142,6 +1148,7 @@ async fn context_overflow_promotes_to_target() {
         max_tool_output: None,
         summary_model: None,
         session_retention_days: None,
+        builtin_tools: Default::default(),
     }));
     let store = damon_core::store::Store::in_memory().await.unwrap();
     let mcp = damon_core::mcp::McpRegistry::connect_all(&HashMap::new()).await;
@@ -1973,6 +1980,7 @@ async fn presets_auto_register_from_env() {
         max_tool_output: None,
         summary_model: None,
         session_retention_days: None,
+        builtin_tools: Default::default(),
     };
     let (built, errors) = damon_core::provider::build_providers(&cfg);
     assert!(errors.is_empty(), "{errors:?}");

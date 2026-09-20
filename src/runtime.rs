@@ -98,6 +98,11 @@ pub async fn run_prompt(
     // Model resolution order: per-prompt param → session default (stored
     // by session/new) → provider's default_model. Read the session row
     // before taking the config lock so no lock is held across .await.
+    // Token usage accumulates across tool-loop iterations and is
+    // recorded once per turn on every exit path that consumed upstream
+    // tokens — including error/cancel exits, which still cost money.
+    let mut usage_in: u64 = 0;
+    let mut usage_out: u64 = 0;
     let session_model = state.store.session_model(session_id).await?;
     let requested = model.or(session_model.as_deref()).map(String::from);
     // Compaction is re-evaluated every iteration — every pass through the
@@ -107,6 +112,7 @@ pub async fn run_prompt(
     let mut model_used: Option<String> = None;
     for _ in 0..MAX_ITERATIONS {
         if cancel.is_cancelled() {
+            record_turn_usage(state, session_id, &model_used, usage_in, usage_out).await;
             return Ok(PromptOutcome {
                 stop_reason: llm::StopReason::Other,
                 model: None,
@@ -117,7 +123,19 @@ pub async fn run_prompt(
         // reload or a deleted overlay can't leak stale tools in.
         let session_mcp = state.session_mcp.lock().await.get(session_id).cloned();
         let mcp = crate::mcp::McpView::new(&state.mcp, session_mcp);
-        let tools = mcp.openai_tools();
+        // Builtin tools merge with MCP tools; a builtin name colliding
+        // with an MCP tool loses (MCP is explicit config, builtins are
+        // ambient — explicit wins).
+        let mut tools = mcp.openai_tools();
+        {
+            let builtin = state.builtin.read();
+            for t in builtin.openai_tools() {
+                let name = t["function"]["name"].as_str().unwrap_or("");
+                if !tools.iter().any(|e| e["function"]["name"] == name) {
+                    tools.push(t);
+                }
+            }
+        }
         let ResolvedModel {
             provider_name,
             provider,
@@ -264,6 +282,8 @@ pub async fn run_prompt(
                     arguments,
                 }) => acc.push(index, id, name, &arguments),
                 Ok(StreamEvent::Usage { input, output }) => {
+                    usage_in += input;
+                    usage_out += output;
                     state
                         .metrics
                         .tokens_input
@@ -303,6 +323,7 @@ pub async fn run_prompt(
                 }
                 let _ = state.store.append(session_id, "assistant", &msg).await;
             }
+            record_turn_usage(state, session_id, &model_used, usage_in, usage_out).await;
             if let Some(e) = stream_err {
                 return Err(e);
             }
@@ -319,6 +340,7 @@ pub async fn run_prompt(
                 msg["thinking"] = thinking_json;
             }
             state.store.append(session_id, "assistant", &msg).await?;
+            record_turn_usage(state, session_id, &model_used, usage_in, usage_out).await;
             return Ok(PromptOutcome {
                 stop_reason: stop,
                 model: model_used,
@@ -456,9 +478,11 @@ pub async fn run_prompt(
                 .await;
         }
         if let Some(e) = tool_err {
+            record_turn_usage(state, session_id, &model_used, usage_in, usage_out).await;
             return Err(e);
         }
         if cancel.is_cancelled() {
+            record_turn_usage(state, session_id, &model_used, usage_in, usage_out).await;
             return Ok(PromptOutcome {
                 stop_reason: llm::StopReason::Other,
                 model: model_used.clone(),
@@ -469,6 +493,7 @@ pub async fn run_prompt(
         // at the top of the next iteration.
     }
     warn!(session_id, "hit max tool iterations");
+    record_turn_usage(state, session_id, &model_used, usage_in, usage_out).await;
     Ok(PromptOutcome {
         stop_reason: llm::StopReason::MaxTurnRequests,
         model: model_used,
@@ -490,12 +515,34 @@ fn derive_title(content: &Value) -> Option<String> {
             .join(" "),
         _ => return None,
     };
+
     let first_line = text.lines().find(|l| !l.trim().is_empty())?.trim();
     let mut t: String = first_line.chars().take(60).collect();
     if first_line.chars().count() > 60 {
         t.push('…');
     }
     Some(t)
+}
+/// Persist one turn's accumulated token usage. Best-effort — a store
+/// failure must not fail the turn after the model already answered.
+async fn record_turn_usage(
+    state: &Arc<AppState>,
+    session_id: &str,
+    model: &Option<String>,
+    input: u64,
+    output: u64,
+) {
+    if input == 0 && output == 0 {
+        return;
+    }
+    let m = model.clone().unwrap_or_default();
+    if let Err(e) = state
+        .store
+        .record_usage(session_id, &m, input, output)
+        .await
+    {
+        warn!(session_id, error = %e, "failed to record token usage");
+    }
 }
 
 /// Rough token estimate. Text runs ~4 chars/token for ASCII; non-ASCII
@@ -872,10 +919,20 @@ async fn execute_tool(
     cancel: &CancellationToken,
     perm_lock: &tokio::sync::Mutex<()>,
 ) -> anyhow::Result<Value> {
-    if !mcp.has_tool(&call.name) {
+    // Builtin tools share the permission flow but dispatch to the
+    // builtin registry, not MCP. `builtin` is an Arc clone so no lock
+    // is held across awaits.
+    let builtin = state.builtin.read().clone();
+    let is_builtin = !mcp.has_tool(&call.name) && builtin.has_tool(&call.name);
+    if !mcp.has_tool(&call.name) && !is_builtin {
         anyhow::bail!("unknown tool {}", call.name);
     }
-    if !mcp.auto_approve(&call.name) && !mcp.session_approved(session_id, &call.name) {
+    let pre_approved = if is_builtin {
+        builtin.auto_approve(&call.name) || builtin.session_approved(session_id, &call.name)
+    } else {
+        mcp.auto_approve(&call.name) || mcp.session_approved(session_id, &call.name)
+    };
+    if !pre_approved {
         // Race the permission round-trip against cancellation and a
         // timeout — a silent client must not stall the turn forever.
         // The mutex serializes prompts so parallel calls never surface
@@ -899,13 +956,28 @@ async fn execute_tool(
             // Re-check under the lock: a parallel call to the same tool
             // may have just been granted "always allow" — skip a second
             // prompt instead of serializing two dialogs.
-            if mcp.session_approved(session_id, &call.name) {
+            let already = if is_builtin {
+                builtin.session_approved(session_id, &call.name)
+            } else {
+                mcp.session_approved(session_id, &call.name)
+            };
+            if already {
                 true
             } else {
                 tokio::select! {
                     _ = cancel.cancelled() => false,
                     g = tokio::time::timeout(timeout, request_permission(mcp, session_id, call, client)) => {
-                        g.unwrap_or(false)
+                        // "Always allow" lands on whichever registry owns
+                        // the tool — request_permission only reports the
+                        // optionId, the grant is recorded here.
+                        if matches!(g, Ok(PermissionOutcome::AllowAlways)) {
+                            if is_builtin {
+                                builtin.approve_for_session(session_id, &call.name);
+                            } else {
+                                mcp.approve_for_session(session_id, &call.name);
+                            }
+                        }
+                        matches!(g, Ok(PermissionOutcome::AllowOnce | PermissionOutcome::AllowAlways))
                     }
                 }
             }
@@ -916,9 +988,26 @@ async fn execute_tool(
     }
     let args: Value = llm::parse_partial_json(&call.arguments);
     state.metrics.mcp_tool_calls.fetch_add(1, Ordering::Relaxed);
-    let result = tokio::select! {
-        _ = cancel.cancelled() => anyhow::bail!(Cancelled),
-        r = mcp.call(&call.name, args) => r,
+    let result = if is_builtin {
+        // Builtin tools resolve relative paths against the session's
+        // cwd — the directory the client was launched in, not the
+        // daemon's.
+        let cwd = state
+            .store
+            .session_cwd(session_id)
+            .await
+            .ok()
+            .flatten()
+            .unwrap_or_default();
+        tokio::select! {
+            _ = cancel.cancelled() => anyhow::bail!(Cancelled),
+            r = builtin.call(&call.name, args, &cwd) => r,
+        }
+    } else {
+        tokio::select! {
+            _ = cancel.cancelled() => anyhow::bail!(Cancelled),
+            r = mcp.call(&call.name, args) => r,
+        }
     };
     if result.is_err() {
         state
@@ -929,14 +1018,22 @@ async fn execute_tool(
     result
 }
 
+/// Which option the client picked in a permission prompt.
+enum PermissionOutcome {
+    AllowOnce,
+    AllowAlways,
+    Denied,
+}
+
 /// ACP session/request_permission round-trip. Failures and non-allow
-/// outcomes both deny. "Always allow" records a session-scoped grant so
+/// outcomes both deny. The caller records "always allow" grants on the
+/// registry that owns the tool (MCP or builtin).
 async fn request_permission(
-    mcp: &crate::mcp::McpView<'_>,
+    _mcp: &crate::mcp::McpView<'_>,
     session_id: &str,
     call: &llm::ToolCall,
     client: &Arc<dyn ClientChannel>,
-) -> bool {
+) -> PermissionOutcome {
     let resp = client
         .request(
             "session/request_permission",
@@ -956,13 +1053,11 @@ async fn request_permission(
         )
         .await;
     match resp {
-        Ok(v) => {
-            let option = v["outcome"]["optionId"].as_str().unwrap_or("");
-            if option == "allow-always" {
-                mcp.approve_for_session(session_id, &call.name);
-            }
-            option.starts_with("allow")
-        }
-        Err(_) => false,
+        Ok(v) => match v["outcome"]["optionId"].as_str().unwrap_or("") {
+            "allow-always" => PermissionOutcome::AllowAlways,
+            o if o.starts_with("allow") => PermissionOutcome::AllowOnce,
+            _ => PermissionOutcome::Denied,
+        },
+        Err(_) => PermissionOutcome::Denied,
     }
 }

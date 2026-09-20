@@ -91,7 +91,17 @@ impl Store {
                      content,
                      session_id UNINDEXED,
                      message_id UNINDEXED
-                 );",
+                 );
+                 CREATE TABLE IF NOT EXISTS usage (
+                     id INTEGER PRIMARY KEY AUTOINCREMENT,
+                     session_id TEXT NOT NULL,
+                     model TEXT NOT NULL DEFAULT '',
+                     input_tokens INTEGER NOT NULL DEFAULT 0,
+                     output_tokens INTEGER NOT NULL DEFAULT 0,
+                     created_at TEXT NOT NULL DEFAULT (datetime('now'))
+                 );
+                 CREATE INDEX IF NOT EXISTS idx_usage_session
+                     ON usage(session_id, id);",
             )?;
             // Migrate pre-compaction databases. Check column existence
             // first — swallowing every ALTER error would hide real
@@ -174,7 +184,17 @@ impl Store {
                      content,
                      session_id UNINDEXED,
                      message_id UNINDEXED
-                 );",
+                );
+                CREATE TABLE IF NOT EXISTS usage (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    session_id TEXT NOT NULL,
+                    model TEXT NOT NULL DEFAULT '',
+                    input_tokens INTEGER NOT NULL DEFAULT 0,
+                    output_tokens INTEGER NOT NULL DEFAULT 0,
+                    created_at TEXT NOT NULL DEFAULT (datetime('now'))
+                );
+                CREATE INDEX IF NOT EXISTS idx_usage_session
+                    ON usage(session_id, id);",
             )
             .map_err(tokio_rusqlite::Error::from)
         })
@@ -219,6 +239,20 @@ impl Store {
             })
             .await?
             .flatten())
+    }
+
+    /// The session's working directory — the cwd builtin tools run in.
+    pub async fn session_cwd(&self, id: &str) -> anyhow::Result<Option<String>> {
+        let id = id.to_string();
+        Ok(self
+            .conn
+            .call(move |c| {
+                c.query_row("SELECT cwd FROM sessions WHERE id = ?1", [id], |r| {
+                    r.get::<_, String>(0)
+                })
+                .optional()
+            })
+            .await?)
     }
 
     pub async fn append(&self, session_id: &str, role: &str, data: &Value) -> anyhow::Result<i64> {
@@ -583,6 +617,75 @@ impl Store {
             .map_err(Into::into)
     }
 
+    /// Record one turn's token usage. Called once per completed prompt
+    /// turn — a zero-usage turn (cancelled before first response) writes
+    /// nothing so the table only holds real consumption.
+    pub async fn record_usage(
+        &self,
+        session_id: &str,
+        model: &str,
+        input: u64,
+        output: u64,
+    ) -> anyhow::Result<()> {
+        if input == 0 && output == 0 {
+            return Ok(());
+        }
+        let sid = session_id.to_string();
+        let model = model.to_string();
+        self.conn
+            .call(move |c| {
+                c.execute(
+                    "INSERT INTO usage (session_id, model, input_tokens, output_tokens)
+                     VALUES (?1, ?2, ?3, ?4)",
+                    rusqlite::params![sid, model, input as i64, output as i64],
+                )?;
+                Ok::<(), tokio_rusqlite::Error>(())
+            })
+            .await
+            .map_err(Into::into)
+    }
+
+    /// Per-model totals across all sessions: (model, input, output, turns).
+    pub async fn usage_summary(&self) -> anyhow::Result<Vec<(String, u64, u64, u64)>> {
+        self.conn
+            .call(|c| {
+                let mut stmt = c.prepare(
+                    "SELECT model, SUM(input_tokens), SUM(output_tokens), COUNT(*)
+                     FROM usage GROUP BY model ORDER BY SUM(input_tokens) DESC",
+                )?;
+                let rows = stmt
+                    .query_map([], |row| {
+                        Ok((
+                            row.get::<_, String>(0)?,
+                            row.get::<_, i64>(1)? as u64,
+                            row.get::<_, i64>(2)? as u64,
+                            row.get::<_, i64>(3)? as u64,
+                        ))
+                    })?
+                    .collect::<Result<Vec<_>, _>>()?;
+                Ok::<Vec<(String, u64, u64, u64)>, tokio_rusqlite::Error>(rows)
+            })
+            .await
+            .map_err(Into::into)
+    }
+
+    /// Per-session totals: (input, output, turns).
+    pub async fn session_usage(&self, session_id: &str) -> anyhow::Result<(u64, u64, u64)> {
+        let sid = session_id.to_string();
+        self.conn
+            .call(move |c| {
+                let (i, o, n): (i64, i64, i64) = c.query_row(
+                    "SELECT COALESCE(SUM(input_tokens),0), COALESCE(SUM(output_tokens),0), COUNT(*)
+                     FROM usage WHERE session_id = ?1",
+                    rusqlite::params![sid],
+                    |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+                )?;
+                Ok::<(u64, u64, u64), tokio_rusqlite::Error>((i as u64, o as u64, n as u64))
+            })
+            .await
+            .map_err(Into::into)
+    }
+
     /// Update the session's stored default model (None clears it).
     pub async fn set_session_model(
         &self,
@@ -696,7 +799,6 @@ impl Store {
             .await
             .map_err(Into::into)
     }
-
 
     /// Like `list_sessions`, but paginated — same 4-tuple shape.
     pub async fn list_sessions_paged(

@@ -48,6 +48,10 @@ pub struct Config {
     pub summary_model: Option<String>,
     /// Sessions idle longer than this many days are pruned. Unset = keep all.
     pub session_retention_days: Option<u32>,
+    /// Builtin fs.*/shell.exec tools — see BuiltinConfig. Always available
+    /// unless explicitly disabled; MCP servers are unaffected.
+    #[serde(default)]
+    pub builtin_tools: BuiltinConfig,
 }
 
 /// `[relay]` — outbound tunnel to a public relay.
@@ -61,6 +65,30 @@ pub struct RelayConfig {
     /// Registration secret when the relay sets DAMON_RELAY_SECRET.
     /// Supports env:/keychain:/!cmd secret refs.
     pub secret: Option<String>,
+}
+
+/// `[builtin_tools]` — the daemon's own fs.*/shell.exec toolset. Every
+/// field is optional; the toolset is ON by default so a fresh install is
+/// useful without MCP servers. `#[serde(default)]` at the container level
+/// makes a bare `[builtin_tools]` table valid.
+#[derive(Clone, Debug, Default, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct BuiltinConfig {
+    /// Master switch. Default true; `false` removes every builtin tool.
+    pub enabled: Option<bool>,
+    /// Skip the permission prompt for ALL builtin tools. Default false —
+    /// these tools run with the daemon's privileges, so prompts are the
+    /// primary gate (see the threat model in builtin.rs).
+    pub auto_approve: Option<bool>,
+    /// shell.exec on/off. Default true. `allowed_paths` does NOT confine
+    /// the shell — set this to false when confinement matters.
+    pub shell: Option<bool>,
+    /// fs.* path sandbox: canonicalized targets must live under one of
+    /// these roots. Empty = unrestricted.
+    pub allowed_paths: Vec<String>,
+    /// Default shell.exec timeout in seconds. Default 120; a per-call
+    /// `timeout_secs` argument overrides it (hard ceiling 3600).
+    pub shell_timeout_secs: Option<u64>,
 }
 
 /// Per-model metadata. User config (`[models."<id-or-glob>"]`) overrides

@@ -109,6 +109,9 @@ pub struct AppState {
     /// were the client's, not the daemon's). Removed on session/delete,
     /// the retention sweep, and daemon shutdown.
     pub session_mcp: tokio::sync::Mutex<HashMap<String, Arc<McpRegistry>>>,
+    /// Builtin fs/shell tools — rebuilt on config reload alongside
+    /// providers so [builtin_tools] edits take effect without restart.
+    pub builtin: parking_lot::RwLock<Arc<crate::builtin::BuiltinTools>>,
 }
 
 impl AppState {
@@ -129,6 +132,7 @@ impl AppState {
         for e in &errors {
             warn!(error = %e, "provider init failed");
         }
+        let builtin = crate::builtin::BuiltinTools::from_config(&config.read().builtin_tools);
         let discovered = {
             let cfg = config.read().clone();
             crate::provider::discovery::discover_all(&cfg, &mut providers).await
@@ -152,6 +156,7 @@ impl AppState {
             },
             ws_tickets: tokio::sync::Mutex::new(HashMap::new()),
             rate_buckets: tokio::sync::Mutex::new(HashMap::new()),
+            builtin: parking_lot::RwLock::new(Arc::new(builtin)),
             live_prompts: tokio::sync::Mutex::new(HashMap::new()),
             session_mcp: tokio::sync::Mutex::new(HashMap::new()),
         });
@@ -269,6 +274,11 @@ impl AppState {
         for e in &errors {
             warn!(error = %e, "provider rebuild failed");
         }
+        // Builtin tools reload even when provider rebuild fails — the
+        // early return below must not freeze a [builtin_tools] edit.
+        *self.builtin.write() = Arc::new(crate::builtin::BuiltinTools::from_config(
+            &cfg.builtin_tools,
+        ));
         if providers.is_empty() && !errors.is_empty() {
             return;
         }
@@ -289,6 +299,7 @@ pub fn router(state: Arc<AppState>) -> Router {
     let v1 = Router::new()
         .route("/models", get(models))
         .route("/chat/completions", post(chat_completions))
+        .route("/responses", post(crate::responses_api::responses))
         .route("/ws_ticket", post(ws_ticket))
         .route_layer(middleware::from_fn_with_state(state.clone(), require_token))
         .route_layer(middleware::from_fn_with_state(state.clone(), rate_limit));
@@ -433,7 +444,7 @@ async fn chat_completions(State(state): State<Arc<AppState>>, body: bytes::Bytes
 
 /// Route by model field → provider. openai-compat passes through raw;
 /// anthropic/gemini translate to/from OpenAI shape.
-async fn forward(
+pub(crate) async fn forward(
     state: &Arc<AppState>,
     method: reqwest::Method,
     path: &str,
@@ -989,7 +1000,7 @@ async fn require_token(State(state): State<Arc<AppState>>, req: Request, next: N
     }
 }
 
-fn openai_error(status: StatusCode, message: &str, kind: &str) -> Response {
+pub(crate) fn openai_error(status: StatusCode, message: &str, kind: &str) -> Response {
     (
         status,
         Json(json!({

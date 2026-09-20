@@ -48,6 +48,7 @@ fn test_config(auth_token: Option<&str>, upstream: Option<String>) -> SharedConf
         max_tool_output: None,
         summary_model: None,
         session_retention_days: None,
+        builtin_tools: Default::default(),
     }))
 }
 
@@ -432,7 +433,11 @@ async fn session_load_replays_history() {
         .await
         .unwrap();
     store
-        .append("s1", "assistant", &json!({"role":"assistant","content":"done"}))
+        .append(
+            "s1",
+            "assistant",
+            &json!({"role":"assistant","content":"done"}),
+        )
         .await
         .unwrap();
 

@@ -89,6 +89,12 @@ enum Cmd {
         #[arg(long)]
         model: Option<String>,
     },
+    /// Token usage: per-model totals, or one session's with --session
+    Usage {
+        /// Session id for per-session totals
+        #[arg(long)]
+        session: Option<String>,
+    },
 }
 
 #[tokio::main]
@@ -131,6 +137,28 @@ async fn main() -> anyhow::Result<()> {
             for (id, created, model, title) in client.list_sessions().await? {
                 let label = if title.is_empty() { &id } else { &title };
                 outln(format!("{id}\t{created}\t{model}\t{label}"));
+            }
+        }
+        Cmd::Usage { session } => {
+            let v = client.usage(session.as_deref()).await?;
+            if let Some(models) = v["models"].as_array() {
+                for m in models {
+                    outln(format!(
+                        "{}\t{} in\t{} out\t{} turns",
+                        m["model"].as_str().unwrap_or(""),
+                        m["inputTokens"].as_u64().unwrap_or(0),
+                        m["outputTokens"].as_u64().unwrap_or(0),
+                        m["turns"].as_u64().unwrap_or(0),
+                    ));
+                }
+            } else {
+                outln(format!(
+                    "{}\t{} in\t{} out\t{} turns",
+                    v["sessionId"].as_str().unwrap_or(""),
+                    v["inputTokens"].as_u64().unwrap_or(0),
+                    v["outputTokens"].as_u64().unwrap_or(0),
+                    v["turns"].as_u64().unwrap_or(0),
+                ));
             }
         }
         Cmd::Rename { id, title } => {
@@ -277,15 +305,15 @@ fn render_replay(u: &serde_json::Value) {
             }
         }
         Some("tool_call") => {
-            eprintln!(
-                "[tool {}]",
-                u["title"].as_str().unwrap_or("")
-            );
+            eprintln!("[tool {}]", u["title"].as_str().unwrap_or(""));
         }
         Some("tool_call_update") => {
             let status = u["status"].as_str().unwrap_or("");
             if status != "completed" {
-                eprintln!("[tool {} → {status}]", u["toolCallId"].as_str().unwrap_or(""));
+                eprintln!(
+                    "[tool {} → {status}]",
+                    u["toolCallId"].as_str().unwrap_or("")
+                );
             }
         }
         _ => {}

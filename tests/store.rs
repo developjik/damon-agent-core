@@ -242,7 +242,10 @@ async fn session_title_and_model_overrides() {
 
     // Model override set/clear round-trips through session_model.
     assert!(store.set_session_model("s1", Some("gpt-4o")).await.unwrap());
-    assert_eq!(store.session_model("s1").await.unwrap().as_deref(), Some("gpt-4o"));
+    assert_eq!(
+        store.session_model("s1").await.unwrap().as_deref(),
+        Some("gpt-4o")
+    );
     assert!(store.set_session_model("s1", None).await.unwrap());
     assert_eq!(store.session_model("s1").await.unwrap(), None);
     assert!(!store.set_session_model("ghost", Some("m")).await.unwrap());

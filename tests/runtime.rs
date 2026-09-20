@@ -88,6 +88,7 @@ async fn ws_prompt_streams_and_persists() {
         max_tool_output: None,
         summary_model: None,
         session_retention_days: None,
+        builtin_tools: Default::default(),
     }));
     let store = Store::in_memory().await.unwrap();
     let mcp = McpRegistry::connect_all(&HashMap::new()).await;
@@ -296,6 +297,7 @@ async fn cancel_does_not_mask_real_tool_errors() {
         max_tool_output: None,
         summary_model: None,
         session_retention_days: None,
+        builtin_tools: Default::default(),
     }));
     let store = Store::in_memory().await.unwrap();
     let mcp = McpRegistry::connect_all(&HashMap::new()).await;
@@ -321,7 +323,9 @@ async fn cancel_does_not_mask_real_tool_errors() {
     // "cancelled"), reached by
     // cancel_reaches_inflight_tool_and_persists_cancelled below, nor the
     // append-failure repair loop that backfills orphan tool_calls.
-    let _ = damon_core::runtime::run_prompt(&state, session_id, &json!("hi"), None, &client, cancel).await;
+    let _ =
+        damon_core::runtime::run_prompt(&state, session_id, &json!("hi"), None, &client, cancel)
+            .await;
 
     let msgs = store.messages(session_id).await.unwrap();
     // user + assistant(tool_calls) + tool(error) + tool(error)
@@ -379,6 +383,7 @@ async fn cancel_reaches_inflight_tool_and_persists_cancelled() {
         max_tool_output: None,
         summary_model: None,
         session_retention_days: None,
+        builtin_tools: Default::default(),
     }));
     let store = Store::in_memory().await.unwrap();
     let mcp = {
@@ -404,7 +409,9 @@ async fn cancel_reaches_inflight_tool_and_persists_cancelled() {
     // is persisted as "cancelled" — a cancel must still leave a
     // well-formed tool row, not drop it (a missing row would orphan the
     // assistant tool_calls and 400 every later turn).
-    let _ = damon_core::runtime::run_prompt(&state, session_id, &json!("hi"), None, &client, cancel).await;
+    let _ =
+        damon_core::runtime::run_prompt(&state, session_id, &json!("hi"), None, &client, cancel)
+            .await;
 
     let msgs = store.messages(session_id).await.unwrap();
     // user + assistant(tool_calls) + tool(cancelled); the cancelled turn
@@ -516,6 +523,7 @@ async fn test_state(upstream: &str) -> (Arc<AppState>, Store) {
         max_tool_output: None,
         summary_model: None,
         session_retention_days: None,
+        builtin_tools: Default::default(),
     }));
     let store = Store::in_memory().await.unwrap();
     let mcp = McpRegistry::connect_all(&HashMap::new()).await;
@@ -741,6 +749,7 @@ async fn disconnect_cancels_prompt_and_frees_session() {
         max_tool_output: None,
         summary_model: None,
         session_retention_days: None,
+        builtin_tools: Default::default(),
     }));
     let store = Store::in_memory().await.unwrap();
     let mcp = McpRegistry::connect_all(&HashMap::new()).await;
@@ -887,7 +896,6 @@ async fn client_request_fails_on_disconnect() {
 /// the placeholder used to permanently drop half the session's context.
 #[tokio::test]
 async fn compaction_failure_keeps_full_history() {
-    use damon_core::runtime::{self, ClientChannel};
 
     // Mock upstream: non-streaming (the summarizer) 500s, streaming
     // (the actual turn) succeeds.
@@ -954,6 +962,7 @@ async fn compaction_failure_keeps_full_history() {
         max_tool_output: None,
         summary_model: None,
         session_retention_days: None,
+        builtin_tools: Default::default(),
     }));
     let store = Store::in_memory().await.unwrap();
     let mcp = McpRegistry::connect_all(&HashMap::new()).await;
@@ -1012,7 +1021,6 @@ async fn compaction_failure_keeps_full_history() {
 /// formula must now trigger compaction.
 #[tokio::test]
 async fn compaction_triggers_on_cjk_history() {
-    use damon_core::runtime::{self, ClientChannel};
 
     // Mock upstream: non-streaming (the summarizer) returns a summary,
     // streaming (the actual turn) succeeds.
@@ -1084,6 +1092,7 @@ async fn compaction_triggers_on_cjk_history() {
         max_tool_output: None,
         summary_model: None,
         session_retention_days: None,
+        builtin_tools: Default::default(),
     }));
     let store = Store::in_memory().await.unwrap();
     let mcp = McpRegistry::connect_all(&HashMap::new()).await;
@@ -1203,6 +1212,7 @@ async fn mcp_state(
         max_tool_output: None,
         summary_model: None,
         session_retention_days: None,
+        builtin_tools: Default::default(),
     }));
     let store = Store::in_memory().await.unwrap();
     let servers = shared.read().mcp_servers.clone();
@@ -1328,7 +1338,6 @@ async fn max_iterations_returns_max_turn_requests() {
 
 #[tokio::test]
 async fn compaction_reevaluates_after_tool_results_grow_history() {
-    use damon_core::runtime::{self, ClientChannel};
     use std::sync::atomic::{AtomicUsize, Ordering};
 
     // Mock upstream: streaming calls emit one tool call then text;
@@ -1535,6 +1544,7 @@ async fn first_prompt_sets_title_and_rename_sticks() {
         max_tool_output: None,
         summary_model: None,
         session_retention_days: None,
+        builtin_tools: Default::default(),
     }));
     let store = Store::in_memory().await.unwrap();
     let mcp = McpRegistry::connect_all(&HashMap::new()).await;

@@ -592,7 +592,11 @@ pub async fn handle_socket(
                 // null/absent model clears the override — the session
                 // falls back to the provider's default_model.
                 let model = params["model"].as_str().map(String::from);
-                match state.store.set_session_model(&session_id, model.as_deref()).await {
+                match state
+                    .store
+                    .set_session_model(&session_id, model.as_deref())
+                    .await
+                {
                     Ok(true) => client.respond(id, Ok(json!({}))).await,
                     Ok(false) => {
                         client
@@ -604,6 +608,53 @@ pub async fn handle_socket(
                             .respond(id, Err(rpc_error(-32603, &e.to_string())))
                             .await;
                     }
+                }
+            }
+            ("session/usage", Some(id)) => {
+                // Per-session totals when sessionId given, per-model
+                // rollup across all sessions otherwise.
+                match params["sessionId"].as_str() {
+                    Some(sid) => match state.store.session_usage(sid).await {
+                        Ok((input, output, turns)) => {
+                            client
+                                .respond(
+                                    id,
+                                    Ok(json!({
+                                        "sessionId": sid,
+                                        "inputTokens": input,
+                                        "outputTokens": output,
+                                        "turns": turns,
+                                    })),
+                                )
+                                .await;
+                        }
+                        Err(e) => {
+                            client
+                                .respond(id, Err(rpc_error(-32603, &e.to_string())))
+                                .await;
+                        }
+                    },
+                    None => match state.store.usage_summary().await {
+                        Ok(rows) => {
+                            let models: Vec<Value> = rows
+                                .into_iter()
+                                .map(|(model, input, output, turns)| {
+                                    json!({
+                                        "model": model,
+                                        "inputTokens": input,
+                                        "outputTokens": output,
+                                        "turns": turns,
+                                    })
+                                })
+                                .collect();
+                            client.respond(id, Ok(json!({"models": models}))).await;
+                        }
+                        Err(e) => {
+                            client
+                                .respond(id, Err(rpc_error(-32603, &e.to_string())))
+                                .await;
+                        }
+                    },
                 }
             }
             ("session/load", Some(id)) => {
@@ -1122,9 +1173,9 @@ fn content_blocks(content: &Value) -> Vec<Value> {
                         .unwrap_or("");
                     url.strip_prefix("data:")
                         .and_then(|rest| rest.split_once(";base64,"))
-                        .map(|(mime, data)| {
-                            json!({"type": "image", "data": data, "mimeType": mime})
-                        })
+                        .map(
+                            |(mime, data)| json!({"type": "image", "data": data, "mimeType": mime}),
+                        )
                         .or_else(|| {
                             Some(json!({"type": "text", "text": format!("[image: {url}]")}))
                         })
@@ -1219,4 +1270,3 @@ mod tests {
         );
     }
 }
-

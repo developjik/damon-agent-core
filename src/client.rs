@@ -380,6 +380,13 @@ impl DamonClient {
         Ok(())
     }
 
+    /// Token usage: per-session totals when `id` is given, per-model
+    /// rollup (model, input, output, turns) otherwise.
+    pub async fn usage(&self, id: Option<&str>) -> anyhow::Result<Value> {
+        self.request("session/usage", json!({"sessionId": id}))
+            .await
+    }
+
     /// Delete a session and its history.
     pub async fn delete_session(&self, id: &str) -> anyhow::Result<()> {
         self.request("session/delete", json!({"sessionId": id}))
