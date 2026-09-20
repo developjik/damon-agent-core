@@ -896,7 +896,6 @@ async fn client_request_fails_on_disconnect() {
 /// the placeholder used to permanently drop half the session's context.
 #[tokio::test]
 async fn compaction_failure_keeps_full_history() {
-
     // Mock upstream: non-streaming (the summarizer) 500s, streaming
     // (the actual turn) succeeds.
     let app = Router::new().route(
@@ -1021,7 +1020,6 @@ async fn compaction_failure_keeps_full_history() {
 /// formula must now trigger compaction.
 #[tokio::test]
 async fn compaction_triggers_on_cjk_history() {
-
     // Mock upstream: non-streaming (the summarizer) returns a summary,
     // streaming (the actual turn) succeeds.
     let app = Router::new().route(
