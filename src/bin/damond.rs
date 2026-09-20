@@ -34,9 +34,10 @@ enum Cmd {
     },
     /// Check config, secrets, provider reachability, and store dir
     Doctor,
-    /// OAuth login for a provider (stores tokens in the OS keychain)
+    /// OAuth login for a provider (stores tokens in the OS keychain):
+    /// anthropic = Claude Pro/Max, openai = ChatGPT Plus/Pro
     Login {
-        /// Provider name (currently only "anthropic")
+        /// Provider name ("anthropic" or "openai")
         provider: String,
     },
     /// Remove stored OAuth tokens for a provider
@@ -44,6 +45,8 @@ enum Cmd {
         /// Provider name
         provider: String,
     },
+    /// List omp-parity provider presets and which are active right now
+    Presets,
 }
 #[derive(clap::Subcommand)]
 enum ServiceAction {
@@ -97,6 +100,9 @@ async fn main() -> anyhow::Result<()> {
             damon_core::oauth::delete(&provider)?;
             println!("logged out of {provider}");
             return Ok(());
+        }
+        Some(Cmd::Presets) => {
+            return presets_table();
         }
         Some(Cmd::Doctor) => return doctor(&path).await,
         None => {}
@@ -235,6 +241,10 @@ async fn main() -> anyhow::Result<()> {
     }
     // Tear down MCP children explicitly — rmcp's Drop only *schedules* an
     // async close, so relying on it at process exit can orphan servers.
+    // Session overlays (ACP mcpServers) get the same treatment.
+    for (_, reg) in state.session_mcp.lock().await.drain() {
+        reg.shutdown().await;
+    }
     state.mcp.shutdown().await;
     info!("damond stopped");
     Ok(())
@@ -291,6 +301,54 @@ async fn doctor(path: &Path) -> anyhow::Result<()> {
                     true,
                     format!("provider {name} api_key — not set (unauthenticated upstream)"),
                 ),
+                // The oauth sentinel is not a SecretRef — check the
+                // keychain for a live token set instead.
+                Some(raw) if raw == "oauth" || raw.starts_with("oauth:") => {
+                    let flavor: anyhow::Result<String> = if raw == "oauth" {
+                        damon_core::oauth::provider_for_api(&p.api)
+                            .map(String::from)
+                            .ok_or_else(|| {
+                                anyhow::anyhow!(
+                                    "api_key \"oauth\" is not supported for api '{}'",
+                                    p.api
+                                )
+                            })
+                    } else {
+                        let f = raw["oauth:".len()..].to_string();
+                        damon_core::oauth::validate_flavor(&f).map(|_| f)
+                    };
+                    match flavor {
+                        Ok(oauth_provider) => match damon_core::oauth::load(&oauth_provider) {
+                            Ok(Some(t)) if !t.is_expired() => report(
+                                &mut ok,
+                                true,
+                                format!("provider {name} — logged in via {oauth_provider} OAuth"),
+                            ),
+                            Ok(Some(_)) => report(
+                                &mut ok,
+                                true,
+                                format!(
+                                    "provider {name} — {oauth_provider} OAuth token \
+                                         expired; it refreshes on next use"
+                                ),
+                            ),
+                            Ok(None) => report(
+                                &mut ok,
+                                false,
+                                format!(
+                                    "provider {name} — not logged in; run `damond login \
+                                         {oauth_provider}`"
+                                ),
+                            ),
+                            Err(e) => report(
+                                &mut ok,
+                                false,
+                                format!("provider {name} — OAuth token store: {e:#}"),
+                            ),
+                        },
+                        Err(msg) => report(&mut ok, false, format!("provider {name} — {msg}")),
+                    }
+                }
                 Some(raw) => match SecretRef::parse(raw).and_then(|r| r.resolve()) {
                     Ok(_) => report(
                         &mut ok,
@@ -305,10 +363,9 @@ async fn doctor(path: &Path) -> anyhow::Result<()> {
                 },
             }
 
-            let base = p.base_url.clone().unwrap_or_else(|| match p.api.as_str() {
-                "anthropic-messages" => "https://api.anthropic.com".to_string(),
-                "gemini" => "https://generativelanguage.googleapis.com".to_string(),
-                _ => "https://api.openai.com/v1".to_string(),
+            let base = p.base_url.clone().unwrap_or_else(|| {
+                damon_core::config::default_base_url(&p.api, p.api_key.as_deref() == Some("oauth"))
+                    .to_string()
             });
             match tcp_check(&base).await {
                 Ok(()) => report(
@@ -420,15 +477,71 @@ fn writable_dir(dir: &Path) -> anyhow::Result<()> {
     Ok(())
 }
 
-/// `damond login anthropic` — PKCE flow. Prints the authorize URL; the user
-/// pastes the code shown on the callback page back into the terminal.
-async fn login(provider: &str) -> anyhow::Result<()> {
-    if provider != "anthropic" {
-        anyhow::bail!("OAuth login is only supported for 'anthropic' for now");
+/// `damond presets` — print the omp-parity catalog with a live marker:
+/// key env vars that are set right now (or keyless local engines) would
+/// auto-register at boot unless the id is explicitly configured.
+fn presets_table() -> anyhow::Result<()> {
+    use damon_core::provider::presets::PRESETS;
+    println!("{:<18} {:<20} {:<28} NOTE", "ID", "API", "KEY ENV");
+    for p in PRESETS {
+        let active = p.env_active();
+        let keys = if p.key_env.is_empty() {
+            "(keyless)".to_string()
+        } else {
+            p.key_env.join(" | ")
+        };
+        println!(
+            "{:<18} {:<20} {:<28} {}{}",
+            p.id,
+            p.api,
+            keys,
+            p.note,
+            if active { "  [active]" } else { "" }
+        );
     }
-    let (url, verifier) = damon_core::oauth::authorize_url();
+    println!(
+        "\n[active] = key env var is set (keyless engines always) — the provider\n\
+         auto-registers at boot unless you configure the same id explicitly."
+    );
+    Ok(())
+}
+
+/// `damond login <provider>` — anthropic/openai: PKCE flow, the user
+/// pastes back the code (anthropic) or the full callback URL (openai,
+/// where the browser lands on a dead localhost port). kimi-code,
+/// xai-oauth, github-copilot: RFC 8628 device flow — the CLI polls until
+/// the browser approval lands, nothing to paste.
+async fn login(provider: &str) -> anyhow::Result<()> {
+    if damon_core::oauth::is_device_flow(provider) {
+        let auth = damon_core::oauth::device_authorization(provider).await?;
+        match auth
+            .verification_uri_complete
+            .as_deref()
+            .filter(|u| !u.is_empty())
+        {
+            Some(url) => println!(
+                "Open this URL in your browser (code: {}):\n\n  {url}\n",
+                auth.user_code
+            ),
+            None => println!(
+                "Open {} in your browser and enter code: {}\n",
+                auth.verification_uri, auth.user_code
+            ),
+        }
+        println!("Waiting for approval… (Ctrl-C to cancel)");
+        damon_core::oauth::device_poll(provider, &auth).await?;
+        println!("logged in — tokens stored in the OS keychain");
+        return Ok(());
+    }
+    let (url, verifier) = damon_core::oauth::authorize_url(provider)?;
     println!("Open this URL in your browser:\n\n  {url}\n");
-    println!("After approving, paste the code shown on the callback page:");
+    match provider {
+        "openai" => println!(
+            "After approving, the browser lands on a localhost page that won't load —\n\
+             that's expected. Paste the FULL URL from the browser's address bar:"
+        ),
+        _ => println!("After approving, paste the code shown on the callback page:"),
+    }
     let mut code = String::new();
     tokio::io::BufReader::new(tokio::io::stdin())
         .read_line(&mut code)

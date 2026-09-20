@@ -105,56 +105,18 @@ pub async fn run_prompt(
                 model: None,
             });
         }
-        let tools = state.mcp.openai_tools();
-        let (provider, model, thinking) = {
-            let cfg = state.config.read();
-            let providers = state.providers.read();
-            let discovered = state.discovered.read();
-            // A `:low|:medium|:high` suffix is a thinking-level selector —
-            // strip it before routing, same as the /v1 path.
-            let (req_model, req_thinking) = requested
-                .as_deref()
-                .map(Config::split_thinking_level)
-                .unwrap_or(("", None));
-            let resolved = if req_model.is_empty() {
-                cfg.default_provider().map(|(n, p)| {
-                    // default_model may itself carry a thinking suffix.
-                    let raw = p.default_model.clone().unwrap_or_else(|| "default".into());
-                    let (m, t) = Config::split_thinking_level(&raw);
-                    (n.to_string(), m.to_string(), t.map(String::from))
-                })
-            } else {
-                // Discovered exact ids claim the request first — a
-                // `provider/model` prefix match inside route_model_strict
-                // would hijack a discovered id like "meta-llama/llama-3"
-                // when its first segment collides with a provider name.
-                // Then strict route (prefix/glob), then the default
-                // provider still gets the requested model name — mirrors
-                // the /v1 forward path.
-                discovered
-                    .iter()
-                    .find_map(|(name, ids)| {
-                        ids.iter()
-                            .any(|id| id == req_model)
-                            .then(|| (name.clone(), req_model.to_string()))
-                    })
-                    .or_else(|| {
-                        cfg.route_model_strict(req_model)
-                            .map(|(name, _, upstream)| (name.to_string(), upstream))
-                    })
-                    .or_else(|| {
-                        cfg.default_provider()
-                            .map(|(n, _)| (n.to_string(), req_model.to_string()))
-                    })
-                    .map(|(n, m)| (n, m, req_thinking.map(String::from)))
-            };
-            let (name, model, thinking) = resolved.context("no provider configured")?;
-            let provider = providers
-                .get(&name)
-                .cloned()
-                .context("provider not built")?;
-            (provider, model, thinking)
-        };
+        // Global MCP tools plus this session's overlay servers (ACP
+        // session/new mcpServers) — rebuilt each iteration so a config
+        // reload or a deleted overlay can't leak stale tools in.
+        let session_mcp = state.session_mcp.lock().await.get(session_id).cloned();
+        let mcp = crate::mcp::McpView::new(&state.mcp, session_mcp);
+        let tools = mcp.openai_tools();
+        let ResolvedModel {
+            provider_name,
+            provider,
+            model,
+            thinking,
+        } = resolve_provider_model(state, requested.as_deref())?;
         // First successful resolution wins — later iterations re-resolve
         // (config may change mid-turn) but must not rewrite what the
         // client was told answered.
@@ -182,12 +144,17 @@ pub async fn run_prompt(
         // forever, the live_prompts entry never frees, and the session
         // rejects every new prompt ("busy") until daemon restart.
         let ttfb = std::time::Duration::from_secs(120);
+        let started = std::time::Instant::now();
         let stream = tokio::select! {
             _ = cancel.cancelled() => return Ok(PromptOutcome { stop_reason: llm::StopReason::Other, model: model_used.clone() }),
             r = tokio::time::timeout(ttfb, provider.chat_stream(body.clone())) => {
                 match r {
-                    Ok(Ok(s)) => s,
+                    Ok(Ok(s)) => {
+                        state.metrics.record_provider(&provider_name, true, started.elapsed());
+                        s
+                    }
                     Ok(Err(e)) => {
+                        state.metrics.record_provider(&provider_name, false, started.elapsed());
                         // A rate-limited upstream tells us how long to
                         // back off — honor it before the single retry.
                         if let Some(rl) = e.downcast_ref::<crate::provider::RateLimited>() {
@@ -199,17 +166,30 @@ pub async fn run_prompt(
                         } else {
                             warn!(error = %e, "chat_stream failed; retrying once");
                         }
+                        let retry_started = std::time::Instant::now();
                         let retried = tokio::select! {
                             _ = cancel.cancelled() => return Ok(PromptOutcome { stop_reason: llm::StopReason::Other, model: model_used.clone() }),
                             r = tokio::time::timeout(ttfb, provider.chat_stream(body)) => r,
                         };
                         match retried {
-                            Ok(Ok(s)) => s,
-                            Ok(Err(e)) => return Err(e),
-                            Err(_) => bail!("no response from upstream within {}s (retry)", ttfb.as_secs()),
+                            Ok(Ok(s)) => {
+                                state.metrics.record_provider(&provider_name, true, retry_started.elapsed());
+                                s
+                            }
+                            Ok(Err(e)) => {
+                                state.metrics.record_provider(&provider_name, false, retry_started.elapsed());
+                                return Err(e);
+                            }
+                            Err(_) => {
+                                state.metrics.record_provider(&provider_name, false, retry_started.elapsed());
+                                bail!("no response from upstream within {}s (retry)", ttfb.as_secs())
+                            }
                         }
                     }
-                    Err(_) => bail!("no response from upstream within {}s", ttfb.as_secs()),
+                    Err(_) => {
+                        state.metrics.record_provider(&provider_name, false, started.elapsed());
+                        bail!("no response from upstream within {}s", ttfb.as_secs())
+                    }
                 }
             }
         };
@@ -382,12 +362,11 @@ pub async fn run_prompt(
         // Permission prompts serialize on a turn-local mutex — the client
         // must never see two prompts at once.
         let perm_lock = tokio::sync::Mutex::new(());
-        let results = futures::future::join_all(
-            calls
-                .iter()
-                .map(|call| execute_tool(state, session_id, call, client, &cancel, &perm_lock)),
-        )
-        .await;
+        let results =
+            futures::future::join_all(calls.iter().map(|call| {
+                execute_tool(state, &mcp, session_id, call, client, &cancel, &perm_lock)
+            }))
+            .await;
 
         // Every persisted tool_call MUST get a matching role:"tool" row —
         // an orphan poisons every later turn ("tool_calls without tool
@@ -555,10 +534,127 @@ fn truncate_tool_output(content: String, max: usize) -> String {
     )
 }
 
+/// A resolved prompt target: which provider serves the request and the
+/// upstream model id to send it.
+pub struct ResolvedModel {
+    pub provider_name: String,
+    pub provider: Arc<crate::provider::Provider>,
+    pub model: String,
+    pub thinking: Option<String>,
+}
+
+/// Resolve which provider + upstream model a request targets: discovered
+/// exact ids first (a `provider/model` prefix match would hijack a
+/// discovered id like "meta-llama/llama-3" whose first segment collides
+/// with a provider name), then strict prefix/glob routing, then the
+/// default provider still gets the requested name — mirrors the /v1
+/// forward path. A `:low|:medium|:high` suffix is a thinking-level
+/// selector, stripped before routing.
+fn resolve_provider_model(
+    state: &Arc<AppState>,
+    requested: Option<&str>,
+) -> anyhow::Result<ResolvedModel> {
+    let cfg = state.config.read();
+    let providers = state.providers.read();
+    let discovered = state.discovered.read();
+    let (req_model, req_thinking) = requested
+        .map(Config::split_thinking_level)
+        .unwrap_or(("", None));
+    let resolved = if req_model.is_empty() {
+        cfg.default_provider().map(|(n, p)| {
+            // default_model may itself carry a thinking suffix.
+            let raw = p.default_model.clone().unwrap_or_else(|| "default".into());
+            let (m, t) = Config::split_thinking_level(&raw);
+            (n.to_string(), m.to_string(), t.map(String::from))
+        })
+    } else {
+        discovered
+            .iter()
+            .find_map(|(name, ids)| {
+                ids.iter()
+                    .any(|id| id == req_model)
+                    .then(|| (name.clone(), req_model.to_string()))
+            })
+            .or_else(|| {
+                cfg.route_model_strict(req_model)
+                    .map(|(name, _, upstream)| (name.to_string(), upstream))
+            })
+            .or_else(|| {
+                cfg.default_provider()
+                    .map(|(n, _)| (n.to_string(), req_model.to_string()))
+            })
+            .map(|(n, m)| (n, m, req_thinking.map(String::from)))
+    };
+    let (name, model, thinking) = resolved.context("no provider configured")?;
+    let provider = providers
+        .get(&name)
+        .cloned()
+        .context("provider not built")?;
+    Ok(ResolvedModel {
+        provider_name: name,
+        provider,
+        model,
+        thinking,
+    })
+}
+
+/// Outcome of one compaction attempt. `compacted` is true only when a
+/// summary was produced and recorded; `reason` explains a no-op.
+#[derive(Debug)]
+pub struct CompactReport {
+    pub compacted: bool,
+    /// Newest message id folded into the summary.
+    pub compacted_through: Option<i64>,
+    pub reason: Option<String>,
+}
+
+impl CompactReport {
+    fn done(through: i64) -> Self {
+        Self {
+            compacted: true,
+            compacted_through: Some(through),
+            reason: None,
+        }
+    }
+    fn skipped(reason: impl Into<String>) -> Self {
+        Self {
+            compacted: false,
+            compacted_through: None,
+            reason: Some(reason.into()),
+        }
+    }
+}
+
+/// Force a compaction pass on a session regardless of the 85% threshold —
+/// the manual escape hatch for a session wedged against the real context
+/// window while the estimate still reads under it. Resolves the model the
+/// same way a prompt turn would (session default → provider default).
+/// Callers must hold the session's live_prompts slot so a turn can't
+/// interleave history writes mid-summarize.
+pub async fn compact_session(
+    state: &Arc<AppState>,
+    session_id: &str,
+    cancel: CancellationToken,
+) -> anyhow::Result<CompactReport> {
+    let session_model = state.store.session_model(session_id).await?;
+    let resolved = resolve_provider_model(state, session_model.as_deref())?;
+    compact_inner(
+        state,
+        session_id,
+        &resolved.provider,
+        &resolved.model,
+        &cancel,
+        true,
+    )
+    .await
+}
+
 /// If the session's estimated tokens exceed 85% of the model's context
 /// window, summarize the oldest half of messages via the provider and
 /// record the compaction. Failures are logged, never fatal — the turn
-/// proceeds with the full history.
+/// proceeds with the full history. `force` skips the threshold check
+/// (manual `session/compact`); store failures still propagate so the
+/// RPC caller sees them.
 async fn maybe_compact(
     state: &Arc<AppState>,
     session_id: &str,
@@ -566,18 +662,35 @@ async fn maybe_compact(
     model: &str,
     cancel: &CancellationToken,
 ) {
+    match compact_inner(state, session_id, provider, model, cancel, false).await {
+        Ok(_) => {}
+        Err(e) => warn!(session_id, error = %e, "compaction failed; keeping full history"),
+    }
+}
+
+async fn compact_inner(
+    state: &Arc<AppState>,
+    session_id: &str,
+    provider: &Arc<crate::provider::Provider>,
+    model: &str,
+    cancel: &CancellationToken,
+    force: bool,
+) -> anyhow::Result<CompactReport> {
+    // The window only gates the automatic threshold — a forced compact
+    // (manual escape hatch) must work even on models with no
+    // context_window metadata.
     let window = {
         let cfg = state.config.read();
         cfg.model_meta(model).context_window
     };
-    let Some(window) = window else { return };
+    if window.is_none() && !force {
+        return Ok(CompactReport::skipped(
+            "model has no context_window metadata",
+        ));
+    }
 
-    let Ok((compacted_through, prev_summary)) = state.store.compaction(session_id).await else {
-        return;
-    };
-    let Ok(full) = state.store.messages_full(session_id).await else {
-        return;
-    };
+    let (compacted_through, prev_summary) = state.store.compaction(session_id).await?;
+    let full = state.store.messages_full(session_id).await?;
     // Only the uncompacted tail still costs context — counting the whole
     // log would re-trigger compaction on every turn.
     let tail: Vec<&StoredMessage> = full.iter().filter(|m| m.id > compacted_through).collect();
@@ -585,8 +698,8 @@ async fn maybe_compact(
     if let Some(s) = &prev_summary {
         est += text_tokens(s);
     }
-    if est < window * 85 / 100 {
-        return;
+    if !force && est < window.unwrap_or(u64::MAX) * 85 / 100 {
+        return Ok(CompactReport::skipped("under 85% of context window"));
     }
 
     // Split: keep the newest ~50% of the tail, summarize the rest. The
@@ -599,7 +712,7 @@ async fn maybe_compact(
     }
     let dropped = &tail[..keep_from];
     if dropped.is_empty() {
-        return;
+        return Ok(CompactReport::skipped("nothing to compact"));
     }
     let through_id = dropped.last().unwrap().id;
 
@@ -661,7 +774,7 @@ async fn maybe_compact(
                     Some(v) => v,
                     None => {
                         warn!(session_id, model = %raw, "summary_model not routable; skipping compaction");
-                        return;
+                        return Ok(CompactReport::skipped("summary_model not routable"));
                     }
                 }
             }
@@ -683,7 +796,7 @@ async fn maybe_compact(
     // live_prompts slot promptly, not sit here for up to 120s.
     let summary = match tokio::select! {
         _ = cancel.cancelled() => {
-            return;
+            return Ok(CompactReport::skipped("cancelled"));
         }
         r = tokio::time::timeout(
             std::time::Duration::from_secs(120),
@@ -700,40 +813,39 @@ async fn maybe_compact(
             // context. The turn proceeds with full history and the next
             // iteration retries.
             warn!(session_id, error = %e, "compaction summarize failed; keeping full history");
-            return;
+            return Ok(CompactReport::skipped(format!("summarize failed: {e}")));
         }
         Err(_) => {
             warn!(
                 session_id,
                 "compaction summarize timed out; keeping full history"
             );
-            return;
+            return Ok(CompactReport::skipped("summarize timed out"));
         }
     };
     if summary.is_empty() {
-        return;
+        return Ok(CompactReport::skipped("empty summary"));
     }
-    if let Err(e) = state
+    state
         .store
         .set_compaction(session_id, through_id, &summary)
-        .await
-    {
-        warn!(session_id, error = %e, "failed to record compaction");
-    }
+        .await?;
+    Ok(CompactReport::done(through_id))
 }
 
 async fn execute_tool(
     state: &Arc<AppState>,
+    mcp: &crate::mcp::McpView<'_>,
     session_id: &str,
     call: &llm::ToolCall,
     client: &Arc<dyn ClientChannel>,
     cancel: &CancellationToken,
     perm_lock: &tokio::sync::Mutex<()>,
 ) -> anyhow::Result<Value> {
-    if !state.mcp.has_tool(&call.name) {
+    if !mcp.has_tool(&call.name) {
         anyhow::bail!("unknown tool {}", call.name);
     }
-    if !state.mcp.auto_approve(&call.name) && !state.mcp.session_approved(session_id, &call.name) {
+    if !mcp.auto_approve(&call.name) && !mcp.session_approved(session_id, &call.name) {
         // Race the permission round-trip against cancellation and a
         // timeout — a silent client must not stall the turn forever.
         // The mutex serializes prompts so parallel calls never surface
@@ -757,12 +869,12 @@ async fn execute_tool(
             // Re-check under the lock: a parallel call to the same tool
             // may have just been granted "always allow" — skip a second
             // prompt instead of serializing two dialogs.
-            if state.mcp.session_approved(session_id, &call.name) {
+            if mcp.session_approved(session_id, &call.name) {
                 true
             } else {
                 tokio::select! {
                     _ = cancel.cancelled() => false,
-                    g = tokio::time::timeout(timeout, request_permission(state, session_id, call, client)) => {
+                    g = tokio::time::timeout(timeout, request_permission(mcp, session_id, call, client)) => {
                         g.unwrap_or(false)
                     }
                 }
@@ -773,17 +885,24 @@ async fn execute_tool(
         }
     }
     let args: Value = llm::parse_partial_json(&call.arguments);
-    tokio::select! {
+    state.metrics.mcp_tool_calls.fetch_add(1, Ordering::Relaxed);
+    let result = tokio::select! {
         _ = cancel.cancelled() => anyhow::bail!(Cancelled),
-        r = state.mcp.call(&call.name, args) => r,
+        r = mcp.call(&call.name, args) => r,
+    };
+    if result.is_err() {
+        state
+            .metrics
+            .mcp_tool_errors
+            .fetch_add(1, Ordering::Relaxed);
     }
+    result
 }
 
 /// ACP session/request_permission round-trip. Failures and non-allow
 /// outcomes both deny. "Always allow" records a session-scoped grant so
-/// later calls to the same tool skip the prompt.
 async fn request_permission(
-    state: &Arc<AppState>,
+    mcp: &crate::mcp::McpView<'_>,
     session_id: &str,
     call: &llm::ToolCall,
     client: &Arc<dyn ClientChannel>,
@@ -810,7 +929,7 @@ async fn request_permission(
         Ok(v) => {
             let option = v["outcome"]["optionId"].as_str().unwrap_or("");
             if option == "allow-always" {
-                state.mcp.approve_for_session(session_id, &call.name);
+                mcp.approve_for_session(session_id, &call.name);
             }
             option.starts_with("allow")
         }

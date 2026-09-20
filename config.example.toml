@@ -43,8 +43,12 @@ default_model = "gpt-4o"           # used by the agent runtime
 # requires_tool_result_name = true         # Mistral
 # requires_mistral_tool_ids = true         # 9-char alphanumeric tool ids
 # supports_usage_in_streaming = false      # omit stream_options
-# inband_tools = true                      # render tools as text prompt, parse <tool_call> blocks
-                                          # (local models without a native tool API)
+# azure_deployment_urls = true            # Azure OpenAI: /deployments/{model} path
+# azure_api_version = "2024-10-21"        #   + api-version query (key in `api-key` header)
+# bearer_auth = true                      # anthropic-compatible Bearer instead of x-api-key
+#                                         # (Bedrock mantle / Bearer-fronting gateways)
+# vertex = true                           # Vertex AI paths on a project/location base
+# inband_tools = true                     # render tools as text prompt, parse <tool_call> blocks
 # [providers.default.compat.extra_body]
 # gateway = "m1-01"
 
@@ -58,6 +62,25 @@ default_model = "gpt-4o"           # used by the agent runtime
 # api_key = "env:ANTHROPIC_API_KEY"
 # models  = ["claude-*"]
 # default_model = "claude-sonnet-4-5"
+
+# Subscription auth — no API key needed. Login once, tokens live in the
+# OS keychain and refresh automatically.
+# [providers.chatgpt]
+# api     = "openai-responses"      # ChatGPT Plus/Pro (`damond login openai`)
+# api_key = "oauth"                 # base_url defaults to the ChatGPT backend
+# models  = ["gpt-5*", "codex-*"]
+
+# omp-parity presets — providers auto-register when their key env var is
+# set (or after `damond login` for the subscription flavors kimi-code /
+# github-copilot / xai-oauth), zero Damon config needed. An explicit
+# [providers.<id>] block here overrides the preset of the same id. Full
+# list: `damond presets`.
+# Examples (all covered): GROQ_API_KEY, OPENROUTER_API_KEY, MISTRAL_API_KEY,
+# XAI_API_KEY, DEEPSEEK_API_KEY, MOONSHOT_API_KEY/KIMI_API_KEY, ZAI_API_KEY,
+# AZURE_OPENAI_API_KEY + AZURE_OPENAI_ENDPOINT, GOOGLE_CLOUD_API_KEY +
+# GOOGLE_CLOUD_PROJECT + GOOGLE_CLOUD_LOCATION, AWS_BEARER_TOKEN_BEDROCK +
+# AWS_REGION, GEMINI_API_KEY — and keyless local engines lm-studio /
+# llama.cpp (discovered on their default ports).
 
 # [providers.gemini]
 # api     = "gemini"

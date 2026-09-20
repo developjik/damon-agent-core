@@ -4,6 +4,36 @@
 
 ### Added
 
+- **omp-parity provider presets** — `damond presets` lists ~26 hosted and
+  local providers (Groq, OpenRouter, Mistral, xAI, DeepSeek, Fireworks,
+  Together, Cerebras, NVIDIA, Moonshot/Kimi, Z.AI, BigModel, MiniMax,
+  SiliconFlow, Venice, Hugging Face, Vercel AI Gateway, LiteLLM, Azure
+  OpenAI, Vertex AI, Bedrock-mantle, LM Studio, llama.cpp) that
+  auto-register when their key environment variable is set — env-only,
+  zero Damon config; an explicit provider block of the same id wins. New
+  compat wire shapes: `azure_deployment_urls` (deployment-in-path +
+  `api-version` + `api-key` header), `vertex` (Vertex AI paths),
+  `bearer_auth` (Anthropic-compatible Bearer). Local engines
+  `lm-studio`/`llama.cpp` discover keylessly out of the box.
+- **Subscription OAuth flavors: kimi-code, github-copilot, xai-oauth** —
+  RFC 8628 device flows via `damond login` (`kimi-code`/`github-copilot`
+  pair with `openai-completions`, `xai-oauth` with `openai-responses`);
+  tokens live in the OS keychain and auto-refresh (Copilot's long-lived
+  GitHub token needs no rotation). Presets register each provider as soon
+  as its login exists, and `qwen-portal` joins as an env-key preset
+  (`QWEN_OAUTH_TOKEN` / `QWEN_PORTAL_API_KEY`). The oauth sentinel now
+  also names the flavor explicitly: `api_key = "oauth:kimi-code"` —
+  required where one api kind carries several flavors, with api-kind
+  validation in `Provider::new` and `damond doctor`.
+- **ChatGPT 구독제 OAuth (`damond login openai`)** — Codex PKCE 플로우로
+  ChatGPT Plus/Pro 구독을 그대로 사용한다. 토큰 + `chatgpt-account-id`는 OS
+  키체인에 저장되고 자동 갱신되며, `api = "openai-responses"` +
+  `api_key = "oauth"` 프로바이더는 ChatGPT 백엔드
+  (`chatgpt.com/backend-api/codex`)로 요청을 번역해 보낸다(SSE 전용이므로
+  비스트리밍 요청은 내부에서 SSE로 스트리밍 후 JSON으로 접어 돌려준다).
+  401 재시도, `store:false` 강제, `chatgpt-account-id` 헤더가 포함된다.
+  `damond doctor`도 OAuth 프로바이더를 올바르게 검증한다(기존에는
+  `api_key = "oauth"`를 시크릿 참조로 파싱해 실패로 보고했다).
 - **`~/.damon/daemon.json` discovery file** — the daemon writes
   `{port, pid, version, tls, configPath}` (0700/0600) at boot and removes
   it on shutdown, deleting only while the file still names its own pid so
@@ -17,6 +47,36 @@
   glob routing it is the remapped upstream id, so clients can badge the
   real route taken. Absent only when the turn was cancelled before the
   first model resolution.
+- **`session/compact` RPC + `damon compact <id>`** — force a context
+  compaction on a session regardless of the 85% estimate threshold: the
+  escape hatch for a session wedged against the real context window while
+  the estimate still reads under it. Takes the session's live-prompt slot
+  (rejects while a turn runs, cancellable via session/cancel or
+  session/delete) and returns `{compacted, compactedThrough, reason?}`.
+- **Per-session MCP servers (ACP `mcpServers`)** — `session/new` now
+  accepts `{name, command, args?, env?, auto_approve?}` entries instead
+  of rejecting non-empty lists. Servers spawn as a session overlay:
+  their tools merge into the turn's tool list (session names shadow
+  globals), permission grants stay scoped to the owning registry, and
+  the overlay's stdio children are torn down on session/delete, the
+  retention sweep, and daemon shutdown. Caps: 8 servers per session,
+  64 live overlays. Names colliding with a configured `[mcp_servers]`
+  entry are rejected rather than shadowing it.
+- **Embedded web UI at `/ui`** — a zero-dependency single-file chat
+  client served by the daemon: session sidebar, streaming replies,
+  tool-call status, permission prompts (allow/deny), cancel, reconnect
+  with backoff, and the ws_ticket auth flow when `auth_token` is set.
+- **Deeper `/metrics`** — `damon_mcp_tool_calls_total`,
+  `damon_mcp_tool_errors_total`, and per-provider
+  `damon_provider_{requests,errors}_total` +
+  `damon_provider_latency_ms_sum` (TTFB) labeled by provider name.
+- **`ConnectOptions::event_capacity` + `dropped_events()`** — the Rust
+  client's event channel is still bounded and lossy for Update
+  notifications (a slow consumer must never stall RPC responses), but
+  capacity is now configurable and every drop is counted and logged
+  (once per power of two) instead of vanishing silently.
+- **`damon-relay --help`/`--version`** — the relay used to ignore argv
+  entirely and start the server on `--help`; unknown args now exit 2.
 
 ## 0.2.0 — unreleased
 

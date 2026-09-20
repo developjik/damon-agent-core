@@ -315,6 +315,13 @@ impl McpRegistry {
         self.inner.read().tools.contains_key(namespaced_tool)
     }
 
+    /// Whether a server with this name is configured (running or not) —
+    /// used to reject session-overlay names that would shadow a global
+    /// server.
+    pub fn has_server(&self, name: &str) -> bool {
+        self.inner.read().servers.contains_key(name)
+    }
+
     pub async fn call(&self, namespaced_tool: &str, args: Value) -> anyhow::Result<Value> {
         let (server, tool_name) = {
             let inner = self.inner.read();
@@ -420,6 +427,77 @@ impl McpRegistry {
                 ))
             }
         }
+    }
+}
+
+/// A merged view over the global registry plus an optional per-session
+/// overlay (ACP `session/new` mcpServers). Session tools win on lookup;
+/// approvals route to the registry that owns the tool so a grant never
+/// crosses the global/session boundary.
+pub struct McpView<'a> {
+    global: &'a McpRegistry,
+    session: Option<Arc<McpRegistry>>,
+}
+
+impl<'a> McpView<'a> {
+    pub fn new(global: &'a McpRegistry, session: Option<Arc<McpRegistry>>) -> Self {
+        Self { global, session }
+    }
+
+    /// The registry owning `namespaced_tool` — session overlay first.
+    fn owner(&self, namespaced_tool: &str) -> &McpRegistry {
+        match &self.session {
+            Some(s) if s.has_tool(namespaced_tool) => s,
+            _ => self.global,
+        }
+    }
+
+    /// OpenAI `tools` array: global tools plus session-overlay tools.
+    /// A session tool shadowing a global name replaces it — the overlay
+    /// is the session's explicit choice.
+    pub fn openai_tools(&self) -> Vec<Value> {
+        let mut tools = self.global.openai_tools();
+        if let Some(s) = &self.session {
+            let overlay = s.openai_tools();
+            let overlay_names: HashSet<&str> = overlay
+                .iter()
+                .filter_map(|t| t["function"]["name"].as_str())
+                .collect();
+            tools.retain(|t| {
+                !t["function"]["name"]
+                    .as_str()
+                    .is_some_and(|n| overlay_names.contains(n))
+            });
+            tools.extend(overlay);
+        }
+        tools
+    }
+
+    pub fn has_tool(&self, namespaced_tool: &str) -> bool {
+        self.session
+            .as_ref()
+            .is_some_and(|s| s.has_tool(namespaced_tool))
+            || self.global.has_tool(namespaced_tool)
+    }
+
+    pub fn auto_approve(&self, namespaced_tool: &str) -> bool {
+        self.owner(namespaced_tool).auto_approve(namespaced_tool)
+    }
+
+    pub fn session_approved(&self, session_id: &str, namespaced_tool: &str) -> bool {
+        self.owner(namespaced_tool)
+            .session_approved(session_id, namespaced_tool)
+    }
+
+    pub fn approve_for_session(&self, session_id: &str, namespaced_tool: &str) {
+        self.owner(namespaced_tool)
+            .approve_for_session(session_id, namespaced_tool);
+    }
+
+    pub async fn call(&self, namespaced_tool: &str, args: Value) -> anyhow::Result<Value> {
+        self.owner(namespaced_tool)
+            .call(namespaced_tool, args)
+            .await
     }
 }
 

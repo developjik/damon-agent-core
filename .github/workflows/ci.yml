@@ -30,6 +30,17 @@ jobs:
       # Release-only code paths (cfg(not(debug_assertions))) get no
       # compile coverage from a debug test run — check them explicitly.
       - run: cargo check --release --all-targets
+      # Channel binaries and the CLI share no test coverage — a --help
+      # smoke on every OS catches link/startup regressions (e.g. a
+      # missing native dep on Windows) that `cargo test` can't see.
+      - name: Binary smoke (--help on every shipped binary)
+        shell: bash
+        run: |
+          for b in damond damon damon-relay damon-telegram damon-discord damon-slack; do
+            exe="./target/debug/$b"
+            [ -f "$exe.exe" ] && exe="$exe.exe"
+            "$exe" --help >/dev/null || { echo "$b --help failed"; exit 1; }
+          done
 
   audit:
     # Direct cargo-audit instead of rustsec/audit-check: that image pins a

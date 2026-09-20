@@ -13,10 +13,17 @@ pub struct OpenAiCompat {
     pub name: String,
     pub base_url: String,
     client: reqwest::Client,
-    auth: Option<HeaderValue>,
+    /// Static API key, or None when OAuth-backed.
+    key: Option<String>,
+    /// OAuth flavor ("kimi-code", "github-copilot", …) — resolve the
+    /// credential from the keychain on each request instead of `key`.
+    oauth_flavor: Option<String>,
     headers: Vec<(HeaderName, HeaderValue)>,
     compat: ProviderCompat,
 }
+
+/// Per-request OAuth credential: bearer token plus any flavor headers.
+type OauthCred = Option<(String, Vec<(HeaderName, HeaderValue)>)>;
 
 impl OpenAiCompat {
     pub fn new(
@@ -25,13 +32,18 @@ impl OpenAiCompat {
         key: Option<String>,
         headers: &std::collections::HashMap<String, String>,
         compat: ProviderCompat,
+        oauth_flavor: Option<String>,
     ) -> anyhow::Result<Self> {
-        let auth = key
-            .map(|k| {
-                HeaderValue::from_str(&format!("Bearer {k}"))
-                    .context("provider api_key contains invalid header characters")
-            })
-            .transpose()?;
+        if oauth_flavor.is_some() && key.is_some() {
+            bail!("provider {name}: oauth and a static api_key are mutually exclusive");
+        }
+
+        // Static keys are validated up front — the key rides in an
+        // Authorization header built per request in `credential()`.
+        if let Some(k) = &key {
+            HeaderValue::from_str(k)
+                .context("provider api_key contains invalid header characters")?;
+        }
         let headers = headers
             .iter()
             .map(|(k, v)| {
@@ -47,15 +59,43 @@ impl OpenAiCompat {
             name: name.to_string(),
             base_url: base_url.trim_end_matches('/').to_string(),
             client: super::http_client(),
-            auth,
+            key,
+            oauth_flavor,
             headers,
             compat,
         })
     }
 
+    /// (bearer token, extra per-flavor headers) — OAuth resolves live
+    /// from the keychain (rotated tokens take effect without a restart).
+    fn credential(&self) -> impl Future<Output = anyhow::Result<OauthCred>> + Send {
+        let flavor = self.oauth_flavor.clone();
+        async move {
+            let Some(flavor) = flavor else {
+                return Ok(self.key.clone().map(|k| (k, vec![])));
+            };
+            let c = crate::oauth::credential(&flavor).await?;
+            let extra = match flavor.as_str() {
+                // Headers the Copilot API expects from client integrations.
+                "github-copilot" => vec![
+                    (
+                        HeaderName::from_static("editor-version"),
+                        HeaderValue::from_static("copilot/1.0.82"),
+                    ),
+                    (
+                        HeaderName::from_static("copilot-integration-id"),
+                        HeaderValue::from_static("copilot-developer-cli"),
+                    ),
+                ],
+                _ => vec![],
+            };
+            Ok(Some((c.access_token, extra)))
+        }
+    }
+
     fn authed(&self, req: reqwest::RequestBuilder) -> reqwest::RequestBuilder {
-        let req = match &self.auth {
-            Some(a) => req.header(AUTHORIZATION, a.clone()),
+        let req = match &self.key {
+            Some(k) => req.header(AUTHORIZATION, format!("Bearer {k}")),
             None => req,
         };
         self.headers
@@ -104,21 +144,66 @@ impl OpenAiCompat {
             Some(v) => Bytes::from(v.to_string()),
             None => body,
         };
-        let url = format!("{}{}", self.base_url, path);
-        let send = |body: Bytes| {
+        // Azure OpenAI rides the deployment in the path with an
+        // `api-version` query: POST /chat/completions becomes
+        // `{base}/deployments/{model}/chat/completions?api-version=V`
+        // (the model name in the body selects the deployment).
+        let url = if self.compat.azure_deployment_urls {
+            let version = self.compat.azure_api_version_or_default();
+            if method == reqwest::Method::POST && path == "/chat/completions" {
+                let model = shaped
+                    .as_ref()
+                    .and_then(|v| v["model"].as_str())
+                    .unwrap_or_default();
+                format!(
+                    "{}/deployments/{model}{path}?api-version={version}",
+                    self.base_url
+                )
+            } else {
+                format!(
+                    "{}/{}?api-version={version}",
+                    self.base_url,
+                    path.trim_start_matches('/')
+                )
+            }
+        } else {
+            format!("{}{}", self.base_url, path)
+        };
+        // OAuth: resolve the credential per request (rotated tokens take
+        // effect without a restart); a 401 forces one refresh + retry.
+        let cred = self.credential().await?;
+        let send = {
             let method = method.clone();
             let url = url.clone();
-            async move {
-                self.authed(self.client.request(method, &url))
-                    .header("content-type", "application/json")
-                    .body(body)
-                    .send()
-                    .await
+            move |cred: Option<(String, Vec<(HeaderName, HeaderValue)>)>, body: Bytes| {
+                let method = method.clone();
+                let url = url.clone();
+                async move {
+                    let mut req = self.client.request(method, &url);
+                    if let Some((bearer, extra)) = &cred {
+                        req = req.header(AUTHORIZATION, format!("Bearer {bearer}"));
+                        for (k, v) in extra {
+                            req = req.header(k.clone(), v.clone());
+                        }
+                    }
+                    self.authed(req)
+                        .header("content-type", "application/json")
+                        .body(body)
+                        .send()
+                        .await
+                }
             }
         };
-        let mut resp = send(body.clone())
+        let mut resp = send(cred.clone(), body.clone())
             .await
             .context("upstream request failed")?;
+        if resp.status() == reqwest::StatusCode::UNAUTHORIZED && self.oauth_flavor.is_some() {
+            let flavor = self.oauth_flavor.clone().unwrap_or_default();
+            let c = crate::oauth::force_credential(&flavor).await?;
+            resp = send(Some((c.access_token, vec![])), body.clone())
+                .await
+                .context("upstream request failed after token refresh")?;
+        }
 
         // Strict-tools fallback: a 400 mentioning "strict" on a request that
         // carried strict tools retries once without the field.
@@ -147,7 +232,7 @@ impl OpenAiCompat {
                             t.as_object_mut().map(|o| o.remove("strict"));
                         }
                     }
-                    resp = send(Bytes::from(retry.to_string()))
+                    resp = send(cred.clone(), Bytes::from(retry.to_string()))
                         .await
                         .context("upstream request failed")?;
                 } else {

@@ -1,0 +1,617 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>damon</title>
+<style>
+  :root {
+    --bg: #0d1117; --panel: #161b22; --border: #30363d;
+    --fg: #e6edf3; --muted: #8b949e; --accent: #58a6ff;
+    --user: #1f6feb; --err: #f85149; --ok: #3fb950;
+  }
+  * { box-sizing: border-box; margin: 0; }
+  html, body { height: 100%; }
+  body {
+    background: var(--bg); color: var(--fg);
+    font: 14px/1.5 -apple-system, "Segoe UI", Roboto, Helvetica, Arial, sans-serif;
+    display: flex; overflow: hidden;
+  }
+  /* ---- sidebar ---- */
+  #sidebar {
+    width: 250px; min-width: 250px; background: var(--panel);
+    border-right: 1px solid var(--border);
+    display: flex; flex-direction: column;
+  }
+  #sidebar h1 {
+    font-size: 15px; padding: 14px 14px 10px; font-weight: 600;
+    border-bottom: 1px solid var(--border);
+  }
+  #newBtn {
+    margin: 10px; padding: 8px; background: var(--user); color: #fff;
+    border: 0; border-radius: 6px; cursor: pointer; font-size: 13px;
+  }
+  #newBtn:hover { filter: brightness(1.15); }
+  #sessions { flex: 1; overflow-y: auto; padding: 0 6px 10px; }
+  .sess {
+    display: flex; align-items: center; gap: 6px;
+    padding: 7px 8px; border-radius: 6px; cursor: pointer;
+    color: var(--muted); font-size: 12px;
+  }
+  .sess:hover { background: #21262d; }
+  .sess.active { background: #21262d; color: var(--fg); }
+  .sess .sid { flex: 1; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+  .sess .model { color: var(--muted); font-size: 10px; }
+  .sess .del {
+    border: 0; background: none; color: var(--muted); cursor: pointer;
+    font-size: 14px; padding: 0 2px; visibility: hidden;
+  }
+  .sess:hover .del { visibility: visible; }
+  .sess .del:hover { color: var(--err); }
+  /* ---- main ---- */
+  #main { flex: 1; display: flex; flex-direction: column; min-width: 0; }
+  #banner {
+    display: none; padding: 6px 14px; font-size: 12px;
+    background: #3d2323; color: #ffb3ae; border-bottom: 1px solid var(--border);
+  }
+  #banner.show { display: block; }
+  #log { flex: 1; overflow-y: auto; padding: 18px 20px; }
+  .msg { max-width: 78%; margin: 0 0 12px; padding: 9px 13px; border-radius: 10px; white-space: pre-wrap; word-wrap: break-word; }
+  .msg.user { margin-left: auto; background: var(--user); color: #fff; }
+  .msg.assistant { background: var(--panel); border: 1px solid var(--border); }
+  .msg.error { background: #3d2323; border: 1px solid var(--err); color: #ffb3ae; font-size: 13px; }
+  .msg.thought { background: none; border: 1px dashed var(--border); color: var(--muted); font-style: italic; font-size: 12px; }
+  .tool { color: var(--muted); font: 12px/1.4 ui-monospace, SFMono-Regular, Menlo, monospace; margin: 0 0 8px; padding-left: 4px; }
+  .tool .st-in_progress { color: var(--accent); }
+  .tool .st-completed { color: var(--ok); }
+  .tool .st-failed, .tool .st-cancelled { color: var(--err); }
+  .msg pre, .toolmsg pre {
+    background: #010409; border: 1px solid var(--border); border-radius: 6px;
+    padding: 8px 10px; margin: 6px 0; overflow-x: auto;
+    font: 12px/1.45 ui-monospace, SFMono-Regular, Menlo, monospace; white-space: pre;
+  }
+  .msg code {
+    background: #010409; border-radius: 4px; padding: 1px 5px;
+    font: 12px ui-monospace, SFMono-Regular, Menlo, monospace;
+  }
+  .msg pre code { background: none; padding: 0; }
+  .toolmsg {
+    max-width: 78%; margin: 0 0 12px; padding: 7px 11px; border-radius: 8px;
+    background: #0d1117; border: 1px solid var(--border);
+    color: var(--muted); font: 12px/1.4 ui-monospace, SFMono-Regular, Menlo, monospace;
+    white-space: pre-wrap; word-wrap: break-word;
+  }
+  .sys { text-align: center; color: var(--muted); font-size: 12px; margin: 10px 0; }
+  /* ---- permission card ---- */
+  #perm {
+    display: none; margin: 0 20px 10px; padding: 12px 14px;
+    background: var(--panel); border: 1px solid var(--accent); border-radius: 8px;
+  }
+  #perm.show { display: block; }
+  #permTitle { font-weight: 600; margin-bottom: 4px; }
+  #permInput {
+    color: var(--muted); font: 12px ui-monospace, Menlo, monospace;
+    white-space: pre-wrap; word-wrap: break-word; max-height: 120px; overflow-y: auto; margin-bottom: 10px;
+  }
+  #permBtns { display: flex; gap: 8px; }
+  #permBtns button {
+    padding: 6px 14px; border-radius: 6px; border: 1px solid var(--border);
+    background: #21262d; color: var(--fg); cursor: pointer; font-size: 13px;
+  }
+  #permBtns button.allow { background: var(--ok); border-color: var(--ok); color: #06110a; }
+  #permBtns button.reject { background: none; color: var(--err); border-color: var(--err); }
+  /* ---- composer ---- */
+  #composer { border-top: 1px solid var(--border); padding: 12px 20px; display: flex; gap: 8px; align-items: flex-end; }
+  #input {
+    flex: 1; resize: none; background: var(--panel); color: var(--fg);
+    border: 1px solid var(--border); border-radius: 8px; padding: 9px 12px;
+    font: inherit; max-height: 160px; min-height: 38px;
+  }
+  #input:focus { outline: none; border-color: var(--accent); }
+  #model {
+    width: 130px; background: var(--panel); color: var(--fg);
+    border: 1px solid var(--border); border-radius: 8px; padding: 9px 10px; font: 12px inherit;
+  }
+  #sendBtn, #cancelBtn {
+    padding: 9px 18px; border-radius: 8px; border: 0; cursor: pointer; font-size: 13px;
+  }
+  #sendBtn { background: var(--user); color: #fff; }
+  #sendBtn:disabled { opacity: .45; cursor: default; }
+  #cancelBtn { background: var(--err); color: #fff; display: none; }
+  /* ---- auth overlay ---- */
+  #auth {
+    position: fixed; inset: 0; background: rgba(1,4,9,.85);
+    display: none; align-items: center; justify-content: center; z-index: 10;
+  }
+  #auth.show { display: flex; }
+  #authCard {
+    background: var(--panel); border: 1px solid var(--border); border-radius: 10px;
+    padding: 24px; width: 340px;
+  }
+  #authCard h2 { font-size: 15px; margin-bottom: 6px; }
+  #authCard p { color: var(--muted); font-size: 12px; margin-bottom: 14px; }
+  #token {
+    width: 100%; background: var(--bg); color: var(--fg);
+    border: 1px solid var(--border); border-radius: 6px; padding: 9px 10px;
+    font: 13px ui-monospace, Menlo, monospace; margin-bottom: 10px;
+  }
+  #authErr { color: var(--err); font-size: 12px; min-height: 16px; margin-bottom: 8px; }
+  #authBtn { width: 100%; padding: 9px; border: 0; border-radius: 6px; background: var(--user); color: #fff; cursor: pointer; }
+</style>
+</head>
+<body>
+  <div id="sidebar">
+    <h1>damon</h1>
+    <button id="newBtn">+ New session</button>
+    <div id="sessions"></div>
+  </div>
+  <div id="main">
+    <div id="banner"></div>
+    <div id="log"></div>
+    <div id="perm">
+      <div id="permTitle"></div>
+      <div id="permInput"></div>
+      <div id="permBtns"></div>
+    </div>
+    <div id="composer">
+      <input id="model" placeholder="model (optional)" title="Model override sent with each prompt">
+      <textarea id="input" rows="1" placeholder="Message — Enter to send, Shift+Enter for newline"></textarea>
+      <button id="sendBtn">Send</button>
+      <button id="cancelBtn">Cancel</button>
+    </div>
+  </div>
+  <div id="auth">
+    <div id="authCard">
+      <h2>Authentication required</h2>
+      <p>This daemon has an auth token configured. Paste it to continue — it is exchanged for a one-shot WebSocket ticket and kept only in this tab's session storage.</p>
+      <input id="token" type="password" placeholder="auth token" autocomplete="off">
+      <div id="authErr"></div>
+      <button id="authBtn">Connect</button>
+    </div>
+  </div>
+
+<script>
+"use strict";
+// ---------- state ----------
+let ws = null;                 // live WebSocket or null
+let nextId = 1;
+const pending = new Map();     // id -> {resolve, timer}
+let activeSession = null;      // sessionId shown in the log
+let busy = false;              // a prompt turn is running on activeSession
+let streamEl = null;           // assistant bubble receiving chunks
+let streamText = "";
+let thoughtEl = null, thoughtText = "";
+const toolEls = new Map();     // toolCallId -> status line element
+let token = sessionStorage.getItem("damon_token") || "";
+let retries = 0;               // consecutive failed direct dials
+let backoff = 1000;
+let reconnectTimer = null;
+let manualClose = false;
+
+const $ = id => document.getElementById(id);
+const log = $("log"), banner = $("banner"), input = $("input");
+
+// ---------- helpers ----------
+function esc(s) {
+  return String(s).replace(/&/g, "&amp;").replace(/</g, "&lt;")
+    .replace(/>/g, "&gt;").replace(/"/g, "&quot;");
+}
+// Markdown-lite: HTML is escaped first, then fenced code blocks and
+// inline code get markup. Everything else stays plain text.
+function mdLite(src) {
+  const parts = String(src).split(/```/);
+  let out = "";
+  for (let i = 0; i < parts.length; i++) {
+    if (i % 2 === 1) {
+      let code = parts[i].replace(/^[a-zA-Z0-9_-]*\n/, ""); // drop lang tag
+      out += "<pre><code>" + esc(code) + "</code></pre>";
+    } else {
+      out += esc(parts[i]).replace(/`([^`\n]+)`/g, (m, c) => "<code>" + c + "</code>");
+    }
+  }
+  return out;
+}
+function bubble(cls, html) {
+  const d = document.createElement("div");
+  d.className = "msg " + cls;
+  d.innerHTML = html;
+  log.appendChild(d);
+  log.scrollTop = log.scrollHeight;
+  return d;
+}
+function sysline(text) {
+  const d = document.createElement("div");
+  d.className = "sys";
+  d.textContent = text;
+  log.appendChild(d);
+  log.scrollTop = log.scrollHeight;
+}
+function errBubble(text) { bubble("error", esc(text)); }
+function setBusy(on) {
+  busy = on;
+  input.disabled = on;
+  $("sendBtn").style.display = on ? "none" : "";
+  $("cancelBtn").style.display = on ? "" : "none";
+  if (!on) input.focus();
+}
+function setBanner(text) {
+  banner.textContent = text || "";
+  banner.classList.toggle("show", !!text);
+}
+
+// ---------- JSON-RPC ----------
+function send(obj) {
+  if (ws && ws.readyState === WebSocket.OPEN) ws.send(JSON.stringify(obj));
+}
+function request(method, params) {
+  return new Promise((resolve, reject) => {
+    if (!ws || ws.readyState !== WebSocket.OPEN)
+      return reject(new Error("not connected"));
+    const id = nextId++;
+    const timer = setTimeout(() => {
+      pending.delete(id);
+      reject(new Error("daemon not responding"));
+    }, 120000);
+    pending.set(id, { resolve, reject, timer });
+    send({ jsonrpc: "2.0", id, method, params: params || {} });
+  });
+}
+function notify(method, params) {
+  send({ jsonrpc: "2.0", method, params: params || {} });
+}
+function respond(id, result) {
+  send({ jsonrpc: "2.0", id, result });
+}
+
+// ---------- connection ----------
+function wsUrl(ticket) {
+  const proto = location.protocol === "https:" ? "wss:" : "ws:";
+  return proto + "//" + location.host + "/ws" + (ticket ? "?ticket=" + encodeURIComponent(ticket) : "");
+}
+async function fetchTicket() {
+  const r = await fetch("/v1/ws_ticket", {
+    method: "POST",
+    headers: { "Authorization": "Bearer " + token }
+  });
+  if (!r.ok) throw new Error("ticket rejected: HTTP " + r.status);
+  const j = await r.json();
+  if (!j.ticket) throw new Error("ticket response malformed");
+  return j.ticket;
+}
+async function connect() {
+  clearTimeout(reconnectTimer); reconnectTimer = null;
+  let ticket = "";
+  if (token) {
+    try { ticket = await fetchTicket(); }
+    catch (e) {
+      // Bad/expired token — stop retrying and ask again.
+      token = ""; sessionStorage.removeItem("damon_token");
+      showAuth(e.message);
+      scheduleReconnect();
+      return;
+    }
+  }
+  try { ws = new WebSocket(wsUrl(ticket)); }
+  catch (e) { scheduleReconnect(); return; }
+
+  ws.onopen = async () => {
+    retries = 0; backoff = 1000;
+    setBanner("");
+    try {
+      await request("initialize", { protocolVersion: 1, clientCapabilities: {} });
+      await refreshSessions();
+      if (activeSession) {
+        // Reattach: reload history; a turn interrupted by the drop was
+        // cancelled server-side on disconnect.
+        setBusy(false);
+        await loadMessages(activeSession);
+        sysline("reconnected");
+      }
+    } catch (e) {
+      errBubble("handshake failed: " + e.message);
+    }
+  };
+  ws.onmessage = ev => {
+    let v;
+    try { v = JSON.parse(ev.data); } catch { return; }
+    if (v.method && v.id !== undefined && v.id !== null) onServerRequest(v);
+    else if (v.method) onNotify(v);
+    else if (v.id !== undefined) onResponse(v);
+  };
+  ws.onclose = () => {
+    ws = null;
+    for (const [id, p] of pending) { clearTimeout(p.timer); p.reject(new Error("disconnected")); }
+    pending.clear();
+    if (manualClose) { manualClose = false; return; }
+    setBanner("disconnected — retrying");
+    if (!token && ++retries >= 2) showAuth(""); // probably auth-gated
+    scheduleReconnect();
+  };
+  ws.onerror = () => { /* onclose follows */ };
+}
+function scheduleReconnect() {
+  if (reconnectTimer) return;
+  setBanner("disconnected — retrying");
+  reconnectTimer = setTimeout(() => {
+    reconnectTimer = null;
+    connect();
+  }, backoff);
+  backoff = Math.min(backoff * 2, 10000);
+}
+
+// ---------- inbound dispatch ----------
+function onResponse(v) {
+  const p = pending.get(v.id);
+  if (!p) return;
+  pending.delete(v.id);
+  clearTimeout(p.timer);
+  if (v.error) p.reject(new Error(v.error.message || JSON.stringify(v.error)));
+  else p.resolve(v.result);
+}
+function onNotify(v) {
+  if (v.method !== "session/update") return;
+  const sid = v.params && v.params.sessionId;
+  const u = v.params && v.params.update;
+  if (!u || sid !== activeSession) return;
+  switch (u.sessionUpdate) {
+    case "agent_message_chunk": {
+      const t = u.content && u.content.text;
+      if (!t) break;
+      if (!streamEl) { streamEl = bubble("assistant", ""); streamText = ""; }
+      streamText += t;
+      streamEl.innerHTML = mdLite(streamText);
+      log.scrollTop = log.scrollHeight;
+      break;
+    }
+    case "agent_thought_chunk": {
+      const t = u.content && u.content.text;
+      if (!t) break;
+      if (!thoughtEl) { thoughtEl = bubble("thought", ""); thoughtText = ""; }
+      thoughtText += t;
+      thoughtEl.textContent = "thinking: " + thoughtText;
+      log.scrollTop = log.scrollHeight;
+      break;
+    }
+    case "tool_call_update": {
+      const id = u.toolCallId || "?";
+      const name = (u.title || u.name || id);
+      let el = toolEls.get(id);
+      if (!el) {
+        el = document.createElement("div");
+        el.className = "tool";
+        toolEls.set(id, el);
+        log.appendChild(el);
+      }
+      const st = u.status || "";
+      el.innerHTML = "&#9881; " + esc(name) + ' — <span class="st-' + esc(st) + '">' + esc(st) + "</span>";
+      log.scrollTop = log.scrollHeight;
+      break;
+    }
+  }
+}
+function onServerRequest(v) {
+  if (v.method === "session/request_permission") {
+    showPermission(v.id, v.params || {});
+  } else {
+    // Unknown server request — answer with method-not-found so the
+    // daemon isn't left waiting for its timeout.
+    send({ jsonrpc: "2.0", id: v.id,
+           error: { code: -32601, message: "method not found" } });
+  }
+}
+
+// ---------- permission card ----------
+function showPermission(reqId, params) {
+  const tc = params.toolCall || {};
+  $("permTitle").textContent = "Allow tool: " + (tc.title || tc.toolCallId || "?");
+  $("permInput").textContent =
+    tc.rawInput !== undefined ? JSON.stringify(tc.rawInput, null, 2) : "";
+  const btns = $("permBtns");
+  btns.textContent = "";
+  const opts = Array.isArray(params.options) && params.options.length
+    ? params.options
+    : [{ optionId: "allow-once", name: "Allow" },
+       { optionId: "reject-once", name: "Deny" }];
+  for (const o of opts) {
+    const b = document.createElement("button");
+    b.textContent = o.name || o.optionId;
+    b.className = String(o.optionId).startsWith("allow") ? "allow" : "reject";
+    b.onclick = () => {
+      respond(reqId, { outcome: { outcome: "selected", optionId: o.optionId } });
+      $("perm").classList.remove("show");
+    };
+    btns.appendChild(b);
+  }
+  $("perm").classList.add("show");
+}
+
+// ---------- sessions ----------
+async function refreshSessions() {
+  try {
+    const r = await request("session/list", {});
+    const list = $("sessions");
+    list.textContent = "";
+    for (const s of (r.sessions || [])) {
+      const row = document.createElement("div");
+      row.className = "sess" + (s.sessionId === activeSession ? " active" : "");
+      const label = document.createElement("span");
+      label.className = "sid";
+      label.textContent = s.sessionId.slice(0, 8);
+      label.title = s.sessionId + (s.createdAt ? " — " + s.createdAt : "");
+      row.appendChild(label);
+      if (s.model) {
+        const m = document.createElement("span");
+        m.className = "model";
+        m.textContent = s.model;
+        row.appendChild(m);
+      }
+      const del = document.createElement("button");
+      del.className = "del";
+      del.textContent = "×";
+      del.title = "delete session";
+      del.onclick = async ev => {
+        ev.stopPropagation();
+        if (!confirm("Delete session " + s.sessionId.slice(0, 8) + "?")) return;
+        try {
+          await request("session/delete", { sessionId: s.sessionId });
+          if (activeSession === s.sessionId) { activeSession = null; log.textContent = ""; }
+          refreshSessions();
+        } catch (e) { errBubble("delete failed: " + e.message); }
+      };
+      row.appendChild(del);
+      row.onclick = () => selectSession(s.sessionId);
+      list.appendChild(row);
+    }
+  } catch (e) {
+    errBubble("session/list failed: " + e.message);
+  }
+}
+async function selectSession(sid) {
+  if (sid === activeSession) return;
+  try {
+    await request("session/resume", { sessionId: sid });
+    activeSession = sid;
+    setBusy(false);
+    await loadMessages(sid);
+    refreshSessions();
+  } catch (e) {
+    errBubble("resume failed: " + e.message);
+  }
+}
+async function newSession() {
+  try {
+    const r = await request("session/new", { cwd: "web", mcpServers: [] });
+    activeSession = r.sessionId;
+    log.textContent = "";
+    toolEls.clear();
+    setBusy(false);
+    sysline("session " + r.sessionId.slice(0, 8));
+    refreshSessions();
+    input.focus();
+  } catch (e) {
+    errBubble("session/new failed: " + e.message);
+  }
+}
+// History arrives as OpenAI-shaped message objects.
+async function loadMessages(sid) {
+  log.textContent = "";
+  toolEls.clear();
+  streamEl = thoughtEl = null;
+  try {
+    const r = await request("session/messages", { sessionId: sid });
+    for (const m of (r.messages || [])) renderStored(m);
+    log.scrollTop = log.scrollHeight;
+  } catch (e) {
+    errBubble("session/messages failed: " + e.message);
+  }
+}
+function msgText(m) {
+  if (typeof m.content === "string") return m.content;
+  if (Array.isArray(m.content))
+    return m.content.map(p => (p && (p.text || p.content)) || "").join("\n");
+  return "";
+}
+function renderStored(m) {
+  const text = msgText(m);
+  switch (m.role) {
+    case "user":
+      if (text.trim()) bubble("user", esc(text));
+      break;
+    case "assistant": {
+      if (Array.isArray(m.tool_calls)) {
+        for (const tc of m.tool_calls) {
+          const d = document.createElement("div");
+          d.className = "tool";
+          const name = tc.function && tc.function.name || tc.name || "tool";
+          d.innerHTML = "&#9881; " + esc(name) + ' — <span class="st-completed">completed</span>';
+          log.appendChild(d);
+        }
+      }
+      if (text.trim()) bubble("assistant", mdLite(text));
+      break;
+    }
+    case "tool": {
+      const d = document.createElement("div");
+      d.className = "toolmsg";
+      const t = text.length > 2000 ? text.slice(0, 2000) + "…" : text;
+      d.textContent = t;
+      log.appendChild(d);
+      break;
+    }
+    default:
+      if (text.trim()) bubble("assistant", mdLite(text));
+  }
+  log.scrollTop = log.scrollHeight;
+}
+
+// ---------- prompt ----------
+async function sendPrompt() {
+  const text = input.value;
+  if (!text.trim() || busy) return;
+  if (!activeSession) await newSession();
+  if (!activeSession) return;
+  input.value = "";
+  input.style.height = "auto";
+  bubble("user", esc(text));
+  setBusy(true);
+  streamEl = thoughtEl = null; streamText = thoughtText = "";
+  toolEls.clear();
+  const params = { sessionId: activeSession, prompt: [{ type: "text", text }] };
+  const model = $("model").value.trim();
+  if (model) params.model = model;
+  try {
+    const r = await request("session/prompt", params);
+    if (r && r.stopReason === "cancelled") sysline("cancelled");
+    else if (r && r.stopReason && r.stopReason !== "end_turn")
+      sysline("stopped: " + r.stopReason);
+  } catch (e) {
+    errBubble(e.message);
+  } finally {
+    setBusy(false);
+    streamEl = thoughtEl = null;
+  }
+}
+function cancelPrompt() {
+  if (activeSession) notify("session/cancel", { sessionId: activeSession });
+}
+
+// ---------- auth overlay ----------
+function showAuth(err) {
+  $("authErr").textContent = err || "";
+  $("auth").classList.add("show");
+  $("token").focus();
+}
+async function submitToken() {
+  const t = $("token").value.trim();
+  if (!t) { $("authErr").textContent = "token required"; return; }
+  try {
+    token = t;
+    await fetchTicket(); // validate before hiding the prompt
+    sessionStorage.setItem("damon_token", token);
+    $("auth").classList.remove("show");
+    $("token").value = "";
+    backoff = 1000;
+    connect();
+  } catch (e) {
+    token = "";
+    $("authErr").textContent = e.message;
+  }
+}
+
+// ---------- wiring ----------
+$("newBtn").onclick = newSession;
+$("sendBtn").onclick = sendPrompt;
+$("cancelBtn").onclick = cancelPrompt;
+$("authBtn").onclick = submitToken;
+$("token").addEventListener("keydown", e => { if (e.key === "Enter") submitToken(); });
+input.addEventListener("keydown", e => {
+  if (e.key === "Enter" && !e.shiftKey) { e.preventDefault(); sendPrompt(); }
+});
+input.addEventListener("input", () => {
+  input.style.height = "auto";
+  input.style.height = Math.min(input.scrollHeight, 160) + "px";
+});
+connect();
+</script>
+</body>
+</html>

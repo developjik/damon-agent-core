@@ -15,7 +15,13 @@ pub struct OpenAiResponses {
     pub name: String,
     pub base_url: String,
     client: reqwest::Client,
-    auth: Option<HeaderValue>,
+    /// Static API key, or None when OAuth-backed.
+    key: Option<String>,
+    /// When true, resolve the credential from the OAuth keychain on each
+    /// request (auto-refreshing; ChatGPT subscription) instead of `key`.
+    /// OAuth flavor ("openai", "xai-oauth", …) — resolve the credential
+    /// from the keychain on each request instead of `key`.
+    oauth_flavor: Option<String>,
     headers: Vec<(HeaderName, HeaderValue)>,
     compat: ProviderCompat,
 }
@@ -27,13 +33,17 @@ impl OpenAiResponses {
         key: Option<String>,
         headers: &std::collections::HashMap<String, String>,
         compat: ProviderCompat,
+        oauth_flavor: Option<String>,
     ) -> anyhow::Result<Self> {
-        let auth = key
-            .map(|k| {
-                HeaderValue::from_str(&format!("Bearer {k}"))
-                    .context("provider api_key contains invalid header characters")
-            })
-            .transpose()?;
+        if oauth_flavor.is_some() && key.is_some() {
+            bail!("provider {name}: oauth and a static api_key are mutually exclusive");
+        }
+        // Header characters are validated up front — the key rides in an
+        // Authorization header on every request.
+        if let Some(k) = &key {
+            HeaderValue::from_str(k)
+                .context("provider api_key contains invalid header characters")?;
+        }
         let headers = headers
             .iter()
             .map(|(k, v)| {
@@ -49,20 +59,122 @@ impl OpenAiResponses {
             name: name.to_string(),
             base_url: base_url.trim_end_matches('/').to_string(),
             client: super::http_client(),
-            auth,
+            key,
+            oauth_flavor,
             headers,
             compat,
         })
     }
 
-    fn authed(&self, req: reqwest::RequestBuilder) -> reqwest::RequestBuilder {
-        let req = match &self.auth {
-            Some(a) => req.header(AUTHORIZATION, a.clone()),
-            None => req,
-        };
+    /// (bearer, chatgpt-account-id) for the wire. OAuth resolves live from
+    /// the keychain — rotated tokens take effect without a restart; the
+    /// static key passes through unchanged.
+    async fn token(&self) -> anyhow::Result<Option<(String, Option<String>)>> {
+        if let Some(flavor) = &self.oauth_flavor {
+            let c = crate::oauth::credential(flavor).await?;
+            return Ok(Some((c.access_token, c.account_id)));
+        }
+        Ok(self.key.clone().map(|k| (k, None)))
+    }
+
+    /// POST {base}/responses with auth and custom headers applied. The
+    /// originator/beta headers mirror what the ChatGPT subscription
+    /// backend expects from Codex-style clients.
+    fn post(
+        &self,
+        body: &Value,
+        token: Option<&(String, Option<String>)>,
+    ) -> reqwest::RequestBuilder {
+        let mut req = self
+            .client
+            .post(format!("{}/responses", self.base_url))
+            .header("content-type", "application/json")
+            .json(body);
+        if let Some((bearer, account)) = token {
+            req = req.header(AUTHORIZATION, format!("Bearer {bearer}"));
+            if let Some(a) = account {
+                req = req.header("chatgpt-account-id", a);
+            }
+            if self.oauth_flavor.is_some() {
+                req = req
+                    .header("originator", "codex_cli_rs")
+                    .header("OpenAI-Beta", "responses=experimental");
+            }
+        }
         self.headers
             .iter()
             .fold(req, |r, (k, v)| r.header(k.clone(), v.clone()))
+    }
+
+    /// Send a translated request. OAuth requests retry once on 401 after
+    /// a forced token refresh — a rejected token must not fail the turn
+    /// when a fresh one is one refresh away (mirrors the Anthropic
+    /// provider).
+    async fn send(&self, body: &Value) -> anyhow::Result<reqwest::Response> {
+        let token = self.token().await?;
+        let resp = self
+            .post(body, token.as_ref())
+            .send()
+            .await
+            .context("upstream request failed")?;
+        if resp.status() == reqwest::StatusCode::UNAUTHORIZED && self.oauth_flavor.is_some() {
+            let c =
+                crate::oauth::force_credential(self.oauth_flavor.as_deref().unwrap_or("openai"))
+                    .await?;
+            return self
+                .post(body, Some(&(c.access_token, c.account_id)))
+                .send()
+                .await
+                .context("upstream request failed after token refresh");
+        }
+        Ok(resp)
+    }
+
+    /// OAuth backends are SSE-only: they answer `stream:true` with an
+    /// event stream and have no JSON mode. The non-streaming path
+    /// (POST /v1/chat/completions without "stream") therefore streams
+    /// internally and folds the events back into the terminal `response`
+    /// object, which `responses_to_openai` then translates. A stream that
+    /// ends without a terminal event is an error, not an empty reply —
+    /// callers must see the truncation.
+    async fn collect_completed(&self, body: Value) -> anyhow::Result<Value> {
+        let resp = self.send(&body).await?;
+        let status = resp.status();
+        if status == reqwest::StatusCode::TOO_MANY_REQUESTS {
+            return Err(crate::provider::RateLimited(crate::provider::retry_after(&resp)).into());
+        }
+        if !status.is_success() {
+            let text = resp.text().await.unwrap_or_default();
+            bail!("upstream {status}: {text}");
+        }
+        let mut buf: Vec<u8> = Vec::new();
+        let mut stream = resp.bytes_stream();
+        while let Some(chunk) = stream.next().await {
+            buf.extend_from_slice(&chunk?);
+            while let Some(pos) = buf.iter().position(|&b| b == b'\n') {
+                let line: Vec<u8> = buf.drain(..=pos).collect();
+                let line = String::from_utf8_lossy(&line[..line.len() - 1]);
+                let Some(data) = line.strip_prefix("data:").map(str::trim) else {
+                    continue;
+                };
+                if data == "[DONE]" {
+                    continue;
+                }
+                let Ok(v) = serde_json::from_str::<Value>(data) else {
+                    continue;
+                };
+                match v["type"].as_str() {
+                    // failed/incomplete carry the response object too —
+                    // responses_to_openai surfaces their status semantics.
+                    Some("response.completed")
+                    | Some("response.incomplete")
+                    | Some("response.failed") => return Ok(v["response"].clone()),
+                    Some("error") => bail!("upstream stream error: {data}"),
+                    _ => {}
+                }
+            }
+        }
+        bail!("stream ended without a terminal response event")
     }
 
     /// Chat-completions request → responses request.
@@ -226,18 +338,17 @@ impl OpenAiResponses {
         for (k, v) in &self.compat.extra_body {
             out[k] = v.clone();
         }
+        // ChatGPT-subscription backend: SSE-only and stateless — always
+        // stream, never persist, and `instructions` must be present even
+        // when empty.
+        if self.oauth_flavor.is_some() {
+            out["stream"] = Value::Bool(true);
+            out["store"] = Value::Bool(false);
+            if out.get("instructions").is_none() {
+                out["instructions"] = json!("");
+            }
+        }
         Ok(out)
-    }
-
-    async fn send(&self, body: Value) -> anyhow::Result<reqwest::Response> {
-        let resp = self
-            .authed(self.client.post(format!("{}/responses", self.base_url)))
-            .header("content-type", "application/json")
-            .json(&body)
-            .send()
-            .await
-            .context("upstream request failed")?;
-        Ok(resp)
     }
 
     pub async fn chat_stream(
@@ -246,7 +357,7 @@ impl OpenAiResponses {
     ) -> anyhow::Result<Box<dyn futures::Stream<Item = anyhow::Result<StreamEvent>> + Send + Unpin>>
     {
         let req = self.translate_request(&body, true)?;
-        let resp = self.send(req).await?;
+        let resp = self.send(&req).await?;
         if resp.status() == reqwest::StatusCode::TOO_MANY_REQUESTS {
             return Err(crate::provider::RateLimited(crate::provider::retry_after(&resp)).into());
         }
@@ -262,8 +373,15 @@ impl OpenAiResponses {
     }
 
     pub async fn chat(&self, body: Value) -> anyhow::Result<Value> {
+        // OAuth backends have no JSON mode — stream internally and fold
+        // the events back into the terminal response object.
+        if self.oauth_flavor.is_some() {
+            let req = self.translate_request(&body, true)?;
+            let v = self.collect_completed(req).await?;
+            return responses_to_openai(&v);
+        }
         let req = self.translate_request(&body, false)?;
-        let resp = self.send(req).await?;
+        let resp = self.send(&req).await?;
         let status = resp.status();
         if status == reqwest::StatusCode::TOO_MANY_REQUESTS {
             return Err(crate::provider::RateLimited(crate::provider::retry_after(&resp)).into());
@@ -279,8 +397,18 @@ impl OpenAiResponses {
     }
 
     pub async fn list_models(&self) -> anyhow::Result<Value> {
+        let token = self.token().await?;
+        let mut req = self.client.get(format!("{}/models", self.base_url));
+        if let Some((bearer, account)) = &token {
+            req = req.header(AUTHORIZATION, format!("Bearer {bearer}"));
+            if let Some(a) = account {
+                req = req.header("chatgpt-account-id", a);
+            }
+        }
         let resp = self
-            .authed(self.client.get(format!("{}/models", self.base_url)))
+            .headers
+            .iter()
+            .fold(req, |r, (k, v)| r.header(k.clone(), v.clone()))
             .send()
             .await
             .context("upstream request failed")?;
@@ -604,8 +732,58 @@ mod tests {
             None,
             &std::collections::HashMap::new(),
             Default::default(),
+            None,
         )
         .unwrap()
+    }
+
+    fn oauth_provider() -> OpenAiResponses {
+        OpenAiResponses::new(
+            "t",
+            "http://localhost:1",
+            None,
+            &std::collections::HashMap::new(),
+            Default::default(),
+            Some("openai".into()),
+        )
+        .unwrap()
+    }
+
+    /// The ChatGPT-subscription backend is SSE-only and stateless:
+    /// translate_request must force stream:true and store:false even when
+    /// the caller asked for JSON mode, and default instructions in.
+    #[test]
+    fn translate_oauth_forces_stream_and_store() {
+        let p = oauth_provider();
+        let body = json!({
+            "model": "m",
+            "messages": [{"role": "user", "content": "hi"}],
+        });
+        let req = p.translate_request(&body, false).unwrap();
+        assert_eq!(req["stream"], true);
+        assert_eq!(req["store"], false);
+        assert_eq!(req["instructions"], "");
+
+        // A client-sent system message wins over the default.
+        let body = json!({
+            "model": "m",
+            "messages": [
+                {"role": "system", "content": "be brief"},
+                {"role": "user", "content": "hi"},
+            ],
+        });
+        let req = p.translate_request(&body, true).unwrap();
+        assert_eq!(req["instructions"], "be brief");
+
+        // Static-key providers keep JSON mode.
+        let p = provider();
+        let body = json!({
+            "model": "m",
+            "messages": [{"role": "user", "content": "hi"}],
+        });
+        let req = p.translate_request(&body, false).unwrap();
+        assert_eq!(req["stream"], false);
+        assert!(req.get("store").is_none());
     }
 
     /// Multimodal user content must translate, not vanish: text →
@@ -697,5 +875,20 @@ mod tests {
             "thinking hard"
         );
         assert_eq!(out["choices"][0]["message"]["content"], "answer");
+    }
+
+    #[test]
+    fn oauth_rejects_static_key() {
+        assert!(
+            OpenAiResponses::new(
+                "t",
+                "http://localhost:1",
+                Some("sk-thing".into()),
+                &std::collections::HashMap::new(),
+                Default::default(),
+                Some("openai".into()),
+            )
+            .is_err()
+        );
     }
 }

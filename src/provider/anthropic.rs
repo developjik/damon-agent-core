@@ -20,6 +20,9 @@ pub struct Anthropic {
     /// When true, resolve the key from the OAuth keychain on each request
     /// (auto-refreshing) instead of using `key`.
     oauth: bool,
+    /// Send `Authorization: Bearer <key>` instead of `x-api-key` — AWS
+    /// Bedrock bearer surfaces and Bearer-fronting gateways.
+    bearer: bool,
     headers: Vec<(reqwest::header::HeaderName, reqwest::header::HeaderValue)>,
 }
 
@@ -30,6 +33,7 @@ impl Anthropic {
         key: Option<String>,
         headers: &std::collections::HashMap<String, String>,
         oauth: bool,
+        bearer: bool,
     ) -> anyhow::Result<Self> {
         let headers = headers
             .iter()
@@ -48,6 +52,7 @@ impl Anthropic {
             client: super::http_client(),
             key,
             oauth,
+            bearer,
             headers,
         })
     }
@@ -68,7 +73,11 @@ impl Anthropic {
             .header("content-type", "application/json")
             .json(&body);
         if let Some(k) = key {
-            req = req.header("x-api-key", k);
+            req = if self.bearer {
+                req.header(reqwest::header::AUTHORIZATION, format!("Bearer {k}"))
+            } else {
+                req.header("x-api-key", k)
+            };
         }
         if self.oauth {
             req = req
@@ -791,6 +800,7 @@ mod tests {
             "http://localhost",
             None,
             &Default::default(),
+            false,
             false,
         )
         .unwrap()

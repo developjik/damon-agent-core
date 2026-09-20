@@ -55,14 +55,22 @@ damond --print-config-path   # config.toml 위치
 
 `config.example.toml` 참조. provider API 키는 `env:` 또는 `keychain:` 참조만 허용.
 
-## OAuth 로그인 (Anthropic)
+## OAuth 로그인 (구독제)
 
 ```sh
-damond login anthropic     # 브라우저에서 승인 → 코드 붙여넣기 → 토큰은 OS 키체인에
-damond logout anthropic
+damond login anthropic      # Claude Pro/Max — 브라우저 승인 후 코드 붙여넣기
+damond login openai         # ChatGPT Plus/Pro — 브라우저 승인 후 콜백 URL 붙여넣기
+damond login kimi-code      # Kimi For Coding — 디바이스 플로우, 승인될 때까지 폴링
+damond login github-copilot # GitHub Copilot — 디바이스 플로우
+damond login xai-oauth      # SuperGrok / X Premium+ — 디바이스 플로우
+damond logout anthropic     # 또는: damond logout <프로바이더>
 ```
 
-config에서 `api_key = "oauth"`로 설정하면 데몬이 키체인에서 토큰을 읽고 자동 갱신.
+config에서 `api_key = "oauth"`(또는 `"oauth:<flavor>"`)로 설정하면 데몬이
+키체인에서 토큰을 읽고 자동 갱신한다. 짝: `anthropic` ↔
+`anthropic-messages`, `openai` / `xai-oauth` ↔ `openai-responses`,
+`kimi-code` / `github-copilot` ↔ `openai-completions`. 로그인하면 해당
+프리셋 프로바이더가 부팅 때 자동 등록된다(`damond presets` 참조).
 
 ## 원격 릴레이
 

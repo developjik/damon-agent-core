@@ -348,24 +348,17 @@ pub async fn handle_socket(
             }
             ("session/new", Some(id)) => {
                 let cwd = params["cwd"].as_str().unwrap_or("").to_string();
-                // ACP clients send mcpServers; per-session MCP servers are
-                // not supported, so a non-empty list is rejected rather
-                // than silently ignored.
-                let mcp_nonempty = params["mcpServers"]
-                    .as_array()
-                    .is_some_and(|a| !a.is_empty());
-                if mcp_nonempty {
-                    client
-                        .respond(
-                            id,
-                            Err(rpc_error(
-                                -32602,
-                                "per-session mcpServers are not supported; configure [mcp_servers] in the daemon config",
-                            )),
-                        )
-                        .await;
-                    continue;
-                }
+                // ACP mcpServers: per-session stdio servers overlaid on the
+                // daemon's global [mcp_servers]. Entries: {name, command,
+                // args?, env?, auto_approve?} — env accepts the ACP array
+                // form [{name,value}] or a plain object.
+                let overlay = match parse_session_mcp(&params["mcpServers"], &state).await {
+                    Ok(o) => o,
+                    Err(e) => {
+                        client.respond(id, Err(rpc_error(-32602, &e))).await;
+                        continue;
+                    }
+                };
                 let model = params["model"].as_str().map(String::from);
                 let session_id = uuid::Uuid::new_v4().to_string();
                 match state
@@ -374,6 +367,13 @@ pub async fn handle_socket(
                     .await
                 {
                     Ok(()) => {
+                        if let Some(reg) = overlay {
+                            state
+                                .session_mcp
+                                .lock()
+                                .await
+                                .insert(session_id.clone(), reg);
+                        }
                         client
                             .respond(id, Ok(json!({"sessionId": session_id})))
                             .await;
@@ -503,8 +503,12 @@ pub async fn handle_socket(
                     }
                     match state.store.delete_session(&session_id).await {
                         Ok(()) => {
-                            // Session-scoped tool approvals die with the session.
+                            // Session-scoped tool approvals and MCP
+                            // servers die with the session.
                             state.mcp.clear_session(&session_id);
+                            if let Some(reg) = state.session_mcp.lock().await.remove(&session_id) {
+                                reg.shutdown().await;
+                            }
                             client.respond(id, Ok(json!({"deleted": true}))).await;
                         }
                         Err(e) => {
@@ -700,6 +704,80 @@ pub async fn handle_socket(
                     }
                 });
             }
+            ("session/compact", Some(id)) => {
+                let session_id = params["sessionId"].as_str().unwrap_or("").to_string();
+                // Same slot discipline as session/prompt: compaction calls
+                // the provider, so it shares the in-flight cap.
+                let Ok(permit) = PROMPT_SLOTS.try_acquire() else {
+                    client
+                        .respond(id, Err(rpc_error(-32603, "too many concurrent prompts")))
+                        .await;
+                    continue;
+                };
+                match state.store.session_exists(&session_id).await {
+                    Ok(true) => {}
+                    Ok(false) => {
+                        client
+                            .respond(id, Err(rpc_error(-32602, "session not found")))
+                            .await;
+                        continue;
+                    }
+                    Err(e) => {
+                        client
+                            .respond(id, Err(rpc_error(-32603, &e.to_string())))
+                            .await;
+                        continue;
+                    }
+                }
+                let cancel = CancellationToken::new();
+                {
+                    let mut map = state.live_prompts.lock().await;
+                    // Compaction rewrites the session's compaction cursor —
+                    // it must not interleave with a live turn's history
+                    // reads, so it takes the same per-session slot.
+                    if map.contains_key(&session_id) {
+                        drop(map);
+                        client
+                            .respond(
+                                id,
+                                Err(rpc_error(
+                                    -32602,
+                                    "session already has a prompt in progress",
+                                )),
+                            )
+                            .await;
+                        continue;
+                    }
+                    map.insert(session_id.clone(), (conn_id, cancel.clone()));
+                }
+                let (state, client) = (state.clone(), client.clone());
+                tokio::spawn(async move {
+                    let _permit = permit;
+                    let result = runtime::compact_session(&state, &session_id, cancel).await;
+                    let mut map = state.live_prompts.lock().await;
+                    if map.get(&session_id).is_some_and(|(c, _)| *c == conn_id) {
+                        map.remove(&session_id);
+                    }
+                    drop(map);
+                    match result {
+                        Ok(report) => {
+                            let mut v = json!({
+                                "compacted": report.compacted,
+                                "compactedThrough": report.compacted_through,
+                            });
+                            if let Some(r) = report.reason {
+                                v["reason"] = json!(r);
+                            }
+                            client.respond(id, Ok(v)).await;
+                        }
+                        Err(e) => {
+                            client
+                                .respond(id, Err(rpc_error(-32603, &format!("{e:#}"))))
+                                .await;
+                        }
+                    }
+                });
+            }
             ("session/cancel", id) => {
                 // Any connected client may cancel a session's turn — the
                 // map is shared, so this also reaches prompts started by
@@ -782,6 +860,92 @@ pub(crate) fn is_localhost_origin(origin: &str) -> bool {
     host.trim_matches(|c| c == '[' || c == ']')
         .parse::<std::net::IpAddr>()
         .is_ok_and(|ip| ip.is_loopback())
+}
+
+/// Max stdio servers one session may declare, and max live session
+/// overlays daemon-wide — each overlay owns spawned child processes.
+const MAX_SESSION_MCP_SERVERS: usize = 8;
+const MAX_SESSION_MCP_OVERLAYS: usize = 64;
+
+/// Parse ACP `session/new` mcpServers into a connected overlay registry.
+/// Absent/empty → None. Each entry: {name, command, args?, env?,
+/// auto_approve?}; env accepts the ACP array [{name,value}] or an object.
+/// Names colliding with a configured global server are rejected — the
+/// overlay would silently shadow the operator's server.
+async fn parse_session_mcp(
+    raw: &Value,
+    state: &Arc<AppState>,
+) -> Result<Option<Arc<crate::mcp::McpRegistry>>, String> {
+    let Some(list) = raw.as_array() else {
+        return Ok(None);
+    };
+    if list.is_empty() {
+        return Ok(None);
+    }
+    if list.len() > MAX_SESSION_MCP_SERVERS {
+        return Err(format!(
+            "too many mcpServers ({} > {MAX_SESSION_MCP_SERVERS})",
+            list.len()
+        ));
+    }
+    if state.session_mcp.lock().await.len() >= MAX_SESSION_MCP_OVERLAYS {
+        return Err("too many sessions with mcpServers".into());
+    }
+    let mut cfgs = HashMap::new();
+    for (i, entry) in list.iter().enumerate() {
+        let name = entry["name"]
+            .as_str()
+            .ok_or_else(|| format!("mcpServers[{i}].name required"))?;
+        if name.is_empty() || name.contains('.') {
+            return Err(format!("mcpServers[{i}].name invalid: {name:?}"));
+        }
+        if state.mcp.has_server(name) {
+            return Err(format!(
+                "mcpServers[{i}].name {name:?} collides with a configured server"
+            ));
+        }
+        let command = entry["command"]
+            .as_str()
+            .ok_or_else(|| format!("mcpServers[{i}].command required"))?
+            .to_string();
+        let args = entry["args"]
+            .as_array()
+            .map(|a| {
+                a.iter()
+                    .filter_map(|v| v.as_str().map(String::from))
+                    .collect()
+            })
+            .unwrap_or_default();
+        // ACP sends env as [{name, value}]; accept a plain object too.
+        let env = match &entry["env"] {
+            Value::Array(a) => a
+                .iter()
+                .filter_map(|e| {
+                    Some((
+                        e["name"].as_str()?.to_string(),
+                        e["value"].as_str()?.to_string(),
+                    ))
+                })
+                .collect(),
+            Value::Object(o) => o
+                .iter()
+                .filter_map(|(k, v)| v.as_str().map(|s| (k.clone(), s.to_string())))
+                .collect(),
+            _ => HashMap::new(),
+        };
+        cfgs.insert(
+            name.to_string(),
+            crate::config::McpServerConfig {
+                command,
+                args,
+                env,
+                auto_approve: entry["auto_approve"].as_bool().unwrap_or(false),
+            },
+        );
+    }
+    Ok(Some(Arc::new(
+        crate::mcp::McpRegistry::connect_all(&cfgs).await,
+    )))
 }
 #[cfg(test)]
 mod tests {

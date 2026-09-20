@@ -19,10 +19,10 @@ Most agent stacks make you pick a surface first, then bolt on tools and memory i
 
 - **OpenAI-compatible endpoint** — point any existing OpenAI client at `http://127.0.0.1:9470/v1` and it just works. Anthropic, Gemini, and Responses-API models are translated to the OpenAI schema, so your client never cares which provider answered.
 - **A real agent runtime** — sessions, streaming, tool calls, permission prompts, cancellation, context compaction. Exposed as ACP-style JSON-RPC over WebSocket at `/ws`.
-- **Every provider, one config** — OpenAI, Anthropic, Gemini, OpenRouter, Groq, DeepSeek, vLLM, Ollama (auto-discovered, zero config). Model globs route requests; `model:low/medium/high` suffixes map to each provider's thinking controls.
+- **Every provider, one config** — OpenAI, Anthropic, Gemini, OpenRouter, Groq, DeepSeek, vLLM, Ollama (auto-discovered, zero config). Subscriptions too — Claude Pro/Max, ChatGPT Plus/Pro, Kimi For Coding, GitHub Copilot, SuperGrok: `damond login <provider>`, no API key needed. And omp-parity presets: set `GROQ_API_KEY` or friends in the environment and the matching backend registers itself (`damond presets` lists them). Model globs route requests; `model:low/medium/high` suffixes map to each provider's thinking controls.
 - **Tools via MCP** — declare stdio MCP servers in TOML and their tools join the loop, namespaced as `server.tool`. Per-server `auto_approve` or interactive permission prompts.
 - **Chat channels out of the box** — Telegram, Discord, and Slack adapters ship as separate binaries. Per-chat session mapping, streamed replies, approve tool calls by replying `allow`/`deny`.
-- **Secrets never touch disk in plaintext** — `env:`, `keychain:`, or `!cmd` references only; literal keys are rejected. OAuth login for Anthropic stores tokens in the OS keychain and auto-refreshes.
+- **Secrets never touch disk in plaintext** — `env:`, `keychain:`, or `!cmd` references only; literal keys are rejected. OAuth login stores tokens in the OS keychain and auto-refreshes.
 - **Reachable from anywhere** — serve `wss` with your own certs, or run `damon-relay` on a public host: the daemon dials out (no inbound port), and the tunnel is end-to-end encrypted with X25519 + AES-256-GCM. The relay sees only ciphertext.
 - **Built to stay resident** — ~12 MB idle RSS, streaming passes through with sub-millisecond overhead, fast cold start, no degradation under concurrent sessions.
 
@@ -87,6 +87,9 @@ damon search "error timeout"      # FTS5 phrase search over all history
 
 Desktop apps (Electron/Tauri) are just another thin client: attach to `ws://127.0.0.1:9470/ws`, or spawn `damond` as a sidecar. See [docs/integration.md](docs/integration.md) for the wire protocol and copy-paste clients in Node, Python, and Rust.
 
+Or just open the built-in UI: `http://127.0.0.1:9470/ui` — sessions,
+streaming, tool-permission prompts, no install.
+
 ## Configuration
 
 One TOML file in the platform config dir, hot-reloaded on change:
@@ -102,6 +105,11 @@ models   = ["gpt-*"]
 api     = "anthropic-messages"
 api_key = "oauth"                   # `damond login anthropic` → OS keychain
 models  = ["claude-*"]
+
+[providers.chatgpt]
+api     = "openai-responses"
+api_key = "oauth"                   # `damond login openai` (ChatGPT Plus/Pro)
+models  = ["gpt-5*", "codex-*"]     # base_url defaults to the ChatGPT backend
 
 [mcp_servers.filesystem]
 command = "npx"

@@ -339,6 +339,14 @@ export class DamonClient {
     }
   }
 
+  /** Force a context compaction on the session — the manual escape hatch
+   *  when a session wedges against the real context window while the
+   *  daemon's estimate still reads under the threshold.
+   *  Returns { compacted, compactedThrough?, reason? }. */
+  async compactSession(sessionId) {
+    return this.#call("session/compact", { sessionId });
+  }
+
   close() {
     this.#closed = true;
     // #ws is null inside a reconnect window — guard the deref, then end

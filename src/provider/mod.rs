@@ -4,6 +4,7 @@ pub mod discovery;
 pub mod gemini;
 pub mod inband;
 pub mod openai;
+pub mod presets;
 pub mod responses;
 
 use std::collections::HashMap;
@@ -85,8 +86,39 @@ pub enum Provider {
 }
 impl Provider {
     pub fn new(name: &str, cfg: &ProviderConfig) -> anyhow::Result<Self> {
-        // "oauth" is a sentinel: the provider resolves tokens itself.
-        let oauth = cfg.api_key.as_deref() == Some("oauth");
+        // "oauth" / "oauth:<flavor>" are sentinels: the provider resolves
+        // tokens from the OS keychain itself. Bare "oauth" infers the
+        // flavor from the api kind (one flavor per kind); "oauth:<flavor>"
+        // names it explicitly — required where a kind carries several
+        // (openai-completions: kimi-code, github-copilot).
+        let oauth_flavor: Option<String> = match cfg.api_key.as_deref() {
+            Some("oauth") => {
+                let flavor = crate::oauth::provider_for_api(&cfg.api).ok_or_else(|| {
+                    anyhow::anyhow!(
+                        "provider {name}: api_key = \"oauth\" needs api \
+                         'anthropic-messages' or 'openai-responses', not '{}'\n\
+                         hint: name the flavor explicitly, e.g. api_key = \"oauth:kimi-code\"",
+                        cfg.api
+                    )
+                })?;
+                Some(flavor.to_string())
+            }
+            Some(raw) if raw.starts_with("oauth:") => {
+                let flavor = raw["oauth:".len()..].to_string();
+                crate::oauth::validate_flavor(&flavor)?;
+                let expected = crate::oauth::api_for_flavor(&flavor).ok_or_else(|| {
+                    anyhow::anyhow!("provider {name}: unknown OAuth flavor '{flavor}'")
+                })?;
+                anyhow::ensure!(
+                    cfg.api == expected,
+                    "provider {name}: oauth flavor '{flavor}' needs api '{expected}', not '{}'",
+                    cfg.api
+                );
+                Some(flavor)
+            }
+            _ => None,
+        };
+        let oauth = oauth_flavor.is_some();
         let key = match &cfg.api_key {
             Some(raw) if !oauth => Some(
                 SecretRef::parse(raw)
@@ -112,11 +144,7 @@ impl Provider {
         let base = cfg
             .base_url
             .clone()
-            .unwrap_or_else(|| match cfg.api.as_str() {
-                "anthropic-messages" => "https://api.anthropic.com".to_string(),
-                "gemini" => "https://generativelanguage.googleapis.com".to_string(),
-                _ => "https://api.openai.com/v1".to_string(),
-            });
+            .unwrap_or_else(|| crate::config::default_base_url(&cfg.api, oauth).to_string());
         match cfg.api.as_str() {
             "openai-completions" => Ok(Self::OpenAiCompletions(openai::OpenAiCompat::new(
                 name,
@@ -124,6 +152,7 @@ impl Provider {
                 key,
                 &headers,
                 cfg.compat.clone(),
+                oauth_flavor,
             )?)),
             "openai-responses" => Ok(Self::OpenAiResponses(responses::OpenAiResponses::new(
                 name,
@@ -131,12 +160,22 @@ impl Provider {
                 key,
                 &headers,
                 cfg.compat.clone(),
+                oauth_flavor,
             )?)),
             "anthropic-messages" => Ok(Self::Anthropic(anthropic::Anthropic::new(
-                name, &base, key, &headers, oauth,
+                name,
+                &base,
+                key,
+                &headers,
+                oauth,
+                cfg.compat.bearer_auth,
             )?)),
             "gemini" => Ok(Self::Gemini(gemini::Gemini::new(
-                name, &base, key, &headers,
+                name,
+                &base,
+                key,
+                &headers,
+                cfg.compat.vertex,
             )?)),
             other => bail!("provider {name}: unknown api '{other}'"),
         }
@@ -222,6 +261,17 @@ pub fn build_providers(cfg: &Config) -> (HashMap<String, Arc<Provider>>, Vec<any
         match Provider::new(name, p) {
             Ok(p) => {
                 providers.insert(name.clone(), Arc::new(p));
+            }
+            Err(e) => errors.push(e),
+        }
+    }
+    // omp-parity presets: providers whose key env var is set (and id not
+    // explicitly configured) join the map automatically, so a project
+    // picks up its available backends with zero Damon-specific config.
+    for (name, p) in presets::resolve_env_providers(&cfg.providers) {
+        match Provider::new(&name, &p) {
+            Ok(p) => {
+                providers.insert(name, Arc::new(p));
             }
             Err(e) => errors.push(e),
         }

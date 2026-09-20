@@ -104,6 +104,18 @@ fn default_bind() -> SocketAddr {
     "127.0.0.1:9470".parse().unwrap()
 }
 
+/// Default upstream base URL for an api kind. `oauth` marks subscription
+/// auth (Claude Pro/Max, ChatGPT Plus/Pro) — the OpenAI responses kind then
+/// targets the ChatGPT backend, not the platform API.
+pub fn default_base_url(api: &str, oauth: bool) -> &'static str {
+    match (api, oauth) {
+        ("anthropic-messages", _) => "https://api.anthropic.com",
+        ("gemini", _) => "https://generativelanguage.googleapis.com",
+        ("openai-responses", true) => "https://chatgpt.com/backend-api/codex",
+        _ => "https://api.openai.com/v1",
+    }
+}
+
 #[derive(Clone, Debug, Deserialize, PartialEq)]
 #[serde(deny_unknown_fields)]
 pub struct McpServerConfig {
@@ -187,6 +199,31 @@ pub struct ProviderCompat {
     /// response — for local models without a native tool API.
     #[serde(default)]
     pub inband_tools: bool,
+    /// Azure OpenAI URL shape: `{base}/deployments/{model}{path}` with an
+    /// `api-version` query. The key rides in the `api-key` header (set it
+    /// via `headers`), not `Authorization: Bearer`.
+    #[serde(default)]
+    pub azure_deployment_urls: bool,
+    /// `api-version` query value for Azure OpenAI (required with
+    /// `azure_deployment_urls`; defaults to "2024-10-21").
+    pub azure_api_version: Option<String>,
+    /// Anthropic-compatible endpoints that take `Authorization: Bearer`
+    /// instead of `x-api-key` — AWS Bedrock bearer (mantle) surfaces and
+    /// Bearer-fronting gateways.
+    #[serde(default)]
+    pub bearer_auth: bool,
+    /// Vertex AI URL shape: `{base}/models/{model}:...` with
+    /// `x-goog-api-key` auth — `base` then carries the full
+    /// `/v1/projects/{p}/locations/{l}/publishers/google` prefix.
+    #[serde(default)]
+    pub vertex: bool,
+}
+
+impl ProviderCompat {
+    /// Default `api-version` for Azure OpenAI deployments.
+    pub fn azure_api_version_or_default(&self) -> &str {
+        self.azure_api_version.as_deref().unwrap_or("2024-10-21")
+    }
 }
 
 fn default_true() -> bool {
@@ -363,10 +400,11 @@ impl Config {
                 other => bail!("provider {name}: unknown api '{other}'"),
             }
             if let Some(key) = &p.api_key {
-                // "oauth" is a sentinel handled by Provider::new — the
-                // provider resolves tokens from the OS keychain itself.
-                // It is not a SecretRef and must not be validated as one.
-                if key != "oauth" {
+                // "oauth" / "oauth:<flavor>" are sentinels handled by
+                // Provider::new — the provider resolves tokens from the
+                // OS keychain itself. They are not SecretRefs and must
+                // not be validated as one.
+                if key != "oauth" && !key.starts_with("oauth:") {
                     SecretRef::parse(key)
                         .with_context(|| format!("provider {name}: invalid api_key"))?;
                 }

@@ -89,6 +89,34 @@ async fn main() -> anyhow::Result<()> {
         )
         .init();
 
+    // No clap — the relay is env-only (DAMON_RELAY_BIND /
+    // DAMON_RELAY_SECRET), but --help/--version must not silently start
+    // a server.
+    match std::env::args().nth(1).as_deref() {
+        None => {}
+        Some("-h" | "--help") => {
+            println!(
+                "damon-relay {} — E2E-encrypted relay for damond\n\
+                 \n\
+                 Usage: damon-relay\n\
+                 \n\
+                 Environment:\n\
+                 \x20 DAMON_RELAY_BIND    listen address (default 0.0.0.0:8080)\n\
+                 \x20 DAMON_RELAY_SECRET  require this secret on /register\n\
+                 \x20 RUST_LOG            tracing filter (default info)",
+                env!("CARGO_PKG_VERSION")
+            );
+            return Ok(());
+        }
+        Some("-V" | "--version") => {
+            println!("damon-relay {}", env!("CARGO_PKG_VERSION"));
+            return Ok(());
+        }
+        Some(other) => {
+            eprintln!("unknown argument: {other} (try --help)");
+            std::process::exit(2);
+        }
+    }
     let bind: std::net::SocketAddr = std::env::var("DAMON_RELAY_BIND")
         .unwrap_or_else(|_| "0.0.0.0:8080".into())
         .parse()?;

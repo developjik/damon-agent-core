@@ -19,10 +19,10 @@ Damon은 Rust로 만든 로컬 상주 에이전트 코어다. 어려운 부분 �
 
 - **OpenAI 호환 엔드포인트** — 기존 OpenAI 클라이언트를 `http://127.0.0.1:9470/v1`에 그대로 향하게 하면 된다. Anthropic, Gemini, Responses API 모델도 OpenAI 스키마로 번역되므로 클라이언트는 어느 프로바이더가 응답했는지 신경 쓸 필요가 없다.
 - **진짜 에이전트 런타임** — 세션, 스트리밍, tool call, 권한 프롬프트, 취소, 컨텍스트 컴팩션. `/ws`에서 ACP형 JSON-RPC over WebSocket으로 노출.
-- **모든 프로바이더, 하나의 config** — OpenAI, Anthropic, Gemini, OpenRouter, Groq, DeepSeek, vLLM, Ollama(자동 탐지, 설정 불필요). 모델 glob이 요청을 라우팅하고, `model:low/medium/high` 접미사가 프로바이더별 thinking 제어로 매핑된다.
+- **모든 프로바이더, 하나의 config** — OpenAI, Anthropic, Gemini, OpenRouter, Groq, DeepSeek, vLLM, Ollama(자동 탐지, 설정 불필요). 구독제도 마찬가지 — Claude Pro/Max, ChatGPT Plus/Pro, Kimi For Coding, GitHub Copilot, SuperGrok: `damond login <프로바이더>`, API 키 불필요. 그리고 omp 패리티 프리셋: `GROQ_API_KEY` 등 키 env만 있으면 해당 백엔드가 스스로 등록된다(`damond presets`로 목록 확인). 모델 glob이 요청을 라우팅하고, `model:low/medium/high` 접미사가 프로바이더별 thinking 제어로 매핑된다.
 - **MCP로 툴 연결** — stdio MCP 서버를 TOML에 선언하면 `server.tool` 네임스페이스로 tool loop에 합류. 서버별 `auto_approve` 또는 대화형 권한 프롬프트.
 - **채팅 채널 기본 제공** — Telegram, Discord, Slack 어댑터가 별도 바이너리로 나간다. 채널별 세션 자동 매핑, 스트리밍 응답, `allow`/`deny` 답장으로 tool 승인.
-- **시크릿은 평문으로 디스크에 남지 않는다** — `env:`, `keychain:`, `!cmd` 참조만 허용, 리터럴 키는 거부. Anthropic OAuth 로그인은 토큰을 OS 키체인에 저장하고 자동 갱신한다.
+- **시크릿은 평문으로 디스크에 남지 않는다** — `env:`, `keychain:`, `!cmd` 참조만 허용, 리터럴 키는 거부. OAuth 로그인은 토큰을 OS 키체인에 저장하고 자동 갱신한다.
 - **어디서든 접근** — 자체 인증서로 `wss` 서빙, 또는 공개 호스트에 `damon-relay`를 띄우면 데몬이 아웃바운드로 연결한다(인바운드 포트 불필요). 터널은 X25519 + AES-256-GCM으로 E2E 암호화 — 릴레이는 암호문만 본다.
 - **상주하도록 설계** — idle RSS ~12MB, 스트리밍은 1ms 미만 오버헤드로 패스스루, 빠른 콜드스타트, 동시 세션에서도 저하 없음.
 
@@ -87,6 +87,9 @@ damon search "error timeout"      # 전체 이력 FTS5 구문 검색
 
 데스크톱 앱(Electron/Tauri)도 같은 thin client다: `ws://127.0.0.1:9470/ws`에 attach하거나 `damond`를 sidecar로 띄운다. 와이어 프로토콜과 Node/Python/Rust 복붙 클라이언트는 [docs/integration.md](docs/integration.md) 참조.
 
+내장 웹 UI도 있다: `http://127.0.0.1:9470/ui` — 세션, 스트리밍,
+툴 권한 프롬프트까지 설치 없이 바로 사용.
+
 ## 설정
 
 플랫폼 config 디렉터리의 TOML 파일 하나. 변경 시 핫리로드:
@@ -102,6 +105,11 @@ models   = ["gpt-*"]
 api     = "anthropic-messages"
 api_key = "oauth"                   # `damond login anthropic` → OS 키체인
 models  = ["claude-*"]
+
+[providers.chatgpt]
+api     = "openai-responses"
+api_key = "oauth"                   # `damond login openai` (ChatGPT Plus/Pro)
+models  = ["gpt-5*", "codex-*"]     # base_url은 ChatGPT 백엔드가 기본
 
 [mcp_servers.filesystem]
 command = "npx"

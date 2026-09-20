@@ -1511,3 +1511,611 @@ async fn accumulator_drops_empty_slots() {
     assert_eq!(calls.len(), 1);
     assert_eq!(calls[0].id, "id1");
 }
+
+// ─── ChatGPT subscription OAuth: openai-responses + api_key = "oauth" ───
+//
+// The oauth path flips the same process-global DAMON_TEST_* hooks the
+// tests/oauth.rs binary uses (a separate test binary, so no cross-file
+// contention) — but the two tests here run in parallel with each other,
+// so they serialize on a local lock.
+
+use std::sync::atomic::{AtomicUsize, Ordering};
+
+/// (authorization, chatgpt-account-id, body) per /responses call.
+type CapturedRequest = (Option<String>, Option<String>, Value);
+static OAUTH_ENV_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+
+/// Fake id_token JWT carrying the given ChatGPT account id claim.
+fn fake_id_token(account: &str) -> String {
+    use base64::Engine;
+    let b64 = |bytes: &[u8]| base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(bytes);
+    let header = b64(br#"{"alg":"none","typ":"JWT"}"#);
+    let payload = b64(&serde_json::to_vec(&json!({
+        "https://api.openai.com/auth": {"chatgpt_account_id": account},
+    }))
+    .unwrap());
+    format!("{header}.{payload}.c2ln")
+}
+
+struct OAuthMock {
+    /// Origin serving both /responses and /token.
+    base: String,
+    /// Captured /responses calls, in order.
+    requests: Arc<tokio::sync::Mutex<Vec<CapturedRequest>>>,
+    upstream_hits: Arc<AtomicUsize>,
+    token_hits: Arc<AtomicUsize>,
+}
+
+/// Spawn one mock origin: /responses answers the first call with 401 and
+/// later calls with a completed SSE stream; /token rotates the access
+/// token on every hit (rotated-1, rotated-2, …) for account acc-2.
+async fn oauth_mocks(dir_name: &str) -> OAuthMock {
+    use axum::http::{HeaderMap, StatusCode};
+
+    let requests: Arc<tokio::sync::Mutex<Vec<CapturedRequest>>> =
+        Arc::new(tokio::sync::Mutex::new(Vec::new()));
+    let upstream_hits = Arc::new(AtomicUsize::new(0));
+    let token_hits = Arc::new(AtomicUsize::new(0));
+
+    let req_state = requests.clone();
+    let up_hits = upstream_hits.clone();
+    let tok_hits = token_hits.clone();
+    let app = Router::new()
+        .route(
+            "/responses",
+            post(move |headers: HeaderMap, body: String| {
+                let requests = req_state.clone();
+                let hits = up_hits.clone();
+                async move {
+                    let n = hits.fetch_add(1, Ordering::SeqCst);
+                    requests.lock().await.push((
+                        headers
+                            .get("authorization")
+                            .and_then(|v| v.to_str().ok().map(String::from)),
+                        headers
+                            .get("chatgpt-account-id")
+                            .and_then(|v| v.to_str().ok().map(String::from)),
+                        serde_json::from_str(&body).unwrap(),
+                    ));
+                    if n == 0 {
+                        return Response::builder()
+                            .status(StatusCode::UNAUTHORIZED)
+                            .header("content-type", "application/json")
+                            .body(Body::from(r#"{"error":"stale token"}"#))
+                            .unwrap();
+                    }
+                    Response::builder()
+                        .header("content-type", "text/event-stream")
+                        .body(Body::from(concat!(
+                            "data: {\"type\":\"response.output_text.delta\",\"delta\":\"he\"}\n\n",
+                            "data: {\"type\":\"response.completed\",\"response\":{\"status\":\"completed\",",
+                            "\"output\":[{\"type\":\"message\",\"content\":[{\"type\":\"output_text\",\"text\":\"he\"}]}],",
+                            "\"usage\":{\"input_tokens\":1,\"output_tokens\":2,\"total_tokens\":3}}}\n\n",
+                        )))
+                        .unwrap()
+                }
+            }),
+        )
+        .route(
+            "/token",
+            post(move |body: String| {
+                let hits = tok_hits.clone();
+                async move {
+                    let n = hits.fetch_add(1, Ordering::SeqCst);
+                    let req: Value = serde_json::from_str(&body).unwrap();
+                    assert_eq!(req["grant_type"], "refresh_token");
+                    assert_eq!(req["client_id"], "app_EMoamEEZ73f0CkXaXp7hrann");
+                    Json(json!({
+                        "access_token": format!("rotated-{}", n + 1),
+                        "refresh_token": format!("rt-{}", n + 2),
+                        "expires_in": 3600,
+                        "id_token": fake_id_token("acc-2"),
+                    }))
+                }
+            }),
+        )
+        .with_state(());
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+
+    // Seed an expired token set for acc-1: the proactive refresh rotates
+    // to rotated-1/acc-2 before the first upstream call.
+    let dir = std::env::temp_dir().join(dir_name);
+    std::fs::create_dir_all(&dir).unwrap();
+    std::fs::write(
+        dir.join("openai.json"),
+        serde_json::to_string(&json!({
+            "access_token": "stale-access",
+            "refresh_token": "rt-1",
+            "expires_at": 0,
+            "account_id": "acc-1",
+        }))
+        .unwrap(),
+    )
+    .unwrap();
+
+    OAuthMock {
+        base: format!("http://{addr}"),
+        requests,
+        upstream_hits,
+        token_hits,
+    }
+}
+
+fn wire_env(base: &str, dir_name: &str) {
+    // SAFETY: callers hold OAUTH_ENV_LOCK.
+    unsafe {
+        std::env::set_var("DAMON_TEST_TOKEN_URL", format!("{base}/token"));
+        std::env::set_var("DAMON_TEST_TOKEN_DIR", std::env::temp_dir().join(dir_name));
+    }
+}
+
+fn clear_env(dir_name: &str) {
+    // SAFETY: callers hold OAUTH_ENV_LOCK.
+    unsafe {
+        std::env::remove_var("DAMON_TEST_TOKEN_DIR");
+        std::env::remove_var("DAMON_TEST_TOKEN_URL");
+    }
+    std::fs::remove_dir_all(std::env::temp_dir().join(dir_name)).ok();
+}
+
+fn oauth_provider_config(base: &str) -> ProviderConfig {
+    ProviderConfig {
+        api: "openai-responses".to_string(),
+        base_url: Some(base.to_string()),
+        api_key: Some("oauth".to_string()),
+        models: vec![],
+        default_model: None,
+        headers: Default::default(),
+        compat: Default::default(),
+        discovery: None,
+        context_promotion_target: None,
+    }
+}
+
+#[tokio::test]
+async fn responses_oauth_stream_authenticates_and_retries_on_401() {
+    use futures::StreamExt;
+    let _guard = OAUTH_ENV_LOCK.lock().await;
+    const DIR: &str = "damon-prov-oauth-stream";
+    let m = oauth_mocks(DIR).await;
+    wire_env(&m.base, DIR);
+
+    let p =
+        damon_core::provider::Provider::new("chatgpt", &oauth_provider_config(&m.base)).unwrap();
+    let body = json!({"model": "gpt-5.1", "messages": [{"role": "user", "content": "hi"}]});
+    let mut stream = std::pin::pin!(p.chat_stream(body).await.unwrap());
+    let (mut text, mut done) = (String::new(), false);
+    while let Some(ev) = stream.next().await {
+        match ev.unwrap() {
+            damon_core::llm::StreamEvent::Text(t) => text.push_str(&t),
+            damon_core::llm::StreamEvent::Done(_) => done = true,
+            _ => {}
+        }
+    }
+    assert_eq!(text, "he");
+    assert!(done, "terminal Done event must arrive");
+
+    // Proactive refresh (expired seed) + forced refresh (upstream 401).
+    assert_eq!(m.token_hits.load(Ordering::SeqCst), 2);
+    assert_eq!(m.upstream_hits.load(Ordering::SeqCst), 2);
+    let reqs = m.requests.lock().await;
+    // First call: the rotated-at-load token, retry: the forced one.
+    assert_eq!(reqs[0].0.as_deref(), Some("Bearer rotated-1"));
+    assert_eq!(reqs[0].1.as_deref(), Some("acc-2"));
+    assert_eq!(reqs[1].0.as_deref(), Some("Bearer rotated-2"));
+    assert_eq!(reqs[1].1.as_deref(), Some("acc-2"));
+    // Codex dialect: SSE-only, stateless, instructions defaulted in.
+    assert_eq!(reqs[1].2["stream"], json!(true));
+    assert_eq!(reqs[1].2["store"], json!(false));
+    assert_eq!(reqs[1].2["instructions"], json!(""));
+    assert_eq!(reqs[1].2["model"], json!("gpt-5.1"));
+
+    // The rotated set was persisted for the next turn.
+    let stored = damon_core::oauth::load("openai").unwrap().unwrap();
+    assert_eq!(stored.access_token, "rotated-2");
+    assert_eq!(stored.account_id.as_deref(), Some("acc-2"));
+
+    clear_env(DIR);
+}
+
+#[tokio::test]
+async fn responses_oauth_nonstream_folds_sse_into_json() {
+    let _guard = OAUTH_ENV_LOCK.lock().await;
+    const DIR: &str = "damon-prov-oauth-nonstream";
+    let m = oauth_mocks(DIR).await;
+    wire_env(&m.base, DIR);
+
+    let p =
+        damon_core::provider::Provider::new("chatgpt", &oauth_provider_config(&m.base)).unwrap();
+    let body = json!({"model": "gpt-5.1", "messages": [{"role": "user", "content": "hi"}]});
+    // No "stream" flag on the inbound request — the oauth backend still
+    // only speaks SSE, so the provider folds it back into JSON.
+    let resp = p.chat(body).await.unwrap();
+    assert_eq!(resp["choices"][0]["message"]["content"], "he");
+    assert_eq!(resp["choices"][0]["finish_reason"], "stop");
+    assert_eq!(resp["usage"]["prompt_tokens"], 1);
+    assert_eq!(resp["usage"]["completion_tokens"], 2);
+
+    assert_eq!(m.upstream_hits.load(Ordering::SeqCst), 2);
+    let reqs = m.requests.lock().await;
+    assert_eq!(reqs[0].2["stream"], json!(true), "outbound must be SSE");
+
+    clear_env(DIR);
+}
+
+// ─── omp wire shapes: Azure deployments, Vertex paths, Bedrock bearer ───
+
+/// Captured-request tuple types for the wire-shape mocks below.
+type AzureCapture = (String, Option<String>, Option<String>, Value);
+type AuthHeaders = (Option<String>, Option<String>);
+type VertexCapture = (String, Option<String>);
+
+fn compat_provider(
+    kind: &str,
+    base: &str,
+    compat: damon_core::config::ProviderCompat,
+) -> ProviderConfig {
+    ProviderConfig {
+        api: kind.to_string(),
+        base_url: Some(base.to_string()),
+        api_key: None,
+        models: vec![],
+        default_model: None,
+        headers: Default::default(),
+        compat,
+        discovery: None,
+        context_promotion_target: None,
+    }
+}
+
+/// Azure OpenAI: the deployment rides in the path with an `api-version`
+/// query, and the key rides in the `api-key` header — not Bearer.
+#[tokio::test]
+async fn azure_deployment_url_and_api_key_header() {
+    let captured: Arc<tokio::sync::Mutex<Vec<AzureCapture>>> =
+        Arc::new(tokio::sync::Mutex::new(Vec::new()));
+    let state = captured.clone();
+    let app = Router::new().fallback(
+        move |uri: axum::http::Uri, headers: axum::http::HeaderMap, body: String| {
+            let captured = state.clone();
+            async move {
+                captured.lock().await.push((
+                    uri.to_string(),
+                    headers
+                        .get("api-key")
+                        .and_then(|v| v.to_str().ok().map(String::from)),
+                    headers
+                        .get("authorization")
+                        .and_then(|v| v.to_str().ok().map(String::from)),
+                    serde_json::from_str(&body).unwrap(),
+                ));
+                Json(json!({
+                    "choices": [{"message": {"role": "assistant", "content": "ok"}}],
+                    "usage": {},
+                }))
+            }
+        },
+    );
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+
+    let compat = damon_core::config::ProviderCompat {
+        azure_deployment_urls: true,
+        azure_api_version: Some("2024-10-21".into()),
+        ..Default::default()
+    };
+    let mut cfg = compat_provider(
+        "openai-completions",
+        &format!("http://{addr}/openai"),
+        compat,
+    );
+    cfg.api_key = None;
+    cfg.headers.insert("api-key".into(), "azkey".into());
+    let p = damon_core::provider::Provider::new("azure", &cfg).unwrap();
+
+    let resp = p
+        .chat(json!({"model": "gpt-4o", "messages": [{"role": "user", "content": "hi"}]}))
+        .await
+        .unwrap();
+    assert_eq!(resp["choices"][0]["message"]["content"], "ok");
+
+    let reqs = captured.lock().await;
+    let (uri, api_key, bearer, body) = &reqs[0];
+    assert_eq!(
+        uri, "/openai/deployments/gpt-4o/chat/completions?api-version=2024-10-21",
+        "deployment in path, api-version in query"
+    );
+    assert_eq!(api_key.as_deref(), Some("azkey"));
+    assert!(bearer.is_none(), "azure does not use Bearer");
+    assert_eq!(body["model"], "gpt-4o");
+}
+
+/// Anthropic-compatible bearer surfaces (Bedrock mantle): the key goes
+/// out as `Authorization: Bearer`, never `x-api-key`.
+#[tokio::test]
+async fn anthropic_bearer_auth_compat() {
+    let captured: Arc<tokio::sync::Mutex<Vec<AuthHeaders>>> =
+        Arc::new(tokio::sync::Mutex::new(Vec::new()));
+    let state = captured.clone();
+    let app = Router::new().route(
+        "/v1/messages",
+        post(move |headers: axum::http::HeaderMap| {
+            let captured = state.clone();
+            async move {
+                captured.lock().await.push((
+                    headers
+                        .get("authorization")
+                        .and_then(|v| v.to_str().ok().map(String::from)),
+                    headers
+                        .get("x-api-key")
+                        .and_then(|v| v.to_str().ok().map(String::from)),
+                ));
+                Json(json!({"content":[{"type":"text","text":"ok"}],"usage":{}}))
+            }
+        }),
+    );
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+
+    // SAFETY: single-threaded test; removed after the assertions.
+    unsafe {
+        std::env::set_var("DAMON_TEST_BEARER_KEY", "bedrock-bearer");
+    }
+    let mut cfg = compat_provider(
+        "anthropic-messages",
+        &format!("http://{addr}"),
+        damon_core::config::ProviderCompat {
+            bearer_auth: true,
+            ..Default::default()
+        },
+    );
+    cfg.api_key = Some("env:DAMON_TEST_BEARER_KEY".into());
+    let p = damon_core::provider::Provider::new("mantle", &cfg).unwrap();
+    let resp = p
+        .chat(json!({"model": "claude-x", "messages": [{"role": "user", "content": "hi"}]}))
+        .await
+        .unwrap();
+    assert_eq!(resp["choices"][0]["message"]["content"], "ok");
+
+    let reqs = captured.lock().await;
+    assert_eq!(reqs[0].0.as_deref(), Some("Bearer bedrock-bearer"));
+    assert!(reqs[0].1.is_none(), "x-api-key must be absent");
+    // SAFETY: set above; no other test reads this var.
+    unsafe {
+        std::env::remove_var("DAMON_TEST_BEARER_KEY");
+    }
+}
+
+/// Vertex AI: `{base}/models/{model}:generateContent` paths on a
+/// project/location base, key still via `x-goog-api-key`.
+#[tokio::test]
+async fn vertex_url_shape() {
+    let captured: Arc<tokio::sync::Mutex<Vec<VertexCapture>>> =
+        Arc::new(tokio::sync::Mutex::new(Vec::new()));
+    let state = captured.clone();
+    let app = Router::new().fallback(
+        move |uri: axum::http::Uri, headers: axum::http::HeaderMap, body: String| {
+            let captured = state.clone();
+            async move {
+                captured.lock().await.push((
+                    uri.to_string(),
+                    headers
+                        .get("x-goog-api-key")
+                        .and_then(|v| v.to_str().ok().map(String::from)),
+                ));
+                let _ = body;
+                Json(json!({
+                    "candidates": [{"content": {"parts": [{"text": "ok"}]}}],
+                    "usageMetadata": {"promptTokenCount": 1, "candidatesTokenCount": 1, "totalTokenCount": 2},
+                }))
+            }
+        },
+    );
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+
+    // SAFETY: single-threaded test; removed after the assertions.
+    unsafe {
+        std::env::set_var("DAMON_TEST_VERTEX_KEY", "vk");
+    }
+    let mut cfg = compat_provider(
+        "gemini",
+        &format!("http://{addr}/v1/projects/p/locations/us-central1/publishers/google"),
+        damon_core::config::ProviderCompat {
+            vertex: true,
+            ..Default::default()
+        },
+    );
+    cfg.api_key = Some("env:DAMON_TEST_VERTEX_KEY".into());
+    let p = damon_core::provider::Provider::new("vertex", &cfg).unwrap();
+    let resp = p
+        .chat(json!({"model": "gemini-2-0", "messages": [{"role": "user", "content": "hi"}]}))
+        .await
+        .unwrap();
+    assert_eq!(resp["choices"][0]["message"]["content"], "ok");
+
+    let reqs = captured.lock().await;
+    assert_eq!(
+        reqs[0].0,
+        "/v1/projects/p/locations/us-central1/publishers/google/models/gemini-2-0:generateContent"
+    );
+    assert_eq!(reqs[0].1.as_deref(), Some("vk"));
+    // SAFETY: set above; no other test reads this var.
+    unsafe {
+        std::env::remove_var("DAMON_TEST_VERTEX_KEY");
+    }
+}
+
+/// Presets auto-register from env vars; keyless local engines always do.
+#[tokio::test]
+async fn presets_auto_register_from_env() {
+    // SAFETY: single-threaded env mutation; removed before returning.
+    unsafe {
+        std::env::set_var("OPENROUTER_API_KEY", "sk-or");
+    }
+    let providers = BTreeMap::new();
+    let cfg = Config {
+        bind: "127.0.0.1:0".parse().unwrap(),
+        auth_token: None,
+        data_dir: None,
+        tls_cert: None,
+        tls_key: None,
+        mcp_servers: HashMap::new(),
+        providers,
+        models: BTreeMap::new(),
+        relay: None,
+        permission_timeout_secs: None,
+        max_tool_output: None,
+        summary_model: None,
+        session_retention_days: None,
+    };
+    let (built, errors) = damon_core::provider::build_providers(&cfg);
+    assert!(errors.is_empty(), "{errors:?}");
+    // Env-keyed preset registered.
+    assert!(built.contains_key("openrouter"));
+    // Keyless local engines always register.
+    assert!(built.contains_key("lm-studio"));
+    assert!(built.contains_key("llama.cpp"));
+    unsafe {
+        std::env::remove_var("OPENROUTER_API_KEY");
+    }
+}
+
+/// The `oauth:<flavor>` sentinel only pairs with its own api kind, and
+/// bare `oauth` on a multi-flavor kind is rejected (ambiguous).
+#[test]
+fn oauth_sentinel_flavor_validation() {
+    let pc = |kind: &str, key: &str| ProviderConfig {
+        api: kind.to_string(),
+        base_url: Some("http://127.0.0.1:1".into()),
+        api_key: Some(key.into()),
+        models: vec![],
+        default_model: None,
+        headers: Default::default(),
+        compat: Default::default(),
+        discovery: None,
+        context_promotion_target: None,
+    };
+    // Bare oauth infers from api — openai-completions carries several
+    // flavors, so the inference is ambiguous and rejected.
+    assert!(damon_core::provider::Provider::new("x", &pc("openai-completions", "oauth")).is_err());
+    // Flavor must match the transport.
+    assert!(
+        damon_core::provider::Provider::new("x", &pc("openai-completions", "oauth:openai"))
+            .is_err()
+    );
+    assert!(
+        damon_core::provider::Provider::new("x", &pc("openai-completions", "oauth:anthropic"))
+            .is_err()
+    );
+    assert!(
+        damon_core::provider::Provider::new("x", &pc("openai-responses", "oauth:kimi-code"))
+            .is_err()
+    );
+    assert!(
+        damon_core::provider::Provider::new("x", &pc("openai-completions", "oauth:nonsense"))
+            .is_err()
+    );
+    // Valid pairings build without touching the keychain.
+    assert!(
+        damon_core::provider::Provider::new("x", &pc("openai-completions", "oauth:github-copilot"))
+            .is_ok()
+    );
+    assert!(
+        damon_core::provider::Provider::new("x", &pc("openai-completions", "oauth:kimi-code"))
+            .is_ok()
+    );
+    assert!(
+        damon_core::provider::Provider::new("x", &pc("openai-responses", "oauth:xai-oauth"))
+            .is_ok()
+    );
+    assert!(
+        damon_core::provider::Provider::new("x", &pc("anthropic-messages", "oauth:anthropic"))
+            .is_ok()
+    );
+}
+
+/// A copilot-flavored provider sends the bearer token AND the integration
+/// headers the Copilot API expects (Editor-Version, Copilot-Integration-Id).
+#[tokio::test]
+async fn copilot_oauth_provider_sends_integration_headers() {
+    let _guard = OAUTH_ENV_LOCK.lock().await;
+    const DIR: &str = "damon-prov-copilot";
+    // SAFETY: guarded by OAUTH_ENV_LOCK; removed below.
+    unsafe {
+        std::env::set_var("DAMON_TEST_TOKEN_DIR", std::env::temp_dir().join(DIR));
+    }
+    let dir = std::env::temp_dir().join(DIR);
+    std::fs::create_dir_all(&dir).unwrap();
+    std::fs::write(
+        dir.join("github-copilot.json"),
+        serde_json::to_string(&json!({
+            "access_token": "gho_1",
+            "refresh_token": "gho_1",
+            "expires_at": 4102444800_i64,
+            "account_id": null,
+        }))
+        .unwrap(),
+    )
+    .unwrap();
+
+    let captured: Arc<tokio::sync::Mutex<Vec<AuthHeaders>>> =
+        Arc::new(tokio::sync::Mutex::new(Vec::new()));
+    let state = captured.clone();
+    let app = Router::new().route(
+        "/chat/completions",
+        post(move |headers: axum::http::HeaderMap| {
+            let captured = state.clone();
+            async move {
+                captured.lock().await.push((
+                    headers
+                        .get("authorization")
+                        .and_then(|v| v.to_str().ok().map(String::from)),
+                    headers
+                        .get("editor-version")
+                        .and_then(|v| v.to_str().ok().map(String::from)),
+                ));
+                Json(json!({
+                    "choices": [{"message": {"role": "assistant", "content": "ok"}}],
+                    "usage": {},
+                }))
+            }
+        }),
+    );
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+
+    let cfg = ProviderConfig {
+        api: "openai-completions".to_string(),
+        base_url: Some(format!("http://{addr}")),
+        api_key: Some("oauth:github-copilot".into()),
+        models: vec![],
+        default_model: None,
+        headers: Default::default(),
+        compat: Default::default(),
+        discovery: None,
+        context_promotion_target: None,
+    };
+    let p = damon_core::provider::Provider::new("copilot", &cfg).unwrap();
+    let resp = p
+        .chat(json!({"model": "gpt-5", "messages": [{"role": "user", "content": "hi"}]}))
+        .await
+        .unwrap();
+    assert_eq!(resp["choices"][0]["message"]["content"], "ok");
+
+    let reqs = captured.lock().await;
+    assert_eq!(reqs[0].0.as_deref(), Some("Bearer gho_1"));
+    assert_eq!(reqs[0].1.as_deref(), Some("copilot/1.0.82"));
+
+    // SAFETY: set above; no other test reads this var name.
+    unsafe {
+        std::env::remove_var("DAMON_TEST_TOKEN_DIR");
+    }
+    std::fs::remove_dir_all(&dir).ok();
+}

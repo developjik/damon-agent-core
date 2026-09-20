@@ -69,6 +69,11 @@ enum Cmd {
         #[arg(long, default_value = "10")]
         limit: usize,
     },
+    /// Force context compaction on a session (summarize oldest half)
+    Compact {
+        /// Session id to compact
+        id: String,
+    },
 }
 
 #[tokio::main]
@@ -132,6 +137,15 @@ async fn main() -> anyhow::Result<()> {
         Cmd::Search { query, limit } => {
             for (sid, mid, snippet) in client.search(&query, limit).await? {
                 outln(format!("{sid}:{mid}\t{snippet}"));
+            }
+        }
+        Cmd::Compact { id } => {
+            let (compacted, through, reason) = client.compact_session(&id).await?;
+            match (compacted, through, reason) {
+                (true, Some(t), _) => outln(format!("compacted through message {t}")),
+                (true, None, _) => outln("compacted"),
+                (false, _, Some(r)) => outln(format!("not compacted: {r}")),
+                (false, _, None) => outln("not compacted"),
             }
         }
         Cmd::Prompt {

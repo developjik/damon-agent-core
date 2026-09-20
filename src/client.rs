@@ -53,6 +53,24 @@ pub struct DamonClient {
     events: Arc<Mutex<mpsc::Receiver<ClientEvent>>>,
     /// Connection liveness, driven by the reconnect supervisor.
     conn: watch::Receiver<ConnState>,
+    /// Update notifications dropped because the event channel was full —
+    /// a slow consumer loses streamed chunks; poll this to detect it.
+    dropped: Arc<AtomicU64>,
+}
+
+/// Tunables for `connect_with_options` / `connect_relay_with_options`.
+#[derive(Clone, Debug)]
+pub struct ConnectOptions {
+    /// Capacity of the ClientEvent channel. Update notifications are
+    /// dropped (counted via `dropped_events()`) when a slow consumer lets
+    /// this fill — raise it for consumers that batch-render.
+    pub event_capacity: usize,
+}
+
+impl Default for ConnectOptions {
+    fn default() -> Self {
+        Self { event_capacity: 64 }
+    }
 }
 
 /// Whether the transport is currently usable.
@@ -103,6 +121,15 @@ impl DamonClient {
     /// exponential backoff (100ms doubling to 5s) until the daemon returns;
     /// `request()` waits for the link instead of failing outright.
     pub async fn connect(url: &str, token: Option<&str>) -> anyhow::Result<Self> {
+        Self::connect_with_options(url, token, ConnectOptions::default()).await
+    }
+
+    /// `connect` with tunables — see `ConnectOptions`.
+    pub async fn connect_with_options(
+        url: &str,
+        token: Option<&str>,
+        opts: ConnectOptions,
+    ) -> anyhow::Result<Self> {
         let ws_url = ticketed_url(url, token).await?;
         let (ws, _) =
             tokio_tungstenite::connect_async_with_config(&ws_url, Some(ws_connect_config()), false)
@@ -126,11 +153,21 @@ impl DamonClient {
                 Ok(ws_transport(ws))
             })
         });
-        Ok(Self::start(writer, rx, Some(redial)))
+        Ok(Self::start(writer, rx, Some(redial), opts.event_capacity))
     }
     /// Reconnects like `connect` — a dropped tunnel is redialed, which
     /// re-runs the E2E handshake.
     pub async fn connect_relay(relay_url: &str, name: &str, token: &str) -> anyhow::Result<Self> {
+        Self::connect_relay_with_options(relay_url, name, token, ConnectOptions::default()).await
+    }
+
+    /// `connect_relay` with tunables — see `ConnectOptions`.
+    pub async fn connect_relay_with_options(
+        relay_url: &str,
+        name: &str,
+        token: &str,
+        opts: ConnectOptions,
+    ) -> anyhow::Result<Self> {
         let (tx, rx) = crate::relay::client_connect(relay_url, name, token).await?;
         let (u, n, t) = (relay_url.to_string(), name.to_string(), token.to_string());
         let redial: Redial = Box::new(move || {
@@ -140,7 +177,12 @@ impl DamonClient {
                 Ok((Box::new(ChannelWriter(tx)) as Box<dyn TextWriter>, rx))
             })
         });
-        Ok(Self::start(Box::new(ChannelWriter(tx)), rx, Some(redial)))
+        Ok(Self::start(
+            Box::new(ChannelWriter(tx)),
+            rx,
+            Some(redial),
+            opts.event_capacity,
+        ))
     }
 
     /// Shared constructor: spawn the read/supervisor task and build Self.
@@ -150,11 +192,13 @@ impl DamonClient {
         writer: Box<dyn TextWriter>,
         rx: mpsc::Receiver<String>,
         redial: Option<Redial>,
+        event_capacity: usize,
     ) -> Self {
         let pending: Arc<Mutex<HashMap<u64, Pending>>> = Arc::new(Mutex::new(HashMap::new()));
-        let (event_tx, event_rx) = mpsc::channel(64);
+        let (event_tx, event_rx) = mpsc::channel(event_capacity.max(1));
         let (conn_tx, conn_rx) = watch::channel(ConnState::Connected);
         let writer: Arc<Mutex<Box<dyn TextWriter>>> = Arc::new(Mutex::new(writer));
+        let dropped = Arc::new(AtomicU64::new(0));
 
         tokio::spawn(
             Reconnect {
@@ -163,6 +207,7 @@ impl DamonClient {
                 pending: pending.clone(),
                 event_tx,
                 conn_tx,
+                dropped: dropped.clone(),
             }
             .run(rx),
         );
@@ -173,6 +218,7 @@ impl DamonClient {
             next_id: Arc::new(AtomicU64::new(1)),
             events: Arc::new(Mutex::new(event_rx)),
             conn: conn_rx,
+            dropped,
         }
     }
 
@@ -229,6 +275,13 @@ impl DamonClient {
                 Err(_) => bail!("timed out waiting for reconnect"),
             }
         }
+    }
+
+    /// Update notifications dropped because the event channel filled —
+    /// nonzero means a slow consumer lost streamed chunks. Raise
+    /// `ConnectOptions::event_capacity` or consume faster.
+    pub fn dropped_events(&self) -> u64 {
+        self.dropped.load(Ordering::Relaxed)
     }
 
     /// Respond to a server-initiated request (ClientEvent::Request).
@@ -395,6 +448,24 @@ impl DamonClient {
             .await
             .context("send failed")
     }
+
+    /// Force a context compaction on the session — the manual escape
+    /// hatch when a session is wedged against the real context window
+    /// while the daemon's estimate still reads under the threshold.
+    /// Returns (compacted, compacted_through, reason).
+    pub async fn compact_session(
+        &self,
+        session_id: &str,
+    ) -> anyhow::Result<(bool, Option<i64>, Option<String>)> {
+        let v = self
+            .request("session/compact", json!({"sessionId": session_id}))
+            .await?;
+        Ok((
+            v["compacted"].as_bool().unwrap_or(false),
+            v["compactedThrough"].as_i64(),
+            v["reason"].as_str().map(String::from),
+        ))
+    }
 }
 
 /// Exchange the bearer token for a single-use WS ticket and return the
@@ -489,6 +560,7 @@ struct Reconnect {
     pending: Arc<Mutex<HashMap<u64, Pending>>>,
     event_tx: mpsc::Sender<ClientEvent>,
     conn_tx: watch::Sender<ConnState>,
+    dropped: Arc<AtomicU64>,
 }
 
 impl Reconnect {
@@ -496,7 +568,7 @@ impl Reconnect {
         let mut backoff = RECONNECT_MIN;
         loop {
             while let Some(text) = rx.recv().await {
-                handle_frame(&text, &self.pending, &self.event_tx).await;
+                handle_frame(&text, &self.pending, &self.event_tx, &self.dropped).await;
             }
             // Connection ended: fail every pending request so callers
             // don't wait on a response that can never arrive.
@@ -538,6 +610,7 @@ async fn handle_frame(
     text: &str,
     pending: &Mutex<HashMap<u64, Pending>>,
     event_tx: &mpsc::Sender<ClientEvent>,
+    dropped: &AtomicU64,
 ) {
     let Ok(v) = serde_json::from_str::<Value>(text) else {
         return;
@@ -557,12 +630,20 @@ async fn handle_frame(
         }
         // Notification. Updates are lossy by design — a slow consumer
         // must never backpressure the pump into stalling RPC responses.
+        // Every drop is counted on `dropped_events()`; warn once per
+        // power of two so a wedged consumer doesn't spam the log.
         (Some(_method), None)
             if event_tx
                 .try_send(ClientEvent::Update(v["params"].clone()))
                 .is_err() =>
         {
-            tracing::warn!("event channel full; dropping update notification");
+            let n = dropped.fetch_add(1, Ordering::Relaxed) + 1;
+            if n.is_power_of_two() {
+                tracing::warn!(
+                    dropped = n,
+                    "event channel full; dropping update notifications — slow consumer"
+                );
+            }
         }
         (Some(_method), None) => {}
         // Response to one of our requests.

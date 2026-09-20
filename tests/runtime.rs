@@ -561,20 +561,23 @@ async fn ws_rejects_foreign_origin_without_token() {
     }
 }
 
-/// session/new must reject a non-empty mcpServers list instead of
-/// silently ignoring it, and session/prompt must reject unknown sessions.
+/// session/new validates mcpServers entries (malformed → -32602, a
+/// well-formed but unspawnable command still creates the session —
+/// connect failures are logged, not fatal), and session/prompt must
+/// reject unknown sessions.
 #[tokio::test]
-async fn session_new_rejects_mcp_servers_and_prompt_unknown_session() {
+async fn session_new_validates_mcp_servers_and_prompt_unknown_session() {
     let upstream = mock_llm().await;
     let (state, _store) = test_state(&upstream).await;
     let addr = serve(state).await;
     let mut ws = ws_connect(&addr).await;
 
+    // Malformed entry — no command — is rejected before any spawn.
     send_rpc(
         &mut ws,
         1,
         "session/new",
-        json!({"cwd": "/tmp", "mcpServers": [{"name": "x", "command": "y"}]}),
+        json!({"cwd": "/tmp", "mcpServers": [{"name": "x"}]}),
     )
     .await;
     let resp = read_json(&mut ws).await;
@@ -583,12 +586,25 @@ async fn session_new_rejects_mcp_servers_and_prompt_unknown_session() {
         resp["error"]["message"]
             .as_str()
             .unwrap()
-            .contains("mcpServers")
+            .contains("command")
     );
 
+    // A well-formed entry is accepted even when the command itself is
+    // unspawnable — connect failures are logged, not fatal (same rule as
+    // global [mcp_servers]).
     send_rpc(
         &mut ws,
         2,
+        "session/new",
+        json!({"cwd": "/tmp", "mcpServers": [{"name": "x", "command": "definitely-not-a-real-binary-damon"}]}),
+    )
+    .await;
+    let resp = read_json(&mut ws).await;
+    assert!(resp["result"]["sessionId"].is_string(), "got {resp}");
+
+    send_rpc(
+        &mut ws,
+        3,
         "session/prompt",
         json!({"sessionId": "no-such", "prompt": [{"type": "text", "text": "hi"}]}),
     )
@@ -1417,4 +1433,70 @@ async fn compaction_reevaluates_after_tool_results_grow_history() {
         2,
         "compaction did not re-evaluate after tool results grew history"
     );
+}
+
+/// session/compact forces a compaction pass regardless of the estimate
+/// threshold — the manual escape hatch for a wedged session. The mock
+/// answers non-streaming calls (the summarizer) with a JSON summary.
+/// The provider model has no context_window metadata, so this also
+/// covers the forced path where the threshold can't even be computed.
+#[tokio::test]
+async fn session_compact_forces_summarization() {
+    let app = Router::new().route(
+        "/chat/completions",
+        post(|_body: String| async move {
+            Response::builder()
+                .header("content-type", "application/json")
+                .body(Body::from(
+                    json!({"choices":[{"message":{"content":"summary of earlier turns"}}]})
+                        .to_string(),
+                ))
+                .unwrap()
+        }),
+    );
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let upstream = listener.local_addr().unwrap();
+    tokio::spawn(async move {
+        axum::serve(listener, app).await.unwrap();
+    });
+
+    let (state, store) = test_state(&upstream.to_string()).await;
+    let addr = serve(state).await;
+    let mut ws = ws_connect(&addr).await;
+
+    send_rpc(&mut ws, 1, "session/new", json!({"cwd": "/tmp"})).await;
+    let resp = read_json(&mut ws).await;
+    let sid = resp["result"]["sessionId"].as_str().unwrap().to_string();
+
+    // Seed history directly — four rows so the oldest half is droppable.
+    for i in 0..4 {
+        store
+            .append(
+                &sid,
+                if i % 2 == 0 { "user" } else { "assistant" },
+                &json!({"role": if i % 2 == 0 { "user" } else { "assistant" }, "content": format!("msg {i}")}),
+            )
+            .await
+            .unwrap();
+    }
+
+    send_rpc(&mut ws, 2, "session/compact", json!({"sessionId": sid})).await;
+    let resp = read_json(&mut ws).await;
+    assert_eq!(resp["result"]["compacted"], true, "got {resp}");
+    assert!(resp["result"]["compactedThrough"].as_i64().unwrap() > 0);
+
+    // The summary is now what the model sees for the compacted range.
+    let (_, summary) = store.compaction(&sid).await.unwrap();
+    assert_eq!(summary.as_deref(), Some("summary of earlier turns"));
+
+    // Unknown session → -32602, same as session/prompt.
+    send_rpc(
+        &mut ws,
+        3,
+        "session/compact",
+        json!({"sessionId": "no-such"}),
+    )
+    .await;
+    let resp = read_json(&mut ws).await;
+    assert_eq!(resp["error"]["code"], -32602, "got {resp}");
 }

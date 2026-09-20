@@ -15,3 +15,4 @@ pub mod service;
 pub mod slack;
 pub mod store;
 pub mod telegram;
+pub mod ui;

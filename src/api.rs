@@ -40,6 +40,37 @@ pub struct Metrics {
     pub prompts_total: AtomicU64,
     pub tokens_input: AtomicU64,
     pub tokens_output: AtomicU64,
+    /// MCP tool calls and their failures (all registries — global and
+    /// per-session overlays share the counter).
+    pub mcp_tool_calls: AtomicU64,
+    pub mcp_tool_errors: AtomicU64,
+    /// Per-provider upstream stats. Keyed by provider name — bounded by
+    /// the configured provider count, so no label-cardinality blowup.
+    pub providers: std::sync::Mutex<HashMap<String, ProviderStat>>,
+}
+
+/// Per-provider upstream counters. `latency_ms` is a sum — divide by
+/// `requests` for the mean; Prometheus rate() over it gives throughput-
+/// weighted latency.
+#[derive(Default)]
+pub struct ProviderStat {
+    pub requests: u64,
+    pub errors: u64,
+    pub latency_ms: u64,
+}
+
+impl Metrics {
+    /// Record one upstream provider call. `ok` counts transport/HTTP
+    /// failures, not model-level refusals.
+    pub fn record_provider(&self, name: &str, ok: bool, elapsed: std::time::Duration) {
+        let mut map = self.providers.lock().unwrap_or_else(|e| e.into_inner());
+        let s = map.entry(name.to_string()).or_default();
+        s.requests += 1;
+        if !ok {
+            s.errors += 1;
+        }
+        s.latency_ms += elapsed.as_millis() as u64;
+    }
 }
 
 pub struct AppState {
@@ -72,6 +103,12 @@ pub struct AppState {
     /// turns it started instead of orphaning them.
     pub live_prompts:
         tokio::sync::Mutex<HashMap<String, (u64, tokio_util::sync::CancellationToken)>>,
+    /// Per-session MCP overlays from ACP `session/new` mcpServers —
+    /// session id → registry of that session's own stdio servers.
+    /// In-memory only: a resumed session has no overlay (its servers
+    /// were the client's, not the daemon's). Removed on session/delete,
+    /// the retention sweep, and daemon shutdown.
+    pub session_mcp: tokio::sync::Mutex<HashMap<String, Arc<McpRegistry>>>,
 }
 
 impl AppState {
@@ -109,10 +146,14 @@ impl AppState {
                 prompts_total: AtomicU64::new(0),
                 tokens_input: AtomicU64::new(0),
                 tokens_output: AtomicU64::new(0),
+                mcp_tool_calls: AtomicU64::new(0),
+                mcp_tool_errors: AtomicU64::new(0),
+                providers: std::sync::Mutex::new(HashMap::new()),
             },
             ws_tickets: tokio::sync::Mutex::new(HashMap::new()),
             rate_buckets: tokio::sync::Mutex::new(HashMap::new()),
             live_prompts: tokio::sync::Mutex::new(HashMap::new()),
+            session_mcp: tokio::sync::Mutex::new(HashMap::new()),
         });
         // Daily session-retention sweep, plus one immediate pass at boot.
         // Sessions with a live prompt turn are excluded — deleting one
@@ -131,6 +172,11 @@ impl AppState {
                         Ok(ids) if !ids.is_empty() => {
                             for sid in &ids {
                                 state.mcp.clear_session(sid);
+                                // Session-scoped MCP servers die with the
+                                // session — their stdio children too.
+                                if let Some(reg) = state.session_mcp.lock().await.remove(sid) {
+                                    reg.shutdown().await;
+                                }
                             }
                             info!(removed = ids.len(), days, "session retention sweep")
                         }
@@ -249,6 +295,9 @@ pub fn router(state: Arc<AppState>) -> Router {
 
     Router::new()
         .route("/health", get(health))
+        // Embedded chat UI — static markup, no secrets; the page
+        // authenticates itself through the ws ticket flow.
+        .route("/ui", get(crate::ui::ui))
         // /ws and /metrics get the same rate limit as /v1 — on a
         // non-loopback bind an unlimited /ws would allow online
         // brute-force of the auth token via ticket exchange.
@@ -278,18 +327,33 @@ async fn health(State(state): State<Arc<AppState>>) -> Json<serde_json::Value> {
 /// GET /metrics — Prometheus text exposition of the process counters.
 async fn metrics(State(state): State<Arc<AppState>>) -> Response {
     let m = &state.metrics;
-    let body = format!(
+    let mut body = format!(
         "damon_requests_total {}\n\
          damon_prompts_total {}\n\
          damon_tokens_input_total {}\n\
          damon_tokens_output_total {}\n\
-         damon_active_sessions {}\n",
+         damon_active_sessions {}\n\
+         damon_mcp_tool_calls_total {}\n\
+         damon_mcp_tool_errors_total {}\n",
         m.requests_total.load(Ordering::Relaxed),
         m.prompts_total.load(Ordering::Relaxed),
         m.tokens_input.load(Ordering::Relaxed),
         m.tokens_output.load(Ordering::Relaxed),
         state.live_prompts.lock().await.len(),
+        m.mcp_tool_calls.load(Ordering::Relaxed),
+        m.mcp_tool_errors.load(Ordering::Relaxed),
     );
+    // Per-provider upstream stats — Prometheus labels carry the provider
+    // name (bounded by config size, safe as a label).
+    let providers = m.providers.lock().unwrap_or_else(|e| e.into_inner());
+    for (name, s) in providers.iter() {
+        body.push_str(&format!(
+            "damon_provider_requests_total{{provider=\"{name}\"}} {}\n\
+             damon_provider_errors_total{{provider=\"{name}\"}} {}\n\
+             damon_provider_latency_ms_sum{{provider=\"{name}\"}} {}\n",
+            s.requests, s.errors, s.latency_ms,
+        ));
+    }
     (
         [(
             axum::http::header::CONTENT_TYPE,
@@ -469,7 +533,12 @@ async fn forward(
         .await;
     }
 
-    match provider.forward(method.clone(), path, body.clone()).await {
+    let started = std::time::Instant::now();
+    let fwd = provider.forward(method.clone(), path, body.clone()).await;
+    state
+        .metrics
+        .record_provider(&provider_name, fwd.is_ok(), started.elapsed());
+    match fwd {
         Ok(up) => {
             // Context promotion: on a context-overflow error, retry once with
             // the configured promotion target. Client errors are buffered so
@@ -555,7 +624,12 @@ async fn promote_or_error(
     if !matches!(&*tprovider, crate::provider::Provider::OpenAiCompletions(_)) {
         return translate_forward(state, &tname, &tprovider, path, body, tmodel, 1).await;
     }
-    match tprovider.forward(method, path, body).await {
+    let started = std::time::Instant::now();
+    let fwd = tprovider.forward(method, path, body).await;
+    state
+        .metrics
+        .record_provider(&tname, fwd.is_ok(), started.elapsed());
+    match fwd {
         Ok(up) => up.into_response(),
         Err(e) => {
             // Same disclosure rule as `forward`: cause to the log, fixed
@@ -624,7 +698,12 @@ async fn translate_forward(
     }
     let stream = req["stream"].as_bool().unwrap_or(false);
     if stream {
-        match provider.chat_stream(req.clone()).await {
+        let started = std::time::Instant::now();
+        let stream_result = provider.chat_stream(req.clone()).await;
+        state
+            .metrics
+            .record_provider(provider_name, stream_result.is_ok(), started.elapsed());
+        match stream_result {
             Ok(events) => {
                 // Re-emit normalized events as OpenAI SSE chunks.
                 let sse = events.map(|ev| {
@@ -728,7 +807,12 @@ async fn translate_forward(
             }
         }
     } else {
-        match provider.chat(req.clone()).await {
+        let started = std::time::Instant::now();
+        let chat_result = provider.chat(req.clone()).await;
+        state
+            .metrics
+            .record_provider(provider_name, chat_result.is_ok(), started.elapsed());
+        match chat_result {
             Ok(v) => Json(v).into_response(),
             Err(e) => {
                 // A provider 429 must reach the client as 429 + Retry-After —

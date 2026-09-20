@@ -64,15 +64,23 @@ damond --print-config-path   # where config.toml lives
 See `config.example.toml`. Provider API keys must be `env:` or `keychain:`
 references — literals are rejected.
 
-## OAuth login (Anthropic)
+## OAuth login (subscriptions)
 
 ```sh
-damond login anthropic     # approve in browser → paste the code → tokens go to the OS keychain
-damond logout anthropic
+damond login anthropic      # Claude Pro/Max — approve in browser, paste the code
+damond login openai         # ChatGPT Plus/Pro — approve in browser, paste the callback URL
+damond login kimi-code      # Kimi For Coding — device flow, polls until approved
+damond login github-copilot # GitHub Copilot — device flow
+damond login xai-oauth      # SuperGrok / X Premium+ — device flow
+damond logout anthropic     # or: damond logout <any-provider>
 ```
 
-With `api_key = "oauth"` in config, the daemon reads the token from the
-keychain and refreshes it automatically.
+With `api_key = "oauth"` (or `"oauth:<flavor>"`) in config, the daemon
+reads the token from the keychain and refreshes it automatically.
+Pairings: `anthropic` ↔ `anthropic-messages`, `openai` / `xai-oauth` ↔
+`openai-responses`, `kimi-code` / `github-copilot` ↔
+`openai-completions`. Once logged in, the matching preset provider
+registers itself at boot (see `damond presets`).
 
 ## Remote relay
 

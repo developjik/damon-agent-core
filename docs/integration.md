@@ -21,6 +21,27 @@
 | `anthropic-messages` | Claude | `/v1/messages` translation |
 | `gemini` | Gemini | `generateContent` translation |
 
+Subscription auth: set `api_key = "oauth"` and log in once —
+`anthropic-messages` then speaks for Claude Pro/Max (`damond login
+anthropic`) and `openai-responses` for ChatGPT Plus/Pro (`damond login
+openai`). Tokens live in the OS keychain and refresh automatically; the
+openai flavor targets the ChatGPT backend unless `base_url` is set.
+Further subscription flavors: `kimi-code`, `github-copilot`, `xai-oauth`
+(RFC 8628 device flows — `damond login <flavor>`); `qwen-portal` joins
+as an env-key preset instead of a login.
+
+Provider presets: `damond presets` lists the omp-parity catalog — hosted
+backends (Groq, OpenRouter, Mistral, xAI, DeepSeek, Fireworks, Together,
+Cerebras, NVIDIA, Moonshot/Kimi, Z.AI, BigModel, MiniMax, SiliconFlow,
+Venice, Hugging Face, Vercel AI Gateway, LiteLLM, …) plus Azure OpenAI,
+Vertex AI, Bedrock-mantle and the keyless local engines `lm-studio` /
+`llama.cpp`. Any preset whose key env var is set registers itself at boot;
+an explicit `[providers.<id>]` block overrides it. Wire shapes beyond the
+four transports are compat flags: `compat.azure_deployment_urls` (+
+`azure_api_version`, key in the `api-key` header), `compat.vertex`
+(Vertex paths on a project/location base), and `compat.bearer_auth`
+(Anthropic-compatible `Authorization: Bearer` — Bedrock mantle).
+
 Model routing: the `model` field resolves by `provider/model` prefix →
 config `models` glob → default, in that order. `/v1/chat/completions`
 always answers in the OpenAI schema regardless of provider — clients never
@@ -127,7 +148,10 @@ Query-string tokens (`?token=`) are not accepted — they leak into logs
 and browser history. Unset → open on localhost.
 `GET /metrics` (behind the token gate) exposes Prometheus counters:
 `damon_requests_total`, `damon_prompts_total`, `damon_tokens_input_total`,
-`damon_tokens_output_total`, `damon_active_sessions`.
+`damon_tokens_output_total`, `damon_active_sessions`,
+`damon_mcp_tool_calls_total`, `damon_mcp_tool_errors_total`, and
+per-provider `damon_provider_requests_total` / `damon_provider_errors_total`
+/ `damon_provider_latency_ms_sum` labeled `provider="…"`.
 
 Browser origins: when no `auth_token` is configured, requests carrying an
 `Origin` header are only accepted from loopback origins (`localhost`,
@@ -142,10 +166,13 @@ Client → daemon requests:
 - `initialize` → `{protocolVersion, agentCapabilities, agentInfo}`
 - `session/new {cwd, model?}` → `{sessionId}` — `model` sets the session's
   default model (`provider/model`, glob-routed or discovered id, or a
-  `model:low|medium|high` thinking suffix). `mcpServers` must be empty or
-  omitted: per-session MCP servers are not supported and a non-empty list
-  is rejected with `-32602` (configure `[mcp_servers]` in the daemon
-  config instead).
+  `model:low|medium|high` thinking suffix). `mcpServers` declares
+  per-session stdio MCP servers — `[{name, command, args?, env?,
+  auto_approve?}]` (env as `[{name,value}]` or an object). Their tools
+  overlay the daemon's `[mcp_servers]` for that session only, are torn
+  down on session/delete and daemon shutdown, and cap at 8 per session /
+  64 live overlays; a name colliding with a configured server is
+  rejected.
 - `session/list {limit?, offset?}` → `{sessions: [{sessionId, createdAt, model}]}`
 - `session/resume {sessionId}` → `{sessionId}` (error if unknown)
 - `session/delete {sessionId}` → `{deleted: true}` — cancels a live turn
@@ -154,6 +181,10 @@ Client → daemon requests:
 - `session/search {query, limit}` → `{results: [{sessionId, messageId, snippet}]}`
 - `session/prompt {sessionId, prompt: [{type:"text", text}], model?}` → `{stopReason, model?}` — `model` overrides the session default for this turn; the response arrives when the turn ends. The result's `model` is the upstream model string actually sent to the provider — with default-provider fallback the request name passes through, with `provider/model` or glob routing it is the remapped upstream id, so clients can badge the real route taken. Absent only when the turn was cancelled before the first model resolution. Unknown `sessionId` → `-32602`.
 - `session/cancel {sessionId}` — notification; if sent with an `id` it gets an empty `{}` result
+- `session/compact {sessionId}` → `{compacted, compactedThrough?, reason?}` —
+  force a context compaction now, ignoring the 85% estimate threshold.
+  Rejected while a turn runs on the session (`-32602`); the summarization
+  itself is bounded at 120s and cancellable via `session/cancel`.
 
 Daemon → client:
 - `session/request_permission` request — the client must answer `{outcome: {outcome:"selected", optionId:"allow-once"|"reject-once"|"allow-always"}}` for tool execution to proceed. `allow-always` approves that tool for the rest of the session (in-memory only). Unanswered prompts are denied after `permission_timeout_secs` (default 300s). `auto_approve` servers never send this.

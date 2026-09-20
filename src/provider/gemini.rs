@@ -15,6 +15,10 @@ pub struct Gemini {
     base_url: String,
     client: reqwest::Client,
     key: Option<String>,
+    /// Vertex AI URL shape: `{base}/models/{model}:...` (base carries the
+    /// full /v1/projects/{p}/locations/{l}/publishers/google prefix)
+    /// instead of `{base}/v1beta/models/...`.
+    vertex: bool,
     headers: Vec<(reqwest::header::HeaderName, reqwest::header::HeaderValue)>,
 }
 
@@ -24,6 +28,7 @@ impl Gemini {
         base_url: &str,
         key: Option<String>,
         headers: &std::collections::HashMap<String, String>,
+        vertex: bool,
     ) -> anyhow::Result<Self> {
         let headers = headers
             .iter()
@@ -41,6 +46,7 @@ impl Gemini {
             base_url: base_url.trim_end_matches('/').to_string(),
             client: super::http_client(),
             key,
+            vertex,
             headers,
         })
     }
@@ -51,7 +57,11 @@ impl Gemini {
         } else {
             "generateContent"
         };
-        format!("{}/v1beta/models/{model}:{method}", self.base_url)
+        if self.vertex {
+            format!("{}/models/{model}:{method}", self.base_url)
+        } else {
+            format!("{}/v1beta/models/{model}:{method}", self.base_url)
+        }
     }
 
     fn translate_request(
@@ -574,7 +584,7 @@ mod tests {
     use super::*;
 
     fn prov() -> Gemini {
-        Gemini::new("g", "http://localhost", None, &Default::default()).unwrap()
+        Gemini::new("g", "http://localhost", None, &Default::default(), false).unwrap()
     }
 
     #[test]
