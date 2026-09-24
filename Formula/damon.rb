@@ -7,24 +7,24 @@ class Damon < Formula
   on_macos do
     on_arm do
       url "https://github.com/developjik/damon-agent-core/releases/download/v0.3.0/damon-aarch64-apple-darwin.tar.gz"
-      sha256 "06f0880225d6d0c80ca80306368ada092b1cf5ca38512ce4171f4bba6e4bc887"
+      sha256 "9cf731aeb36eb1c750f7c79005b8c243366dabd6dec3e1bec7e38ddfe886d2ea"
     end
     on_intel do
       url "https://github.com/developjik/damon-agent-core/releases/download/v0.3.0/damon-x86_64-apple-darwin.tar.gz"
-      sha256 "7304ceae2a7840c4e8537a62f8973129c82066aacacfbfd6968e52461aa75dde"
+      sha256 "c4c9f1c67d79faffb1e51350c8f9c7fe8e924210f0a1e6ebd7590da47cd05616"
     end
   end
   on_linux do
     on_intel do
       url "https://github.com/developjik/damon-agent-core/releases/download/v0.3.0/damon-x86_64-unknown-linux-gnu.tar.gz"
-      sha256 "7773ac7e946e7f42fa1c4a534162848aa76832f811ea508158b4615c327a1409"
+      sha256 "d4a650ecb439bcc0bdc8b99433b499d16b577ab8704ad184c96e53cce8af5387"
     end
     on_arm do
       # The sha256 is a placeholder — the release workflow rewrites it
       # from the published tarball on every tag ("Update Formula
       # sha256" step in .github/workflows/ci.yml).
       url "https://github.com/developjik/damon-agent-core/releases/download/v0.3.0/damon-aarch64-unknown-linux-gnu.tar.gz"
-      sha256 "0000000000000000000000000000000000000000000000000000000000000000"
+      sha256 "2802bee909065dee9c86d6476a556ccdd2db5b3c34a51317d3af7ebabce5a194"
     end
   end
 
