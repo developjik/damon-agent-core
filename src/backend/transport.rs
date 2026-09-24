@@ -318,6 +318,30 @@ fn epoch_secs() -> u64 {
         .unwrap_or(0)
 }
 
+/// PATH lookup without shelling out to `which` — checks each PATH entry
+/// for `name` plus the Windows executable extensions.
+#[cfg(windows)]
+fn which(name: &str) -> Option<std::path::PathBuf> {
+    let path_ext: Vec<String> = std::env::var("PATHEXT")
+        .unwrap_or_else(|_| ".COM;.EXE;.BAT;.CMD".to_string())
+        .split(';')
+        .map(|e| e.to_ascii_lowercase())
+        .collect();
+    for dir in std::env::split_paths(&std::env::var_os("PATH")?) {
+        let candidate = dir.join(name);
+        if candidate.is_file() {
+            return Some(candidate);
+        }
+        for ext in &path_ext {
+            let with_ext = dir.join(format!("{name}{ext}"));
+            if with_ext.is_file() {
+                return Some(with_ext);
+            }
+        }
+    }
+    None
+}
+
 /// Windows cannot exec `.cmd`/`.bat` files directly — they need the cmd
 /// interpreter. Returns `("cmd.exe", ["/c", resolved_path])` when the
 /// command resolves to a batch file, else None.
@@ -327,7 +351,7 @@ fn windows_batch(command: &str) -> Option<(String, Vec<String>)> {
     let resolved = if path.is_absolute() || command.contains(['/', '\\']) {
         Path::new(command).to_path_buf()
     } else {
-        crate::agents::which(command)?
+        which(command)?
     };
     let ext = resolved.extension()?.to_str()?.to_ascii_lowercase();
     if ext == "cmd" || ext == "bat" {

@@ -139,13 +139,13 @@ section { scroll-margin-top: 72px; }
 .hero-scrim {
   position: absolute; inset: 0; pointer-events: none;
   background:
-    radial-gradient(ellipse 60% 70% at 18% 45%, rgba(10, 14, 22, 0.88), transparent 65%),
+    radial-gradient(ellipse 68% 80% at 16% 45%, rgba(10, 14, 22, 0.94), transparent 72%),
     linear-gradient(180deg, rgba(10, 14, 22, 0.55), transparent 22%, transparent 70%, var(--bg) 100%);
 }
 
 .hero-inner { position: relative; z-index: 2; width: 100%; }
 
-.hero-copy { max-width: 640px; }
+.hero-copy { max-width: 640px; text-shadow: 0 1px 10px rgba(10, 14, 22, 0.85); }
 
 .hero h1 {
   font-size: clamp(38px, 6vw, 62px);
@@ -188,6 +188,7 @@ section { scroll-margin-top: 72px; }
 .install-box code { background: none; padding: 0; font-size: 14.5px; color: var(--accent-2); }
 
 .copy-btn {
+  position: relative;
   display: inline-flex; align-items: center; justify-content: center;
   width: 30px; height: 30px; border-radius: 8px;
   border: 1px solid var(--border);
@@ -197,10 +198,6 @@ section { scroll-margin-top: 72px; }
 }
 .copy-btn:hover { color: var(--accent-2); border-color: var(--accent); }
 .copy-btn.copied { color: #4ade80; border-color: #4ade80; }
-.copy-btn.copied::after {
-  content: ""; position: absolute; width: 0; height: 0;
-}
-.copy-btn { position: relative; }
 
 .cta-row { display: flex; flex-wrap: wrap; gap: 12px; }
 
