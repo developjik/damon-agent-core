@@ -106,3 +106,52 @@ fn print_definition_matches_platform_generator() {
     #[cfg(not(any(target_os = "macos", target_os = "linux", target_os = "windows")))]
     assert_eq!(def, "unsupported platform");
 }
+
+#[test]
+fn launchctl_kickstart_targets_gui_domain() {
+    assert_eq!(
+        launchctl_kickstart(501),
+        vec!["launchctl", "kickstart", "-k", "gui/501/dev.damon.damond"]
+    );
+}
+
+#[test]
+fn launchctl_bootout_targets_gui_domain() {
+    assert_eq!(
+        launchctl_bootout(501),
+        vec!["launchctl", "bootout", "gui/501/dev.damon.damond"]
+    );
+}
+
+#[test]
+fn systemctl_user_maps_actions_to_verbs() {
+    assert_eq!(
+        systemctl_user(Action::Start),
+        vec!["systemctl", "--user", "start", "damond"]
+    );
+    assert_eq!(
+        systemctl_user(Action::Stop),
+        vec!["systemctl", "--user", "stop", "damond"]
+    );
+    assert_eq!(
+        systemctl_user(Action::Restart),
+        vec!["systemctl", "--user", "restart", "damond"]
+    );
+}
+
+#[test]
+fn schtasks_control_runs_or_ends() {
+    // schtasks has no restart verb: /Run covers start and restart.
+    assert_eq!(
+        schtasks_control(Action::Start),
+        vec!["schtasks", "/Run", "/TN", "damond"]
+    );
+    assert_eq!(
+        schtasks_control(Action::Restart),
+        vec!["schtasks", "/Run", "/TN", "damond"]
+    );
+    assert_eq!(
+        schtasks_control(Action::Stop),
+        vec!["schtasks", "/End", "/TN", "damond"]
+    );
+}

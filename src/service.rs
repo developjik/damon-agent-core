@@ -3,6 +3,71 @@
 
 use std::path::PathBuf;
 
+/// What `damond service <action>` should do with the registered service.
+/// Kept here (not in the CLI) so the command builders below stay pure
+/// and unit-testable without clap.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Action {
+    Start,
+    Stop,
+    Restart,
+}
+
+impl Action {
+    fn systemctl_verb(self) -> &'static str {
+        match self {
+            Action::Start => "start",
+            Action::Stop => "stop",
+            Action::Restart => "restart",
+        }
+    }
+}
+
+/// launchctl start-or-restart: `kickstart -k` kills a running instance
+/// and starts a fresh one, so Start and Restart share it.
+pub fn launchctl_kickstart(uid: u32) -> Vec<String> {
+    vec![
+        "launchctl".into(),
+        "kickstart".into(),
+        "-k".into(),
+        format!("gui/{uid}/dev.damon.damond"),
+    ]
+}
+
+/// launchctl stop: bootout tears the gui-domain job down. Errors when
+/// the agent is not loaded — the caller treats that best-effort.
+pub fn launchctl_bootout(uid: u32) -> Vec<String> {
+    vec![
+        "launchctl".into(),
+        "bootout".into(),
+        format!("gui/{uid}/dev.damon.damond"),
+    ]
+}
+
+/// systemd user unit control command.
+pub fn systemctl_user(action: Action) -> Vec<String> {
+    vec![
+        "systemctl".into(),
+        "--user".into(),
+        action.systemctl_verb().into(),
+        "damond".into(),
+    ]
+}
+
+/// Task Scheduler control command: `/Run` starts (and "restarts" —
+/// schtasks has no separate restart verb), `/End` stops.
+pub fn schtasks_control(action: Action) -> Vec<String> {
+    vec![
+        "schtasks".into(),
+        match action {
+            Action::Stop => "/End".into(),
+            _ => "/Run".into(),
+        },
+        "/TN".into(),
+        "damond".into(),
+    ]
+}
+
 /// launchd plist for a user agent.
 pub fn launchd_plist(exe: &str, config: &str, log: &str) -> String {
     // Paths go into XML verbatim — escape or a `&`/`<` in a path
@@ -103,6 +168,71 @@ pub fn schtasks_command(exe: &str, config: &str) -> String {
     format!(
         "schtasks /Create /TN damond /SC ONLOGON /TR \"\\\"{exe}\\\" --config \\\"{config}\\\"\" /F"
     )
+}
+
+/// Run a service-control command line, folding its outcome into one
+/// human-readable line. Best-effort: a stop of a non-running service is
+/// reported, not fatal.
+fn run_control(cmd: &[String]) -> String {
+    let display = cmd.join(" ");
+    match std::process::Command::new(&cmd[0]).args(&cmd[1..]).output() {
+        Ok(o) if o.status.success() => format!("ran: {display}"),
+        Ok(o) => {
+            let why = String::from_utf8_lossy(&o.stderr).trim().to_string();
+            let why = if why.is_empty() {
+                String::from_utf8_lossy(&o.stdout).trim().to_string()
+            } else {
+                why
+            };
+            let why = if why.is_empty() {
+                format!("exit {}", o.status)
+            } else {
+                why
+            };
+            format!("best-effort: `{display}` failed — {why}")
+        }
+        Err(e) => format!("best-effort: cannot run `{display}` — {e}"),
+    }
+}
+
+/// The current user's numeric id, for launchd's gui/<uid> domain.
+#[cfg(unix)]
+fn current_uid() -> anyhow::Result<u32> {
+    let out = std::process::Command::new("id")
+        .arg("-u")
+        .output()
+        .map_err(|e| anyhow::anyhow!("cannot run `id -u`: {e}"))?;
+    String::from_utf8_lossy(&out.stdout)
+        .trim()
+        .parse::<u32>()
+        .map_err(|e| anyhow::anyhow!("`id -u` output not a uid: {e}"))
+}
+
+/// Start/stop/restart the registered service on this platform. Returns
+/// what was run (and whether it worked) — never fatal, matching the
+/// best-effort posture of uninstall.
+pub fn control(action: Action) -> anyhow::Result<String> {
+    #[cfg(target_os = "macos")]
+    {
+        let uid = current_uid()?;
+        let cmd = match action {
+            Action::Stop => launchctl_bootout(uid),
+            _ => launchctl_kickstart(uid),
+        };
+        return Ok(run_control(&cmd));
+    }
+    #[cfg(target_os = "linux")]
+    {
+        return Ok(run_control(&systemctl_user(action)));
+    }
+    #[cfg(target_os = "windows")]
+    {
+        return Ok(run_control(&schtasks_control(action)));
+    }
+    #[allow(unreachable_code)]
+    Err(anyhow::anyhow!(
+        "service control not supported on this platform"
+    ))
 }
 
 pub fn launchd_plist_path() -> PathBuf {

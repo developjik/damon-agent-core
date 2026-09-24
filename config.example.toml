@@ -1,128 +1,53 @@
 # Damon agent core — example configuration
 # Copy to the platform config dir (run `damond --print-config-path` to see it).
 # .env files are loaded from the config dir, then cwd (existing env wins).
+#
+# Damon drives coding agents through their native CLIs — Claude Code,
+# Codex CLI, Oh My Pi. Each backend brings its own login, models, and
+# tools. If the CLIs are installed and logged in, NOTHING below is required.
 
 # bind = "127.0.0.1:9470"          # default; changing requires restart
-# auth_token = "env:DAMON_TOKEN"   # optional bearer token for /v1/*
+# auth_token = "env:DAMON_TOKEN"   # required for non-loopback binds
 
-# permission_timeout_secs = 300   # deny tool calls if the permission prompt
-#                                 # goes unanswered this long
-# max_tool_output = 8192          # bytes persisted per tool result (head+tail kept)
-# summary_model = "gpt-4o-mini"   # cheaper model for compaction summaries;
-#                                 # default: the session's own model
-# session_retention_days = 30     # delete sessions older than this; unset = keep forever
+# Session store location (SQLite + FTS5) — defaults to the platform
+# data dir (~/.local/share/damon, ~/Library/Application Support/…).
+# data_dir = "/path/to/data"
 
-[providers.default]
-api      = "openai-completions"    # openai-completions | openai-responses | anthropic-messages | gemini
-base_url = "https://api.openai.com/v1"
-api_key  = "env:OPENAI_API_KEY"    # env:VAR | keychain:svc/acct | "!cmd" (e.g. "!op read op://dev/openai")
-models   = ["gpt-*"]               # model globs routed here
-default_model = "gpt-4o"           # used by the agent runtime
-# discovery = "openai-models-list" # GET {base}/models → discovered ids join routing
-#                                  # "ollama" → GET {base}/api/tags
-# context_promotion_target = "big-model"  # retry once on context overflow ("provider/model" or bare id)
+# Backend selection when session.create omits `backend`:
+# default_backend = "claude"
 
-# Per-model metadata overrides. Built-in hints cover common families;
-# add entries for models the hints miss.
-# [models."claude-*"]
-# context_window = 200000
-# max_output_tokens = 8192
-# input_cost = 3.0    # USD per million input tokens
-# output_cost = 15.0  # USD per million output tokens
+# Backend launch overrides — every field optional, catalog defaults otherwise.
+# [backends.claude]
+# command = "claude"                       # or a local adapter build's path
+# args = ["-p", "--output-format", "stream-json", "--input-format", "stream-json", "--verbose"]
+# [backends.claude.env]
+# ANTHROPIC_MODEL = "claude-sonnet-4-5"
 
-# Extra headers on every upstream request. Values may be secret refs.
-# [providers.default.headers]
-# X-Team = "platform"
+# Any other agent CLI plugs in the same way (always available, no PATH check):
+# [backends.my-agent]
+# command = "/path/to/agent-cli"
+# args = []
+# [backends.my-agent.env]
+# KEY = "value"
 
-# Endpoint quirks — set only what the endpoint needs.
-# [providers.default.compat]
-# supports_store = true                    # send store:false
-# supports_developer_role = true           # system → developer
-# supports_multiple_system_messages = false # coalesce system messages
-# max_tokens_field = "max_completion_tokens" # o-series / newer endpoints
-# requires_tool_result_name = true         # Mistral
-# requires_mistral_tool_ids = true         # 9-char alphanumeric tool ids
-# supports_usage_in_streaming = false      # omit stream_options
-# azure_deployment_urls = true            # Azure OpenAI: /deployments/{model} path
-# azure_api_version = "2024-10-21"        #   + api-version query (key in `api-key` header)
-# bearer_auth = true                      # anthropic-compatible Bearer instead of x-api-key
-#                                         # (Bedrock mantle / Bearer-fronting gateways)
-# vertex = true                           # Vertex AI paths on a project/location base
-# inband_tools = true                     # render tools as text prompt, parse <tool_call> blocks
-# [providers.default.compat.extra_body]
-# gateway = "m1-01"
-
-# [providers.o3]
-# api     = "openai-responses"
-# api_key = "env:OPENAI_API_KEY"
-# models  = ["o3*", "gpt-5*"]
-
-# [providers.claude]
-# api     = "anthropic-messages"
-# api_key = "env:ANTHROPIC_API_KEY"
-# models  = ["claude-*"]
-# default_model = "claude-sonnet-4-5"
-
-# Subscription auth — no API key needed. Login once, tokens live in the
-# OS keychain and refresh automatically.
-# [providers.chatgpt]
-# api     = "openai-responses"      # ChatGPT Plus/Pro (`damond login openai`)
-# api_key = "oauth"                 # base_url defaults to the ChatGPT backend
-# models  = ["gpt-5*", "codex-*"]
-
-# omp-parity presets — providers auto-register when their key env var is
-# set (or after `damond login` for the subscription flavors kimi-code /
-# github-copilot / xai-oauth), zero Damon config needed. An explicit
-# [providers.<id>] block here overrides the preset of the same id. Full
-# list: `damond presets`.
-# Examples (all covered): GROQ_API_KEY, OPENROUTER_API_KEY, MISTRAL_API_KEY,
-# XAI_API_KEY, DEEPSEEK_API_KEY, MOONSHOT_API_KEY/KIMI_API_KEY, ZAI_API_KEY,
-# AZURE_OPENAI_API_KEY + AZURE_OPENAI_ENDPOINT, GOOGLE_CLOUD_API_KEY +
-# GOOGLE_CLOUD_PROJECT + GOOGLE_CLOUD_LOCATION, AWS_BEARER_TOKEN_BEDROCK +
-# AWS_REGION, GEMINI_API_KEY — and keyless local engines lm-studio /
-# llama.cpp (discovered on their default ports).
-
-# [providers.gemini]
-# api     = "gemini"
-# api_key = "env:GEMINI_API_KEY"
-# models  = ["gemini-*"]
-
-# Implicit ollama: if no [providers.ollama] exists, damond probes
-# $OLLAMA_HOST (default http://127.0.0.1:11434) at startup and on reload.
-# Discovered models route automatically — no config needed.
-
-# MCP tool servers (stdio). Tools are namespaced as "server.tool".
-# auto_approve = false → client gets a session/request_permission prompt.
+# MCP servers forwarded to every agent session at session.create time —
+# the AGENT spawns and permissions them (Damon never launches them itself).
 # [mcp_servers.filesystem]
 # command = "npx"
 # args = ["-y", "@modelcontextprotocol/server-filesystem", "/tmp"]
-# auto_approve = false
 
-# Builtin tools — fs.read/fs.write/fs.edit/fs.list/fs.search + shell.exec,
-# always available without MCP config. On by default.
-# [builtin_tools]
-# enabled = true              # false removes every builtin tool
-# auto_approve = false        # true skips the permission prompt for ALL
-#                             # builtin tools — they run with the daemon's
-#                             # privileges, so prefer leaving this off
-# shell = true                # false removes shell.exec
-# allowed_paths = []          # fs.* sandbox: canonicalized targets must
-#                             # stay under one of these roots; empty =
-#                             # unrestricted. Does NOT confine shell.exec —
-#                             # set shell = false when confinement matters
-# shell_timeout_secs = 120    # default shell.exec timeout (per-call
-#                             # timeout_secs overrides; hard ceiling 3600)
+# permission_timeout_secs = 300   # deny agent permission asks after this
+# session_retention_days = 30     # delete sessions older than this; unset = keep forever
+# agent_idle_secs = 1800          # idle backend sessions are closed after this;
+                                  # sessions reattach via the resume chain; 0 = disabled
 
-# Remote relay: dial out to a public damon-relay so clients can reach this
-# daemon without an inbound port. E2E encrypted — the relay sees only
-# ciphertext. Run your own relay: `damon-relay` (binds 0.0.0.0:8080).
+# Remote relay — dial out so clients can reach this daemon without an
+# inbound port. Run damon-relay on a public host first.
 # [relay]
-# url  = "ws://your-relay-host:8080"
-# name = "my-daemon"               # clients use this name to connect
-# secret = "env:RELAY_SECRET"      # set when the relay requires
-#                                  # DAMON_RELAY_SECRET (anti-squatting);
-#                                  # sent inside the handshake, never a URL
-#
-# auth_token note: relayed clients authenticate with the daemon's
-# auth_token. Use a high-entropy token (e.g. `openssl rand -hex 32`);
-# short guessable tokens are brute-forceable.
+# url = "ws://your-relay:8080"
+# name = "my-daemon"
+# secret = "env:DAMON_RELAY_SECRET"   # when the relay requires one
+
+# TLS — serve wss instead of ws.
+# tls_cert = "/path/to/cert.pem"
+# tls_key = "/path/to/key.pem"

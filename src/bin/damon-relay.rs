@@ -65,6 +65,15 @@ const MAX_CONNS_TOTAL: u64 = 1024;
 /// channel before the session ends and frees its slot.
 const DAEMON_SEND_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
 
+/// How long a session-ending notice (attach/disconnect) may wait on a
+/// full daemon channel — bounded so cleanup can't hang, generous enough
+/// that a merely-busy daemon still learns the session ended.
+const DAEMON_NOTIFY_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
+
+/// A tunnel socket silent this long is half-open (NAT drop, dead peer)
+/// — the daemon pings every 30s, so a healthy link never reaches it.
+const TUNNEL_IDLE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(120);
+
 /// Daemon names are map keys and log fields — restrict to a printable
 /// charset so an unauthenticated caller can't forge log lines with
 /// newlines/control chars.
@@ -289,11 +298,20 @@ async fn register_session(socket: axum::extract::ws::WebSocket, name: String, st
     let recv_task = tokio::spawn(async move {
         // Ping/Pong/Binary keep the link alive — axum yields them to us,
         // so a keepalive ping must not end the pump and drop the tunnel.
-        while let Some(msg) = reader.next().await {
+        // Any frame resets the idle clock: a socket silent for
+        // TUNNEL_IDLE_TIMEOUT is half-open, not merely quiet.
+        loop {
+            let msg = match tokio::time::timeout(TUNNEL_IDLE_TIMEOUT, reader.next()).await {
+                Err(_) => {
+                    warn!(daemon = %name2, "tunnel silent for 120s; dropping");
+                    break;
+                }
+                Ok(m) => m,
+            };
             let text = match msg {
-                Ok(Message::Text(t)) => t,
-                Ok(Message::Close(_)) | Err(_) => break,
-                Ok(_) => continue,
+                Some(Ok(Message::Text(t))) => t,
+                Some(Ok(Message::Close(_))) | Some(Err(_)) | None => break,
+                Some(Ok(_)) => continue,
             };
             let Ok(v) = serde_json::from_str::<Value>(&text) else {
                 continue;
@@ -301,6 +319,21 @@ async fn register_session(socket: axum::extract::ws::WebSocket, name: String, st
             let Some(client_id) = v["client"].as_u64() else {
                 continue;
             };
+            // The daemon ended this client session (decrypt failure,
+            // backpressure drop, replaced connect) — abort its pump so
+            // the socket closes instead of lingering as a zombie.
+            if v["disconnect"].as_bool() == Some(true) {
+                let mut map = clients.lock().await;
+                if map
+                    .get(&client_id)
+                    .is_some_and(|(owner, ..)| owner == &name2)
+                    && let Some((_, _, abort, _)) = map.remove(&client_id)
+                {
+                    warn!(client = client_id, "daemon ended client session");
+                    abort.abort();
+                }
+                continue;
+            }
             if let Some(data) = v["data"].as_str() {
                 let mut map = clients.lock().await;
                 let drop_client = match map.get(&client_id) {
@@ -513,24 +546,27 @@ async fn relay_client_session(
     };
     info!(daemon = %name, client = client_id, "client connected");
 
-    // Tell the daemon a new client attached. Best-effort: a saturated
-    // channel drops the notice (the tunnel's laggard-drop ends clients
-    // it can't serve) instead of pinning this slot on an unbounded
-    // await. A closed channel still means the daemon tunnel died before
-    // the attach was even announced — tear the session down now instead
-    // of pinning a zombie slot a rebuilt tunnel will never see.
-    match daemon_tx.try_send(json!({"client": client_id}).to_string()) {
-        Err(mpsc::error::TrySendError::Full(_)) => {
+    // Tell the daemon a new client attached. Bounded send: an unbounded
+    // await would pin this slot on a saturated daemon, while a dropped
+    // notice leaves the client a zombie the daemon never serves. A
+    // closed channel still means the daemon tunnel died before the
+    // attach was even announced — tear the session down now instead of
+    // pinning a zombie slot a rebuilt tunnel will never see.
+    match tokio::time::timeout(
+        DAEMON_NOTIFY_TIMEOUT,
+        daemon_tx.send(json!({"client": client_id}).to_string()),
+    )
+    .await
+    {
+        Err(_) | Ok(Err(mpsc::error::SendError(_))) => {
             debug!(daemon = %name, client = client_id,
-                "attach notice dropped: daemon channel saturated");
-        }
-        Err(mpsc::error::TrySendError::Closed(_)) => {
+                "attach notice dropped: daemon channel saturated or closed");
             recv_task.abort();
             send_task.abort();
             state.clients.lock().await.remove(&client_id);
             return;
         }
-        Ok(()) => {}
+        Ok(Ok(())) => {}
     }
 
     // Either pump ending ends the connection — abort the other so a
@@ -544,14 +580,17 @@ async fn relay_client_session(
     }
     state.clients.lock().await.remove(&client_id);
     // Tell the daemon this client is gone so it can prune the session.
-    // Best-effort: saturation drops the notice rather than holding the
-    // slot — the daemon's laggard-drop already reaps clients it can't
-    // deliver to.
-    if let Err(mpsc::error::TrySendError::Full(_)) =
-        daemon_tx.try_send(json!({"client": client_id, "disconnect": true}).to_string())
-    {
+    // Bounded send: a dropped notice leaks the daemon's session slot,
+    // but an unbounded await would pin cleanup on a saturated daemon —
+    // its laggard-drop reaps whatever the notice misses.
+    let sent = tokio::time::timeout(
+        DAEMON_NOTIFY_TIMEOUT,
+        daemon_tx.send(json!({"client": client_id, "disconnect": true}).to_string()),
+    )
+    .await;
+    if !matches!(sent, Ok(Ok(()))) {
         debug!(daemon = %name, client = client_id,
-            "disconnect notice dropped: daemon channel saturated");
+            "disconnect notice dropped: daemon channel saturated or closed");
     }
     info!(client = client_id, "client disconnected");
 }

@@ -5,43 +5,12 @@ use std::sync::Arc;
 
 use damon_core::api::AppState;
 use damon_core::client::DamonClient;
-use damon_core::config::{Config, ProviderConfig};
-use damon_core::mcp::McpRegistry;
+mod common;
 use damon_core::store::Store;
 use serde_json::json;
 
-fn test_config() -> Config {
-    let mut providers = std::collections::BTreeMap::new();
-    providers.insert(
-        "default".into(),
-        ProviderConfig {
-            api: "openai-completions".into(),
-            base_url: Some("http://127.0.0.1:1".into()),
-            api_key: Some("test".into()),
-            models: vec![],
-            default_model: None,
-            headers: HashMap::new(),
-            compat: Default::default(),
-            discovery: None,
-            context_promotion_target: None,
-        },
-    );
-    Config {
-        bind: "127.0.0.1:0".parse().unwrap(),
-        auth_token: Some("test-token".into()),
-        data_dir: None,
-        tls_cert: None,
-        tls_key: None,
-        mcp_servers: HashMap::new(),
-        providers,
-        models: Default::default(),
-        relay: None,
-        permission_timeout_secs: None,
-        max_tool_output: None,
-        summary_model: None,
-        session_retention_days: None,
-        builtin_tools: Default::default(),
-    }
+fn test_config() -> damon_core::config::Config {
+    common::mock_config(Some("test-token"))
 }
 
 #[tokio::test]
@@ -63,8 +32,7 @@ async fn relay_e2e() {
     let cfg = test_config();
     let shared = Arc::new(parking_lot::RwLock::new(cfg));
     let store = Store::in_memory().await.unwrap();
-    let mcp = McpRegistry::connect_all(&HashMap::new()).await;
-    let state = AppState::new(shared, store, mcp).await;
+    let state = AppState::new(shared, store).await;
     tokio::spawn(damon_core::relay::run_tunnel(
         state,
         relay_url.clone(),
@@ -82,8 +50,8 @@ async fn relay_e2e() {
     .await
     .expect("connect_relay timed out")
     .unwrap();
-    let resp = client.initialize().await.unwrap();
-    assert_eq!(resp["agentInfo"]["name"], "damond");
+    let resp = client.hello().await.unwrap();
+    assert_eq!(resp["daemon"], "damond");
 }
 
 // ---------------------------------------------------------------------------
@@ -187,7 +155,12 @@ async fn relay_register(
                 }
             }
         });
-        while let Some(Ok(axum::extract::ws::Message::Text(text))) = reader.next().await {
+        while let Some(Ok(msg)) = reader.next().await {
+            // Ping/Pong/Binary keep the link alive — only Text carries
+            // protocol frames; anything else must not end the pump.
+            let axum::extract::ws::Message::Text(text) = msg else {
+                continue;
+            };
             let Ok(v) = serde_json::from_str::<serde_json::Value>(&text) else {
                 continue;
             };
@@ -237,7 +210,12 @@ async fn relay_connect(
                 }
             }
         });
-        while let Some(Ok(axum::extract::ws::Message::Text(text))) = reader.next().await {
+        while let Some(Ok(msg)) = reader.next().await {
+            // Same as relay_register: non-Text frames are liveness, not
+            // protocol — skip them instead of ending the pump.
+            let axum::extract::ws::Message::Text(text) = msg else {
+                continue;
+            };
             let Ok(v) = serde_json::from_str::<serde_json::Value>(&text) else {
                 continue;
             };

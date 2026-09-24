@@ -14,7 +14,17 @@ use crate::client::DamonClient;
 pub trait TelegramApi: Send + Sync {
     /// Long-poll for updates. Returns raw update objects.
     async fn get_updates(&self, offset: i64, timeout_secs: u64) -> anyhow::Result<Vec<Value>>;
-    async fn send_message(&self, chat_id: i64, text: &str) -> anyhow::Result<()>;
+    /// Send a message; `thread_id` is a forum topic (message_thread_id).
+    async fn send_message(
+        &self,
+        chat_id: i64,
+        text: &str,
+        thread_id: Option<i64>,
+    ) -> anyhow::Result<()>;
+    /// Show "typing…" in the chat. Best-effort — failures are ignored.
+    async fn send_chat_action(&self, _chat_id: i64, _action: &str) -> anyhow::Result<()> {
+        Ok(())
+    }
     /// Resolve a Bot API file_id to (bytes, mime). Default errors —
     /// test doubles that never see photos don't implement it.
     async fn fetch_file(&self, _file_id: &str) -> anyhow::Result<(Vec<u8>, String)> {
@@ -74,7 +84,12 @@ impl TelegramApi for BotApi {
         Ok(resp["result"].as_array().cloned().unwrap_or_default())
     }
 
-    async fn send_message(&self, chat_id: i64, text: &str) -> anyhow::Result<()> {
+    async fn send_message(
+        &self,
+        chat_id: i64,
+        text: &str,
+        thread_id: Option<i64>,
+    ) -> anyhow::Result<()> {
         // Telegram caps messages at 4096 chars — split instead of
         // truncating so long agent replies aren't silently lost.
         const MAX: usize = 4000;
@@ -85,10 +100,14 @@ impl TelegramApi for BotApi {
             } else {
                 rest.len()
             };
+            let mut body = serde_json::json!({"chat_id": chat_id, "text": &rest[..end]});
+            if let Some(t) = thread_id {
+                body["message_thread_id"] = serde_json::json!(t);
+            }
             let resp = self
                 .http
                 .post(format!("{}/sendMessage", self.base))
-                .json(&serde_json::json!({"chat_id": chat_id, "text": &rest[..end]}))
+                .json(&body)
                 .send()
                 .await
                 .map_err(|e| self.sanitize(e))?;
@@ -104,7 +123,7 @@ impl TelegramApi for BotApi {
                 tokio::time::sleep(std::time::Duration::from_secs_f64(wait.min(30.0))).await;
                 self.http
                     .post(format!("{}/sendMessage", self.base))
-                    .json(&serde_json::json!({"chat_id": chat_id, "text": &rest[..end]}))
+                    .json(&body)
                     .send()
                     .await
                     .map_err(|e| self.sanitize(e))?
@@ -120,6 +139,20 @@ impl TelegramApi for BotApi {
                 resp["description"].as_str().unwrap_or("unknown")
             );
             rest = &rest[end..];
+        }
+        Ok(())
+    }
+    async fn send_chat_action(&self, chat_id: i64, action: &str) -> anyhow::Result<()> {
+        let resp = self
+            .http
+            .post(format!("{}/sendChatAction", self.base))
+            .json(&serde_json::json!({"chat_id": chat_id, "action": action}))
+            .send()
+            .await
+            .map_err(|e| self.sanitize(e))?;
+        // Best-effort: a 4xx here (e.g. chat gone) must not kill the turn.
+        if !resp.status().is_success() {
+            return Ok(());
         }
         Ok(())
     }
@@ -149,7 +182,11 @@ impl TelegramApi for BotApi {
             Some("jpg") | Some("jpeg") => "image/jpeg",
             Some("gif") => "image/gif",
             Some("webp") => "image/webp",
-            _ => "image/jpeg",
+            Some("txt") | Some("md") | Some("csv") | Some("log") => "text/plain",
+            Some("json") => "application/json",
+            // Unknown extensions (documents) default to a blob resource
+            // — guessing image/jpeg would feed a PDF to the image path.
+            _ => "application/octet-stream",
         }
         .to_string();
         let bytes = self
@@ -238,6 +275,15 @@ impl ChannelApi for TelegramChannel {
                 continue;
             }
             let msg = incoming_from_update(&u);
+            // Media we can't turn into a prompt (voice, video, sticker…)
+            // gets a one-line notice instead of silence — the update is
+            // still confirmed normally so it isn't redelivered.
+            if let Some((chat_id, thread_id)) = unsupported_message(&u) {
+                let _ = self
+                    .tg
+                    .send_message(chat_id, "unsupported message type", thread_id)
+                    .await;
+            }
             // A malformed entry has no id to confirm — its message, if
             // any, is delivered once and Telegram is never told it was
             // seen.
@@ -250,10 +296,27 @@ impl ChannelApi for TelegramChannel {
     }
 
     async fn send(&self, chat_id: &str, text: &str) -> anyhow::Result<()> {
+        self.send_in_thread(chat_id, None, text).await
+    }
+
+    async fn send_in_thread(
+        &self,
+        chat_id: &str,
+        thread_id: Option<&str>,
+        text: &str,
+    ) -> anyhow::Result<()> {
         let id: i64 = chat_id
             .parse()
             .map_err(|_| anyhow::anyhow!("invalid telegram chat_id: {chat_id}"))?;
-        self.tg.send_message(id, text).await
+        let tid: Option<i64> = thread_id.and_then(|t| t.parse().ok());
+        self.tg.send_message(id, text, tid).await
+    }
+
+    async fn typing(&self, chat_id: &str) -> anyhow::Result<()> {
+        let id: i64 = chat_id
+            .parse()
+            .map_err(|_| anyhow::anyhow!("invalid telegram chat_id: {chat_id}"))?;
+        self.tg.send_chat_action(id, "typing").await
     }
 
     async fn fetch(&self, att: &crate::channel::Attachment) -> anyhow::Result<(Vec<u8>, String)> {
@@ -277,9 +340,15 @@ pub fn incoming_from_update(u: &Value) -> Option<Incoming> {
     }
     let chat_id = u["message"]["chat"]["id"].as_i64()?;
     let sender_id = u["message"]["from"]["id"].as_i64().map(|id| id.to_string());
+    // Forum topics: message_thread_id scopes the conversation to its
+    // own session lane.
+    let thread_id = u["message"]["message_thread_id"]
+        .as_i64()
+        .map(|t| t.to_string());
     if let Some(text) = u["message"]["text"].as_str() {
         return Some(Incoming {
             chat_id: chat_id.to_string(),
+            thread_id,
             sender_id,
             text: text.to_string(),
             attachments: Vec::new(),
@@ -288,28 +357,74 @@ pub fn incoming_from_update(u: &Value) -> Option<Incoming> {
     // Photo message: take the largest size (last in the array), caption
     // becomes the prompt text. The file_id is resolved lazily at prompt
     // time — a message that never becomes a turn never downloads.
-    let photos = u["message"]["photo"].as_array()?;
-    let file_id = photos.last()?["file_id"].as_str()?;
-    Some(Incoming {
-        chat_id: chat_id.to_string(),
-        sender_id,
-        text: u["message"]["caption"].as_str().unwrap_or("").to_string(),
-        attachments: vec![crate::channel::Attachment::TelegramFile {
-            file_id: file_id.to_string(),
-        }],
-    })
+    if let Some(photos) = u["message"]["photo"].as_array()
+        && let Some(file_id) = photos.last().and_then(|p| p["file_id"].as_str())
+    {
+        return Some(Incoming {
+            chat_id: chat_id.to_string(),
+            thread_id,
+            sender_id,
+            text: u["message"]["caption"].as_str().unwrap_or("").to_string(),
+            attachments: vec![crate::channel::Attachment::TelegramFile {
+                file_id: file_id.to_string(),
+            }],
+        });
+    }
+    // Document message: caption becomes the prompt text, the file_id is
+    // resolved lazily at prompt time like a photo.
+    if let Some(file_id) = u["message"]["document"]["file_id"].as_str() {
+        return Some(Incoming {
+            chat_id: chat_id.to_string(),
+            thread_id,
+            sender_id,
+            text: u["message"]["caption"].as_str().unwrap_or("").to_string(),
+            attachments: vec![crate::channel::Attachment::TelegramFile {
+                file_id: file_id.to_string(),
+            }],
+        });
+    }
+    None
+}
+
+/// Chat coordinates of a message whose payload we can't deliver —
+/// voice, video, sticker and friends. Returns None for non-message
+/// updates and for payloads incoming_from_update already handles.
+fn unsupported_message(u: &Value) -> Option<(i64, Option<i64>)> {
+    let msg = &u["message"];
+    if !msg.is_object() {
+        return None;
+    }
+    for key in [
+        "voice",
+        "video",
+        "video_note",
+        "audio",
+        "sticker",
+        "animation",
+    ] {
+        if msg[key].is_object() {
+            return Some((
+                msg["chat"]["id"].as_i64()?,
+                msg["message_thread_id"].as_i64(),
+            ));
+        }
+    }
+    None
 }
 
 /// Telegram bridge: thin wrapper over the generic channel bridge that
 /// keeps the update-driven API used by tests and embedders.
 pub struct Bridge {
     inner: Arc<ChannelBridge>,
+    /// Kept for the unsupported-type notice in handle_update — the
+    /// generic bridge has no public send surface.
+    tg: Arc<dyn TelegramApi>,
 }
 
 impl Bridge {
     pub fn new(tg: Arc<dyn TelegramApi>, client: DamonClient) -> Arc<Self> {
-        let inner = ChannelBridge::new(Arc::new(TelegramChannel::new(tg)), client);
-        Arc::new(Self { inner })
+        let inner = ChannelBridge::new(Arc::new(TelegramChannel::new(tg.clone())), client);
+        Arc::new(Self { inner, tg })
     }
 
     /// Restrict the bridge to these sender/chat ids — see
@@ -337,7 +452,20 @@ impl Bridge {
     pub async fn handle_update(self: &Arc<Self>, u: Value) {
         if let Some(msg) = incoming_from_update(&u) {
             self.inner
-                .handle_message(msg.chat_id, msg.sender_id, msg.text, msg.attachments)
+                .handle_message(
+                    msg.chat_id,
+                    msg.thread_id,
+                    msg.sender_id,
+                    msg.text,
+                    msg.attachments,
+                )
+                .await;
+        } else if let Some((chat_id, thread_id)) = unsupported_message(&u) {
+            // Same notice as the recv path — media we can't prompt on
+            // must not be met with silence.
+            let _ = self
+                .tg
+                .send_message(chat_id, "unsupported message type", thread_id)
                 .await;
         }
     }
@@ -367,7 +495,12 @@ mod tests {
                 Ok(batches.remove(0))
             }
         }
-        async fn send_message(&self, _chat_id: i64, _text: &str) -> anyhow::Result<()> {
+        async fn send_message(
+            &self,
+            _chat_id: i64,
+            _text: &str,
+            _thread_id: Option<i64>,
+        ) -> anyhow::Result<()> {
             Ok(())
         }
     }

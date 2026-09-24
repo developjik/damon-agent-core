@@ -5,20 +5,97 @@ use anyhow::Context;
 use serde_json::Value;
 use tokio_rusqlite::Connection;
 
-/// SQLite-backed session/message store. Append-only message log;
-/// forking and compaction are deliberately out of Phase 2 scope.
+/// SQLite-backed session/message store. Append-only message log with
+/// FTS search, usage rows, and compaction-aware reads.
 #[derive(Clone)]
 pub struct Store {
     conn: Connection,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, serde::Serialize)]
 pub struct StoredMessage {
     pub id: i64,
     pub session_id: String,
     pub role: String,
     /// OpenAI-shaped message JSON: content, tool_calls, tool_call_id, name.
     pub data: Value,
+}
+
+/// One `sessions` table row — the source for session exports.
+#[derive(Debug, Clone)]
+pub struct SessionRow {
+    pub id: String,
+    pub created_at: String,
+    pub last_active_at: Option<String>,
+    pub cwd: String,
+    pub model: Option<String>,
+    pub agent: Option<String>,
+    pub agent_session: Option<String>,
+    pub title: Option<String>,
+    pub compacted_through: i64,
+    pub summary: Option<String>,
+}
+
+/// The searchable text of one stored message, for the FTS index:
+/// `content` text (plain string, text parts of an array, or nested ACP
+/// `content` blocks) plus tool I/O — OpenAI-style `tool_calls` names
+/// and arguments on assistant messages, any `toolCall` title/rawInput,
+/// and JSON-stringified payloads for tool results with no extractable
+/// text. Image data is deliberately skipped — indexing base64 would
+/// bloat the index without ever matching a query. Returns None when
+/// nothing searchable remains.
+fn fts_text(role: &str, data: &Value) -> Option<String> {
+    let mut parts: Vec<String> = Vec::new();
+    match &data["content"] {
+        Value::String(s) => parts.push(s.clone()),
+        Value::Array(items) => {
+            for p in items {
+                if p["type"] == "text"
+                    && let Some(t) = p["text"].as_str()
+                {
+                    parts.push(t.to_string());
+                } else if p["type"] == "content"
+                    && let Some(t) = p["content"]["text"].as_str()
+                {
+                    // ACP tool_call_update content blocks wrap the text
+                    // one level deeper: {type:"content", content:{text}}.
+                    parts.push(t.to_string());
+                }
+            }
+        }
+        _ => {}
+    }
+    if role == "assistant" {
+        for tc in data["tool_calls"].as_array().into_iter().flatten() {
+            let f = &tc["function"];
+            if let Some(name) = f["name"].as_str() {
+                parts.push(name.to_string());
+            }
+            if let Some(args) = f["arguments"].as_str() {
+                parts.push(args.to_string());
+            }
+        }
+        if let Some(title) = data["toolCall"]["title"].as_str() {
+            parts.push(title.to_string());
+        }
+        let raw = &data["toolCall"]["rawInput"];
+        if let Some(s) = raw.as_str() {
+            parts.push(s.to_string());
+        } else if !raw.is_null() {
+            parts.push(raw.to_string());
+        }
+    }
+    // A tool result with no extractable text (object/number payload)
+    // still gets its compact JSON indexed — the output is what users
+    // search for.
+    if role == "tool"
+        && !matches!(&data["content"], Value::String(_) | Value::Array(_))
+        && !data["content"].is_null()
+    {
+        parts.push(data["content"].to_string());
+    }
+    let text = parts.join("\n");
+    (!text.trim().is_empty()).then_some(text)
 }
 /// Force `mode` on `path`. Session transcripts and tool I/O must not be
 /// group/world-accessible regardless of the process umask (SQLite opens
@@ -27,7 +104,7 @@ pub struct StoredMessage {
 /// looser pre-existing one is tightened with a warning; failures only
 /// warn so the store still opens.
 #[cfg(unix)]
-fn tighten_permissions(path: &Path, mode: u32) {
+pub(crate) fn tighten_permissions(path: &Path, mode: u32) {
     use std::os::unix::fs::PermissionsExt;
     use tracing::warn;
     let was_looser = std::fs::metadata(path)
@@ -69,12 +146,14 @@ impl Store {
                 "PRAGMA journal_mode = WAL;
                  PRAGMA busy_timeout = 5000;
                  PRAGMA foreign_keys = ON;
-                 CREATE TABLE IF NOT EXISTS sessions (
+                CREATE TABLE IF NOT EXISTS sessions (
                      id TEXT PRIMARY KEY,
                      created_at TEXT NOT NULL DEFAULT (datetime('now')),
                      last_active_at TEXT,
                      cwd TEXT NOT NULL DEFAULT '',
                      model TEXT,
+                     agent TEXT,
+                     agent_session TEXT,
                      compacted_through INTEGER NOT NULL DEFAULT 0,
                      summary TEXT,
                      title TEXT
@@ -92,14 +171,16 @@ impl Store {
                      session_id UNINDEXED,
                      message_id UNINDEXED
                  );
-                 CREATE TABLE IF NOT EXISTS usage (
-                     id INTEGER PRIMARY KEY AUTOINCREMENT,
-                     session_id TEXT NOT NULL,
-                     model TEXT NOT NULL DEFAULT '',
-                     input_tokens INTEGER NOT NULL DEFAULT 0,
-                     output_tokens INTEGER NOT NULL DEFAULT 0,
-                     created_at TEXT NOT NULL DEFAULT (datetime('now'))
-                 );
+                CREATE TABLE IF NOT EXISTS usage (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    session_id TEXT NOT NULL,
+                    model TEXT NOT NULL DEFAULT '',
+                    context_used INTEGER NOT NULL DEFAULT 0,
+                    context_size INTEGER NOT NULL DEFAULT 0,
+                    cost_usd REAL NOT NULL DEFAULT 0,
+                    cumulative_cost REAL,
+                    created_at TEXT NOT NULL DEFAULT (datetime('now'))
+                );
                  CREATE INDEX IF NOT EXISTS idx_usage_session
                      ON usage(session_id, id);",
             )?;
@@ -122,6 +203,11 @@ impl Store {
                     "ALTER TABLE sessions ADD COLUMN last_active_at TEXT",
                 ),
                 ("title", "ALTER TABLE sessions ADD COLUMN title TEXT"),
+                ("agent", "ALTER TABLE sessions ADD COLUMN agent TEXT"),
+                (
+                    "agent_session",
+                    "ALTER TABLE sessions ADD COLUMN agent_session TEXT",
+                ),
             ] {
                 if !cols.contains(col)
                     && let Err(e) = c.execute_batch(ddl)
@@ -132,6 +218,38 @@ impl Store {
                     // swallowing every error (locked/corrupt must fail).
                     let now: std::collections::HashSet<String> = c
                         .prepare("PRAGMA table_info(sessions)")?
+                        .query_map([], |r| r.get::<_, String>(1))?
+                        .collect::<Result<_, _>>()?;
+                    if !now.contains(col) {
+                        return Err(e.into());
+                    }
+                }
+            }
+            // Same column-existence migration for the usage table's
+            // context/cost columns added after the ACP pivot.
+            let ucols: std::collections::HashSet<String> = c
+                .prepare("PRAGMA table_info(usage)")?
+                .query_map([], |r| r.get::<_, String>(1))?
+                .collect::<Result<_, _>>()?;
+            for (col, ddl) in [
+                (
+                    "context_used",
+                    "ALTER TABLE usage ADD COLUMN context_used INTEGER NOT NULL DEFAULT 0",
+                ),
+                (
+                    "context_size",
+                    "ALTER TABLE usage ADD COLUMN context_size INTEGER NOT NULL DEFAULT 0",
+                ),
+                (
+                    "cumulative_cost",
+                    "ALTER TABLE usage ADD COLUMN cumulative_cost REAL",
+                ),
+            ] {
+                if !ucols.contains(col)
+                    && let Err(e) = c.execute_batch(ddl)
+                {
+                    let now: std::collections::HashSet<String> = c
+                        .prepare("PRAGMA table_info(usage)")?
                         .query_map([], |r| r.get::<_, String>(1))?
                         .collect::<Result<_, _>>()?;
                     if !now.contains(col) {
@@ -152,6 +270,63 @@ impl Store {
                      PRAGMA user_version = 1;",
                 )?;
             }
+            // Usage integrity (user_version 2): ACP `usage_update` cost
+            // is CUMULATIVE per agent session, but rows stored it raw,
+            // so SUM(cost_usd) over-counted every intermediate value.
+            // Old rows are rewritten once into per-turn deltas with the
+            // raw cumulative kept in `cumulative_cost`; new rows are
+            // written as deltas directly (see `record_usage`). The
+            // `cumulative_cost IS NULL` marker makes the rewrite
+            // idempotent — a re-run (crash mid-migration, two damonds)
+            // finds nothing left to convert. The never-written
+            // input_tokens/output_tokens columns go away too: agents
+            // send no token counts, and bundled SQLite (3.4x) supports
+            // DROP COLUMN (3.35+).
+            if v < 2 {
+                for (col, ddl) in [
+                    ("input_tokens", "ALTER TABLE usage DROP COLUMN input_tokens"),
+                    (
+                        "output_tokens",
+                        "ALTER TABLE usage DROP COLUMN output_tokens",
+                    ),
+                ] {
+                    let cols: std::collections::HashSet<String> = c
+                        .prepare("PRAGMA table_info(usage)")?
+                        .query_map([], |r| r.get::<_, String>(1))?
+                        .collect::<Result<_, _>>()?;
+                    if cols.contains(col)
+                        && let Err(e) = c.execute_batch(ddl)
+                    {
+                        // Same concurrent-damond re-check as the column
+                        // adds above: the loser's DROP fails with
+                        // no-such-column once the winner dropped it;
+                        // locked/corrupt db must still fail.
+                        let now: std::collections::HashSet<String> = c
+                            .prepare("PRAGMA table_info(usage)")?
+                            .query_map([], |r| r.get::<_, String>(1))?
+                            .collect::<Result<_, _>>()?;
+                        if now.contains(col) {
+                            return Err(e.into());
+                        }
+                    }
+                }
+                c.execute_batch(
+                    "UPDATE usage SET
+                         cumulative_cost = c.cum,
+                         cost_usd = CASE
+                             WHEN c.prev IS NULL OR c.cum < c.prev THEN c.cum
+                             ELSE c.cum - c.prev
+                         END
+                     FROM (
+                         SELECT id, cost_usd AS cum,
+                                LAG(cost_usd) OVER (
+                                    PARTITION BY session_id, model ORDER BY id) AS prev
+                         FROM usage WHERE cumulative_cost IS NULL
+                     ) AS c
+                     WHERE usage.id = c.id AND usage.cumulative_cost IS NULL;
+                     PRAGMA user_version = 2;",
+                )?;
+            }
             Ok::<(), rusqlite::Error>(()).map_err(tokio_rusqlite::Error::from)
         })
         .await?;
@@ -170,6 +345,8 @@ impl Store {
                      last_active_at TEXT,
                      cwd TEXT NOT NULL DEFAULT '',
                      model TEXT,
+                     agent TEXT,
+                     agent_session TEXT,
                      compacted_through INTEGER NOT NULL DEFAULT 0,
                      summary TEXT,
                      title TEXT
@@ -189,8 +366,10 @@ impl Store {
                     id INTEGER PRIMARY KEY AUTOINCREMENT,
                     session_id TEXT NOT NULL,
                     model TEXT NOT NULL DEFAULT '',
-                    input_tokens INTEGER NOT NULL DEFAULT 0,
-                    output_tokens INTEGER NOT NULL DEFAULT 0,
+                    context_used INTEGER NOT NULL DEFAULT 0,
+                    context_size INTEGER NOT NULL DEFAULT 0,
+                    cost_usd REAL NOT NULL DEFAULT 0,
+                    cumulative_cost REAL,
                     created_at TEXT NOT NULL DEFAULT (datetime('now'))
                 );
                 CREATE INDEX IF NOT EXISTS idx_usage_session
@@ -202,23 +381,22 @@ impl Store {
         Ok(Self { conn })
     }
 
-    /// `model` is the session's default model override (from session/new);
-    /// a per-prompt model still wins over it.
+    /// `agent` is the Damon agent id backing this session (e.g. "claude").
     pub async fn create_session(
         &self,
         id: &str,
         cwd: &str,
-        model: Option<&str>,
+        agent: Option<&str>,
     ) -> anyhow::Result<()> {
         let id = id.to_string();
         let cwd = cwd.to_string();
-        let model = model.map(String::from);
+        let agent = agent.map(String::from);
         self.conn
             .call(move |c| {
                 c.execute(
-                    "INSERT INTO sessions (id, cwd, model, last_active_at)
+                    "INSERT INTO sessions (id, cwd, agent, last_active_at)
                      VALUES (?1, ?2, ?3, datetime('now'))",
-                    rusqlite::params![id, cwd, model],
+                    rusqlite::params![id, cwd, agent],
                 )?;
                 Ok::<(), tokio_rusqlite::Error>(())
             })
@@ -226,22 +404,49 @@ impl Store {
         Ok(())
     }
 
-    /// The session's stored default model override, if any.
-    pub async fn session_model(&self, id: &str) -> anyhow::Result<Option<String>> {
-        let id = id.to_string();
+    /// Persist the ACP session routing: (agent id, agent-side sessionId).
+    /// Survives daemon restarts so session/resume can reattach.
+    pub async fn set_agent_session(
+        &self,
+        id: &str,
+        agent: &str,
+        agent_session: &str,
+    ) -> anyhow::Result<()> {
+        let sid = id.to_string();
+        let agent = agent.to_string();
+        let agent_session = agent_session.to_string();
+        self.conn
+            .call(move |c| {
+                c.execute(
+                    "UPDATE sessions SET agent = ?2, agent_session = ?3 WHERE id = ?1",
+                    rusqlite::params![sid, agent, agent_session],
+                )?;
+                Ok::<(), tokio_rusqlite::Error>(())
+            })
+            .await?;
+        Ok(())
+    }
+
+    /// The persisted (agent id, agent-side sessionId) for a session.
+    pub async fn agent_session(&self, id: &str) -> anyhow::Result<Option<(String, String)>> {
+        let sid = id.to_string();
         Ok(self
             .conn
             .call(move |c| {
-                c.query_row("SELECT model FROM sessions WHERE id = ?1", [id], |r| {
-                    r.get::<_, Option<String>>(0)
-                })
+                c.query_row(
+                    "SELECT COALESCE(agent, ''), COALESCE(agent_session, '')
+                     FROM sessions WHERE id = ?1",
+                    [sid],
+                    |r| Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?)),
+                )
                 .optional()
             })
             .await?
-            .flatten())
+            .filter(|(a, s)| !a.is_empty() && !s.is_empty()))
     }
 
-    /// The session's working directory — the cwd builtin tools run in.
+    /// The session's working directory — the cwd the agent's tools run
+    /// in.
     pub async fn session_cwd(&self, id: &str) -> anyhow::Result<Option<String>> {
         let id = id.to_string();
         Ok(self
@@ -267,10 +472,12 @@ impl Store {
                     rusqlite::params![sid, role, data],
                 )?;
                 let id = tx.last_insert_rowid();
-                // Index text content for full-text search.
-                if let Ok(v) = serde_json::from_str::<Value>(&data)
-                    && let Some(text) = v["content"].as_str()
-                {
+                // Index the message's searchable text for full-text
+                // search — message text and tool I/O (see `fts_text`).
+                // Applies to NEW rows only; messages written before
+                // tool-text indexing keep their original index entries.
+                let v: Value = serde_json::from_str(&data).unwrap_or(Value::Null);
+                if let Some(text) = fts_text(&role, &v) {
                     tx.execute(
                         "INSERT INTO messages_fts (content, session_id, message_id)
                              VALUES (?1, ?2, ?3)",
@@ -298,6 +505,25 @@ impl Store {
         query: &str,
         limit: usize,
     ) -> anyhow::Result<Vec<(String, i64, String)>> {
+        self.search_filtered(query, limit, None, None, None).await
+    }
+
+    /// `search` with optional narrowing: `session_id` restricts hits to
+    /// one session; `before`/`after` bound the SESSION's `created_at`
+    /// inclusively (messages carry no timestamps, so the session's
+    /// creation is the coarsest honest bound). ISO-8601 strings — a `T`
+    /// date/time separator is normalized to the space form
+    /// `datetime('now')` writes, so plain string comparison holds;
+    /// date-only bounds compare as their midnight. No filters → the
+    /// same results as [`Store::search`].
+    pub async fn search_filtered(
+        &self,
+        query: &str,
+        limit: usize,
+        session_id: Option<&str>,
+        before: Option<String>,
+        after: Option<String>,
+    ) -> anyhow::Result<Vec<(String, i64, String)>> {
         if query.trim().is_empty() {
             return Ok(vec![]);
         }
@@ -310,18 +536,50 @@ impl Store {
         let Some(query) = Self::fts5_query(query) else {
             return Ok(vec![]);
         };
+        let norm = |o: Option<String>| {
+            o.map(|s| s.trim().replacen('T', " ", 1))
+                .filter(|s| !s.is_empty())
+        };
+        let (before, after) = (norm(before), norm(after));
+        let sid = session_id.map(String::from);
         self.conn
             .call(move |c| {
-                let mut stmt = c.prepare(
-                    "SELECT session_id, message_id,
-                            snippet(messages_fts, 0, '[', ']', '…', 32)
+                let mut sql = String::from(
+                    "SELECT messages_fts.session_id, messages_fts.message_id,
+                            snippet(messages_fts, 0, char(1), char(2), '…', 32)
                      FROM messages_fts
-                     WHERE messages_fts MATCH ?1
-                     ORDER BY rank
-                     LIMIT ?2",
-                )?;
+                     JOIN sessions ON sessions.id = messages_fts.session_id
+                     WHERE messages_fts MATCH ?1",
+                );
+                let mut idx = 2;
+                if sid.is_some() {
+                    sql.push_str(&format!(" AND messages_fts.session_id = ?{idx}"));
+                    idx += 1;
+                }
+                if before.is_some() {
+                    sql.push_str(&format!(" AND sessions.created_at <= ?{idx}"));
+                    idx += 1;
+                }
+                if after.is_some() {
+                    sql.push_str(&format!(" AND sessions.created_at >= ?{idx}"));
+                    idx += 1;
+                }
+                sql.push_str(&format!(" ORDER BY rank LIMIT ?{idx}"));
+                let mut stmt = c.prepare(&sql)?;
+                let mut binds: Vec<&dyn rusqlite::ToSql> = vec![&query];
+                if let Some(s) = &sid {
+                    binds.push(s);
+                }
+                if let Some(b) = &before {
+                    binds.push(b);
+                }
+                if let Some(a) = &after {
+                    binds.push(a);
+                }
+                let lim = limit as i64;
+                binds.push(&lim);
                 let rows = stmt
-                    .query_map(rusqlite::params![query, limit as i64], |row| {
+                    .query_map(binds.as_slice(), |row| {
                         Ok((row.get(0)?, row.get(1)?, row.get(2)?))
                     })?
                     .collect::<Result<Vec<_>, _>>()?;
@@ -447,8 +705,8 @@ impl Store {
             .conn
             .call(move |c| {
                 // Read cutoff + rows in one transaction — a concurrent
-                // set_compaction (another process) between the two reads
-                // would pair a stale summary with the wrong row window.
+                // compaction write (another process) between the two
+                // reads would pair a stale summary with the wrong window.
                 let tx = c.transaction()?;
                 let (cutoff, summary): (i64, Option<String>) = match tx.query_row(
                     "SELECT compacted_through, summary FROM sessions WHERE id = ?1",
@@ -486,8 +744,8 @@ impl Store {
         Ok(out)
     }
 
-    /// All messages with their row ids, ignoring compaction. Used by the
-    /// compactor to summarize the dropped range.
+    /// All messages with their row ids, ignoring compaction — the
+    /// session/load replay and export source.
     pub async fn messages_full(&self, session_id: &str) -> anyhow::Result<Vec<StoredMessage>> {
         let sid = session_id.to_string();
         self.conn
@@ -521,57 +779,14 @@ impl Store {
             .collect()
     }
 
-    /// Record a compaction: messages up to `through_id` are replaced by
-    /// `summary` on the next `messages()` read.
-    pub async fn set_compaction(
-        &self,
-        session_id: &str,
-        through_id: i64,
-        summary: &str,
-    ) -> anyhow::Result<()> {
-        let sid = session_id.to_string();
-        let summary = summary.to_string();
-        self.conn
-            .call(move |c| {
-                c.execute(
-                    "UPDATE sessions SET compacted_through = ?2, summary = ?3
-                     WHERE id = ?1",
-                    rusqlite::params![sid, through_id, summary],
-                )
-                .map_err(tokio_rusqlite::Error::from)
-            })
-            .await?;
-        Ok(())
-    }
-
-    /// Current compaction state: (compacted_through message id, summary).
-    pub async fn compaction(&self, session_id: &str) -> anyhow::Result<(i64, Option<String>)> {
-        let sid = session_id.to_string();
-        self.conn
-            .call(move |c| {
-                let r = c.query_row(
-                    "SELECT compacted_through, summary FROM sessions WHERE id = ?1",
-                    rusqlite::params![sid],
-                    |row| Ok((row.get(0)?, row.get(1)?)),
-                );
-                match r {
-                    Ok(v) => Ok::<(i64, Option<String>), tokio_rusqlite::Error>(v),
-                    Err(rusqlite::Error::QueryReturnedNoRows) => Ok((0, None)),
-                    Err(e) => Err(e.into()),
-                }
-            })
-            .await
-            .map_err(Into::into)
-    }
-
-    /// All sessions as `(id, created_at, model, title)` — model/title are
+    /// All sessions as `(id, created_at, agent, title)` — agent/title are
     /// empty strings when unset.
     pub async fn list_sessions(&self) -> anyhow::Result<Vec<(String, String, String, String)>> {
         self.conn
             .call(|c| {
                 let mut stmt = c.prepare(
-                    "SELECT id, created_at, COALESCE(model, ''), COALESCE(title, '')
-                     FROM sessions ORDER BY created_at",
+                    "SELECT id, created_at, COALESCE(agent, ''), COALESCE(title, '')
+                     FROM sessions ORDER BY created_at, id",
                 )?;
                 let rows = stmt
                     .query_map([], |row| {
@@ -616,91 +831,143 @@ impl Store {
             .await
             .map_err(Into::into)
     }
-
-    /// Record one turn's token usage. Called once per completed prompt
-    /// turn — a zero-usage turn (cancelled before first response) writes
-    /// nothing so the table only holds real consumption.
+    /// Record one turn's context snapshot. Called once per completed
+    /// prompt turn with the agent's last `usage_update`: `context_used`
+    /// is the window fill level, `context_size` its capacity, `cost_usd`
+    /// the CUMULATIVE cost the agent reported. The row stores the
+    /// per-turn delta in `cost_usd` (this turn's cumulative minus the
+    /// previous row's, so SUM(cost_usd) is the real session total) and
+    /// the raw cumulative in `cumulative_cost` as the next turn's
+    /// baseline. A cumulative reset (fresh agent session, restarted
+    /// counter) has no sane subtraction — the clamp keeps the reported
+    /// value instead of going negative. A turn with no usage update
+    /// (cancelled before the first response) writes nothing.
     pub async fn record_usage(
         &self,
         session_id: &str,
         model: &str,
-        input: u64,
-        output: u64,
+        context_used: u64,
+        context_size: u64,
+        cost_usd: f64,
     ) -> anyhow::Result<()> {
-        if input == 0 && output == 0 {
+        if context_used == 0 && cost_usd == 0.0 {
             return Ok(());
         }
         let sid = session_id.to_string();
         let model = model.to_string();
         self.conn
             .call(move |c| {
-                c.execute(
-                    "INSERT INTO usage (session_id, model, input_tokens, output_tokens)
-                     VALUES (?1, ?2, ?3, ?4)",
-                    rusqlite::params![sid, model, input as i64, output as i64],
+                // Read the baseline and insert in one transaction —
+                // two back-to-back turns must not both subtract the
+                // same predecessor.
+                let tx = c.transaction()?;
+                let last: Option<f64> = tx
+                    .query_row(
+                        "SELECT cumulative_cost FROM usage
+                         WHERE session_id = ?1 ORDER BY id DESC LIMIT 1",
+                        rusqlite::params![sid],
+                        |r| r.get::<_, Option<f64>>(0),
+                    )
+                    .optional()?
+                    .flatten();
+                let delta = match last {
+                    Some(prev) if cost_usd >= prev => cost_usd - prev,
+                    // Reset (or NULL baseline from a pre-migration row):
+                    // keep the raw value — no negative, no subtraction.
+                    _ => cost_usd,
+                };
+                tx.execute(
+                    "INSERT INTO usage
+                         (session_id, model, context_used, context_size, cost_usd, cumulative_cost)
+                     VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+                    rusqlite::params![
+                        sid,
+                        model,
+                        context_used as i64,
+                        context_size as i64,
+                        delta,
+                        cost_usd
+                    ],
                 )?;
+                tx.commit()?;
                 Ok::<(), tokio_rusqlite::Error>(())
             })
             .await
             .map_err(Into::into)
     }
 
-    /// Per-model totals across all sessions: (model, input, output, turns).
-    pub async fn usage_summary(&self) -> anyhow::Result<Vec<(String, u64, u64, u64)>> {
+    /// Per-model rollup across all sessions: (model, last context_used,
+    /// context_size, total cost_usd, turns). Context is a snapshot, so
+    /// the rollup reports the most recent fill level, not a sum.
+    pub async fn usage_summary(&self) -> anyhow::Result<Vec<(String, u64, u64, f64, u64)>> {
         self.conn
             .call(|c| {
                 let mut stmt = c.prepare(
-                    "SELECT model, SUM(input_tokens), SUM(output_tokens), COUNT(*)
-                     FROM usage GROUP BY model ORDER BY SUM(input_tokens) DESC",
+                    "SELECT model, context_used, context_size, cost_usd FROM usage
+                     WHERE id IN (SELECT MAX(id) FROM usage GROUP BY model)",
                 )?;
-                let rows = stmt
+                let latest: Vec<(String, i64, i64, f64)> = stmt
                     .query_map([], |row| {
-                        Ok((
-                            row.get::<_, String>(0)?,
-                            row.get::<_, i64>(1)? as u64,
-                            row.get::<_, i64>(2)? as u64,
-                            row.get::<_, i64>(3)? as u64,
-                        ))
+                        Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?))
                     })?
-                    .collect::<Result<Vec<_>, _>>()?;
-                Ok::<Vec<(String, u64, u64, u64)>, tokio_rusqlite::Error>(rows)
+                    .collect::<Result<_, _>>()?;
+                let mut stmt =
+                    c.prepare("SELECT model, SUM(cost_usd), COUNT(*) FROM usage GROUP BY model")?;
+                let totals: Vec<(String, f64, i64)> = stmt
+                    .query_map([], |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)))?
+                    .collect::<Result<_, _>>()?;
+                let mut out = Vec::new();
+                for (model, used, size, _c) in latest {
+                    let (cost, turns) = totals
+                        .iter()
+                        .find(|(m, _, _)| *m == model)
+                        .map(|(_, c, t)| (*c, *t))
+                        .unwrap_or((0.0, 0));
+                    out.push((model, used as u64, size as u64, cost, turns as u64));
+                }
+                out.sort_by(|a, b| b.3.partial_cmp(&a.3).unwrap_or(std::cmp::Ordering::Equal));
+                Ok::<Vec<(String, u64, u64, f64, u64)>, tokio_rusqlite::Error>(out)
             })
             .await
             .map_err(Into::into)
     }
 
-    /// Per-session totals: (input, output, turns).
-    pub async fn session_usage(&self, session_id: &str) -> anyhow::Result<(u64, u64, u64)> {
+    /// Per-session totals: (last context_used, context_size, total
+    /// cost_usd, turns).
+    pub async fn session_usage(&self, session_id: &str) -> anyhow::Result<(u64, u64, f64, u64)> {
         let sid = session_id.to_string();
         self.conn
             .call(move |c| {
-                let (i, o, n): (i64, i64, i64) = c.query_row(
-                    "SELECT COALESCE(SUM(input_tokens),0), COALESCE(SUM(output_tokens),0), COUNT(*)
+                let (used, size): (i64, i64) = c
+                    .query_row(
+                        "SELECT context_used, context_size FROM usage
+                         WHERE session_id = ?1 ORDER BY id DESC LIMIT 1",
+                        rusqlite::params![sid],
+                        |row| Ok((row.get(0)?, row.get(1)?)),
+                    )
+                    .unwrap_or((0, 0));
+                // "turns" = prompt turns (persisted user messages), not
+                // usage rows — an agent that reports no usage_update
+                // still ran the turn. MAX keeps the count correct for
+                // sessions whose usage rows outnumber stored prompts
+                // (e.g. rows recorded without messages in tests/tools).
+                let (cost, n): (f64, i64) = c.query_row(
+                    "SELECT COALESCE(SUM(cost_usd),0),
+                            MAX(
+                              (SELECT COUNT(*) FROM usage WHERE session_id = ?1),
+                              (SELECT COUNT(*) FROM messages
+                               WHERE session_id = ?1 AND role = 'user')
+                            )
                      FROM usage WHERE session_id = ?1",
                     rusqlite::params![sid],
-                    |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+                    |row| Ok((row.get(0)?, row.get(1)?)),
                 )?;
-                Ok::<(u64, u64, u64), tokio_rusqlite::Error>((i as u64, o as u64, n as u64))
-            })
-            .await
-            .map_err(Into::into)
-    }
-
-    /// Update the session's stored default model (None clears it).
-    pub async fn set_session_model(
-        &self,
-        session_id: &str,
-        model: Option<&str>,
-    ) -> anyhow::Result<bool> {
-        let sid = session_id.to_string();
-        let model = model.map(String::from);
-        self.conn
-            .call(move |c| {
-                let n = c.execute(
-                    "UPDATE sessions SET model = ?2 WHERE id = ?1",
-                    rusqlite::params![sid, model],
-                )?;
-                Ok::<bool, tokio_rusqlite::Error>(n > 0)
+                Ok::<(u64, u64, f64, u64), tokio_rusqlite::Error>((
+                    used as u64,
+                    size as u64,
+                    cost,
+                    n as u64,
+                ))
             })
             .await
             .map_err(Into::into)
@@ -734,6 +1001,13 @@ impl Store {
                 )?;
                 tx.execute(
                     "DELETE FROM messages WHERE session_id = ?1",
+                    rusqlite::params![id],
+                )?;
+                // Usage rows belong to the session's lifecycle too —
+                // leaving them behind orphaned totals into every
+                // future usage_summary.
+                tx.execute(
+                    "DELETE FROM usage WHERE session_id = ?1",
                     rusqlite::params![id],
                 )?;
                 tx.execute("DELETE FROM sessions WHERE id = ?1", rusqlite::params![id])?;
@@ -788,6 +1062,13 @@ impl Store {
                          SELECT value FROM json_each(?1))",
                     rusqlite::params![ids_json],
                 )?;
+                // Same orphan rule as delete_session: swept sessions
+                // must not leave usage rows behind.
+                tx.execute(
+                    "DELETE FROM usage WHERE session_id IN (
+                         SELECT value FROM json_each(?1))",
+                    rusqlite::params![ids_json],
+                )?;
                 tx.execute(
                     "DELETE FROM sessions WHERE id IN (
                          SELECT value FROM json_each(?1))",
@@ -800,6 +1081,21 @@ impl Store {
             .map_err(Into::into)
     }
 
+    /// Mark a session active now — the retention sweep's idle clock.
+    pub async fn touch(&self, id: &str) -> anyhow::Result<()> {
+        let sid = id.to_string();
+        self.conn
+            .call(move |c| {
+                c.execute(
+                    "UPDATE sessions SET last_active_at = datetime('now') WHERE id = ?1",
+                    [sid],
+                )?;
+                Ok::<(), tokio_rusqlite::Error>(())
+            })
+            .await?;
+        Ok(())
+    }
+
     /// Like `list_sessions`, but paginated — same 4-tuple shape.
     pub async fn list_sessions_paged(
         &self,
@@ -809,8 +1105,8 @@ impl Store {
         self.conn
             .call(move |c| {
                 let mut stmt = c.prepare(
-                    "SELECT id, created_at, COALESCE(model, ''), COALESCE(title, '')
-                     FROM sessions ORDER BY created_at LIMIT ?1 OFFSET ?2",
+                    "SELECT id, created_at, COALESCE(agent, ''), COALESCE(title, '')
+                     FROM sessions ORDER BY created_at, id LIMIT ?1 OFFSET ?2",
                 )?;
                 let rows = stmt
                     .query_map(rusqlite::params![limit, offset], |row| {
@@ -823,7 +1119,9 @@ impl Store {
             .map_err(Into::into)
     }
 
-    /// Like `messages_full`, but paginated by row id.
+    /// Like `messages_full`, but paginated by row id. Respects the
+    /// compaction cutoff like `messages` — paged reads must not leak
+    /// rows the unpaged path hides (the summary row is not injected).
     pub async fn messages_paged(
         &self,
         session_id: &str,
@@ -835,7 +1133,10 @@ impl Store {
             .call(move |c| {
                 let mut stmt = c.prepare(
                     "SELECT id, session_id, role, data FROM messages
-                     WHERE session_id = ?1 ORDER BY id LIMIT ?2 OFFSET ?3",
+                     WHERE session_id = ?1
+                       AND id > COALESCE(
+                           (SELECT compacted_through FROM sessions WHERE id = ?1), 0)
+                     ORDER BY id LIMIT ?2 OFFSET ?3",
                 )?;
                 let rows = stmt
                     .query_map(rusqlite::params![sid, limit, offset], |row| {
@@ -860,5 +1161,139 @@ impl Store {
                 })
             })
             .collect()
+    }
+
+    /// One session's full row — the export source. None when the id is
+    /// unknown.
+    pub async fn session_row(&self, id: &str) -> anyhow::Result<Option<SessionRow>> {
+        let sid = id.to_string();
+        Ok(self
+            .conn
+            .call(move |c| {
+                c.query_row(
+                    "SELECT id, created_at, last_active_at, cwd, model, agent,
+                            agent_session, title, compacted_through, summary
+                     FROM sessions WHERE id = ?1",
+                    rusqlite::params![sid],
+                    |r| {
+                        Ok(SessionRow {
+                            id: r.get(0)?,
+                            created_at: r.get(1)?,
+                            last_active_at: r.get(2)?,
+                            cwd: r.get(3)?,
+                            model: r.get(4)?,
+                            agent: r.get(5)?,
+                            agent_session: r.get(6)?,
+                            title: r.get(7)?,
+                            compacted_through: r.get(8)?,
+                            summary: r.get(9)?,
+                        })
+                    },
+                )
+                .optional()
+            })
+            .await?)
+    }
+
+    /// Write a consistent snapshot of the whole database to `to` via
+    /// `VACUUM INTO`. Safe while the daemon is live — SQLite takes the
+    /// snapshot under its normal locking, so WAL writers continue — and
+    /// the target must NOT exist: SQLite refuses to overwrite, which is
+    /// exactly the backup semantics we want. The result is a compacted,
+    /// self-contained file (no -wal/-shm sidecars needed to read it).
+    pub async fn backup(&self, to: &Path) -> anyhow::Result<()> {
+        let dest = to.display().to_string();
+        self.conn
+            .call(move |c| {
+                // VACUUM INTO takes its filename as a parameter-bound
+                // expression; it cannot run inside a transaction, and
+                // conn.call closures never open one implicitly.
+                c.execute("VACUUM INTO ?1", rusqlite::params![dest])?;
+                Ok::<(), tokio_rusqlite::Error>(())
+            })
+            .await?;
+        // The snapshot holds the same transcripts — force the same
+        // private mode as the live database file.
+        #[cfg(unix)]
+        tighten_permissions(to, 0o600);
+        Ok(())
+    }
+
+    /// Duplicate a session: new id, copied row fields (cwd/model/agent/
+    /// title suffixed " (fork)"), and copied messages — optionally only
+    /// up to and including `upto` (an original message id). The agent's
+    /// own session id is NOT copied: the fork must attach a fresh agent
+    /// session (the agent cannot branch its own context). Copied
+    /// messages are re-indexed for FTS under their new ids, so a fork's
+    /// history is searchable. One transaction — a crash mid-fork leaves
+    /// no half-copied session.
+    pub async fn fork_session(&self, from: &str, upto: Option<i64>) -> anyhow::Result<String> {
+        let from = from.to_string();
+        let new_id = uuid::Uuid::new_v4().to_string();
+        let nid = new_id.clone();
+        self.conn
+            .call(move |c| {
+                let tx = c.transaction()?;
+                let row = tx
+                    .query_row(
+                        "SELECT cwd, model, agent, title FROM sessions WHERE id = ?1",
+                        rusqlite::params![from],
+                        |r| {
+                            Ok((
+                                r.get::<_, String>(0)?,
+                                r.get::<_, Option<String>>(1)?,
+                                r.get::<_, Option<String>>(2)?,
+                                r.get::<_, Option<String>>(3)?,
+                            ))
+                        },
+                    )
+                    .optional()?
+                    .ok_or_else(|| rusqlite::Error::QueryReturnedNoRows)?;
+                let (cwd, model, agent, title) = row;
+                let new_title = title.map(|t| format!("{t} (fork)"));
+                tx.execute(
+                    "INSERT INTO sessions (id, created_at, last_active_at, cwd, model, agent, title)
+                     VALUES (?1, datetime('now'), datetime('now'), ?2, ?3, ?4, ?5)",
+                    rusqlite::params![nid, cwd, model, agent, new_title],
+                )?;
+                let mut stmt = tx.prepare(
+                    "SELECT id, role, data FROM messages WHERE session_id = ?1
+                       AND (?2 IS NULL OR id <= ?2) ORDER BY id",
+                )?;
+                let msgs: Vec<(i64, String, String)> = stmt
+                    .query_map(rusqlite::params![from, upto], |r| {
+                        Ok((r.get(0)?, r.get(1)?, r.get(2)?))
+                    })?
+                    .collect::<Result<_, _>>()?;
+                drop(stmt);
+                for (_old_id, role, data) in msgs {
+                    tx.execute(
+                        "INSERT INTO messages (session_id, role, data) VALUES (?1, ?2, ?3)",
+                        rusqlite::params![nid, role, data],
+                    )?;
+                    let mid = tx.last_insert_rowid();
+                    let v: Value = serde_json::from_str(&data).unwrap_or(Value::Null);
+                    if let Some(text) = fts_text(&role, &v) {
+                        tx.execute(
+                            "INSERT INTO messages_fts (content, session_id, message_id)
+                                 VALUES (?1, ?2, ?3)",
+                            rusqlite::params![text, nid, mid],
+                        )?;
+                    }
+                }
+                tx.commit()?;
+                Ok::<(), tokio_rusqlite::Error>(())
+            })
+            .await
+            .map_err(|e| {
+                // QueryReturnedNoRows surfaces as a bare rusqlite error —
+                // translate it into the message callers expect.
+                if e.to_string().contains("QueryReturnedNoRows") {
+                    anyhow::anyhow!("session not found")
+                } else {
+                    e.into()
+                }
+            })?;
+        Ok(new_id)
     }
 }

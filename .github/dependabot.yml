@@ -1,0 +1,16 @@
+version: 2
+updates:
+  - package-ecosystem: github-actions
+    directory: /
+    schedule:
+      interval: weekly
+  # Cargo at the repo root (single workspace, no path deps elsewhere).
+  - package-ecosystem: cargo
+    directory: /
+    schedule:
+      interval: weekly
+  # Python client package (pyproject.toml + dev extras).
+  - package-ecosystem: pip
+    directory: /python
+    schedule:
+      interval: weekly

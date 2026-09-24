@@ -1,10 +1,9 @@
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
-use std::time::Duration;
 
-use anyhow::{Context, bail};
+use anyhow::Context;
 use notify::Watcher;
 use serde::Deserialize;
 use tracing::{info, warn};
@@ -14,48 +13,53 @@ use tracing::{info, warn};
 #[derive(Clone, Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct Config {
-    /// Listen address. Default 127.0.0.1:9470.
     #[serde(default = "default_bind")]
     pub bind: SocketAddr,
-    /// Bearer token required on /v1/* and /ws when set. May be a literal or a
-    /// `env:`/`keychain:` reference.
+    /// Optional bearer token for /ws and /metrics. Required on
+    /// non-loopback binds; `env:VAR` / `keychain:` / `!cmd` refs only.
     pub auth_token: Option<String>,
-    /// Directory for the SQLite store. Default: platform data dir.
+    /// SQLite store location; default ~/.local/share/damon (or platform
+    /// equivalent).
     pub data_dir: Option<PathBuf>,
-    /// TLS cert/key for wss:// remote access. Both or neither.
-    pub tls_cert: Option<PathBuf>,
-    pub tls_key: Option<PathBuf>,
-    /// MCP tool servers (stdio).
+    pub tls_cert: Option<String>,
+    pub tls_key: Option<String>,
+    /// MCP servers forwarded to every agent session (agents own their
+    /// tool execution; Damon just passes the list on).
     #[serde(default)]
     pub mcp_servers: HashMap<String, McpServerConfig>,
-    /// LLM providers keyed by name. `default` is used when no routing exists.
-    /// BTreeMap so iteration order (and the default fallback) is deterministic.
+    /// Per-backend launch overrides: `[backends.claude] command = "…"`
+    /// for a custom adapter, or an absolute path to a locally installed
+    /// agent CLI.
     #[serde(default)]
-    pub providers: std::collections::BTreeMap<String, ProviderConfig>,
-    /// Per-model metadata overrides, keyed by model id or glob.
-    /// `[models."claude-*"]` context_window = 200000 etc.
-    #[serde(default)]
-    pub models: std::collections::BTreeMap<String, ModelMeta>,
-    /// Remote relay: dial out to a public `damon-relay` so clients can reach
-    /// this daemon without an inbound port.
+    pub backends: BTreeMap<String, AgentConfig>,
+    /// Default backend id for session.create without an explicit backend.
+    pub default_backend: Option<String>,
+    #[serde(rename = "relay")]
     pub relay: Option<RelayConfig>,
-    /// Seconds an unanswered permission prompt waits before it is denied.
-    /// Default 300.
+    /// Deny tool calls if the permission prompt goes unanswered this long.
     pub permission_timeout_secs: Option<u64>,
-    /// Byte cap on persisted tool output (head+tail kept). Default 8 KiB.
-    pub max_tool_output: Option<usize>,
-    /// Model used for compaction summaries; defaults to the turn's model.
-    pub summary_model: Option<String>,
-    /// Sessions idle longer than this many days are pruned. Unset = keep all.
-    pub session_retention_days: Option<u32>,
-    /// Builtin fs.*/shell.exec tools — see BuiltinConfig. Always available
-    /// unless explicitly disabled; MCP servers are unaffected.
+    /// Delete sessions older than this; unset = keep forever.
+    pub session_retention_days: Option<u64>,
+    /// Idle ACP subprocesses are killed after this many seconds of no
+    /// use; the session reattaches via the resume chain on the next
+    /// prompt. 0 disables the idle sweep. Default 1800.
+    #[serde(default = "default_agent_idle_secs")]
+    pub agent_idle_secs: u64,
+}
+
+/// `[agents.<id>]` — explicit launch line for one agent. Every field
+/// optional; unset fields fall back to the catalog default.
+#[derive(Clone, Debug, Default, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct AgentConfig {
+    pub command: Option<String>,
+    pub args: Option<Vec<String>>,
     #[serde(default)]
-    pub builtin_tools: BuiltinConfig,
+    pub env: HashMap<String, String>,
 }
 
 /// `[relay]` — outbound tunnel to a public relay.
-#[derive(Clone, Debug, Deserialize)]
+#[derive(Clone, Debug, Deserialize, PartialEq)]
 #[serde(deny_unknown_fields)]
 pub struct RelayConfig {
     /// ws://host:port of the relay server.
@@ -67,83 +71,8 @@ pub struct RelayConfig {
     pub secret: Option<String>,
 }
 
-/// `[builtin_tools]` — the daemon's own fs.*/shell.exec toolset. Every
-/// field is optional; the toolset is ON by default so a fresh install is
-/// useful without MCP servers. `#[serde(default)]` at the container level
-/// makes a bare `[builtin_tools]` table valid.
-#[derive(Clone, Debug, Default, Deserialize)]
-#[serde(default, deny_unknown_fields)]
-pub struct BuiltinConfig {
-    /// Master switch. Default true; `false` removes every builtin tool.
-    pub enabled: Option<bool>,
-    /// Skip the permission prompt for ALL builtin tools. Default false —
-    /// these tools run with the daemon's privileges, so prompts are the
-    /// primary gate (see the threat model in builtin.rs).
-    pub auto_approve: Option<bool>,
-    /// shell.exec on/off. Default true. `allowed_paths` does NOT confine
-    /// the shell — set this to false when confinement matters.
-    pub shell: Option<bool>,
-    /// fs.* path sandbox: canonicalized targets must live under one of
-    /// these roots. Empty = unrestricted.
-    pub allowed_paths: Vec<String>,
-    /// Default shell.exec timeout in seconds. Default 120; a per-call
-    /// `timeout_secs` argument overrides it (hard ceiling 3600).
-    pub shell_timeout_secs: Option<u64>,
-}
-
-/// Per-model metadata. User config (`[models."<id-or-glob>"]`) overrides
-/// the built-in hints; unknown models get None → no context-aware features.
-#[derive(Clone, Debug, Default, Deserialize)]
-#[serde(deny_unknown_fields)]
-pub struct ModelMeta {
-    /// Total context window in tokens.
-    pub context_window: Option<u64>,
-    /// Max output tokens the model can emit.
-    pub max_output_tokens: Option<u64>,
-    /// USD per million input tokens (for usage reporting).
-    pub input_cost: Option<f64>,
-    /// USD per million output tokens.
-    pub output_cost: Option<f64>,
-}
-
-/// Built-in context-window hints for common model families. Deliberately
-/// small — the [models] table is the override surface, not a catalog.
-fn builtin_context_window(model: &str) -> Option<u64> {
-    Some(match model {
-        m if m.starts_with("claude-") => 200_000,
-        m if m.starts_with("gpt-4o") || m.starts_with("gpt-4-turbo") => 128_000,
-        m if m.starts_with("gpt-4.1") || m.starts_with("gpt-5") => 400_000,
-        m if m.starts_with('o') && m[1..].chars().next().is_some_and(|c| c.is_ascii_digit()) => {
-            200_000
-        }
-        m if m.starts_with("gemini-") => 1_000_000,
-        m if m.starts_with("llama")
-            || m.starts_with("qwen")
-            || m.starts_with("mistral")
-            || m.starts_with("deepseek") =>
-        {
-            128_000
-        }
-        _ => return None,
-    })
-}
-
-fn default_bind() -> SocketAddr {
-    "127.0.0.1:9470".parse().unwrap()
-}
-
-/// Default upstream base URL for an api kind. `oauth` marks subscription
-/// auth (Claude Pro/Max, ChatGPT Plus/Pro) — the OpenAI responses kind then
-/// targets the ChatGPT backend, not the platform API.
-pub fn default_base_url(api: &str, oauth: bool) -> &'static str {
-    match (api, oauth) {
-        ("anthropic-messages", _) => "https://api.anthropic.com",
-        ("gemini", _) => "https://generativelanguage.googleapis.com",
-        ("openai-responses", true) => "https://chatgpt.com/backend-api/codex",
-        _ => "https://api.openai.com/v1",
-    }
-}
-
+/// One stdio MCP server, forwarded to agents on session setup in the ACP
+/// `mcpServers` shape. Tool permissions are the agent's own concern.
 #[derive(Clone, Debug, Deserialize, PartialEq)]
 #[serde(deny_unknown_fields)]
 pub struct McpServerConfig {
@@ -152,473 +81,279 @@ pub struct McpServerConfig {
     pub args: Vec<String>,
     #[serde(default)]
     pub env: HashMap<String, String>,
-    /// Skip the permission round-trip for tools from this server.
-    #[serde(default)]
-    pub auto_approve: bool,
-}
-
-#[derive(Clone, Debug, Deserialize)]
-#[serde(deny_unknown_fields)]
-pub struct ProviderConfig {
-    /// Wire API: "openai-completions" (default), "openai-responses",
-    /// "anthropic-messages", or "gemini".
-    #[serde(default = "default_provider_api")]
-    pub api: String,
-    /// Base URL. Defaults per api when omitted.
-    pub base_url: Option<String>,
-    /// Secret reference: `env:VAR_NAME` or `keychain:service/account`.
-    /// Bare literals are rejected — secrets never live in config files.
-    pub api_key: Option<String>,
-    /// Model globs routed to this provider, e.g. ["claude-*"].
-    #[serde(default)]
-    pub models: Vec<String>,
-    /// Model the agent runtime uses with this provider.
-    pub default_model: Option<String>,
-    /// Extra headers sent on every upstream request. Values may be
-    /// `env:`/`keychain:`/`!cmd` secret references or literals.
-    #[serde(default)]
-    pub headers: HashMap<String, String>,
-    /// Model discovery: "openai-models-list" (GET {base}/models) or
-    /// "ollama" (GET {base}/api/tags).
-    pub discovery: Option<String>,
-    /// Fallback model on context-overflow errors: "model-id" (same provider)
-    /// or "provider/model-id". Retried once before surfacing the error.
-    pub context_promotion_target: Option<String>,
-    /// Endpoint quirk flags — see ProviderCompat.
-    #[serde(default)]
-    pub compat: ProviderCompat,
-}
-
-fn default_provider_api() -> String {
-    "openai-completions".to_string()
-}
-
-/// Per-provider endpoint quirks, applied when shaping OpenAI requests.
-/// All default to "leave the request alone" — set only what the endpoint needs.
-#[derive(Clone, Debug, Default, Deserialize)]
-pub struct ProviderCompat {
-    /// Send `store: false` on every request (non-standard endpoints that
-    /// reject or ignore the field get it explicitly).
-    #[serde(default)]
-    pub supports_store: bool,
-    /// Rewrite `system` role messages to `developer` (reasoning models).
-    #[serde(default)]
-    pub supports_developer_role: bool,
-    /// Preserve separate leading system/developer messages. `false` coalesces
-    /// them into one (strict-template / local hosts).
-    #[serde(default = "default_true")]
-    pub supports_multiple_system_messages: bool,
-    /// Token-limit field name: "max_tokens" (default) or
-    /// "max_completion_tokens" (o-series / newer endpoints).
-    pub max_tokens_field: Option<String>,
-    /// Tool-result messages must carry a `name` field (Mistral).
-    #[serde(default)]
-    pub requires_tool_result_name: bool,
-    /// Normalize tool-call ids to exactly 9 alphanumeric chars (Mistral).
-    #[serde(default)]
-    pub requires_mistral_tool_ids: bool,
-    /// Send `stream_options.include_usage` on streaming requests.
-    #[serde(default = "default_true")]
-    pub supports_usage_in_streaming: bool,
-    /// Extra top-level fields merged into every request body.
-    #[serde(default)]
-    pub extra_body: HashMap<String, serde_json::Value>,
-    /// Render tools as a text prompt and parse <tool_call> blocks from the
-    /// response — for local models without a native tool API.
-    #[serde(default)]
-    pub inband_tools: bool,
-    /// Azure OpenAI URL shape: `{base}/deployments/{model}{path}` with an
-    /// `api-version` query. The key rides in the `api-key` header (set it
-    /// via `headers`), not `Authorization: Bearer`.
-    #[serde(default)]
-    pub azure_deployment_urls: bool,
-    /// `api-version` query value for Azure OpenAI (required with
-    /// `azure_deployment_urls`; defaults to "2024-10-21").
-    pub azure_api_version: Option<String>,
-    /// Anthropic-compatible endpoints that take `Authorization: Bearer`
-    /// instead of `x-api-key` — AWS Bedrock bearer (mantle) surfaces and
-    /// Bearer-fronting gateways.
-    #[serde(default)]
-    pub bearer_auth: bool,
-    /// Vertex AI URL shape: `{base}/models/{model}:...` with
-    /// `x-goog-api-key` auth — `base` then carries the full
-    /// `/v1/projects/{p}/locations/{l}/publishers/google` prefix.
-    #[serde(default)]
-    pub vertex: bool,
-}
-
-impl ProviderCompat {
-    /// Default `api-version` for Azure OpenAI deployments.
-    pub fn azure_api_version_or_default(&self) -> &str {
-        self.azure_api_version.as_deref().unwrap_or("2024-10-21")
-    }
-}
-
-fn default_true() -> bool {
-    true
 }
 
 /// A secret that lives outside the config file.
 #[derive(Clone, Debug)]
 pub enum SecretRef {
+    /// Plain environment variable (`env:VAR`).
     Env(String),
-    Keychain {
-        service: String,
-        account: String,
-    },
-    /// `!command` — resolved from the command's stdout (10s timeout).
+    /// OS keychain entry (`keychain:service/account`).
+    Keychain { service: String, account: String },
+    /// Shell command whose stdout is the secret (`!cmd…`).
     Command(String),
 }
 
 impl SecretRef {
+    /// Parse a `env:`/`keychain:`/`!` reference. `Err` carries the parse
+    /// failure; a bare literal is NOT accepted here for api keys anymore
+    /// — callers decide policy.
     pub fn parse(raw: &str) -> anyhow::Result<Self> {
         if let Some(var) = raw.strip_prefix("env:") {
-            if var.is_empty() {
-                bail!("empty env var name in secret reference");
+            if var.is_empty() || var.contains(':') {
+                anyhow::bail!("invalid env reference {raw:?}");
             }
-            return Ok(Self::Env(var.to_string()));
+            return Ok(SecretRef::Env(var.to_string()));
         }
         if let Some(rest) = raw.strip_prefix("keychain:") {
-            let (service, account) = rest
-                .split_once('/')
-                .context("keychain reference must be keychain:<service>/<account>")?;
+            let Some((service, account)) = rest.split_once('/') else {
+                anyhow::bail!("keychain ref must be keychain:service/account, got {raw:?}");
+            };
             if service.is_empty() || account.is_empty() {
-                bail!("keychain reference must be keychain:<service>/<account>");
+                anyhow::bail!("keychain ref must be keychain:service/account, got {raw:?}");
             }
-            return Ok(Self::Keychain {
+            return Ok(SecretRef::Keychain {
                 service: service.to_string(),
                 account: account.to_string(),
             });
         }
         if let Some(cmd) = raw.strip_prefix('!') {
             if cmd.trim().is_empty() {
-                bail!("empty command in secret reference");
+                anyhow::bail!("empty ! command");
             }
-            return Ok(Self::Command(cmd.to_string()));
+            return Ok(SecretRef::Command(cmd.to_string()));
         }
-        bail!(
-            "secret must be a reference, not a literal — use env:VAR, keychain:service/account, or !command"
-        )
+        anyhow::bail!("expected env:, keychain:, or ! prefix")
     }
 
     pub fn resolve(&self) -> anyhow::Result<String> {
         match self {
-            Self::Env(var) => {
-                std::env::var(var).with_context(|| format!("env var {var} is not set"))
-            }
-            Self::Keychain { service, account } => keyring::Entry::new(service, account)
-                .context("keychain backend unavailable")?
-                .get_password()
-                .with_context(|| format!("keychain entry {service}/{account} not found")),
-            Self::Command(cmd) => resolve_command(cmd),
+            SecretRef::Env(var) => std::env::var(var).with_context(|| format!("${var} not set")),
+            SecretRef::Keychain { service, account } => keyring::Entry::new(service, account)
+                .context("keychain backend unavailable")
+                .and_then(|e| e.get_password().context("keychain read failed")),
+            SecretRef::Command(cmd) => resolve_command(cmd),
+        }
+    }
+
+    /// Display form for logs — never the resolved value.
+    pub fn describe(&self) -> String {
+        match self {
+            SecretRef::Env(v) => format!("env:{v}"),
+            SecretRef::Keychain { service, account } => format!("keychain:{service}/{account}"),
+            SecretRef::Command(_) => "!command".to_string(),
         }
     }
 }
 
 /// Run a shell command and return trimmed stdout. 10s timeout; empty or
-/// failing commands are errors (the provider build then fails cleanly).
+/// failing commands are errors (resolution must fail closed).
 fn resolve_command(cmd: &str) -> anyhow::Result<String> {
     use std::io::Read;
-    use std::process::{Command, Stdio};
-    use std::time::Duration;
-    use wait_timeout::ChildExt;
-
-    // Windows has no `sh` — use cmd /C there.
-    #[cfg(windows)]
-    let mut child = Command::new("cmd")
-        .args(["/C", cmd])
-        .stdout(Stdio::piped())
-        .stderr(Stdio::null())
-        .spawn()
-        .with_context(|| format!("cannot spawn secret command: {cmd}"))?;
-    #[cfg(not(windows))]
-    let mut child = Command::new("sh")
+    use std::process::Stdio;
+    let mut child = std::process::Command::new("sh")
         .arg("-c")
         .arg(cmd)
         .stdout(Stdio::piped())
+        // stderr was never surfaced by the old .output() either — null
+        // keeps a noisy command from deadlocking on a full pipe.
         .stderr(Stdio::null())
         .spawn()
-        .with_context(|| format!("cannot spawn secret command: {cmd}"))?;
-    // Drain stdout on a reader thread — a child that writes more than the
-    // OS pipe buffer blocks on write and would otherwise always time out.
-    let mut stdout = child.stdout.take();
-    let (out_tx, out_rx) = std::sync::mpsc::channel();
-    std::thread::spawn(move || {
-        let mut out = String::new();
-        if let Some(s) = stdout.as_mut() {
-            let _ = s.read_to_string(&mut out);
-        }
-        let _ = out_tx.send(out);
+        .with_context(|| format!("cannot run `{cmd}`"))?;
+    // Drain stdout on a helper thread: a command that fills the pipe
+    // buffer would otherwise deadlock against the wait loop below.
+    let mut stdout = child.stdout.take().expect("stdout piped");
+    let drained = std::thread::spawn(move || {
+        let mut buf = Vec::new();
+        let _ = stdout.read_to_end(&mut buf);
+        buf
     });
-    let status = match child.wait_timeout(Duration::from_secs(10))? {
-        Some(s) => s,
-        None => {
-            let _ = child.kill();
-            let _ = child.wait();
-            bail!("secret command timed out after 10s: {cmd}");
+    // Poll instead of wait_with_output so a hung command can be killed —
+    // the documented 10s bound must hold even when the child stalls.
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+    let status = loop {
+        match child.try_wait() {
+            Ok(Some(status)) => break status,
+            Ok(None) if std::time::Instant::now() < deadline => {
+                std::thread::sleep(std::time::Duration::from_millis(20));
+            }
+            Ok(None) => {
+                let _ = child.kill();
+                let _ = child.wait();
+                let _ = drained.join();
+                anyhow::bail!("`{cmd}` timed out after 10s");
+            }
+            Err(e) => {
+                let _ = child.kill();
+                let _ = drained.join();
+                return Err(e).with_context(|| format!("cannot wait on `{cmd}`"));
+            }
         }
     };
-    // A backgrounded grandchild can hold the pipe open forever — bound
-    // the read instead of joining unconditionally.
-    let out = out_rx
-        .recv_timeout(Duration::from_secs(5))
-        .unwrap_or_default();
+    let out = drained.join().unwrap_or_default();
     if !status.success() {
-        bail!("secret command failed ({status}): {cmd}");
+        anyhow::bail!("`{cmd}` exited with {status}");
     }
-    let out = out.trim().to_string();
-    if out.is_empty() {
-        bail!("secret command produced no output: {cmd}");
+    let s = String::from_utf8_lossy(&out).trim().to_string();
+    if s.is_empty() {
+        anyhow::bail!("`{cmd}` produced an empty secret");
     }
-    Ok(out)
+    Ok(s)
 }
+
 /// Constant-time byte equality for token/proof comparisons — a remote
 /// endpoint must not get a timing oracle on the secret.
 pub fn constant_time_eq(a: &[u8], b: &[u8]) -> bool {
-    // Length difference folds into the accumulator and every byte slot is
-    // visited either way, so short-vs-long inputs take the same path —
-    // no early return to leak the length via timing.
-    let mut diff = a.len() ^ b.len();
-    for i in 0..a.len().max(b.len()) {
-        let x = a.get(i).copied().unwrap_or(0);
-        let y = b.get(i).copied().unwrap_or(0);
-        diff |= (x ^ y) as usize;
+    if a.len() != b.len() {
+        return false;
+    }
+    let mut diff = 0u8;
+    for (x, y) in a.iter().zip(b) {
+        diff |= x ^ y;
     }
     diff == 0
 }
+
 impl Config {
+    /// Load and parse the config file. `.env` files load first (config
+    /// dir, then cwd) so `env:` refs resolve.
     pub fn load(path: &Path) -> anyhow::Result<Self> {
-        // .env files: config dir first (daemon-specific), then cwd.
-        // dotenvy never overrides already-set vars; earlier files win.
-        if let Some(dir) = path.parent() {
-            let _ = dotenvy::from_path(dir.join(".env"));
-        }
-        // Debug only: the cwd is attacker-controlled in release use —
-        // running `damond` inside a cloned repo would let a hostile .env
-        // shadow provider keys or set the (also debug-gated) OAuth test
-        // hooks. Debug builds keep it for local dev/test convenience.
-        #[cfg(debug_assertions)]
-        let _ = dotenvy::from_path(Path::new(".env"));
-        // A pre-existing config holding literal secrets must not be
-        // group/world-readable — warn like oauth.rs's 0600 convention.
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::PermissionsExt;
-            if let Ok(meta) = std::fs::metadata(path)
-                && meta.permissions().mode() & 0o077 != 0
-            {
-                warn!(
-                    path = %path.display(),
-                    "config file is group/world-readable — it may hold literal secrets; chmod 600"
-                );
+        Self::load_inner(path, true)
+    }
+
+    /// `load` without the `.env` pass — for the hot-reload path, where
+    /// mutating process env is unsound (other threads may be reading it)
+    /// and pointless: dotenvy never overrides already-set vars anyway.
+    pub fn load_no_env(path: &Path) -> anyhow::Result<Self> {
+        Self::load_inner(path, false)
+    }
+
+    fn load_inner(path: &Path, dotenv: bool) -> anyhow::Result<Self> {
+        if dotenv {
+            // dotenvy: first hit wins per var, miroring the old precedence.
+            if let Some(dir) = path.parent() {
+                // SAFETY: daemon startup — no other threads reference the env
+                // yet (single-threaded config load before the runtime spawns).
+                unsafe {
+                    let _ = dotenvy::from_path_iter(dir.join(".env")).map(|mut it| {
+                        while let Some(Ok(item)) = it.next() {
+                            if std::env::var_os(&item.0).is_none() {
+                                std::env::set_var(&item.0, item.1);
+                            }
+                        }
+                    });
+                }
             }
+            let _ = dotenvy::dotenv();
         }
         let text = std::fs::read_to_string(path)
             .with_context(|| format!("cannot read config {}", path.display()))?;
-        let cfg: Config =
-            toml::from_str(&text).with_context(|| format!("invalid TOML in {}", path.display()))?;
-        cfg.validate()?;
-        Ok(cfg)
-    }
-
-    fn validate(&self) -> anyhow::Result<()> {
-        for (name, p) in &self.providers {
-            match p.api.as_str() {
-                "openai-completions" | "openai-responses" | "anthropic-messages" | "gemini" => {}
-                other => bail!("provider {name}: unknown api '{other}'"),
-            }
-            if let Some(key) = &p.api_key {
-                // "oauth" / "oauth:<flavor>" are sentinels handled by
-                // Provider::new — the provider resolves tokens from the
-                // OS keychain itself. They are not SecretRefs and must
-                // not be validated as one.
-                if key != "oauth" && !key.starts_with("oauth:") {
-                    SecretRef::parse(key)
-                        .with_context(|| format!("provider {name}: invalid api_key"))?;
-                }
-            }
-        }
-        Ok(())
-    }
-
-    /// Route a model name to a provider: explicit `provider/model` prefix,
-    /// then config globs, then default.
-    pub fn route_model<'a>(
-        &'a self,
-        model: &'a str,
-    ) -> Option<(&'a str, &'a ProviderConfig, String)> {
-        self.route_model_strict(model).or_else(|| {
-            self.default_provider()
-                .map(|(n, p)| (n, p, model.to_string()))
-        })
-    }
-
-    /// Route without the default fallback — only explicit prefix or glob.
-    /// Used to distinguish "matched" from "fell through to default" so
-    /// discovered models can claim the request first.
-    pub fn route_model_strict<'a>(
-        &'a self,
-        model: &'a str,
-    ) -> Option<(&'a str, &'a ProviderConfig, String)> {
-        if let Some((name, upstream)) = model.split_once('/')
-            && let Some(p) = self.providers.get(name)
-        {
-            return Some((name, p, upstream.to_string()));
-        }
-        // Most-specific glob wins: iterate all providers and keep the
-        // longest matching pattern, so `aaa = ["*"]` can't shadow
-        // `zzz = ["claude-*"]` just because it sorts first in the map.
-        let mut best: Option<(&str, &ProviderConfig, usize)> = None;
-        for (name, p) in &self.providers {
-            for g in &p.models {
-                if glob_match(g, model) {
-                    let specificity = g.len();
-                    if best.is_none_or(|(_, _, s)| specificity > s) {
-                        best = Some((name, p, specificity));
-                    }
-                }
-            }
-        }
-        if let Some((name, p, _)) = best {
-            return Some((name, p, model.to_string()));
-        }
-        None
-    }
-
-    pub fn default_provider(&self) -> Option<(&str, &ProviderConfig)> {
-        self.providers
-            .get("default")
-            .map(|p| ("default", p))
-            .or_else(|| self.providers.iter().next().map(|(n, p)| (n.as_str(), p)))
-    }
-
-    /// Metadata for a model: user [models] entry (exact then glob) wins,
-    /// then the built-in context-window hint.
-    pub fn model_meta(&self, model: &str) -> ModelMeta {
-        if let Some(m) = self.models.get(model) {
-            return m.clone();
-        }
-        // Most-specific glob wins — same rule as route_model_strict.
-        let mut best: Option<(&ModelMeta, usize)> = None;
-        for (pat, m) in &self.models {
-            if glob_match(pat, model) && best.is_none_or(|(_, s)| pat.len() > s) {
-                best = Some((m, pat.len()));
-            }
-        }
-        if let Some((m, _)) = best {
-            return m.clone();
-        }
-        ModelMeta {
-            context_window: builtin_context_window(model),
-            ..Default::default()
-        }
-    }
-
-    /// Split a `model:level` suffix. Returns (model, level) where level is
-    /// one of "low" | "medium" | "high", or None if absent/unrecognized.
-    pub fn split_thinking_level(model: &str) -> (&str, Option<&str>) {
-        match model.rsplit_once(':') {
-            Some((m, level @ ("low" | "medium" | "high"))) => (m, Some(level)),
-            _ => (model, None),
-        }
+        toml::from_str(&text).with_context(|| format!("invalid config {}", path.display()))
     }
 }
 
-/// Minimal glob: `*` matches any suffix/infix, `?` one char (UTF-8 scalar).
-/// Iterative two-pointer with single-star backtracking — linear time, so
-/// a `*`-heavy pattern can't pin a worker thread on a long model name.
-pub fn glob_match(pattern: &str, s: &str) -> bool {
-    let (p, s) = (pattern.as_bytes(), s.as_bytes());
-    let (mut pi, mut si) = (0usize, 0usize);
-    // Last `*` position and the string index it resumes from.
-    let (mut star, mut star_si) = (usize::MAX, 0usize);
-    while si < s.len() {
-        if pi < p.len() && p[pi] == b'?' {
-            // `?` consumes one whole UTF-8 scalar, not one byte.
-            pi += 1;
-            si += 1;
-            while si < s.len() && (s[si] & 0xC0) == 0x80 {
-                si += 1;
-            }
-        } else if pi < p.len() && p[pi] == s[si] {
-            pi += 1;
-            si += 1;
-        } else if pi < p.len() && p[pi] == b'*' {
-            star = pi;
-            star_si = si;
-            pi += 1;
-        } else if star != usize::MAX {
-            // Mismatch after a `*`: let it consume one more char.
-            pi = star + 1;
-            star_si += 1;
-            si = star_si;
-        } else {
-            return false;
-        }
-    }
-    while pi < p.len() && p[pi] == b'*' {
-        pi += 1;
-    }
-    pi == p.len()
+fn default_bind() -> SocketAddr {
+    "127.0.0.1:9470".parse().unwrap()
+}
+
+fn default_agent_idle_secs() -> u64 {
+    1800
 }
 
 /// Default config path: platform config dir, e.g. ~/.config/damon/config.toml
 pub fn default_config_path() -> PathBuf {
     directories::ProjectDirs::from("dev", "damon", "damon")
         .map(|d| d.config_dir().join("config.toml"))
-        .unwrap_or_else(|| PathBuf::from("damon.toml"))
+        .unwrap_or_else(|| PathBuf::from("damon-config.toml"))
 }
 
 /// Default data dir for the SQLite store, e.g. ~/.local/share/damon
 pub fn default_data_dir() -> PathBuf {
     directories::ProjectDirs::from("dev", "damon", "damon")
         .map(|d| d.data_dir().to_path_buf())
-        .unwrap_or_else(|| PathBuf::from("."))
+        .unwrap_or_else(|| PathBuf::from(".damon"))
 }
 
 /// Write a starter config if none exists. Returns the path used.
 pub fn ensure_config(path: &Path) -> anyhow::Result<PathBuf> {
-    if path.exists() {
-        return Ok(path.to_path_buf());
-    }
-    if let Some(parent) = path.parent() {
-        std::fs::create_dir_all(parent)?;
+    if let Some(dir) = path.parent() {
+        std::fs::create_dir_all(dir)?;
     }
     #[cfg(unix)]
     {
         use std::io::Write;
         use std::os::unix::fs::OpenOptionsExt;
-        // create_new + mode creates the file 0600 atomically — no window
-        // where the starter config sits world-readable before the chmod.
         match std::fs::OpenOptions::new()
             .write(true)
+            // create_new keeps check-and-create atomic: exists()+write
+            // would clobber a config another damond installed meanwhile.
             .create_new(true)
+            // The file may hold a literal auth_token later — create it
+            // private instead of writing-then-chmodding.
             .mode(0o600)
             .open(path)
         {
-            Ok(mut f) => f.write_all(STARTER_CONFIG.as_bytes())?,
-            // Lost a create race — same outcome as the exists() check.
+            Ok(mut f) => {
+                f.write_all(STARTER_CONFIG.as_bytes())?;
+                info!(path = %path.display(), "wrote starter config");
+            }
             Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {
-                return Ok(path.to_path_buf());
+                warn_if_loose(path);
             }
             Err(e) => return Err(e.into()),
         }
     }
     #[cfg(not(unix))]
-    {
+    if !path.exists() {
         std::fs::write(path, STARTER_CONFIG)?;
+        info!(path = %path.display(), "wrote starter config");
     }
-    info!(path = %path.display(), "wrote starter config");
     Ok(path.to_path_buf())
 }
 
-const STARTER_CONFIG: &str = r#"# Damon agent core configuration
-# bind = "127.0.0.1:9470"        # default; changing requires restart
-# auth_token = "env:DAMON_TOKEN" # optional; literal or env:/keychain: ref
+/// Warn when an existing config is group/world-accessible — it may hold
+/// literal secrets. Warn-only: chmod-ing the user's file unprompted
+/// could surprise their tooling.
+#[cfg(unix)]
+fn warn_if_loose(path: &Path) {
+    use std::os::unix::fs::PermissionsExt;
+    let loose = std::fs::metadata(path)
+        .map(|m| m.permissions().mode() & 0o077 != 0)
+        .unwrap_or(false);
+    if loose {
+        warn!(
+            path = %path.display(),
+            "config file is group/world-accessible; consider chmod 600"
+        );
+    }
+}
 
-# [providers.default]
-# base_url = "https://api.openai.com/v1"
-# api_key  = "env:OPENAI_API_KEY"   # or "keychain:damon/openai"
+const STARTER_CONFIG: &str = r#"# Damon agent core configuration.
+#
+# Damon drives coding agents through their native CLIs: Claude Code,
+# Codex CLI, and Oh My Pi — each backend brings its own login, models,
+# and tools. If the CLIs are installed and logged in, nothing here is
+# required.
+
+# Top-level keys must precede every [table] — TOML would otherwise
+# attach them to the last table above.
+# bind = "127.0.0.1:9470"          # default; changing requires restart
+# auth_token = "env:DAMON_TOKEN"   # required for non-loopback binds
+# default_backend = "claude"       # when session.create omits `backend`
+# permission_timeout_secs = 300    # deny agent permission asks after this
+# session_retention_days = 30      # delete sessions older than this
+
+# Launch overrides:
+# [backends.claude]
+# command = "claude"                   # default launch line for claude
+# args = ["-p", "--output-format", "stream-json", "--input-format", "stream-json", "--verbose"]
+# [backends.claude.env]
+# ANTHROPIC_MODEL = "claude-sonnet-4-5"
+
+# MCP servers forwarded to every agent session:
+# [mcp_servers.filesystem]
+# command = "npx"
+# args = ["-y", "@modelcontextprotocol/server-filesystem", "/tmp"]
 "#;
 
 /// Shared, hot-reloadable config. Sync lock: guards are held only for
@@ -659,8 +394,10 @@ pub fn watch(path: PathBuf, shared: SharedConfig) -> Option<tokio::sync::mpsc::R
             match res {
                 Ok(event) if event.paths.iter().any(|p| p == &path || p == &canonical) => {
                     // Debounce: editors often write via rename bursts.
-                    tokio::time::sleep(Duration::from_millis(100)).await;
-                    match Config::load(&path) {
+                    tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+                    // load_no_env: mutating process env mid-runtime is
+                    // unsound — the .env pass only belongs at boot.
+                    match Config::load_no_env(&path) {
                         Ok(new) => {
                             {
                                 let mut cfg = shared.write();
@@ -691,61 +428,48 @@ mod tests {
     use super::*;
 
     #[test]
-    fn glob_question_mark_matches_one_utf8_scalar() {
-        // `?` consumes one whole scalar — not one byte of a multibyte char.
-        assert!(glob_match("ollama-?", "ollama-é"));
-        assert!(glob_match("??", "日本"));
-        // ASCII behavior unchanged.
-        assert!(glob_match("ollama-?", "ollama-a"));
-        assert!(glob_match("gpt-4?", "gpt-4o"));
-        // `?` must not match two scalars or zero.
-        assert!(!glob_match("ollama-?", "ollama-ae"));
-        assert!(!glob_match("ollama-?", "ollama-"));
-        assert!(!glob_match("???", "日本"));
+    fn parses_minimal_and_agent_overrides() {
+        let cfg: Config = toml::from_str("").unwrap();
+        assert_eq!(cfg.bind.to_string(), "127.0.0.1:9470");
+        assert!(cfg.mcp_servers.is_empty());
+
+        let cfg: Config = toml::from_str(
+            r#"
+            default_backend = "codex"
+            [backends.claude]
+            command = "/opt/claude"
+            args = ["--flag"]
+            [mcp_servers.fs]
+            command = "npx"
+            "#,
+        )
+        .unwrap();
+        assert_eq!(cfg.default_backend.as_deref(), Some("codex"));
+        assert_eq!(
+            cfg.backends["claude"].command.as_deref(),
+            Some("/opt/claude")
+        );
+        assert_eq!(cfg.mcp_servers["fs"].command, "npx");
     }
 
     #[test]
-    fn glob_star_and_literals_unchanged() {
-        assert!(glob_match("claude-*", "claude-sonnet-4"));
-        assert!(glob_match("*", "anything"));
-        assert!(glob_match("gpt-*", "gpt-4o-mini"));
-        assert!(!glob_match("claude-*", "gpt-4o"));
-        assert!(glob_match("", ""));
-        assert!(!glob_match("gpt-4", "gpt-4o"));
+    fn rejects_unknown_fields() {
+        assert!(toml::from_str::<Config>(r#"providers = {}"#).is_err());
     }
 
     #[test]
-    fn constant_time_eq_accepts_equal_rejects_unequal() {
-        assert!(constant_time_eq(b"secret", b"secret"));
-        assert!(constant_time_eq(b"", b""));
-        assert!(!constant_time_eq(b"secret", b"secreT"));
-        assert!(!constant_time_eq(b"secret", b"secre"));
-        assert!(!constant_time_eq(b"", b"x"));
-        assert!(!constant_time_eq(b"short", b"a-longer-secret"));
+    fn secret_refs_parse_and_describe() {
+        assert!(matches!(SecretRef::parse("env:X"), Ok(SecretRef::Env(_))));
+        assert!(SecretRef::parse("literal").is_err());
+        assert!(SecretRef::parse("env:").is_err());
+        assert!(SecretRef::parse("keychain:s").is_err());
+        assert_eq!(SecretRef::parse("!echo hi").unwrap().describe(), "!command");
     }
 
     #[test]
-    fn model_meta_rejects_unknown_fields() {
-        assert!(toml::from_str::<ModelMeta>("context_window = 200000").is_ok());
-        assert!(toml::from_str::<ModelMeta>("bogus = 1").is_err());
-    }
-
-    #[test]
-    #[cfg(unix)]
-    fn ensure_config_atomic_0600_and_existing_untouched() {
-        use std::os::unix::fs::PermissionsExt;
-        let dir = std::env::temp_dir().join(format!("damon-config-test-{}", std::process::id()));
-        let path = dir.join("config.toml");
-
-        ensure_config(&path).unwrap();
-        let mode = std::fs::metadata(&path).unwrap().permissions().mode();
-        assert_eq!(mode & 0o777, 0o600, "starter config must be 0600 at rest");
-
-        // Existing file: returned as-is, content left alone.
-        std::fs::write(&path, "# custom").unwrap();
-        ensure_config(&path).unwrap();
-        assert_eq!(std::fs::read_to_string(&path).unwrap(), "# custom");
-
-        std::fs::remove_dir_all(&dir).unwrap();
+    fn constant_time_eq_behaves() {
+        assert!(constant_time_eq(b"abc", b"abc"));
+        assert!(!constant_time_eq(b"abc", b"abd"));
+        assert!(!constant_time_eq(b"abc", b"ab"));
     }
 }

@@ -1,5 +1,7 @@
 # 설치
 
+[English](install.md) | **한국어**
+
 ## 검증된 설치 경로
 
 | 경로 | 상태 |
@@ -7,7 +9,7 @@
 | GitHub Releases tarball | CI 태그 빌드로 생성됨 (4개 타겟) |
 | `npm install -g damon-agent` | CI가 태그 푸시 시 publish; postinstall이 릴리스 tarball 다운로드 |
 | `cargo install damon-core` | CI가 태그 푸시 시 crates.io publish |
-| `brew install developjik/tap/damon` | tap 리포지토리 생성 전 — 아래 참조 |
+| `brew install developjik/tap/damon` | tap 리포지토리 필요 — 아래 참조 |
 
 
 ## 바이너리
@@ -18,11 +20,17 @@ GitHub Releases에서 플랫폼별 tarball:
 curl -fsSL https://github.com/developjik/damon-agent-core/releases/latest/download/damon-aarch64-apple-darwin.tar.gz | tar xz
 ```
 
+tarball에는 `damond`, `damon`, `damon-telegram`, `damon-discord`, `damon-slack`, `damon-relay`가 들어 있다.
+
 ## npm
 
 ```sh
 npm install -g damon-agent
 ```
+
+6개 바이너리가 PATH에 링크된다. 패키지는 무의존성 Node 클라이언트도
+export한다 (`import { DamonClient } from "damon-agent"`) —
+[integration.ko.md](integration.ko.md) 참조.
 
 ## cargo
 
@@ -53,24 +61,10 @@ damond service print      # 설치 전 정의 확인
 damond --print-config-path   # config.toml 위치
 ```
 
-`config.example.toml` 참조. provider API 키는 `env:` 또는 `keychain:` 참조만 허용.
+`config.example.toml` 참조. 에이전트 CLI의 로그인은 각 CLI의 자체 인증을
+그대로 사용한다(탐지된 CLI — `claude`, `codex`, `omp` — 가 각자 인증한다) —
+Damon이 에이전트 토큰을 보관하지 않는다.
 
-## OAuth 로그인 (구독제)
-
-```sh
-damond login anthropic      # Claude Pro/Max — 브라우저 승인 후 코드 붙여넣기
-damond login openai         # ChatGPT Plus/Pro — 브라우저 승인 후 콜백 URL 붙여넣기
-damond login kimi-code      # Kimi For Coding — 디바이스 플로우, 승인될 때까지 폴링
-damond login github-copilot # GitHub Copilot — 디바이스 플로우
-damond login xai-oauth      # SuperGrok / X Premium+ — 디바이스 플로우
-damond logout anthropic     # 또는: damond logout <프로바이더>
-```
-
-config에서 `api_key = "oauth"`(또는 `"oauth:<flavor>"`)로 설정하면 데몬이
-키체인에서 토큰을 읽고 자동 갱신한다. 짝: `anthropic` ↔
-`anthropic-messages`, `openai` / `xai-oauth` ↔ `openai-responses`,
-`kimi-code` / `github-copilot` ↔ `openai-completions`. 로그인하면 해당
-프리셋 프로바이더가 부팅 때 자동 등록된다(`damond presets` 참조).
 
 ## 원격 릴레이
 

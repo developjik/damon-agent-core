@@ -2,126 +2,43 @@
 //! permission round-trip), Discord/Slack message extraction, REST calls,
 //! and the WS handshakes against mock gateway servers.
 
-use std::collections::{BTreeMap, HashMap};
 use std::sync::Arc;
 
 use axum::Json;
 use axum::Router;
-use axum::body::Body;
 use axum::extract::ws::{Message as WsMessage, WebSocket, WebSocketUpgrade};
 use axum::extract::{Path, State};
 use axum::response::Response;
 use axum::routing::{get, post};
 use damon_core::api::{self, AppState};
 use damon_core::channel::{Bridge, ChannelApi, Incoming};
-use damon_core::config::{Config, McpServerConfig, ProviderConfig};
+use damon_core::config::Config;
 use damon_core::discord::{DiscordApi, DiscordChannel, incoming_from_message};
-use damon_core::mcp::McpRegistry;
 use damon_core::slack::{SlackApi, SlackChannel, incoming_from_event};
 use damon_core::store::Store;
 use serde_json::{Value, json};
 use tokio::sync::Mutex;
 
-fn test_config(upstream: &str) -> Config {
-    let mut providers = BTreeMap::new();
-    providers.insert(
-        "default".to_string(),
-        ProviderConfig {
-            api: "openai-completions".to_string(),
-            base_url: Some(upstream.to_string()),
-            api_key: None,
-            models: vec![],
-            default_model: None,
-            headers: Default::default(),
-            compat: Default::default(),
-            discovery: None,
-            context_promotion_target: None,
-        },
-    );
-    Config {
-        bind: "127.0.0.1:0".parse().unwrap(),
-        auth_token: None,
-        data_dir: None,
-        tls_cert: None,
-        tls_key: None,
-        mcp_servers: HashMap::new(),
-        providers,
-        models: BTreeMap::new(),
-        relay: None,
-        permission_timeout_secs: None,
-        max_tool_output: None,
-        summary_model: None,
-        session_retention_days: None,
-        builtin_tools: Default::default(),
-    }
-}
-
-/// Mock LLM: first call → tool_call for test.ping, second → text.
-async fn mock_llm_tool_then_text() -> String {
-    use std::sync::atomic::{AtomicUsize, Ordering};
-    let calls = Arc::new(AtomicUsize::new(0));
-    let app = Router::new().route(
-        "/chat/completions",
-        post(move || {
-            let calls = calls.clone();
-            async move {
-                let n = calls.fetch_add(1, Ordering::SeqCst);
-                let sse = if n == 0 {
-                    concat!(
-                        "data: {\"choices\":[{\"delta\":{\"tool_calls\":[{\"index\":0,\"id\":\"c1\",\"function\":{\"name\":\"test.ping\",\"arguments\":\"{}\"}}]}}]}\n\n",
-                        "data: [DONE]\n\n"
-                    )
-                } else {
-                    concat!(
-                        "data: {\"choices\":[{\"delta\":{\"content\":\"tool done\"}}]}\n\n",
-                        "data: [DONE]\n\n"
-                    )
-                };
-                Response::builder()
-                    .header("content-type", "text/event-stream")
-                    .body(Body::from(sse))
-                    .unwrap()
-            }
-        }),
-    );
-    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-    let addr = listener.local_addr().unwrap();
-    tokio::spawn(async move {
-        axum::serve(listener, app).await.unwrap();
-    });
-    format!("http://{addr}")
+fn test_config() -> Config {
+    common::mock_config(None)
 }
 
 async fn serve_app(state: Arc<AppState>) -> String {
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = listener.local_addr().unwrap();
     tokio::spawn(async move {
-        axum::serve(listener, api::router(state)).await.unwrap();
+        // ConnectInfo installs the peer IP ws_handler's auth check reads.
+        axum::serve(
+            listener,
+            api::router(state).into_make_service_with_connect_info::<std::net::SocketAddr>(),
+        )
+        .await
+        .unwrap();
     });
     format!("ws://{addr}/ws")
 }
 
-/// Mock LLM that always answers with text (no tool calls).
-async fn mock_llm_text() -> String {
-    let app = Router::new().route(
-        "/chat/completions",
-        post(|| async {
-            Response::builder()
-                .header("content-type", "text/event-stream")
-                .body(Body::from(concat!(
-                    "data: {\"choices\":[{\"delta\":{\"content\":\"hello back\"}}]}\n\n",
-                    "data: [DONE]\n\n"
-                )))
-                .unwrap()
-        }),
-    );
-    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-    let addr = listener.local_addr().unwrap();
-    tokio::spawn(async move {
-        axum::serve(listener, app).await.unwrap();
-    });
-    format!("http://{addr}")
-}
+mod common;
 
 // --- Generic bridge ---------------------------------------------------------
 
@@ -129,7 +46,6 @@ async fn mock_llm_text() -> String {
 struct MockChannel {
     sent: Mutex<Vec<(String, String)>>,
 }
-
 #[async_trait::async_trait]
 impl ChannelApi for MockChannel {
     async fn recv(&self) -> anyhow::Result<Option<Incoming>> {
@@ -160,12 +76,13 @@ async fn wait_for_sent(sent: &Mutex<Vec<(String, String)>>, needle: &str) {
 
 #[tokio::test]
 async fn bridge_delivers_response_and_maps_sessions() {
-    let upstream = mock_llm_text().await;
-    let cfg = test_config(&upstream);
+    let cfg = test_config();
     let shared: damon_core::config::SharedConfig = Arc::new(parking_lot::RwLock::new(cfg));
     let store = Store::in_memory().await.unwrap();
-    let mcp = McpRegistry::connect_all(&HashMap::new()).await;
-    let state = AppState::new(shared, store.clone(), mcp).await;
+    let state = AppState::new(shared, store.clone()).await;
+    state
+        .sessions
+        .insert_client("mock".into(), common::mock_client());
     let url = serve_app(state).await;
 
     let client = damon_core::client::DamonClient::connect(&url, None)
@@ -175,15 +92,15 @@ async fn bridge_delivers_response_and_maps_sessions() {
         sent: Mutex::new(vec![]),
     });
     let bridge = Bridge::new(ch.clone(), client);
-    bridge.client().initialize().await.unwrap();
+    bridge.client().hello().await.unwrap();
     bridge.spawn_event_router().await;
 
     // Two different chats → two different sessions.
     bridge
-        .handle_message("chat-a".into(), None, "hi".into(), Vec::new())
+        .handle_message("chat-a".into(), None, None, "hi".into(), Vec::new())
         .await;
     bridge
-        .handle_message("chat-b".into(), None, "hi".into(), Vec::new())
+        .handle_message("chat-b".into(), None, None, "hi".into(), Vec::new())
         .await;
 
     // Wait until BOTH chats got their reply.
@@ -193,10 +110,10 @@ async fn bridge_delivers_response_and_maps_sessions() {
             let sent = ch.sent.lock().await;
             let a = sent
                 .iter()
-                .any(|(c, t)| c == "chat-a" && t.contains("hello back"));
+                .any(|(c, t)| c == "chat-a" && t.contains("echo:"));
             let b = sent
                 .iter()
-                .any(|(c, t)| c == "chat-b" && t.contains("hello back"));
+                .any(|(c, t)| c == "chat-b" && t.contains("echo:"));
             if a && b {
                 break;
             }
@@ -234,24 +151,13 @@ async fn bridge_delivers_response_and_maps_sessions() {
 
 #[tokio::test]
 async fn bridge_permission_reply_allows_tool() {
-    let upstream = mock_llm_tool_then_text().await;
-    let mut cfg = test_config(&upstream);
-    let server_py = concat!(env!("CARGO_MANIFEST_DIR"), "/tests/mcp_server.py");
-    cfg.mcp_servers.insert(
-        "test".to_string(),
-        McpServerConfig {
-            command: "python3".to_string(),
-            args: vec![server_py.to_string()],
-            env: HashMap::new(),
-            auto_approve: false,
-        },
-    );
+    let cfg = test_config();
     let shared: damon_core::config::SharedConfig = Arc::new(parking_lot::RwLock::new(cfg));
     let store = Store::in_memory().await.unwrap();
-    let mcp_servers = shared.read().mcp_servers.clone();
-    let mcp = McpRegistry::connect_all(&mcp_servers).await;
-    assert!(mcp.has_tool("test.ping"), "MCP tool not registered");
-    let state = AppState::new(shared, store, mcp).await;
+    let state = AppState::new(shared, store).await;
+    state
+        .sessions
+        .insert_client("mock".into(), common::mock_client());
     let url = serve_app(state).await;
 
     let client = damon_core::client::DamonClient::connect(&url, None)
@@ -261,20 +167,35 @@ async fn bridge_permission_reply_allows_tool() {
         sent: Mutex::new(vec![]),
     });
     let bridge = Bridge::new(ch.clone(), client);
-    bridge.client().initialize().await.unwrap();
+    bridge.client().hello().await.unwrap();
     bridge.spawn_event_router().await;
 
     bridge
-        .handle_message("42".into(), None, "use the tool".into(), Vec::new())
+        .handle_message(
+            "42".into(),
+            None,
+            None,
+            "use the perm tool".into(),
+            Vec::new(),
+        )
         .await;
     // Permission prompt lands in the chat…
     wait_for_sent(&ch.sent, "🔐").await;
     // …and "allow" approves it, letting the turn finish.
     bridge
-        .handle_message("42".into(), None, "allow".into(), Vec::new())
+        .handle_message("42".into(), None, None, "allow".into(), Vec::new())
         .await;
     wait_for_sent(&ch.sent, "✅ allowed").await;
-    wait_for_sent(&ch.sent, "tool done").await;
+    // The mock emits "allowed" as assistant text once the tool runs —
+    // exact match so "✅ allowed" can't satisfy the wait early.
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(15);
+    loop {
+        if ch.sent.lock().await.iter().any(|(_, t)| t == "allowed") {
+            break;
+        }
+        assert!(std::time::Instant::now() < deadline, "tool never ran");
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+    }
 }
 
 // --- Discord extraction -------------------------------------------------------
@@ -425,7 +346,7 @@ async fn slack_api_auth_post_and_error() {
 
     let api = SlackApi::with_base("xapp-t", "xoxb-t", &format!("http://{addr}"));
     assert_eq!(api.bot_user_id().await.unwrap(), "UBOT");
-    api.post_message("C1", "hi").await.unwrap();
+    api.post_message("C1", "hi", None).await.unwrap();
     assert_eq!(api.connections_open().await.unwrap(), "wss://sock.example/");
 
     // ok:false surfaces as an error.
@@ -601,12 +522,13 @@ async fn slack_socket_envelope_ack_and_dispatch() {
 /// a public bot without an allowlist is unauthenticated agent access.
 #[tokio::test]
 async fn bridge_allowlist_drops_unlisted_senders() {
-    let upstream = mock_llm_text().await;
-    let cfg = test_config(&upstream);
+    let cfg = test_config();
     let shared: damon_core::config::SharedConfig = Arc::new(parking_lot::RwLock::new(cfg));
     let store = Store::in_memory().await.unwrap();
-    let mcp = McpRegistry::connect_all(&HashMap::new()).await;
-    let state = AppState::new(shared, store.clone(), mcp).await;
+    let state = AppState::new(shared, store.clone()).await;
+    state
+        .sessions
+        .insert_client("mock".into(), common::mock_client());
     let url = serve_app(state).await;
 
     let client = damon_core::client::DamonClient::connect(&url, None)
@@ -617,13 +539,14 @@ async fn bridge_allowlist_drops_unlisted_senders() {
     });
     let bridge = Bridge::new(ch.clone(), client);
     bridge.set_allowed(["user-ok".to_string()]);
-    bridge.client().initialize().await.unwrap();
+    bridge.client().hello().await.unwrap();
     bridge.spawn_event_router().await;
 
     // Unlisted sender: dropped before any session is created.
     bridge
         .handle_message(
             "chat-evil".into(),
+            None,
             Some("user-evil".into()),
             "hi".into(),
             Vec::new(),
@@ -643,10 +566,11 @@ async fn bridge_allowlist_drops_unlisted_senders() {
     bridge
         .handle_message(
             "chat-ok".into(),
+            None,
             Some("user-ok".into()),
             "hi".into(),
             Vec::new(),
         )
         .await;
-    wait_for_sent(&ch.sent, "hello back").await;
+    wait_for_sent(&ch.sent, "echo:").await;
 }
