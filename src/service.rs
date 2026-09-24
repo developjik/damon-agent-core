@@ -196,7 +196,7 @@ fn run_control(cmd: &[String]) -> String {
 }
 
 /// The current user's numeric id, for launchd's gui/<uid> domain.
-#[cfg(unix)]
+#[cfg(target_os = "macos")]
 fn current_uid() -> anyhow::Result<u32> {
     let out = std::process::Command::new("id")
         .arg("-u")

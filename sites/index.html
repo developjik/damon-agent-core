@@ -1,0 +1,344 @@
+<!doctype html>
+<html lang="ko">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Damon — 데몬 하나. 모든 코딩 에이전트.</title>
+<meta name="description" content="Damon은 Claude Code·Codex CLI·Oh My Pi를 네이티브 CLI로 구동하는 Rust 로컬 에이전트 컨트롤 데몬입니다. 세션, 권한 릴레이, 검색 가능한 히스토리, 채팅 채널, 원격 접근을 한 곳에서.">
+<meta name="theme-color" content="#0a0e16">
+<meta property="og:title" content="Damon — One daemon. Every coding agent.">
+<meta property="og:description" content="Rust local agent-control daemon. Sessions, permission relay, searchable history, chat channels, remote access — one resident daemon for Claude Code, Codex CLI, and Oh My Pi.">
+<meta property="og:type" content="website">
+<link rel="icon" href="./favicon.svg" type="image/svg+xml">
+<link rel="stylesheet" href="./assets/css/main.css">
+<script type="importmap">
+{
+  "imports": {
+    "three": "https://cdn.jsdelivr.net/npm/three@0.170.0/build/three.module.js",
+    "three/addons/": "https://cdn.jsdelivr.net/npm/three@0.170.0/examples/jsm/"
+  }
+}
+</script>
+</head>
+<body>
+
+<header class="site-header">
+  <div class="container header-inner">
+    <a class="brand" href="#hero">
+      <svg class="brand-mark" viewBox="0 0 24 24" aria-hidden="true"><path d="M12 2l8 6-3 14H7L4 8z" fill="none" stroke="currentColor" stroke-width="1.6"/><circle cx="12" cy="11" r="2.4" fill="currentColor"/></svg>
+      <span>Damon</span>
+    </a>
+    <nav class="site-nav" aria-label="main">
+      <a href="#features" data-i18n="nav.features">기능</a>
+      <a href="#architecture" data-i18n="nav.arch">구조</a>
+      <a href="#quickstart" data-i18n="nav.quick">시작하기</a>
+      <a href="#channels" data-i18n="nav.chan">채널</a>
+      <a href="#ecosystem" data-i18n="nav.eco">생태계</a>
+    </nav>
+    <div class="header-actions">
+      <button id="lang-toggle" class="btn btn-ghost btn-sm" type="button" aria-label="switch language">EN</button>
+      <a class="btn btn-ghost btn-sm gh-btn" href="https://github.com/developjik/damon-agent-core" target="_blank" rel="noopener">
+        <svg viewBox="0 0 16 16" width="15" height="15" aria-hidden="true"><path fill="currentColor" d="M8 0C3.58 0 0 3.58 0 8c0 3.54 2.29 6.53 5.47 7.59.4.07.55-.17.55-.38 0-.19-.01-.82-.01-1.49-2.01.37-2.53-.49-2.69-.94-.09-.23-.48-.94-.82-1.13-.28-.15-.68-.52-.01-.53.63-.01 1.08.58 1.23.82.72 1.21 1.87.87 2.33.66.07-.52.28-.87.51-1.07-1.78-.2-3.64-.89-3.64-3.95 0-.87.31-1.59.82-2.15-.08-.2-.36-1.02.08-2.12 0 0 .67-.21 2.2.82.64-.18 1.32-.27 2-.27s1.36.09 2 .27c1.53-1.04 2.2-.82 2.2-.82.44 1.1.16 1.92.08 2.12.51.56.82 1.27.82 2.15 0 3.07-1.87 3.75-3.65 3.95.29.25.54.73.54 1.48 0 1.07-.01 1.93-.01 2.2 0 .21.15.46.55.38A8.01 8.01 0 0 0 16 8c0-4.42-3.58-8-8-8z"/></svg>
+        <span>GitHub</span>
+      </a>
+    </div>
+  </div>
+</header>
+
+<main>
+
+<!-- ================= HERO ================= -->
+<section class="hero" id="hero">
+  <div id="scene" class="scene" aria-hidden="true"></div>
+  <div class="hero-fallback" aria-hidden="true">
+    <svg viewBox="0 0 400 400" role="img" aria-label="architecture">
+      <circle cx="200" cy="200" r="60" fill="none" stroke="#5b8cff" stroke-width="1.2" opacity=".8"/>
+      <circle cx="200" cy="200" r="110" fill="none" stroke="#7dd3fc" stroke-width=".8" opacity=".4"/>
+      <circle cx="200" cy="200" r="160" fill="none" stroke="#7dd3fc" stroke-width=".6" opacity=".25"/>
+      <circle cx="200" cy="200" r="16" fill="#5b8cff"/>
+      <circle cx="200" cy="90" r="7" fill="#d97757"/><circle cx="295" cy="245" r="7" fill="#10a37f"/><circle cx="105" cy="245" r="7" fill="#a78bfa"/>
+      <circle cx="200" cy="40" r="5" fill="#7dd3fc"/><circle cx="360" cy="200" r="5" fill="#7dd3fc"/><circle cx="200" cy="360" r="5" fill="#7dd3fc"/><circle cx="40" cy="200" r="5" fill="#7dd3fc"/>
+    </svg>
+  </div>
+  <div class="hero-scrim" aria-hidden="true"></div>
+  <div class="container hero-inner">
+    <div class="hero-copy">
+      <p class="kicker" data-i18n="hero.badge">Rust 기반 로컬 에이전트 컨트롤 데몬</p>
+      <h1><span data-i18n="hero.title1">데몬 하나.</span><br><span class="grad" data-i18n="hero.title2">모든 코딩 에이전트.</span></h1>
+      <p class="lead" data-i18n="hero.lead">Damon은 Claude Code·Codex CLI·Oh My Pi를 네이티브 CLI로 구동하는 Rust 상주 데몬입니다. 모델·툴·인증은 에이전트 몫 — Damon은 세션, 권한 릴레이, 검색 가능한 히스토리, 채팅 채널, 원격 접근을 소유합니다.</p>
+      <div class="badges">
+        <img src="https://github.com/developjik/damon-agent-core/actions/workflows/ci.yml/badge.svg" alt="ci">
+        <img src="https://img.shields.io/crates/v/damon-core.svg" alt="crates.io">
+        <img src="https://img.shields.io/npm/v/damon-agent.svg" alt="npm">
+        <img src="https://img.shields.io/badge/license-MIT%20OR%20Apache--2.0-blue.svg" alt="license">
+      </div>
+      <div class="install-box">
+        <span class="install-label" data-i18n="hero.install.label">설치</span>
+        <code id="install-cmd">npm install -g damon-agent</code>
+        <button class="copy-btn" type="button" data-copy="npm install -g damon-agent" data-i18n-aria="copy.aria" aria-label="copy install command">
+          <svg viewBox="0 0 24 24" width="15" height="15" aria-hidden="true"><rect x="9" y="9" width="12" height="12" rx="2" fill="none" stroke="currentColor" stroke-width="2"/><path d="M5 15V5a2 2 0  0 1 2-2h10" fill="none" stroke="currentColor" stroke-width="2"/></svg>
+        </button>
+      </div>
+      <div class="cta-row">
+        <a class="btn btn-primary" href="#quickstart" data-i18n="hero.cta.quick">퀵스타트</a>
+        <a class="btn btn-ghost" href="https://github.com/developjik/damon-agent-core" target="_blank" rel="noopener" data-i18n="hero.cta.gh">GitHub에서 보기</a>
+      </div>
+    </div>
+  </div>
+  <div class="scene-hint" aria-hidden="true">
+    <svg viewBox="0 0 24 24" width="14" height="14"><path d="M12 3v18M3 12h18M12 3l-3 3m3-3l3 3M12 21l-3-3m3 3l3-3M3 12l3-3m-3 3l3 3M21 12l-3-3m3 3l-3 3" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round"/></svg>
+    <span data-i18n="hero.hint">드래그로 회전 · 스크롤로 확대 · 노드 클릭</span>
+  </div>
+  <div id="node-tip" class="node-tip" role="status" hidden></div>
+</section>
+
+<!-- ================= FEATURES ================= -->
+<section class="section" id="features">
+  <div class="container">
+    <p class="kicker" data-i18n="feat.kicker">왜 Damon인가</p>
+    <h2 data-i18n="feat.title">에이전트는 그대로, 제어는 한 곳에서</h2>
+    <p class="section-lead" data-i18n="feat.lead">이미 에이전트 CLI를 구독 중이라면 설정할 게 하나도 없습니다. Damon은 설치된 CLI를 감지해 로그인과 툴을 그대로 물려받습니다.</p>
+    <div class="feature-grid">
+      <article class="card">
+        <div class="card-icon"><svg viewBox="0 0 24 24"><path d="M4 17l6-6-6-6M12 19h8" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"/></svg></div>
+        <h3 data-i18n="f1t">설정 없는 백엔드</h3>
+        <p data-i18n="f1d">PATH의 claude·codex·omp를 자동 등록합니다. 다른 에이전트도 <code>[backends.X]</code> 블록 하나면 연결됩니다.</p>
+      </article>
+      <article class="card">
+        <div class="card-icon"><svg viewBox="0 0 24 24"><path d="M12 22s8-4 8-10V5l-8-3-8 3v7c0 6 8 10 8 10z" fill="none" stroke="currentColor" stroke-width="2" stroke-linejoin="round"/><path d="M9 12l2 2 4-4" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"/></svg></div>
+        <h3 data-i18n="f2t">권한은 당신 채널로</h3>
+        <p data-i18n="f2d">에이전트의 권한 요청을 웹 UI·CLI·텔레그램/디스코드/슬랙의 <code>allow</code>/<code>deny</code> 답장으로 릴레이합니다.</p>
+      </article>
+      <article class="card">
+        <div class="card-icon"><svg viewBox="0 0 24 24"><circle cx="11" cy="11" r="7" fill="none" stroke="currentColor" stroke-width="2"/><path d="M21 21l-4.35-4.35" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"/></svg></div>
+        <h3 data-i18n="f3t">검색 가능한 히스토리</h3>
+        <p data-i18n="f3d">모든 대화가 SQLite + FTS5에 기록됩니다. <code>damon search "error timeout"</code>으로 전체 이력 전문 검색.</p>
+      </article>
+      <article class="card">
+        <div class="card-icon"><svg viewBox="0 0 24 24"><path d="M21 11.5a8.38 8.38 0 01-.9 3.8 8.5 8.5 0 01-7.6 4.7 8.38 8.38 0 01-3.8-.9L3 21l1.9-5.7a8.38 8.38 0 01-.9-3.8 8.5 8.5 0 014.7-7.6 8.38 8.38 0 013.8-.9h.5a8.48 8.48 0 018 8v.5z" fill="none" stroke="currentColor" stroke-width="2" stroke-linejoin="round"/></svg></div>
+        <h3 data-i18n="f4t">채팅 채널 내장</h3>
+        <p data-i18n="f4d">Telegram·Discord·Slack 어댑터가 별도 바이너리로 제공됩니다. 채팅별 세션 자동 매핑, 스트리밍 응답.</p>
+      </article>
+      <article class="card">
+        <div class="card-icon"><svg viewBox="0 0 24 24"><path d="M21 2l-2 2m-7.61 7.61a5.5 5.5 0 11-7.778 7.778 5.5 5.5 0 017.777-7.777zm0 0L15.5 7.5m0 0l3 3L22 7l-3-3m-3.5 3.5L19 4" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"/></svg></div>
+        <h3 data-i18n="f5t">시크릿은 Damon에 없다</h3>
+        <p data-i18n="f5d">에이전트가 자기 인증을 관리합니다. Damon config는 포트와 토큰 정도뿐.</p>
+      </article>
+      <article class="card">
+        <div class="card-icon"><svg viewBox="0 0 24 24"><circle cx="12" cy="12" r="10" fill="none" stroke="currentColor" stroke-width="2"/><path d="M2 12h20M12 2a15.3 15.3 0 014 10 15.3 15.3 0 01-4 10 15.3 15.3 0 01-4-10 15.3 15.3 0 014-10z" fill="none" stroke="currentColor" stroke-width="2"/></svg></div>
+        <h3 data-i18n="f6t">어디서든 접근</h3>
+        <p data-i18n="f6d"><code>wss</code> 직접 서빙 또는 <code>damon-relay</code> 아웃바운드 터널 — X25519 + AES-256-GCM E2E 암호화.</p>
+      </article>
+      <article class="card">
+        <div class="card-icon"><svg viewBox="0 0 24 24"><rect x="4" y="4" width="16" height="16" rx="2" fill="none" stroke="currentColor" stroke-width="2"/><rect x="9" y="9" width="6" height="6" fill="none" stroke="currentColor" stroke-width="2"/><path d="M9 1v3m6-3v3M9 20v3m6-3v3M1 9h3m-3 6h3m16-6h3m-3 6h3" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"/></svg></div>
+        <h3 data-i18n="f7t">상주하도록 설계</h3>
+        <p data-i18n="f7d">Rust 데몬 본체는 가볍게 유지됩니다. 에이전트 프로세스는 에이전트의 몫입니다.</p>
+      </article>
+    </div>
+  </div>
+</section>
+
+<!-- ================= ARCHITECTURE ================= -->
+<section class="section section-alt" id="architecture">
+  <div class="container">
+    <p class="kicker" data-i18n="arch.kicker">아키텍처</p>
+    <h2 data-i18n="arch.title">하나의 API, 하나의 데몬</h2>
+    <p class="section-lead" data-i18n="arch.lead">모든 클라이언트가 같은 JSON-RPC over WebSocket(<code>/ws</code>, 프로토콜 v2)에 붙고, 데몬이 에이전트 CLI를 서브프로세스로 구동합니다.</p>
+
+    <div class="arch">
+      <div class="arch-row arch-clients">
+        <span class="chip">CLI</span>
+        <span class="chip">Telegram</span>
+        <span class="chip">Discord</span>
+        <span class="chip">Slack</span>
+        <span class="chip" data-i18n="arch.chip.web">웹 UI</span>
+        <span class="chip" data-i18n="arch.chip.desktop">데스크톱 앱</span>
+        <span class="chip chip-dim" data-i18n="arch.chip.code">직접 만든 코드</span>
+      </div>
+      <div class="arch-arrow" aria-hidden="true">▼</div>
+      <div class="arch-api"><span data-i18n="arch.api">단일 API — JSON-RPC over WebSocket · <code>/ws</code> · 프로토콜 v2</span></div>
+      <div class="arch-arrow" aria-hidden="true">▼</div>
+      <div class="arch-core">
+        <div class="arch-core-title">Damon core <span data-i18n="arch.core.sub">상주 데몬 · Rust</span></div>
+        <div class="arch-modules">
+          <div class="module"><code data-i18n="arch.m1">백엔드 레지스트리 — CLI 탐지·구동·재시작</code></div>
+          <div class="module"><code data-i18n="arch.m2">세션 매니저 — 생명주기·권한 릴레이·취소</code></div>
+          <div class="module"><code data-i18n="arch.m3">세션 저장소 — SQLite + FTS5</code></div>
+          <div class="module"><code data-i18n="arch.m4">채널 브리지 / E2E 릴레이</code></div>
+        </div>
+      </div>
+      <div class="arch-arrow" aria-hidden="true">▼</div>
+      <div class="arch-row arch-agents">
+        <span class="chip chip-agent" style="--c:#d97757">Claude Code</span>
+        <span class="chip chip-agent" style="--c:#10a37f">Codex CLI</span>
+        <span class="chip chip-agent" style="--c:#a78bfa">Oh My Pi</span>
+      </div>
+      <p class="arch-note" data-i18n="arch.agents.note">모델·툴·구독 인증·컨텍스트는 전부 에이전트 소유</p>
+    </div>
+
+    <p class="arch-links">
+      <a href="https://github.com/developjik/damon-agent-core/blob/main/docs/protocol-v2.md" target="_blank" rel="noopener" data-i18n="arch.proto">와이어 프로토콜 문서 →</a>
+      <a href="https://github.com/developjik/damon-agent-core/blob/main/docs/integration.md" target="_blank" rel="noopener" data-i18n="arch.integration">클라이언트 연동 가이드 →</a>
+    </p>
+  </div>
+</section>
+
+<!-- ================= QUICKSTART ================= -->
+<section class="section" id="quickstart">
+  <div class="container">
+    <p class="kicker" data-i18n="quick.kicker">퀵스타트</p>
+    <h2 data-i18n="quick.title">3줄이면 충분합니다</h2>
+
+    <div class="qs-grid">
+      <div class="term">
+        <div class="term-head"><span></span><span></span><span></span><em data-i18n="quick.install">설치</em>
+          <button class="copy-btn" type="button" data-copy="npm install -g damon-agent" aria-label="copy"><svg viewBox="0 0 24 24" width="14" height="14" aria-hidden="true"><rect x="9" y="9" width="12" height="12" rx="2" fill="none" stroke="currentColor" stroke-width="2"/><path d="M5 15V5a2 2 0 0 1 2-2h10" fill="none" stroke="currentColor" stroke-width="2"/></svg></button>
+        </div>
+        <pre><code><span class="ps1">$</span> npm install -g damon-agent   <span class="cmt" data-i18n="quick.c.npm">npm (프리빌트 바이너리)</span>
+<span class="ps1">$</span> cargo install damon-core       <span class="cmt" data-i18n="quick.c.cargo">crates.io</span>
+<span class="ps1">$</span> brew install developjik/tap/damon  <span class="cmt" data-i18n="quick.c.brew">Homebrew tap</span></code></pre>
+      </div>
+
+      <div class="term">
+        <div class="term-head"><span></span><span></span><span></span><em data-i18n="quick.run">실행</em>
+          <button class="copy-btn" type="button" data-copy="damond" aria-label="copy"><svg viewBox="0 0 24 24" width="14" height="14" aria-hidden="true"><rect x="9" y="9" width="12" height="12" rx="2" fill="none" stroke="currentColor" stroke-width="2"/><path d="M5 15V5a2 2 0 0 1 2-2h10" fill="none" stroke="currentColor" stroke-width="2"/></svg></button>
+        </div>
+        <pre><code><span class="ps1">$</span> damond    <span class="cmt" data-i18n="quick.run.c1">첫 실행 시 스타터 config 생성</span>
+<span class="ps1">$</span> damon doctor  <span class="cmt" data-i18n="quick.run.c2">어떤 백엔드가 설치됐는지 확인</span></code></pre>
+      </div>
+
+      <div class="term">
+        <div class="term-head"><span></span><span></span><span></span><em data-i18n="quick.check">확인</em>
+          <button class="copy-btn" type="button" data-copy="curl localhost:9470/health" aria-label="copy"><svg viewBox="0 0 24 24" width="14" height="14" aria-hidden="true"><rect x="9" y="9" width="12" height="12" rx="2" fill="none" stroke="currentColor" stroke-width="2"/><path d="M5 15V5a2 2 0 0 1 2-2h10" fill="none" stroke="currentColor" stroke-width="2"/></svg></button>
+        </div>
+        <pre><code><span class="ps1">$</span> curl localhost:9470/health
+<span class="out">{"backends":["claude","omp"],"status":"ok"}</span></code></pre>
+      </div>
+
+      <div class="term">
+        <div class="term-head"><span></span><span></span><span></span><em data-i18n="quick.service">OS 서비스로 상주</em>
+          <button class="copy-btn" type="button" data-copy="damond service install" aria-label="copy"><svg viewBox="0 0 24 24" width="14" height="14" aria-hidden="true"><rect x="9" y="9" width="12" height="12" rx="2" fill="none" stroke="currentColor" stroke-width="2"/><path d="M5 15V5a2 2 0 0 1 2-2h10" fill="none" stroke="currentColor" stroke-width="2"/></svg></button>
+        </div>
+        <pre><code><span class="ps1">$</span> damond service install  <span class="cmt" data-i18n="quick.service.c1">launchd / systemd user / Task Scheduler</span>
+<span class="ps1">$</span> damond service print</code></pre>
+      </div>
+    </div>
+
+    <div class="ui-note">
+      <div>
+        <strong data-i18n="quick.ui.t">번들 웹 UI로 바로 대화</strong>
+        <p data-i18n="quick.ui.p">세션, 스트리밍, 권한 프롬프트까지 — 설치 불필요.</p>
+      </div>
+      <code class="ui-url">http://127.0.0.1:9470/ui</code>
+    </div>
+  </div>
+</section>
+
+<!-- ================= CHANNELS ================= -->
+<section class="section section-alt" id="channels">
+  <div class="container">
+    <p class="kicker" data-i18n="chan.kicker">채팅 채널</p>
+    <h2 data-i18n="chan.title">채팅 앱이 곧 컨트롤 룸</h2>
+    <p class="section-lead" data-i18n="chan.lead">각 채팅이 고유한 에이전트 세션에 매핑되고 응답은 스트리밍됩니다. tool 권한 요청은 <code>allow</code>/<code>deny</code> 답장으로 승인합니다.</p>
+
+    <div class="chan-grid">
+      <div class="term">
+        <div class="term-head"><span></span><span></span><span></span><em><i class="dot" style="--c:#26a5e4"></i>Telegram</em>
+          <button class="copy-btn" type="button" data-copy="damon-telegram --bot-token <token>" aria-label="copy"><svg viewBox="0 0 24 24" width="14" height="14" aria-hidden="true"><rect x="9" y="9" width="12" height="12" rx="2" fill="none" stroke="currentColor" stroke-width="2"/><path d="M5 15V5a2 2 0 0 1 2-2h10" fill="none" stroke="currentColor" stroke-width="2"/></svg></button>
+        </div>
+        <pre><code><span class="ps1">$</span> damon-telegram --bot-token &lt;token&gt;</code></pre>
+      </div>
+      <div class="term">
+        <div class="term-head"><span></span><span></span><span></span><em><i class="dot" style="--c:#5865f2"></i>Discord</em>
+          <button class="copy-btn" type="button" data-copy="damon-discord --bot-token <token>" aria-label="copy"><svg viewBox="0 0 24 24" width="14" height="14" aria-hidden="true"><rect x="9" y="9" width="12" height="12" rx="2" fill="none" stroke="currentColor" stroke-width="2"/><path d="M5 15V5a2 2 0 0 1 2-2h10" fill="none" stroke="currentColor" stroke-width="2"/></svg></button>
+        </div>
+        <pre><code><span class="ps1">$</span> damon-discord --bot-token &lt;token&gt;</code></pre>
+      </div>
+      <div class="term">
+        <div class="term-head"><span></span><span></span><span></span><em><i class="dot" style="--c:#e0507e"></i>Slack</em>
+          <button class="copy-btn" type="button" data-copy="damon-slack --app-token xapp-… --bot-token xoxb-…" aria-label="copy"><svg viewBox="0 0 24 24" width="14" height="14" aria-hidden="true"><rect x="9" y="9" width="12" height="12" rx="2" fill="none" stroke="currentColor" stroke-width="2"/><path d="M5 15V5a2 2 0 0 1 2-2h10" fill="none" stroke="currentColor" stroke-width="2"/></svg></button>
+        </div>
+        <pre><code><span class="ps1">$</span> damon-slack --app-token xapp-… --bot-token xoxb-…</code></pre>
+      </div>
+    </div>
+  </div>
+</section>
+
+<!-- ================= REMOTE ================= -->
+<section class="section" id="remote">
+  <div class="container">
+    <p class="kicker" data-i18n="remote.kicker">원격 접근</p>
+    <h2 data-i18n="remote.title">어디서든, 안전하게</h2>
+    <div class="feature-grid three">
+      <article class="card">
+        <h3 data-i18n="remote.r1t">Tailscale (권장)</h3>
+        <p data-i18n="remote.r1d"><code>ws://&lt;tailscale-ip&gt;:9470/ws</code>로 attach — WireGuard E2E, 데몬 설정 변경 없음.</p>
+      </article>
+      <article class="card">
+        <h3 data-i18n="remote.r2t">직접 TLS</h3>
+        <p data-i18n="remote.r2d"><code>tls_cert</code>/<code>tls_key</code>로 <code>wss</code> 서빙. 비루프백 바인드는 <code>auth_token</code> 없이 기동 거부.</p>
+      </article>
+      <article class="card">
+        <h3 data-i18n="remote.r3t">자체 릴레이</h3>
+        <p data-i18n="remote.r3d">공개 호스트의 <code>damon-relay</code>로 아웃바운드 연결 — 인바운드 포트 불필요. X25519 키 교환 → AES-256-GCM, 릴레이는 평문을 볼 수 없음.</p>
+      </article>
+    </div>
+  </div>
+</section>
+
+<!-- ================= ECOSYSTEM ================= -->
+<section class="section section-alt" id="ecosystem">
+  <div class="container">
+    <p class="kicker" data-i18n="eco.kicker">생태계</p>
+    <h2 data-i18n="eco.title">모든 언어에서 한 줄로</h2>
+    <div class="feature-grid three">
+      <article class="card eco-card">
+        <h3>Node — <code>damon-agent</code></h3>
+        <p data-i18n="eco.npm.d">npm 패키지에 포함된 무의존성 클라이언트.</p>
+        <pre class="mini-code"><code>import { DamonClient } from "damon-agent"</code></pre>
+        <a class="card-link" href="https://www.npmjs.com/package/damon-agent" target="_blank" rel="noopener">npm →</a>
+      </article>
+      <article class="card eco-card">
+        <h3>Python — <code>damon-agent</code></h3>
+        <p data-i18n="eco.py.d">asyncio 기반 공식 클라이언트.</p>
+        <pre class="mini-code"><code>pip install damon-agent</code></pre>
+        <a class="card-link" href="https://github.com/developjik/damon-agent-core/tree/main/python" target="_blank" rel="noopener" data-i18n="eco.py.link">python/ 디렉터리 →</a>
+      </article>
+      <article class="card eco-card">
+        <h3>Rust — <code>damon-core</code></h3>
+        <p data-i18n="eco.rs.d">crates.io의 코어 크레이트.</p>
+        <pre class="mini-code"><code>cargo add damon-core</code></pre>
+        <a class="card-link" href="https://crates.io/crates/damon-core" target="_blank" rel="noopener">crates.io →</a>
+      </article>
+    </div>
+
+    <div class="docs-links">
+      <a href="https://github.com/developjik/damon-agent-core/blob/main/docs/protocol-v2.md" target="_blank" rel="noopener">Wire protocol v2</a>
+      <a href="https://github.com/developjik/damon-agent-core/blob/main/docs/install.md" target="_blank" rel="noopener">Install guide</a>
+      <a href="https://github.com/developjik/damon-agent-core/blob/main/docs/integration.md" target="_blank" rel="noopener">Integration guide</a>
+      <a href="https://github.com/developjik/damon-agent-core/blob/main/config.example.toml" target="_blank" rel="noopener">Config reference</a>
+      <a href="https://github.com/developjik/damon-agent-core/blob/main/CHANGELOG.md" target="_blank" rel="noopener">Changelog</a>
+      <a href="https://github.com/developjik/damon-agent-core/blob/main/CONTRIBUTING.md" target="_blank" rel="noopener">Contributing</a>
+    </div>
+  </div>
+</section>
+
+</main>
+
+<footer class="site-footer">
+  <div class="container footer-inner">
+    <p class="footer-tag" data-i18n="foot.tag">이름은 daemon의 말장난이자, 말 그대로 실제 아키텍처입니다.</p>
+    <p class="footer-meta">
+      <span data-i18n="foot.license">듀얼 라이선스 MIT 또는 Apache-2.0</span>
+      <span aria-hidden="true">·</span>
+      <a href="https://github.com/developjik/damon-agent-core" target="_blank" rel="noopener">developjik/damon-agent-core</a>
+    </p>
+  </div>
+</footer>
+
+<noscript>
+  <style>.scene-hint{display:none}</style>
+</noscript>
+<script type="module" src="./assets/js/main.mjs"></script>
+</body>
+</html>
