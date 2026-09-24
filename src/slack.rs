@@ -104,7 +104,12 @@ impl SlackApi {
 
     /// Slack messages effectively cap ~4000 chars — split instead of
     /// truncating so long agent replies aren't silently lost.
-    pub async fn post_message(&self, channel: &str, text: &str) -> anyhow::Result<()> {
+    pub async fn post_message(
+        &self,
+        channel: &str,
+        text: &str,
+        thread_ts: Option<&str>,
+    ) -> anyhow::Result<()> {
         const MAX: usize = 3900;
         let mut rest = text;
         while !rest.is_empty() {
@@ -113,18 +118,18 @@ impl SlackApi {
             } else {
                 rest.len()
             };
-            self.post(
-                "chat.postMessage",
-                &self.bot_token,
-                &json!({
-                    "channel": channel,
-                    "text": &rest[..end],
-                    // Agent output must never ping — a reply containing
-                    // <!channel>/<!here> would otherwise notify the room.
-                    "parse": "none"
-                }),
-            )
-            .await?;
+            let mut body = json!({
+                "channel": channel,
+                "text": &rest[..end],
+                // Agent output must never ping — a reply containing
+                // <!channel>/<!here> would otherwise notify the room.
+                "parse": "none"
+            });
+            if let Some(ts) = thread_ts {
+                body["thread_ts"] = json!(ts);
+            }
+            self.post("chat.postMessage", &self.bot_token, &body)
+                .await?;
             rest = &rest[end..];
         }
         Ok(())
@@ -143,6 +148,9 @@ pub fn incoming_from_event(ev: &Value, bot_user_id: &str) -> Option<Incoming> {
     }
     let channel = ev["channel"].as_str()?.to_string();
     let text = ev["text"].as_str()?.to_string();
+    // Thread replies carry thread_ts — scope them to their own session
+    // lane so a thread is its own conversation.
+    let thread_id = ev["thread_ts"].as_str().map(String::from);
     if ev["channel_type"].as_str() != Some("im") {
         let mention = format!("<@{bot_user_id}>");
         if !text.contains(&mention) {
@@ -158,6 +166,7 @@ pub fn incoming_from_event(ev: &Value, bot_user_id: &str) -> Option<Incoming> {
         }
         return Some(Incoming {
             chat_id: channel,
+            thread_id,
             sender_id: ev["user"].as_str().map(String::from),
             text: stripped,
             attachments: Vec::new(),
@@ -165,10 +174,43 @@ pub fn incoming_from_event(ev: &Value, bot_user_id: &str) -> Option<Incoming> {
     }
     Some(Incoming {
         chat_id: channel,
+        thread_id,
         sender_id: ev["user"].as_str().map(String::from),
         text,
         attachments: Vec::new(),
     })
+}
+
+/// True when a message event is addressed to the bot but carries only
+/// files — no usable text. recv answers these with a notice rather
+/// than dropping them (channel) or prompting on "" (DM). Slack files
+/// arrive as `file_share` subtypes, which incoming_from_event skips.
+fn attachment_only(ev: &Value, bot_user_id: &str) -> bool {
+    if ev["type"] != "message" {
+        return false;
+    }
+    if ev["subtype"].as_str().is_some_and(|s| s != "file_share") {
+        return false;
+    }
+    if ev["user"].as_str() == Some(bot_user_id) {
+        return false;
+    }
+    if ev["files"].as_array().is_none_or(|f| f.is_empty()) {
+        return false;
+    }
+    let text = ev["text"].as_str().unwrap_or("");
+    if ev["channel_type"].as_str() != Some("im") {
+        let mention = format!("<@{bot_user_id}>");
+        if !text.contains(&mention) {
+            return false;
+        }
+        return text
+            .replace(&mention, "")
+            .trim_start_matches([' ', ',', ':'])
+            .trim()
+            .is_empty();
+    }
+    text.trim().is_empty()
 }
 
 type WsStream =
@@ -279,19 +321,21 @@ impl ChannelApi for SlackChannel {
                             Ok(v) => v,
                             Err(_) => continue,
                         };
-                        // Every envelope must be acked, even ones we skip.
-                        if let Some(eid) = v["envelope_id"].as_str() {
-                            let ack = json!({"envelope_id": eid});
-                            let _ = conn
-                                .write
-                                .lock()
-                                .await
-                                .send(Message::Text(ack.to_string().into()))
-                                .await;
-                        }
                         match v["type"].as_str() {
-                            // Slack asked us to reconnect.
-                            Some("disconnect") => *guard = None,
+                            // Slack asked us to reconnect — still ack
+                            // the envelope like every other one.
+                            Some("disconnect") => {
+                                if let Some(eid) = v["envelope_id"].as_str() {
+                                    let ack = json!({"envelope_id": eid});
+                                    let _ = conn
+                                        .write
+                                        .lock()
+                                        .await
+                                        .send(Message::Text(ack.to_string().into()))
+                                        .await;
+                                }
+                                *guard = None;
+                            }
                             Some("events_api") => {
                                 // Dedup by envelope_id, not retry_attempt:
                                 // a retry we never received must be
@@ -300,16 +344,68 @@ impl ChannelApi for SlackChannel {
                                 if let Some(eid) = v["envelope_id"].as_str() {
                                     let mut seen = self.seen_envelopes.lock().await;
                                     if !seen.insert(eid.to_string()) {
+                                        // Still ack the retry — an
+                                        // unacked duplicate would just
+                                        // be retried again.
+                                        let ack = json!({"envelope_id": eid});
+                                        let _ = conn
+                                            .write
+                                            .lock()
+                                            .await
+                                            .send(Message::Text(ack.to_string().into()))
+                                            .await;
                                         continue;
                                     }
                                 }
                                 let ev = &v["payload"]["event"];
                                 let bot_id = self.bot_id.lock().await.clone().unwrap_or_default();
-                                if let Some(msg) = incoming_from_event(ev, &bot_id) {
+                                // Resolve the event BEFORE acking: the
+                                // ack is Slack's signal that the event
+                                // was handled, so the decision to
+                                // process, answer, or drop comes first.
+                                let msg = incoming_from_event(ev, &bot_id);
+                                let notice = attachment_only(ev, &bot_id);
+                                if let Some(eid) = v["envelope_id"].as_str() {
+                                    let ack = json!({"envelope_id": eid});
+                                    let _ = conn
+                                        .write
+                                        .lock()
+                                        .await
+                                        .send(Message::Text(ack.to_string().into()))
+                                        .await;
+                                }
+                                if let Some(msg) = msg {
                                     return Ok(Some(msg));
                                 }
+                                // File-only message for the bot: say so
+                                // instead of dropping it (channel) or
+                                // erroring on an empty prompt (DM).
+                                if notice {
+                                    let channel = ev["channel"].as_str().unwrap_or_default();
+                                    let thread = ev["thread_ts"].as_str();
+                                    let _ = self
+                                        .api
+                                        .post_message(
+                                            channel,
+                                            "attachments aren't supported on this channel yet",
+                                            thread,
+                                        )
+                                        .await;
+                                }
                             }
-                            _ => {} // hello, interactive, slash_commands…
+                            _ => {
+                                // hello, interactive, slash_commands… —
+                                // every envelope must still be acked.
+                                if let Some(eid) = v["envelope_id"].as_str() {
+                                    let ack = json!({"envelope_id": eid});
+                                    let _ = conn
+                                        .write
+                                        .lock()
+                                        .await
+                                        .send(Message::Text(ack.to_string().into()))
+                                        .await;
+                                }
+                            }
                         }
                     }
                     Some(Ok(_)) => {} // ping/pong/binary
@@ -328,7 +424,16 @@ impl ChannelApi for SlackChannel {
     }
 
     async fn send(&self, chat_id: &str, text: &str) -> anyhow::Result<()> {
-        self.api.post_message(chat_id, text).await
+        self.api.post_message(chat_id, text, None).await
+    }
+
+    async fn send_in_thread(
+        &self,
+        chat_id: &str,
+        thread_id: Option<&str>,
+        text: &str,
+    ) -> anyhow::Result<()> {
+        self.api.post_message(chat_id, text, thread_id).await
     }
 }
 

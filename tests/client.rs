@@ -28,8 +28,8 @@ struct ServerState {
     proceed: Notify,
 }
 
-/// WS endpoint: greets each connection with a notification, then answers
-/// every request with `{"echo": <method>}`.
+/// WS endpoint: greets each connection with a `session.event` push, then
+/// answers every request with `{"echo": <method>}`.
 async fn ws_handler(
     State(state): State<Arc<ServerState>>,
     ws: WebSocketUpgrade,
@@ -41,7 +41,7 @@ async fn handle_socket(mut socket: WebSocket, state: Arc<ServerState>) {
     let n = state.greetings.fetch_add(1, Ordering::SeqCst) + 1;
     let _ = socket
         .send(Message::Text(
-            json!({"method": "session/update", "params": {"greeting": n}})
+            json!({"event": "session.event", "sessionId": "test", "data": {"greeting": n}})
                 .to_string()
                 .into(),
         ))
@@ -83,15 +83,22 @@ fn serve(listener: TcpListener, state: Arc<ServerState>) -> JoinHandle<()> {
     })
 }
 
-/// Pull the next `session/update` event off the client's event stream.
+/// Pull the next `session.event` push off the client's event stream.
+/// Connection-state mirror events pass through — reconnects re-emit
+/// `Connected`, which must not be mistaken for payload.
 async fn recv_greeting(events: &mut tokio::sync::mpsc::Receiver<ClientEvent>) -> u64 {
-    let ev = timeout(Duration::from_secs(15), events.recv())
-        .await
-        .expect("timed out waiting for greeting")
-        .expect("event stream closed");
-    match ev {
-        ClientEvent::Update(params) => params["greeting"].as_u64().expect("no greeting"),
-        other => panic!("expected Update, got {other:?}"),
+    loop {
+        let ev = timeout(Duration::from_secs(15), events.recv())
+            .await
+            .expect("timed out waiting for greeting")
+            .expect("event stream closed");
+        match ev {
+            ClientEvent::Event { event, .. } => {
+                return event["greeting"].as_u64().expect("no greeting");
+            }
+            ClientEvent::Connected | ClientEvent::Disconnected => continue,
+            other => panic!("expected Event, got {other:?}"),
+        }
     }
 }
 
@@ -116,8 +123,8 @@ async fn reconnects_after_server_restart() {
     assert_eq!(recv_greeting(&mut events).await, 1);
 
     // First request succeeds, then the server closes the socket.
-    let v = client.request("initialize", json!({})).await.unwrap();
-    assert_eq!(v["echo"], "initialize");
+    let v = client.request("hello", json!({})).await.unwrap();
+    assert_eq!(v["echo"], "hello");
     state.done.notified().await;
 
     // Tear down the accept loop, release the handler, rebind the port.
@@ -130,12 +137,12 @@ async fn reconnects_after_server_restart() {
     // The client redials in the background; this request may span the gap.
     let v = timeout(
         Duration::from_secs(15),
-        client.request("session/list", json!({})),
+        client.request("session.list", json!({})),
     )
     .await
     .expect("request did not complete after reconnect")
     .expect("request failed after reconnect");
-    assert_eq!(v["echo"], "session/list");
+    assert_eq!(v["echo"], "session.list");
     assert_eq!(state.greetings.load(Ordering::SeqCst), 2);
 }
 
@@ -156,7 +163,7 @@ async fn request_times_out_when_server_stays_down() {
     let client = DamonClient::connect(&format!("ws://{addr}/ws"), None)
         .await
         .unwrap();
-    client.request("initialize", json!({})).await.unwrap();
+    client.request("hello", json!({})).await.unwrap();
     state.done.notified().await;
 
     // No restart: release the handler and kill the accept loop for good.
@@ -170,7 +177,7 @@ async fn request_times_out_when_server_stays_down() {
 
     let start = Instant::now();
     let err = client
-        .request("session/list", json!({}))
+        .request("session.list", json!({}))
         .await
         .expect_err("request must fail while the server is down");
     let elapsed = start.elapsed();
@@ -184,8 +191,8 @@ async fn request_times_out_when_server_stays_down() {
     );
 }
 
-/// Notifications keep flowing across a reconnect: the second server
-/// greets the redialed connection and the event stream delivers it.
+/// Events keep flowing across a reconnect: the second server greets the
+/// redialed connection and the event stream delivers it.
 #[tokio::test]
 async fn notifications_resume_after_reconnect() {
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -204,7 +211,7 @@ async fn notifications_resume_after_reconnect() {
     let mut events = client.events().await;
     assert_eq!(recv_greeting(&mut events).await, 1);
 
-    client.request("initialize", json!({})).await.unwrap();
+    client.request("hello", json!({})).await.unwrap();
     state.done.notified().await;
 
     server.abort();
@@ -213,7 +220,76 @@ async fn notifications_resume_after_reconnect() {
     let listener = TcpListener::bind(addr).await.unwrap();
     let _server2 = serve(listener, state.clone());
 
-    // The redialed connection is greeted again — proof the notification
+    // The redialed connection is greeted again — proof the event
     // path survived the reconnect.
     assert_eq!(recv_greeting(&mut events).await, 2);
+}
+
+/// Killing and restarting the server is observable as a
+/// Connected → Disconnected → Connected sequence, both on the
+/// `conn_state()` watch (authoritative) and as ClientEvent mirrors on
+/// the event stream.
+#[tokio::test]
+async fn conn_state_and_events_track_server_lifecycle() {
+    use damon_core::client::ConnState;
+
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let state = Arc::new(ServerState {
+        close_after_reply: AtomicBool::new(true),
+        greetings: AtomicU64::new(0),
+        done: Notify::new(),
+        proceed: Notify::new(),
+    });
+    let server = serve(listener, state.clone());
+
+    let client = DamonClient::connect(&format!("ws://{addr}/ws"), None)
+        .await
+        .unwrap();
+    let mut events = client.events().await;
+    let mut conn = client.conn_state();
+    assert_eq!(*conn.borrow(), ConnState::Connected);
+    assert_eq!(recv_greeting(&mut events).await, 1);
+
+    // Server closes the socket after its first reply.
+    client.request("hello", json!({})).await.unwrap();
+    state.done.notified().await;
+    server.abort();
+    let _ = server.await;
+    state.proceed.notify_one();
+
+    // Disconnected, on both surfaces.
+    let ev = timeout(Duration::from_secs(15), events.recv())
+        .await
+        .expect("timed out waiting for Disconnected")
+        .expect("event stream closed");
+    assert!(matches!(ev, ClientEvent::Disconnected));
+    let deadline = Instant::now() + Duration::from_secs(15);
+    while *conn.borrow() != ConnState::Disconnected {
+        assert!(
+            Instant::now() < deadline,
+            "watch never flipped to Disconnected"
+        );
+        conn.changed().await.expect("conn watch closed");
+    }
+
+    // Restart on the same port; the supervisor redials.
+    let listener = TcpListener::bind(addr).await.unwrap();
+    let _server2 = serve(listener, state.clone());
+    let deadline = Instant::now() + Duration::from_secs(15);
+    while *conn.borrow() != ConnState::Connected {
+        assert!(
+            Instant::now() < deadline,
+            "watch never flipped back to Connected"
+        );
+        conn.changed().await.expect("conn watch closed");
+    }
+    // The Connected mirror arrives before the second greeting (emitted
+    // by the supervisor right after the successful redial).
+    let ev = timeout(Duration::from_secs(15), events.recv())
+        .await
+        .expect("timed out waiting for Connected")
+        .expect("event stream closed");
+    assert!(matches!(ev, ClientEvent::Connected));
+    assert_eq!(state.greetings.load(Ordering::SeqCst), 2);
 }

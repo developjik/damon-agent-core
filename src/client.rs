@@ -1,5 +1,5 @@
-//! Reference client for the damond WS/JSON-RPC (ACP-shaped) API.
-//! This module doubles as the integration example — see docs/integration.md.
+//! Reference client for the damond WS/JSON API (protocol v2).
+//! This module doubles as the integration example — see docs/protocol-v2.md.
 
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -19,28 +19,32 @@ type Ws = WebSocketStream<MaybeTlsStream<TcpStream>>;
 /// Events pushed from the daemon outside of request/response.
 #[derive(Debug)]
 pub enum ClientEvent {
-    /// `session/update` notification params.
-    Update(Value),
-    /// Server-initiated request (e.g. session/request_permission).
-    /// Answer with `client.respond(id, result)`.
-    Request {
-        id: u64,
-        method: String,
-        params: Value,
-    },
-    /// Response to a `prompt` call, routed through the event stream so it
-    /// stays ordered after that session's notifications.
-    PromptDone {
+    /// A `session.event` push: `event` is the StreamEvent payload
+    /// (`{"type": "…", …}` — see docs/protocol-v2.md).
+    Event { session_id: String, event: Value },
+    /// Response to a `turn_start` call, routed through the event stream
+    /// so it stays ordered after that session's `session.event` pushes.
+    /// `result` is the turn result (`{turnId, stopReason, usage?}`) or
+    /// the error object.
+    TurnDone {
         session_id: String,
         result: Result<Value, Value>,
     },
+    /// The transport connected (initially implied; re-emitted after
+    /// each reconnect). Mirrored from the reconnect supervisor —
+    /// best-effort: a full event channel drops it rather than blocking
+    /// the supervisor. `conn_state()` is the authoritative source.
+    Connected,
+    /// The transport died; the supervisor is redialing. Same mirroring
+    /// rules as [`ClientEvent::Connected`].
+    Disconnected,
 }
 
 /// How a pending RPC response should be delivered.
 enum Pending {
     /// Direct oneshot reply (normal requests).
     Direct(oneshot::Sender<Result<Value, Value>>),
-    /// Route into the event stream (prompt — keeps ordering vs notifications).
+    /// Route into the event stream (turn.start — keeps ordering vs events).
     ToEvents { session_id: String },
 }
 
@@ -53,15 +57,18 @@ pub struct DamonClient {
     events: Arc<Mutex<mpsc::Receiver<ClientEvent>>>,
     /// Connection liveness, driven by the reconnect supervisor.
     conn: watch::Receiver<ConnState>,
-    /// Update notifications dropped because the event channel was full —
-    /// a slow consumer loses streamed chunks; poll this to detect it.
+    /// Session events dropped because the event channel was full —
+    /// a slow consumer loses streamed events; poll this to detect it.
     dropped: Arc<AtomicU64>,
+    /// The daemon's permission timeout, learned from the `hello` push
+    /// (`permissionTimeoutSecs`); defaults until then.
+    permission_timeout_secs: Arc<AtomicU64>,
 }
 
 /// Tunables for `connect_with_options` / `connect_relay_with_options`.
 #[derive(Clone, Debug)]
 pub struct ConnectOptions {
-    /// Capacity of the ClientEvent channel. Update notifications are
+    /// Capacity of the ClientEvent channel. Session events are
     /// dropped (counted via `dropped_events()`) when a slow consumer lets
     /// this fill — raise it for consumers that batch-render.
     pub event_capacity: usize,
@@ -72,10 +79,10 @@ impl Default for ConnectOptions {
         Self { event_capacity: 64 }
     }
 }
-
-/// Whether the transport is currently usable.
+/// Whether the transport is currently usable. Public so embedders can
+/// watch connection liveness via [`DamonClient::conn_state`].
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
-enum ConnState {
+pub enum ConnState {
     Connected,
     Disconnected,
 }
@@ -85,6 +92,10 @@ const RECONNECT_WAIT: Duration = Duration::from_secs(10);
 /// First reconnect delay; doubles each failure up to `RECONNECT_MAX`.
 const RECONNECT_MIN: Duration = Duration::from_millis(100);
 const RECONNECT_MAX: Duration = Duration::from_secs(5);
+
+/// Fallback for `permission_timeout()` before the `hello` push reports
+/// the daemon's configured value — mirrors the daemon's own default.
+const DEFAULT_PERMISSION_TIMEOUT_SECS: u64 = 300;
 
 /// Anything that can send a JSON text frame to the daemon.
 #[async_trait::async_trait]
@@ -199,6 +210,7 @@ impl DamonClient {
         let (conn_tx, conn_rx) = watch::channel(ConnState::Connected);
         let writer: Arc<Mutex<Box<dyn TextWriter>>> = Arc::new(Mutex::new(writer));
         let dropped = Arc::new(AtomicU64::new(0));
+        let permission_timeout_secs = Arc::new(AtomicU64::new(DEFAULT_PERMISSION_TIMEOUT_SECS));
 
         tokio::spawn(
             Reconnect {
@@ -208,6 +220,7 @@ impl DamonClient {
                 event_tx,
                 conn_tx,
                 dropped: dropped.clone(),
+                permission_timeout_secs: permission_timeout_secs.clone(),
             }
             .run(rx),
         );
@@ -219,16 +232,17 @@ impl DamonClient {
             events: Arc::new(Mutex::new(event_rx)),
             conn: conn_rx,
             dropped,
+            permission_timeout_secs,
         }
     }
 
-    /// Generic JSON-RPC request. Resolves with the result or the error object.
+    /// Generic request. Resolves with the result or the error object.
     /// While the link is down this waits for the reconnect supervisor —
     /// up to `RECONNECT_WAIT` — before failing. Link deaths are retried
     /// on the reconnected link (bounded); this makes requests
     /// at-least-once — a response lost in transit means the daemon may
     /// have executed the call — acceptable because Direct calls are
-    /// metadata ops (list/new/delete/search), and prompt turns never
+    /// metadata ops (list/create/delete/search), and turns never
     /// take this path.
     pub async fn request(&self, method: &str, params: Value) -> anyhow::Result<Value> {
         for attempt in 0..3 {
@@ -236,7 +250,7 @@ impl DamonClient {
             let id = self.next_id.fetch_add(1, Ordering::Relaxed);
             let (tx, rx) = oneshot::channel();
             self.pending.lock().await.insert(id, Pending::Direct(tx));
-            let msg = json!({"jsonrpc": "2.0", "id": id, "method": method, "params": params});
+            let msg = json!({"id": id, "method": method, "params": params});
             let sent = self.writer.lock().await.send_text(msg.to_string()).await;
             if let Err(e) = sent {
                 // The frame never reached the wire: drop the waiter so a
@@ -259,6 +273,18 @@ impl DamonClient {
         bail!("connection closed")
     }
 
+    /// Fire-and-forget frame — no response is expected or routed.
+    /// No v2 method is a notification; kept for envelope parity.
+    pub async fn notify(&self, method: &str, params: Value) -> anyhow::Result<()> {
+        let msg = json!({"method": method, "params": params});
+        self.writer
+            .lock()
+            .await
+            .send_text(msg.to_string())
+            .await
+            .context("send failed")
+    }
+
     /// Block until the transport is connected, or `RECONNECT_WAIT` elapses.
     async fn wait_connected(&self) -> anyhow::Result<()> {
         let mut rx = self.conn.clone();
@@ -277,38 +303,20 @@ impl DamonClient {
         }
     }
 
-    /// Update notifications dropped because the event channel filled —
-    /// nonzero means a slow consumer lost streamed chunks. Raise
+    /// Session events dropped because the event channel filled —
+    /// nonzero means a slow consumer lost streamed events. Raise
     /// `ConnectOptions::event_capacity` or consume faster.
     pub fn dropped_events(&self) -> u64 {
         self.dropped.load(Ordering::Relaxed)
     }
 
-    /// Respond to a server-initiated request (ClientEvent::Request).
-    pub async fn respond(&self, id: u64, result: Value) -> anyhow::Result<()> {
-        let msg = json!({"jsonrpc": "2.0", "id": id, "result": result});
-        self.writer
-            .lock()
-            .await
-            .send_text(msg.to_string())
-            .await
-            .context("send failed")
-    }
-
-    /// Answer a server-initiated request with a JSON-RPC error — used
-    /// for methods the client doesn't implement so the daemon isn't
-    /// left waiting on a response that never comes.
-    pub async fn respond_error(&self, id: u64, code: i64, message: &str) -> anyhow::Result<()> {
-        let msg = json!({
-            "jsonrpc": "2.0", "id": id,
-            "error": {"code": code, "message": message}
-        });
-        self.writer
-            .lock()
-            .await
-            .send_text(msg.to_string())
-            .await
-            .context("send failed")
+    /// Live connection state — a watch channel driven by the reconnect
+    /// supervisor. Clone and `changed().await` it, or `borrow()` for a
+    /// point-in-time check. This is the authoritative liveness source;
+    /// the `ClientEvent::Connected`/`Disconnected` events are a
+    /// best-effort mirror for event-loop consumers.
+    pub fn conn_state(&self) -> watch::Receiver<ConnState> {
+        self.conn.clone()
     }
 
     /// Stream of server events. Only one consumer — takes the receiver.
@@ -318,22 +326,38 @@ impl DamonClient {
 
     // --- Convenience wrappers -------------------------------------------
 
-    pub async fn initialize(&self) -> anyhow::Result<Value> {
-        self.request(
-            "initialize",
-            json!({"protocolVersion": 1, "clientCapabilities": {}}),
-        )
-        .await
+    /// Handshake: `{protocol, daemon, version, backends[], methods[]}`.
+    /// The daemon also pushes the same shape (minus backends/methods)
+    /// on connect — that push is what feeds `permission_timeout()`.
+    pub async fn hello(&self) -> anyhow::Result<Value> {
+        self.request("hello", json!({})).await
     }
 
-    /// Create a session. `model` becomes the session's default model —
-    /// a per-prompt override still wins. Accepts `provider/model`,
-    /// a glob-routed id, a discovered id, or `model:level` thinking suffix.
-    pub async fn new_session(&self, cwd: &str, model: Option<&str>) -> anyhow::Result<String> {
+    /// How long the daemon waits on an unanswered permission prompt
+    /// before denying it — from the `hello` push, or the 300s default
+    /// until the first push arrives.
+    pub fn permission_timeout(&self) -> Duration {
+        Duration::from_secs(self.permission_timeout_secs.load(Ordering::Relaxed))
+    }
+
+    /// Available backends: `[{id, available, capabilities}]`.
+    pub async fn backend_list(&self) -> anyhow::Result<Vec<Value>> {
+        let v = self.request("backend.list", json!({})).await?;
+        Ok(v["backends"].as_array().cloned().unwrap_or_default())
+    }
+
+    /// Create a session. `backend` picks the agent (None = daemon
+    /// default); `model` becomes the session's default model.
+    pub async fn create_session(
+        &self,
+        backend: Option<&str>,
+        cwd: &str,
+        model: Option<&str>,
+    ) -> anyhow::Result<String> {
         let v = self
             .request(
-                "session/new",
-                json!({"cwd": cwd, "mcpServers": [], "model": model}),
+                "session.create",
+                json!({"backend": backend, "cwd": cwd, "model": model}),
             )
             .await?;
         v["sessionId"]
@@ -342,10 +366,17 @@ impl DamonClient {
             .context("no sessionId in response")
     }
 
-    /// All sessions as `(sessionId, createdAt, model, title)` tuples —
-    /// model/title are empty strings when unset.
-    pub async fn list_sessions(&self) -> anyhow::Result<Vec<(String, String, String, String)>> {
-        let v = self.request("session/list", json!({})).await?;
+    /// Sessions as `(sessionId, createdAt, backend, title)` tuples —
+    /// backend/title are empty strings when unset. `limit`/`offset`
+    /// page the result; None uses the daemon's default page.
+    pub async fn list_sessions(
+        &self,
+        limit: Option<u32>,
+        offset: Option<u32>,
+    ) -> anyhow::Result<Vec<(String, String, String, String)>> {
+        let v = self
+            .request("session.list", json!({"limit": limit, "offset": offset}))
+            .await?;
         Ok(v["sessions"]
             .as_array()
             .map(|a| {
@@ -354,7 +385,7 @@ impl DamonClient {
                         (
                             s["sessionId"].as_str().unwrap_or("").to_string(),
                             s["createdAt"].as_str().unwrap_or("").to_string(),
-                            s["model"].as_str().unwrap_or("").to_string(),
+                            s["backend"].as_str().unwrap_or("").to_string(),
                             s["title"].as_str().unwrap_or("").to_string(),
                         )
                     })
@@ -363,41 +394,61 @@ impl DamonClient {
             .unwrap_or_default())
     }
 
+    /// Stored messages for a session (StoredMessage rows), ordered by
+    /// message id; `limit`/`offset` page the result.
+    pub async fn session_messages(
+        &self,
+        id: &str,
+        limit: Option<u32>,
+        offset: Option<u32>,
+    ) -> anyhow::Result<Vec<Value>> {
+        let v = self
+            .request(
+                "session.messages",
+                json!({"sessionId": id, "limit": limit, "offset": offset}),
+            )
+            .await?;
+        Ok(v["messages"].as_array().cloned().unwrap_or_default())
+    }
+
+    /// Sessions a backend can import from `cwd` (native history).
+    pub async fn import_sessions(
+        &self,
+        backend: &str,
+        cwd: Option<&str>,
+    ) -> anyhow::Result<Vec<Value>> {
+        let v = self
+            .request("session.import", json!({"backend": backend, "cwd": cwd}))
+            .await?;
+        Ok(v["sessions"].as_array().cloned().unwrap_or_default())
+    }
+
     /// Rename a session (sets its title).
     pub async fn rename_session(&self, id: &str, title: &str) -> anyhow::Result<()> {
-        self.request("session/rename", json!({"sessionId": id, "title": title}))
+        self.request("session.rename", json!({"sessionId": id, "title": title}))
             .await?;
         Ok(())
     }
 
-    /// Set or clear (None) the session's default model override.
-    pub async fn set_session_model(&self, id: &str, model: Option<&str>) -> anyhow::Result<()> {
-        self.request(
-            "session/set_model",
-            json!({"sessionId": id, "model": model}),
-        )
-        .await?;
-        Ok(())
-    }
-
-    /// Token usage: per-session totals when `id` is given, per-model
-    /// rollup (model, input, output, turns) otherwise.
+    /// Usage: per-session totals when `id` is given, per-model rollup
+    /// (model, contextUsed, contextSize, costUsd, turns) otherwise.
     pub async fn usage(&self, id: Option<&str>) -> anyhow::Result<Value> {
-        self.request("session/usage", json!({"sessionId": id}))
+        self.request("session.usage", json!({"sessionId": id}))
             .await
     }
 
     /// Delete a session and its history.
     pub async fn delete_session(&self, id: &str) -> anyhow::Result<()> {
-        self.request("session/delete", json!({"sessionId": id}))
+        self.request("session.delete", json!({"sessionId": id}))
             .await?;
         Ok(())
     }
 
-    /// Verify a session exists so the client can prompt into it.
+    /// Resume a persisted session: brings it live (or attaches to the
+    /// already-live one) and subscribes this connection to its events.
     pub async fn resume_session(&self, id: &str) -> anyhow::Result<String> {
         let v = self
-            .request("session/resume", json!({"sessionId": id}))
+            .request("session.resume", json!({"sessionId": id}))
             .await?;
         v["sessionId"]
             .as_str()
@@ -405,13 +456,18 @@ impl DamonClient {
             .context("no sessionId in response")
     }
 
-    /// ACP session/load: attach to an existing session — the daemon
-    /// replays its history as session/update notifications on the event
-    /// stream, so callers should already be draining events.
-    pub async fn load_session(&self, id: &str) -> anyhow::Result<()> {
-        self.request("session/load", json!({"sessionId": id}))
+    /// Fork a session: copy the session row and its messages into a new
+    /// session, optionally only up to and including `upto` (an original
+    /// message id). The agent's own session id is NOT copied — the fork
+    /// attaches a fresh agent session on first prompt.
+    pub async fn fork_session(&self, id: &str, upto: Option<i64>) -> anyhow::Result<String> {
+        let v = self
+            .request("session.fork", json!({"sessionId": id, "upto": upto}))
             .await?;
-        Ok(())
+        v["sessionId"]
+            .as_str()
+            .map(String::from)
+            .context("no sessionId in response")
     }
 
     /// Full-text search over all session history.
@@ -422,7 +478,7 @@ impl DamonClient {
         limit: usize,
     ) -> anyhow::Result<Vec<(String, i64, String)>> {
         let v = self
-            .request("session/search", json!({"query": query, "limit": limit}))
+            .request("session.search", json!({"query": query, "limit": limit}))
             .await?;
         Ok(v["results"]
             .as_array()
@@ -439,16 +495,27 @@ impl DamonClient {
             })
             .unwrap_or_default())
     }
-    /// Start a prompt turn. `model` overrides the session's stored default
-    /// for this turn only. The response arrives as `ClientEvent::PromptDone`
-    /// on the event stream — ordered after that session's chunk notifications,
-    /// so consumers never lose trailing chunks to a race.
-    pub async fn prompt(
+
+    /// Start a turn. The response arrives as `ClientEvent::TurnDone` on
+    /// the event stream — ordered after that session's `session.event`
+    /// pushes, so consumers never lose trailing events to a race.
+    pub async fn turn_start(&self, session_id: &str, text: &str) -> anyhow::Result<()> {
+        self.turn_start_params(session_id, json!(text)).await
+    }
+
+    /// Like `turn_start`, but sends raw content blocks — use for
+    /// multimodal prompts (image/resource blocks alongside text).
+    pub async fn turn_start_blocks(
         &self,
         session_id: &str,
-        text: &str,
-        model: Option<&str>,
+        blocks: Vec<Value>,
     ) -> anyhow::Result<()> {
+        self.turn_start_params(session_id, json!(blocks)).await
+    }
+
+    /// Shared turn.start send: register the pending waiter before the
+    /// frame goes out so the response can never arrive to no waiter.
+    async fn turn_start_params(&self, session_id: &str, prompt: Value) -> anyhow::Result<()> {
         let id = self.next_id.fetch_add(1, Ordering::Relaxed);
         self.pending.lock().await.insert(
             id,
@@ -457,8 +524,8 @@ impl DamonClient {
             },
         );
         let msg = json!({
-            "jsonrpc": "2.0", "id": id, "method": "session/prompt",
-            "params": {"sessionId": session_id, "model": model, "prompt": [{"type": "text", "text": text}]},
+            "id": id, "method": "turn.start",
+            "params": {"sessionId": session_id, "prompt": prompt},
         });
         let sent = self.writer.lock().await.send_text(msg.to_string()).await;
         if let Err(e) = sent {
@@ -470,63 +537,64 @@ impl DamonClient {
         Ok(())
     }
 
-    /// Like `prompt`, but sends raw ACP content blocks — use for
-    /// multimodal prompts (image/resource blocks alongside text).
-    pub async fn prompt_blocks(
-        &self,
-        session_id: &str,
-        blocks: Vec<Value>,
-        model: Option<&str>,
-    ) -> anyhow::Result<()> {
-        let id = self.next_id.fetch_add(1, Ordering::Relaxed);
-        self.pending.lock().await.insert(
-            id,
-            Pending::ToEvents {
-                session_id: session_id.to_string(),
-            },
-        );
-        let msg = json!({
-            "jsonrpc": "2.0", "id": id, "method": "session/prompt",
-            "params": {"sessionId": session_id, "model": model, "prompt": blocks},
-        });
-        let sent = self.writer.lock().await.send_text(msg.to_string()).await;
-        if let Err(e) = sent {
-            self.pending.lock().await.remove(&id);
-            return Err(e).context("send failed");
-        }
+    /// Steer a running turn with additional input.
+    pub async fn turn_steer(&self, session_id: &str, prompt: Value) -> anyhow::Result<Value> {
+        self.request(
+            "turn.steer",
+            json!({"sessionId": session_id, "prompt": prompt}),
+        )
+        .await
+    }
+
+    /// Cancel the session's running turn.
+    pub async fn turn_cancel(&self, session_id: &str) -> anyhow::Result<()> {
+        self.request("turn.cancel", json!({"sessionId": session_id}))
+            .await?;
         Ok(())
     }
 
-    pub async fn cancel(&self, session_id: &str) -> anyhow::Result<()> {
-        let msg = json!({
-            "jsonrpc": "2.0",
-            "method": "session/cancel",
-            "params": {"sessionId": session_id},
-        });
-        self.writer
-            .lock()
-            .await
-            .send_text(msg.to_string())
-            .await
-            .context("send failed")
-    }
-
-    /// Force a context compaction on the session — the manual escape
-    /// hatch when a session is wedged against the real context window
-    /// while the daemon's estimate still reads under the threshold.
-    /// Returns (compacted, compacted_through, reason).
-    pub async fn compact_session(
+    /// Answer a `permission_requested` event. `request_id` is the
+    /// event's `id`; `response` is a PermissionResponse —
+    /// `{behavior:"allow",action_id?,updated_input?}` or
+    /// `{behavior:"deny",action_id?,message?,interrupt}`.
+    pub async fn respond_to_permission(
         &self,
         session_id: &str,
-    ) -> anyhow::Result<(bool, Option<i64>, Option<String>)> {
-        let v = self
-            .request("session/compact", json!({"sessionId": session_id}))
-            .await?;
-        Ok((
-            v["compacted"].as_bool().unwrap_or(false),
-            v["compactedThrough"].as_i64(),
-            v["reason"].as_str().map(String::from),
-        ))
+        request_id: &str,
+        response: Value,
+    ) -> anyhow::Result<()> {
+        self.request(
+            "permission.respond",
+            json!({"sessionId": session_id, "requestId": request_id, "response": response}),
+        )
+        .await?;
+        Ok(())
+    }
+
+    /// Change the session's model mid-flight.
+    pub async fn set_model(&self, session_id: &str, model: &str) -> anyhow::Result<()> {
+        self.request(
+            "session.set_model",
+            json!({"sessionId": session_id, "model": model}),
+        )
+        .await?;
+        Ok(())
+    }
+
+    /// Change the session's mode mid-flight.
+    pub async fn set_mode(&self, session_id: &str, mode: &str) -> anyhow::Result<()> {
+        self.request(
+            "session.set_mode",
+            json!({"sessionId": session_id, "mode": mode}),
+        )
+        .await?;
+        Ok(())
+    }
+
+    /// Backend catalog: `{models[], modes[], commands[]}`.
+    pub async fn catalog_models(&self, backend: &str) -> anyhow::Result<Value> {
+        self.request("catalog.models", json!({"backend": backend}))
+            .await
     }
 }
 
@@ -623,6 +691,7 @@ struct Reconnect {
     event_tx: mpsc::Sender<ClientEvent>,
     conn_tx: watch::Sender<ConnState>,
     dropped: Arc<AtomicU64>,
+    permission_timeout_secs: Arc<AtomicU64>,
 }
 
 impl Reconnect {
@@ -630,11 +699,21 @@ impl Reconnect {
         let mut backoff = RECONNECT_MIN;
         loop {
             while let Some(text) = rx.recv().await {
-                handle_frame(&text, &self.pending, &self.event_tx, &self.dropped).await;
+                handle_frame(
+                    &text,
+                    &self.pending,
+                    &self.event_tx,
+                    &self.dropped,
+                    &self.permission_timeout_secs,
+                )
+                .await;
             }
             // Connection ended: fail every pending request so callers
             // don't wait on a response that can never arrive.
             drain_pending(&self.pending, &self.event_tx).await;
+            // Mirror the state flip onto the event stream — best-effort
+            // (a full channel drops it); the watch is authoritative.
+            let _ = self.event_tx.try_send(ClientEvent::Disconnected);
             if self.conn_tx.send(ConnState::Disconnected).is_err() {
                 return; // every client handle dropped
             }
@@ -649,11 +728,17 @@ impl Reconnect {
                         // Swap the writer before announcing Connected so a
                         // released request() never sends on the dead sink.
                         *self.writer.lock().await = w;
+                        // A waiter that slipped in after the first
+                        // drain_pending may have sent on the dead sink —
+                        // drain again so it can't hang forever.
+                        drain_pending(&self.pending, &self.event_tx).await;
                         rx = r;
                         backoff = RECONNECT_MIN;
                         if self.conn_tx.send(ConnState::Connected).is_err() {
                             return;
                         }
+                        // Same best-effort mirror as the Disconnected flip.
+                        let _ = self.event_tx.try_send(ClientEvent::Connected);
                         break;
                     }
                     Err(_) => {
@@ -666,79 +751,75 @@ impl Reconnect {
     }
 }
 
-/// Route one inbound text frame: server request, notification, or a
-/// response that resolves a pending call.
+/// Route one inbound text frame: the `hello` push, a `session.event`
+/// push, or a response that resolves a pending call.
 async fn handle_frame(
     text: &str,
     pending: &Mutex<HashMap<u64, Pending>>,
     event_tx: &mpsc::Sender<ClientEvent>,
     dropped: &AtomicU64,
+    permission_timeout_secs: &AtomicU64,
 ) {
     let Ok(v) = serde_json::from_str::<Value>(text) else {
         return;
     };
-    match (v.get("method"), v.get("id")) {
-        // Server-initiated request.
-        (Some(method), Some(id)) => {
-            if let Some(id) = id.as_u64() {
-                let _ = event_tx
-                    .send(ClientEvent::Request {
-                        id,
-                        method: method.as_str().unwrap_or("").to_string(),
-                        params: v["params"].clone(),
-                    })
-                    .await;
-            }
-        }
-        // Notification. Updates are lossy by design — a slow consumer
-        // must never backpressure the pump into stalling RPC responses.
-        // Every drop is counted on `dropped_events()`; warn once per
-        // power of two so a wedged consumer doesn't spam the log.
-        (Some(_method), None)
-            if event_tx
-                .try_send(ClientEvent::Update(v["params"].clone()))
-                .is_err() =>
-        {
+    // The connect-time hello carries the daemon's permission budget —
+    // cache it so `permission_timeout()` can be a synchronous getter.
+    if let Some(hello) = v.get("hello")
+        && let Some(secs) = hello["permissionTimeoutSecs"].as_u64()
+    {
+        permission_timeout_secs.store(secs, Ordering::Relaxed);
+        return;
+    }
+    if v.get("event").is_some() {
+        // Events are lossy by design — a slow consumer must never
+        // backpressure the pump into stalling RPC responses. Every drop
+        // is counted on `dropped_events()`; warn once per power of two
+        // so a wedged consumer doesn't spam the log.
+        let ev = ClientEvent::Event {
+            session_id: v["sessionId"].as_str().unwrap_or("").to_string(),
+            event: v["data"].clone(),
+        };
+        if event_tx.try_send(ev).is_err() {
             let n = dropped.fetch_add(1, Ordering::Relaxed) + 1;
             if n.is_power_of_two() {
                 tracing::warn!(
                     dropped = n,
-                    "event channel full; dropping update notifications — slow consumer"
+                    "event channel full; dropping session events — slow consumer"
                 );
             }
         }
-        (Some(_method), None) => {}
-        // Response to one of our requests.
-        (None, Some(id)) => {
-            if let Some(id) = id.as_u64()
-                && let Some(p) = pending.lock().await.remove(&id)
-            {
-                let result = if let Some(err) = v.get("error") {
-                    Err(err.clone())
-                } else {
-                    Ok(v["result"].clone())
-                };
-                match p {
-                    Pending::Direct(tx) => {
-                        let _ = tx.send(result);
-                    }
-                    Pending::ToEvents { session_id } => {
-                        let _ = event_tx
-                            .send(ClientEvent::PromptDone { session_id, result })
-                            .await;
-                    }
-                }
+        return;
+    }
+    // Response to one of our requests. v2 daemons never send
+    // server-initiated requests; a `method` key means it isn't a reply.
+    if v.get("method").is_none()
+        && let Some(id) = v["id"].as_u64()
+        && let Some(p) = pending.lock().await.remove(&id)
+    {
+        let result = if let Some(err) = v.get("error") {
+            Err(err.clone())
+        } else {
+            Ok(v["result"].clone())
+        };
+        match p {
+            Pending::Direct(tx) => {
+                let _ = tx.send(result);
+            }
+            Pending::ToEvents { session_id } => {
+                let _ = event_tx
+                    .send(ClientEvent::TurnDone { session_id, result })
+                    .await;
             }
         }
-        _ => {}
     }
 }
 
 /// Fail every pending request — used when the transport dies so callers
 /// don't wait on a response that can never arrive. Direct waiters see
 /// the dropped oneshot — the closed channel IS the link-death signal, so
-/// `request()` can retry on the reconnected link; prompt waiters get an
-/// error `PromptDone` on the event stream, the only surface their
+/// `request()` can retry on the reconnected link; turn waiters get an
+/// error `TurnDone` on the event stream, the only surface their
 /// consumers read.
 async fn drain_pending(
     pending: &Mutex<HashMap<u64, Pending>>,
@@ -746,7 +827,7 @@ async fn drain_pending(
 ) {
     // Take the waiters out under the lock, then send without it: the
     // event channel is bounded, and a slow consumer must not pin the
-    // pending mutex across that await — request()/prompt()/response
+    // pending mutex across that await — request()/turn_start()/response
     // routing all contend on it. Waiters that race in after the
     // snapshot either fail their send on the dead sink (the caller
     // removes the entry) or resolve on the reconnected link.
@@ -761,7 +842,7 @@ async fn drain_pending(
             }
             Pending::ToEvents { session_id } => {
                 let _ = event_tx
-                    .send(ClientEvent::PromptDone {
+                    .send(ClientEvent::TurnDone {
                         session_id,
                         result: Err(json!({"message": "connection closed"})),
                     })

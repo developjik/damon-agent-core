@@ -1,6 +1,6 @@
 {
   "name": "damon-agent",
-  "version": "0.2.0",
+  "version": "0.3.0",
   "description": "Damon agent core — local multi-provider agent daemon",
   "license": "MIT OR Apache-2.0",
   "repository": "https://github.com/developjik/damon-agent-core",
@@ -15,7 +15,8 @@
     "damon-relay": "bin/damon-relay"
   },
   "scripts": {
-    "postinstall": "node install.js"
+    "postinstall": "node install.js",
+    "test": "node --test client.test.mjs"
   },
   "engines": {
     "node": ">=22"

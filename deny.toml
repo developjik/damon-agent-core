@@ -1,0 +1,36 @@
+# cargo-deny configuration. CI runs `cargo deny check licenses bans
+# sources` (the `deny` job in .github/workflows/ci.yml); advisories are
+# intentionally not checked here — the `audit` job already runs
+# cargo-audit against the same lockfile, so a second rustsec consumer
+# would be redundant.
+
+[licenses]
+version = 2
+# Derived from every license expression Cargo.lock actually resolves to
+# (via `cargo metadata`), not a canned list. Licenses that only appear
+# on the right side of an OR next to an allowed alternative (Unlicense,
+# BSL-1.0, MIT-0, LGPL-2.1-or-later, BSD-1/2-Clause, LLVM-exception)
+# need no entry — the allowed branch satisfies the expression.
+allow = [
+  "MIT",
+  "Apache-2.0",
+  "ISC",                 # ring, aws-lc-rs, aws-lc-sys
+  "BSD-3-Clause",        # matchit (MIT AND BSD-3-Clause), aws-lc-sys
+  "Unicode-3.0",         # unicode-ident ((MIT OR Apache-2.0) AND Unicode-3.0)
+  "CC0-1.0",             # notify (bare CC0-1.0)
+  "Zlib",                # foldhash (bare Zlib)
+  "MPL-2.0",             # option-ext (bare MPL-2.0; file-level copyleft, tiny helper crate)
+  "CDLA-Permissive-2.0", # webpki-roots (Mozilla cert bundle data license)
+]
+
+[bans]
+# The Rust util ecosystem (base64/rand/rand_core generations, etc.)
+# makes duplicate versions routine; warn for visibility, tighten later
+# once a deliberate dedup pass has been done.
+multiple-versions = "warn"
+
+[sources]
+unknown-registries = "deny"
+unknown-git = "deny"
+allow-registry = ["https://github.com/rust-lang/crates.io-index"]
+allow-git = ["https://github.com"]

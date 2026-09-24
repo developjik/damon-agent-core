@@ -7,7 +7,6 @@
 ```sh
 cargo test                              # full test suite
 cargo run --bin damond                  # run the daemon
-cargo run --release --example bench     # performance baseline
 ```
 
 The repo pins a toolchain via `rust-toolchain.toml` (stable + rustfmt +
@@ -20,8 +19,8 @@ clippy); rustup picks it up automatically.
   remove something.
 - Secrets never live in code or config files — `env:`, `keychain:`, or
   `!cmd` references only. Literal API keys are rejected at load time.
-- Performance regressions are bugs — attach `cargo run --release
-  --example bench` output to PRs that touch the streaming path.
+- Performance regressions are bugs — keep the streaming path lean and
+  call out hot-path changes in the PR.
 - Match existing conventions; don't add a second pattern beside a working
   one.
 

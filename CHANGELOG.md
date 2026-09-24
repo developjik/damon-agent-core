@@ -2,15 +2,316 @@
 
 ## Unreleased
 
+### Changed — native-CLI backend architecture (breaking)
+
+- **ACP dropped; backends speak their native CLI protocols.** The agent
+  registry and ACP host layer are replaced by a `backend` module:
+  `claude` drives `claude -p --output-format stream-json`, `codex`
+  drives `codex app-server`, `omp` drives `omp --mode rpc`. Each backend
+  owns its process, protocol translation, and resume token — Damon's
+  normalized `StreamEvent`/`TimelineItem`/`PermissionRequest` model is
+  the single contract every surface consumes.
+- **Wire protocol v2.** `initialize`/`session/new`/`session/prompt`/
+  `session/update` are replaced by `hello`, `session.create`,
+  `turn.start`, and `session.event` pushes. One connection multiplexes
+  every session; requests dispatch concurrently so a long turn never
+  serializes the socket. `turn.start` resolves at turn end with
+  `{turnId, stopReason, usage}`; events stream as
+  `{event:"session.event", sessionId, data}`.
+- **Config renames.** `[agents.X]` → `[backends.X]`,
+  `default_agent` → `default_backend`. Old keys are rejected
+  (`deny_unknown_fields`) — rename on upgrade.
+- **Permission flow.** `session/request_permission` is now a
+  `permission_requested` event answered by `permission.respond
+  {sessionId, requestId, response:{behavior:"allow"|"deny",…}}`.
+- **`damon-acp-mock` removed** — tests use an in-process mock backend.
+
+### Added — wider zero-config agent catalog
+
+- Eight more CLIs self-register from PATH, each speaking ACP natively
+  (no Node needed): `gemini` (`gemini --acp`), `copilot`
+  (`copilot --acp`), `cursor` (`cursor-agent acp`), `qwen` (`qwen --acp`),
+  `kimi` (`kimi acp`), `grok` (`grok agent stdio`), `droid`
+  (`droid exec --output-format acp-daemon`), and `auggie` (`auggie --acp`).
+  Droid and Auggie launch with self-update disabled — Damon supervises
+  the process, so the binary must not replace itself mid-run.
+
+- Eight more CLIs self-register from PATH, all native ACP: `goose`
+  (`goose acp`), `vibe` (`vibe-acp`), `cline` (`cline --acp`), `kilo`
+  (`kilo acp`), `kiro` (`kiro-cli acp`), `openhands` (`openhands acp`),
+  `qoder` (`qoder --acp`), and `glm` (`glm-acp-agent`, Z.AI Coding Plan).
+
+- Catalog entries can now carry default env for the launch line
+  (`[agents.X].env` still wins per key).
+
+### Added — agent supervision
+
+- **Crash backoff & give-up state** — a crash-looping agent process no
+  longer respawns on every request: each discovered death or failed
+  spawn doubles the retry window (1→2→4→…s, capped 60s) and five
+  consecutive failures park the agent for ten minutes.
+  `agents/list` entries gain `status` (`"ok"`/`"cooling"`/`"crashed"`),
+  `crashes`, and `lastError` fields (additive; older clients ignore
+  them).
+- **`agent/status {id}` RPC** — per-agent observability: supervision
+  state plus the live process's `pid`, `uptimeSecs`, and a bounded
+  `stderrTail` (newest 256 lines; stderr is now piped instead of
+  discarded, drained by a dedicated task so chatty adapters can never
+  stall agent I/O). Unknown agent ids return `-32601`.
+- **Idle subprocess shutdown** — new `agent_idle_secs` config (default
+  1800, `0` disables): agent processes unused for that long are killed
+  by a periodic sweep (agents with a live prompt are skipped) and the
+  next prompt respawns them cleanly via the resume chain — no crash is
+  recorded.
+- **Registry hot reload** — config edits now rebuild the resolved
+  agent set on the fly: new `[agents.X]` blocks appear in
+  `agents/list` without a restart, changed launch lines respawn on next
+  use, and vanished agents' processes are shut down.
+- **`damond service start|stop|restart`** — controls the registered
+  OS service (launchd `kickstart -k`/`bootout`, `systemctl --user`,
+  `schtasks /Run`/`/End`) and prints the resulting status line;
+  best-effort, matching `uninstall`.
+- **`damon-acp-mock` knobs** — `MOCK_DIE=1` (exit right after
+  initialize) and `MOCK_STDERR_MSG=<text>` (one stderr line at
+  startup) for supervisor and stderr-ring testing.
+
+### Added — session export, backups, richer search
+
+- **`session/export {sessionId, format}` RPC + `damon export <id> [--md]`** —
+  the full session as a Markdown transcript (`# title`, `**role**` blocks;
+  text-less tool payloads render as fenced JSON) or a pretty JSON
+  `{session, messages}` object. Oversized exports fail loudly with
+  `-32602` like other frame-capped responses.
+- **`damon backup [--out <path>]`** — snapshots the store with SQLite
+  `VACUUM INTO`: consistent while `damond` is running (WAL), refuses to
+  overwrite an existing file, and defaults to
+  `<data_dir>/damon-backup-YYYYMMDD-HHMMSS.db`.
+- **`session/search` filters** — `sessionId`, `before`, `after`
+  (inclusive ISO-8601 bounds on the session's creation) narrow results;
+  no filters behaves exactly as before.
+- **Tool-text indexing** — tool-call names/inputs and tool-result text
+  are now full-text searchable, as are text parts of array-form
+  content. Applies to messages written from this version on; existing
+  rows keep their original index entries.
+- **Rust client connection state** — `ConnState` and
+  `DamonClient::conn_state()` expose the reconnect supervisor's
+  liveness watch, and `ClientEvent::Connected`/`Disconnected` mirror
+  link drops/redials on the event stream (best-effort; the watch is
+  authoritative).
+
+### Added — session fork, SSE events, richer metrics
+
+- **`session/fork {sessionId, uptoMessageId?}` RPC + `damon fork <id> [--upto <msgId>]`** —
+  copies the session row and its messages into a new session, optionally
+  only up to and including `uptoMessageId`. The agent's own session id is
+  NOT copied — the fork attaches a fresh agent session on first prompt
+  (`fresh: true`). Web UI gains a ⑂ fork button on session rows; chat
+  bridges gain `!fork`.
+- **`GET /v1/events` SSE** — Server-Sent Events fan-out of daemon lifecycle
+  events: `session.started`, `session.deleted`, `session.forked`,
+  `turn.started`, `turn.finished`, `agent.status`. Token-gated with the
+  rest of `/v1`; a lagging subscriber sees a `lagged` comment frame.
+- **`GET /metrics` expansion** — new counters `damon_live_prompts`,
+  `damon_permission_waits_total`, `damon_permission_wait_ms_total`, plus
+  per-agent `damon_turn_duration_ms_sum`/`_count`/`damon_turn_errors_total`.
+- **`#[tracing::instrument]`** on `handle_socket`, `session_new`,
+  `session_resume`, `run_turn` — structured spans for RPC dispatch and
+  turn lifecycle.
+
+### Added — chat channel UX
+
+- **Thread-scoped sessions** — Slack `thread_ts` and Telegram
+  `message_thread_id` now scope a conversation to its own session lane:
+  each thread gets its own damon session, turn slot, and permission
+  lane. Discord threads are channels, so they already scoped correctly.
+- **Typing indicators** — Telegram (`sendChatAction`) and Discord
+  (`/channels/{id}/typing`) show a working indicator while a turn runs;
+  Slack bots have no typing API and skip it.
+- **Non-image attachments** — text-ish payloads (`text/*`,
+  `application/json`) go inline as ACP `resource` blocks; binary
+  payloads go as `resource` blobs. Images keep the `image` block.
+- **`always` permission reply** — when the agent offers an
+  `allow-always` option, replying `always` selects it (falls back to
+  `allow-once` when not offered).
+- **`!delete` command** — removes the chat's session and its history
+  from the daemon.
+
+### Added — CLI polish
+
+- **`damon --json`** — machine-readable JSON output for `sessions`,
+  `usage`, `search`, `rename`, `delete`, `fork`, and `doctor`.
+- **`damon doctor`** — connectivity + auth check: reports daemon
+  version, agent count, and RPC method count.
+- **`damon completions <shell>`** — generates shell completions
+  (bash/zsh/fish/powershell/elvish) via `clap_complete`.
+- **`damond --print-rpc-schema`** — prints the JSON-RPC method schema
+  (same list `initialize` returns) for client codegen and docs.
+
+### Fixed — usage accounting
+
+- **Orphaned usage rows** — `session/delete` and the retention sweep
+  now remove a session's usage rows; deleted sessions no longer bleed
+  phantom costs into `session/usage` rollups.
+- **Cumulative-cost over-counting** — ACP `usage_update` reports a
+  CUMULATIVE per-session cost, but each turn's row stored it raw, so
+  `SUM(cost_usd)` counted every intermediate value (a 0.50 + 0.80
+  session reported 1.30). Rows now store per-turn deltas (raw
+  cumulative kept in a new `cumulative_cost` baseline column; a
+  counter reset clamps to the reported value instead of going
+  negative), and pre-existing rows are migrated once on daemon start.
+
+### Fixed — web UI + permission relay
+
+- **Connection indicator never went green** — `setConn("on", …)` was
+  never called, so the status dot stayed "connecting" forever and the
+  settings drawer reported "connecting…" on a healthy link. The dot now
+  flips on a successful `initialize` handshake and shows
+  "handshake failed" when it doesn't.
+- **Permission asks ignored `permission_timeout_secs`** — an unanswered
+  card was denied only after the configured budget PLUS a hardcoded 30s
+  transport slack (a 15s config denied at 45s). `run_turn` now races the
+  client answer against the configured timeout and turn cancellation,
+  so a cancel also interrupts a pending ask instead of waiting it out.
+- **Permission card outlived its ask** — a card stayed visible after
+  the ask timed out, the turn ended, the session was deleted, or the
+  connection dropped. The card is now tracked per session: hidden when
+  its turn ends or its session is left, and re-shown when the session
+  is re-selected while the ask is still live.
+- **Mid-turn session switch lost the busy state** — switching away and
+  back during a live turn showed the session idle; a sent message then
+  rendered its bubble and failed with "session already has a prompt in
+  progress". Turns are now tracked per session (`liveTurns`), the busy
+  state is restored on return, mid-turn input queues as designed, and
+  chunks dropped while viewing another session are re-rendered from the
+  store when the turn completes.
+- **"0 turns" after a real turn** — `session/usage` counted usage rows,
+  so agents that never emit `usage_update` reported 0 turns. Turns now
+  count persisted prompt messages (MAX of prompts vs usage rows).
+- **Sessions started with an attachment got no title** — the
+  first-prompt title was only read from plain-string content; a
+  text+image prompt (parts array) left the session named by its id.
+  Text parts now contribute the title.
+- **Search snippets false-highlighted literal brackets** — FTS5's `[`/`]`
+  match markers collided with real `[`/`]` in message text. Markers are
+  now control characters (U+0001/U+0002) mapped to `<mark>` in the UI.
+
+### Changed — usage schema cleanup
+
+- The `input_tokens`/`output_tokens` columns are dropped from the
+  usage table: agents never sent token counts, so both were always 0.
+  The migration is automatic on the next `damond` start (bundled
+  SQLite supports `DROP COLUMN`).
+
+### Changed — Damon is now an ACP host
+
+Damon no longer runs its own agent runtime. It drives coding agents as
+ACP (Agent Client Protocol) subprocesses and owns sessions, permissions,
+history, channels, and remote access instead:
+
+- **Zero-config agents** — `claude`, `codex`, and `opencode` binaries on
+  PATH register themselves. Claude Code runs through
+  `@agentclientprotocol/claude-agent-acp`, Codex through
+  `@agentclientprotocol/codex-acp`, OpenCode natively (`opencode acp`).
+  Any other ACP agent plugs in via `[agents.X]`. Models, tools,
+  subscription auth, and context management belong to the agents.
+- **`session/new` takes `agent`** — per-session agent selection; the
+  legacy `model` field is interpreted as an agent id for compatibility.
+  `session/resume` reattaches agent sessions across daemon restarts via
+  ACP `session/resume`.
+- **Permission relay** — the agent's `session/request_permission` flows
+  to the web UI / CLI / chat channels (`allow`/`deny` replies) unchanged.
+- **`[mcp_servers]` is forwarded to agents** at session setup; Damon no
+  longer spawns MCP servers itself.
+- **Web UI agent control** — the composer's free-text model box is now an
+  agent picker (available agents selectable, not-installed ones shown with
+  install hints), the sidebar gains an agents status panel (live dots), and
+  session rows show their backing agent. Backed by a new `agents/list` RPC.
+- **`damon-acp-mock`** ships as a minimal ACP agent for tests and
+  protocol debugging (echo, permission ask, hang modes).
+- Sessions persist their backing agent (`sessions.agent` /
+  `agent_session` columns, auto-migrated); ACP `usage_update` telemetry
+  feeds `session/usage`.
+
+### Fixed — Web UI and daemon correctness
+
+- **Assistant replies lost their last block** — the markdown renderer
+  never flushed the trailing paragraph/list, so single-paragraph replies
+  rendered as empty bubbles. Streaming re-renders also wiped the copy
+  button and timestamp; both fixed.
+- **Send button sent "[object PointerEvent]"** — the click handler passed
+  the event through as the message text.
+- **Image attachments never reached the agent** — the daemon flattened
+  prompt blocks to their text, silently dropping `image` parts; the raw
+  ACP blocks are now forwarded verbatim.
+- **Sessions died after a daemon restart** — `session/resume` now falls
+  back `session/resume` → `session/load` → a fresh `session/new`, and
+  `session/prompt` auto-reattaches a detached session instead of failing
+  with "no agent backend". The response gains a `fresh` flag so clients
+  can note the context reset.
+- **Permission prompts showed "Allow ?"** — the relay dropped the
+  agent's `toolCall` object; it is forwarded now, so the card shows the
+  tool title, kind, and input.
+- **`session/usage` reported context occupancy as input tokens** — ACP
+  `usage_update` (`used`/`size`/`cost`) is recorded once per turn into
+  new `context_used`/`context_size`/`cost_usd` columns (auto-migrated);
+  responses now return `contextUsed`, `contextSize`, `costUsd`, `turns`,
+  and the UI/CLI/channels show "used/size ctx · $cost · turns".
+
+### Changed — Web UI rework
+
+- **Markdown-lite for agent replies** — headings, lists, task lists,
+  blockquotes, links (auto-linked bare URLs too), emphasis, strikethrough,
+  and inline code, all escape-first; fenced code blocks gain copy buttons.
+- **Session chrome** — a header bar with the active agent badge, session
+  title, and a live connection dot; a typing indicator with elapsed time
+  while a turn runs; a jump-to-latest button that appears only when you
+  have scrolled up (autoscroll no longer fights reading position).
+- **Responsive** — under 760px the sidebar becomes an off-canvas drawer
+  with a scrim; a light theme follows `prefers-color-scheme`; composer
+  respects iOS safe-area insets.
+- **Sidebar sessions** — rows show title, backing agent, and relative
+  age, sorted newest-first; sessions are renameable (✎ action, backed by
+  the existing `session/rename` RPC) with inline delete/rename buttons
+  always visible on touch devices.
+- **Composer** — Enter no longer fires mid-IME-composition (Korean/
+  Japanese/Chinese input commits the candidate instead of sending);
+  typing stays enabled while a turn runs so the next message can be
+  drafted; the streaming bubble shows a blinking caret.
+- **Honest states** — empty log gets a "start a session" call to action,
+  empty search says so inline, `Ctrl/Cmd+K` focuses search, and the auth
+  card only appears when the daemon actually rejects an unauthenticated
+  ticket request (it used to pop for any unreachable daemon). Closing the
+  tab mid-turn warns before unloading.
+
+### Fixed
+
+- `session/new` with an empty or relative `cwd` — the web UI's case — was
+  rejected by ACP agents ("must be an absolute path"), making session
+  creation from the browser impossible; the daemon now falls back to its
+  own working directory, and `session/resume` sends the session's stored
+  cwd instead of an empty one, fixing reattach after a daemon restart.
+- The web UI's message log and session list could never scroll (flex
+  items default to `min-height: auto`): long conversations silently
+  pushed the composer below the viewport. Both now scroll in place.
+- The Stop button never appeared while a turn ran: `setBusy` reset the
+  inline `display` while the stylesheet kept `#cancelBtn { display: none }`.
+- A missing `}` in the sidebar CSS swallowed the agents-panel block and
+  the `#sidebar h1` bottom border.
+
+### Removed
+
+- The built-in agent runtime and provider layer: `runtime.rs` (tool loop,
+  compaction), `provider/*` (OpenAI/Anthropic/Gemini transports), OAuth
+  login/refresh, credential harvest, builtin fs/shell tools, and the
+  `/v1` OpenAI-compatible endpoints (`/v1/chat/completions`, `/v1/models`,
+  `/v1/responses`). `POST /v1/ws_ticket` remains for browser auth.
+- `damond login` / `damond logout` (agents own their auth), the
+  `session/compact` / `session/set_model` RPCs (agents compact and select
+  models themselves), and the `[providers]` / `[models]` /
+  `[builtin_tools]` config tables.
+
 ### Added
 
-- **Builtin fs/shell tools** — `[builtin_tools]` config adds `fs.read`,
-  `fs.write`, `fs.edit`, `fs.list`, `fs.search`, and `shell.exec` to every
-  session's tool list without an MCP server. Relative paths resolve
-  against the session's cwd; `allowed_paths` sandboxes the fs tools
-  (not `shell.exec` — the permission prompt is the primary gate).
-  Permission flow is identical to MCP tools, including "always allow"
-  session grants; rebuilt on config reload.
 - **Token usage accounting** — `session/usage` RPC, `damon usage
   [--session ID]`, and `!usage` in chat channels report per-model
   input/output token totals and turn counts, persisted in a new `usage`

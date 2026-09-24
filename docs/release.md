@@ -2,8 +2,10 @@
 
 **English** | [한국어](release.ko.md)
 
-Pushing a `v*` tag → CI builds 4 targets → GitHub Releases tarballs →
-npm + crates.io publish. The items below are manual.
+Pushing a `v*` tag → CI builds 5 targets → GitHub Releases tarballs →
+npm + crates.io publish. The items below are manual. The
+`aarch64-unknown-linux-gnu` tarball is built natively on GitHub's
+`ubuntu-24.04-arm` runner — no cross-toolchain involved.
 
 ## 1. Register secrets (repo Settings → Secrets and variables → Actions)
 
@@ -78,10 +80,6 @@ git tag v0.1.0 && git push origin v0.1.0
 - `install.js` now verifies each tarball's `.sha256` sidecar before
   extraction; a `SHA256SUMS` manifest would let one file cover all
   targets instead of per-target sidecars.
-- More CI targets: `aarch64-unknown-linux-gnu` (`ubuntu-24.04-arm`
-  runner), musl/Docker images for `damon-relay` VPS deploys.
-- Remote MCP servers via rmcp's `transport-streamable-http-client-reqwest`
-  feature (stdio only today).
-- A JSON Schema for the WS protocol; opening up the `Provider` trait
-  (closed enum today).
-- `Cargo.toml` `homepage`/`documentation` fields; a CHANGELOG.
+- musl/Docker images for `damon-relay` VPS deploys (the
+  `aarch64-unknown-linux-gnu` target shipped on the `ubuntu-24.04-arm`
+  runner).

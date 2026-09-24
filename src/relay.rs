@@ -124,6 +124,12 @@ impl E2e {
         // 2. Daemon's bare {e2e_pub} — no proof until we authenticate.
         let msg = rx.recv().await.context("daemon handshake missing")?;
         let v: Value = serde_json::from_str(&msg)?;
+        // A relay-level refusal ({"error": ...} forwarded as e2e_error)
+        // or a daemon rejection fails fast with the reason instead of a
+        // generic missing-field error.
+        if let Some(e) = v["e2e_error"].as_str() {
+            bail!("relay/daemon refused handshake: {e}");
+        }
         let their_pub = B64
             .decode(v["e2e_pub"].as_str().context("missing e2e_pub")?)
             .context("bad e2e_pub")?;
@@ -140,8 +146,11 @@ impl E2e {
         //    explicit auth rejection so we fail fast instead of timing out.
         let msg = rx.recv().await.context("daemon proof missing")?;
         let v: Value = serde_json::from_str(&msg)?;
-        if v["e2e_error"].as_str() == Some("auth") {
-            bail!("daemon rejected our proof — wrong auth_token?");
+        if let Some(e) = v["e2e_error"].as_str() {
+            if e == "auth" {
+                bail!("daemon rejected our proof — wrong auth_token?");
+            }
+            bail!("relay/daemon refused handshake: {e}");
         }
         let their_proof = v["e2e_proof"].as_str().context("missing e2e_proof")?;
         if !crate::config::constant_time_eq(
@@ -175,8 +184,18 @@ impl E2e {
     }
 
     /// Encrypt a JSON text frame → base64 of `seq(8B) || nonce(12B) || ct`.
+    /// Plaintext is capped at [`crate::rpc::MAX_RESPONSE_BYTES`]: base64
+    /// inflates ~4/3 and the relay wraps the ciphertext in a JSON
+    /// envelope, so a larger plaintext would produce a frame over the
+    /// 4 MiB socket cap that the peer then drops silently.
     pub fn encrypt(&self, plaintext: &str) -> anyhow::Result<String> {
         use aes_gcm::aead::Aead;
+        anyhow::ensure!(
+            plaintext.len() <= crate::rpc::MAX_RESPONSE_BYTES,
+            "plaintext {} bytes exceeds the {}-byte relay frame budget",
+            plaintext.len(),
+            crate::rpc::MAX_RESPONSE_BYTES
+        );
         let seq = self.send_seq.fetch_add(1, Ordering::Relaxed);
         let nonce = seq_nonce(seq);
         let ct = self
@@ -288,6 +307,13 @@ pub async fn run_tunnel(
             Ok(r) => r
                 .resolve()
                 .map_err(|e| anyhow::anyhow!("relay secret resolution failed: {e:#}")),
+            // A value that LOOKS like a ref but failed to parse
+            // ("env:", "keychain:svc", "!") is a config typo — fail
+            // closed rather than registering with a guessable literal
+            // (same policy as api.rs auth_token resolution).
+            Err(e) if s.starts_with("env:") || s.starts_with("keychain:") || s.starts_with('!') => {
+                Err(anyhow::anyhow!("relay secret ref invalid: {e:#}"))
+            }
             Err(_) => Ok(s.to_string()),
         });
         let secret = match resolved {
@@ -329,6 +355,14 @@ const MAX_SESSIONS: usize = 32;
 /// Bound on the E2E handshake — an idle client must not pin a session
 /// slot (and its place under MAX_SESSIONS) forever.
 const HANDSHAKE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(15);
+
+/// A tunnel socket silent this long is half-open (NAT drop, dead relay)
+/// — the daemon's pings keep a healthy link under it; reconnect past it.
+const TUNNEL_IDLE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(120);
+
+/// Ping cadence: keeps the tunnel inside the relay's idle window and
+/// gives the daemon's own idle check a Pong to observe.
+const TUNNEL_PING_EVERY: std::time::Duration = std::time::Duration::from_secs(30);
 
 async fn tunnel_once(
     state: &Arc<AppState>,
@@ -373,13 +407,20 @@ async fn tunnel_once(
     // that replaced it.
     let (done_tx, mut done_rx) = mpsc::channel::<(u64, tokio::task::Id)>(64);
 
+    // Inbound liveness: any frame (incl. Pong to our pings) resets the
+    // idle clock — a silent socket is half-open, not merely quiet.
+    let mut last_rx = tokio::time::Instant::now();
+    let mut ping = tokio::time::interval(TUNNEL_PING_EVERY);
+
     loop {
         tokio::select! {
             msg = reader.next() => {
                 let Some(Ok(tokio_tungstenite::tungstenite::Message::Text(text))) = msg else {
+                    last_rx = tokio::time::Instant::now();
                     if matches!(msg, Some(Err(_)) | None) { break; }
                     continue;
                 };
+                last_rx = tokio::time::Instant::now();
                 let v: Value = match serde_json::from_str(&text) {
                     Ok(v) => v,
                     Err(_) => continue,
@@ -412,6 +453,12 @@ async fn tunnel_once(
                                 warn!(client = client_id, "dropping backpressured relay session");
                                 abort.abort();
                                 sessions.remove(&client_id);
+                                // Tell the relay to end the client socket
+                                // too — otherwise it keeps a zombie
+                                // session whose frames go nowhere.
+                                let _ = out_tx.try_send(
+                                    json!({"client": client_id, "disconnect": true}).to_string(),
+                                );
                             }
                         }
                     }
@@ -426,6 +473,10 @@ async fn tunnel_once(
                     let (sess_out, mut sess_rx) = mpsc::channel::<String>(64);
                     let state = state.clone();
                     let out_tx = out_tx.clone();
+                    // Kept outside the session task: the shadowed sender
+                    // above moves into it, but a replaced-session
+                    // disconnect notice still needs a sender here.
+                    let out_tx_dup = out_tx.clone();
                     // Pipe sess_out → relay (handshake + encrypted frames).
                     let out_tx2 = out_tx.clone();
                     tokio::spawn(async move {
@@ -470,6 +521,7 @@ async fn tunnel_once(
                         let (plain_out_tx, mut plain_out_rx) = mpsc::channel::<String>(64);
                         let e2e = Arc::new(e2e);
                         let e2e_in = e2e.clone();
+                        let out_tx_in = out_tx.clone();
                         tokio::spawn(async move {
                             while let Some(ct) = in_rx.recv().await {
                                 match e2e_in.decrypt(&ct) {
@@ -479,6 +531,13 @@ async fn tunnel_once(
                                     // silently swallowing messages.
                                     Err(e) => {
                                         warn!(error = %e, "E2E decrypt failed; closing session");
+                                        // Propagate the end to the relay
+                                        // so it closes the client socket
+                                        // instead of leaving a zombie.
+                                        let _ = out_tx_in.send(
+                                            json!({"client": client_id, "disconnect": true})
+                                                .to_string(),
+                                        ).await;
                                         return;
                                     }
                                 }
@@ -509,6 +568,12 @@ async fn tunnel_once(
                         warn!(client = client_id,
                               "relay re-sent connect for a live session; replacing it");
                         old_abort.abort();
+                        // The replaced session is dead — tell the relay
+                        // to drop the client socket so it re-attaches
+                        // cleanly instead of piping into a void.
+                        let _ = out_tx_dup.try_send(
+                            json!({"client": client_id, "disconnect": true}).to_string(),
+                        );
                     }
                     // Free the slot when the task exits for ANY reason —
                     // only the relay's disconnect notice freed it before,
@@ -536,6 +601,23 @@ async fn tunnel_once(
                 {
                     sessions.remove(&client_id);
                 }
+            }
+            _ = ping.tick() => {
+                // Keepalive: proves the socket is writable and gives the
+                // relay's idle check a frame to observe.
+                if writer
+                    .send(tokio_tungstenite::tungstenite::Message::Ping(Vec::new().into()))
+                    .await
+                    .is_err()
+                {
+                    break;
+                }
+            }
+            _ = tokio::time::sleep_until(last_rx + TUNNEL_IDLE_TIMEOUT) => {
+                // No inbound frame for the whole window — the socket is
+                // half-open; break so run_tunnel redials.
+                warn!("relay tunnel silent for {}s; reconnecting", TUNNEL_IDLE_TIMEOUT.as_secs());
+                break;
             }
         }
     }
@@ -579,10 +661,17 @@ pub async fn client_connect(
                 Ok(tokio_tungstenite::tungstenite::Message::Close(_)) | Err(_) => break,
                 Ok(_) => continue,
             };
-            if let Ok(v) = serde_json::from_str::<Value>(&t)
-                && let Some(d) = v["data"].as_str()
-            {
-                let _ = raw_in_tx.send(d.to_string()).await;
+            if let Ok(v) = serde_json::from_str::<Value>(&t) {
+                // Relay-level refusal ({"error": ...}) — forward it as an
+                // e2e_error so the handshake fails fast with the reason
+                // instead of stalling on a missing e2e_pub.
+                if let Some(e) = v["error"].as_str() {
+                    let _ = raw_in_tx.send(json!({"e2e_error": e}).to_string()).await;
+                    continue;
+                }
+                if let Some(d) = v["data"].as_str() {
+                    let _ = raw_in_tx.send(d.to_string()).await;
+                }
             }
         }
     });
@@ -641,8 +730,13 @@ pub async fn client_connect(
     tokio::spawn(async move {
         let mut rx = plain_out_rx;
         while let Some(pt) = rx.recv().await {
-            if let Ok(ct) = e2e.encrypt(&pt) {
-                let _ = raw_out_tx.send(ct).await;
+            match e2e.encrypt(&pt) {
+                Ok(ct) => {
+                    let _ = raw_out_tx.send(ct).await;
+                }
+                // Oversized plaintext is refused by encrypt — surface it
+                // instead of silently dropping the frame.
+                Err(e) => warn!(error = %e, "E2E encrypt failed"),
             }
         }
     });

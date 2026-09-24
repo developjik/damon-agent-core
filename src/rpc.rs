@@ -1,1272 +1,734 @@
-use std::collections::HashMap;
-use std::sync::Arc;
-use std::sync::atomic::{AtomicU64, Ordering};
+//!
+//! Wire shape:
+//!   request:   {"id": N, "method": "session.create", "params": {...}}
+//!   response:  {"id": N, "result": {...}} | {"id": N, "error": {"code","message"}}
+//!   event:     {"event": "session.event", "sessionId": "...", "data": <StreamEvent>}
+//!   hello:     {"hello": {"protocol": 2, "daemon": "damond", "version": "..."}}
+//!
+//! One connection multiplexes every session. Each request is dispatched
+//! as its own task so a long `turn.start` never serializes the socket —
+//! `turn.steer`, `turn.cancel`, and `permission.respond` stay live while
+//! a turn streams. Events are pushed to every connection that has
+//! touched the session (create/resume/load/turn), not just the turn
+//! owner: the daemon is single-user, and a relay or second client must
+//! see the same stream.
 
-use anyhow::bail;
-use axum::extract::ws::{Message, WebSocketUpgrade};
-use axum::extract::{Query, State};
+use std::collections::HashMap;
+use std::net::SocketAddr;
+use std::sync::Arc;
+
+use anyhow::{Context, Result, bail};
+use axum::extract::ws::{Message, WebSocket, WebSocketUpgrade};
+use axum::extract::{ConnectInfo, Query, State};
 use axum::http::StatusCode;
 use axum::response::Response;
 use futures::{SinkExt, StreamExt};
 use serde::Deserialize;
 use serde_json::{Value, json};
-use tokio::sync::{Mutex, mpsc, oneshot};
+use tokio::sync::{Mutex, mpsc};
 use tokio_util::sync::CancellationToken;
-use tracing::{info, warn};
 
 use crate::api::AppState;
-use crate::llm;
-use crate::runtime::{self, ClientChannel};
+use crate::backend::types::*;
+use crate::session::ManagedSession;
 
 #[derive(Deserialize)]
 pub struct WsQuery {
-    /// One-shot ticket from POST /v1/ws_ticket — 60s TTL, consumed on use.
+    /// Single-use auth ticket minted by POST /v1/ws-ticket. Raw tokens
+    /// in the query string are refused — they leak into logs.
     ticket: Option<String>,
 }
 
-/// GET /ws — ACP-shaped JSON-RPC over WebSocket.
-/// Auth: same bearer token as /v1, via Authorization header or a
-/// single-use ?ticket= (query-string tokens are not accepted — they leak
-/// into logs and browser history).
+/// GET /ws — JSON-RPC over WebSocket. Auth: bearer header or ?ticket=.
 pub async fn ws_handler(
     State(state): State<Arc<AppState>>,
     Query(q): Query<WsQuery>,
     headers: axum::http::HeaderMap,
     ws: WebSocketUpgrade,
+    ConnectInfo(peer): ConnectInfo<SocketAddr>,
 ) -> Result<Response, StatusCode> {
-    let authenticated = match state.auth_token().await {
-        Some(Ok(expected)) => {
-            let header_ok = headers
-                .get("authorization")
-                .and_then(|v| v.to_str().ok())
-                .and_then(|v| v.strip_prefix("Bearer "))
-                .is_some_and(|t| {
-                    crate::config::constant_time_eq(t.as_bytes(), expected.as_bytes())
-                });
-            // Ticket auth: single-use — remove() consumes it so a leaked
-            // ticket URL can't be replayed, and a stale one is dead anyway.
-            let ticket_ok = match &q.ticket {
-                Some(t) => state
-                    .ws_tickets
-                    .lock()
-                    .await
-                    .remove(t)
-                    .is_some_and(|issued| issued.elapsed() < std::time::Duration::from_secs(60)),
-                None => false,
-            };
-            if !header_ok && !ticket_ok {
-                return Err(StatusCode::UNAUTHORIZED);
-            }
-            true
-        }
-        // Configured but unresolvable: fail closed, never open.
-        Some(Err(_)) => return Err(StatusCode::SERVICE_UNAVAILABLE),
-        // A reload may have dropped the token — a non-loopback bind
-        // must not silently open the socket.
-        None if !state.bind.ip().is_loopback() => {
-            return Err(StatusCode::SERVICE_UNAVAILABLE);
-        }
-        None => false,
-    };
-    // Browser WS handshakes carry Origin and skip CORS preflight — without
-    // this check any website could drive an unauthenticated local daemon.
-    // Non-browser clients send no Origin. Authenticated connections are
-    // gated by the token, so their Origin is unconstrained.
-    if !authenticated
-        && let Some(origin) = headers.get("origin").and_then(|v| v.to_str().ok())
-        && !is_localhost_origin(origin)
+    if !state
+        .check_auth(&headers, q.ticket.as_deref(), peer.ip())
+        .await
     {
-        return Err(StatusCode::FORBIDDEN);
+        return Err(StatusCode::UNAUTHORIZED);
     }
-    Ok(ws
-        // JSON-RPC text frames need a few KiB; axum's 64 MiB default
-        // lets any connected peer force huge allocation/parse spikes.
-        .max_frame_size(4 << 20)
-        .max_message_size(4 << 20)
-        .on_upgrade(move |socket| {
-            let (mut writer, mut reader) = socket.split();
-            let (tx_in, rx_in) = mpsc::channel::<String>(64);
-            let (tx_out, mut rx_out) = mpsc::channel::<String>(64);
-            // Pump: socket → tx_in (inbound), rx_out → socket (outbound).
-            tokio::spawn(async move {
-                while let Some(Ok(msg)) = reader.next().await {
-                    if let Message::Text(t) = msg
-                        && tx_in.send(t.to_string()).await.is_err()
-                    {
-                        break;
-                    }
-                }
-            });
-            tokio::spawn(async move {
-                while let Some(text) = rx_out.recv().await {
-                    if writer.send(Message::Text(text.into())).await.is_err() {
-                        break;
-                    }
-                }
-            });
-            handle_socket(rx_in, tx_out, state)
-        }))
+    Ok(ws.on_upgrade(move |sock| run_connection(state, sock)))
 }
 
-/// Client-facing channel: notifications and server→client requests.
-/// Transport-agnostic — writes JSON text frames to `tx`.
-/// Server→client request waiter payload: the client's result-or-error.
-type PendingReply = oneshot::Sender<Result<Value, Value>>;
-
-/// Global bound on concurrent prompt turns across all sessions and
-/// connections — every other resource in this path is capped (channels,
-/// frame size, per-session live_prompts), and an unbounded spawn per
-/// request would let one client exhaust memory and upstream quota.
+/// Global bound on concurrent prompt turns — every other resource in
+/// this path is capped, and an unbounded spawn per request would let one
+/// client exhaust memory and agent processes.
 static PROMPT_SLOTS: tokio::sync::Semaphore = tokio::sync::Semaphore::const_new(64);
 
-struct WsClient {
-    tx: mpsc::Sender<String>,
-    /// Server→client request waiters: id → the client's result-or-error.
-    pending: Arc<Mutex<HashMap<u64, PendingReply>>>,
-    next_id: AtomicU64,
-    /// Set once a send times out — later notifications drop immediately
-    /// instead of each paying the full SEND_TIMEOUT again. Cleared by the
-    /// next successful request/response send: the client is draining, so
-    /// notifications resume without a reconnect.
-    stalled: std::sync::atomic::AtomicBool,
-    /// Response wait bound — permission_timeout_secs + slack, so the
-    /// configured permission budget is never silently capped here.
-    req_timeout: std::time::Duration,
+/// Largest single outbound frame — a runaway response must not grow
+/// the relay's encrypt buffer without bound.
+pub const MAX_RESPONSE_BYTES: usize = 1 << 20;
+
+/// Per-connection state: outbound frames, session event forwarders,
+/// and the turns this connection started (cancelled on disconnect).
+struct Conn {
+    tx: mpsc::Sender<Message>,
+    /// session id → forwarder task. A session's events reach this
+    /// connection once it has touched the session.
+    subscriptions: Mutex<HashMap<String, tokio::task::JoinHandle<()>>>,
+    /// Turns this connection owns — disconnect cancels them.
+    owned_turns: Mutex<HashMap<String, CancellationToken>>,
 }
 
-/// Removes a pending waiter if the request future is dropped before the
-/// client answers (external cancel/timeout) — without it the entry
-/// lingers until the connection dies.
-struct PendingGuard {
-    pending: Arc<Mutex<HashMap<u64, PendingReply>>>,
-    id: u64,
+impl Conn {
+    /// Push one JSON value as a text frame. Bounded channel: a stalled
+    /// client drops events rather than stalling the daemon.
+    fn send(&self, v: Value) {
+        let _ = self.tx.try_send(Message::Text(v.to_string().into()));
+    }
+
+    /// Start forwarding a session's event stream to this connection.
+    /// Idempotent — one forwarder per (connection, session).
+    async fn subscribe(&self, session: &Arc<ManagedSession>) {
+        let mut subs = self.subscriptions.lock().await;
+        if subs.contains_key(&session.id) {
+            return;
+        }
+        let mut rx = session.session.subscribe();
+        let tx = self.tx.clone();
+        let sid = session.id.clone();
+        subs.insert(
+            sid.clone(),
+            tokio::spawn(async move {
+                loop {
+                    match rx.recv().await {
+                        Ok(ev) => {
+                            let frame = json!({
+                                "event": "session.event",
+                                "sessionId": sid,
+                                "data": ev,
+                            });
+                            if tx
+                                .try_send(Message::Text(frame.to_string().into()))
+                                .is_err()
+                            {
+                                // Client lagging or gone — drop the frame,
+                                // keep the forwarder (channel may recover).
+                                continue;
+                            }
+                        }
+                        Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => continue,
+                        Err(tokio::sync::broadcast::error::RecvError::Closed) => break,
+                    }
+                }
+            }),
+        );
+    }
 }
 
-impl Drop for PendingGuard {
+async fn run_connection(state: Arc<AppState>, socket: WebSocket) {
+    let (mut ws_tx, mut ws_rx) = socket.split();
+    // Bounded outbound queue — a slow client sheds events, never blocks.
+    let (tx, mut rx) = mpsc::channel::<Message>(256);
+    let conn = Arc::new(Conn {
+        tx,
+        subscriptions: Mutex::new(HashMap::new()),
+        owned_turns: Mutex::new(HashMap::new()),
+    });
+
+    let writer = tokio::spawn(async move {
+        while let Some(msg) = rx.recv().await {
+            if ws_tx.send(msg).await.is_err() {
+                break;
+            }
+        }
+    });
+
+    conn.send(json!({
+        "hello": {
+            "protocol": 2,
+            "daemon": "damond",
+            "version": env!("CARGO_PKG_VERSION"),
+            "permissionTimeoutSecs": state.config.read().permission_timeout_secs,
+        }
+    }));
+
+    while let Some(Ok(msg)) = ws_rx.next().await {
+        let Message::Text(text) = msg else { continue };
+        handle_frame(&state, &conn, &text);
+    }
+
+    // Disconnect: cancel every turn this connection started so a dead
+    // client can't leave an agent burning tokens.
+    for (_, token) in conn.owned_turns.lock().await.drain() {
+        token.cancel();
+    }
+    writer.abort();
+}
+
+/// Relay-tunnel entry point: same dispatch as the WS path, over raw
+/// string channels instead of a WebSocket. The relay pipes decrypted
+/// frames in and takes ciphertext out — the daemon sees plaintext JSON.
+pub async fn handle_socket(
+    mut in_rx: mpsc::Receiver<String>,
+    out_tx: mpsc::Sender<String>,
+    state: Arc<AppState>,
+) {
+    let (tx, mut rx) = mpsc::channel::<Message>(256);
+    let conn = Arc::new(Conn {
+        tx,
+        subscriptions: Mutex::new(HashMap::new()),
+        owned_turns: Mutex::new(HashMap::new()),
+    });
+
+    let writer = tokio::spawn(async move {
+        while let Some(msg) = rx.recv().await {
+            if let Message::Text(t) = msg
+                && out_tx.send(t.to_string()).await.is_err()
+            {
+                break;
+            }
+        }
+    });
+
+    conn.send(json!({
+        "hello": {
+            "protocol": 2,
+            "daemon": "damond",
+            "version": env!("CARGO_PKG_VERSION"),
+            "permissionTimeoutSecs": state.config.read().permission_timeout_secs,
+        }
+    }));
+
+    while let Some(text) = in_rx.recv().await {
+        handle_frame(&state, &conn, &text);
+    }
+
+    for (_, token) in conn.owned_turns.lock().await.drain() {
+        token.cancel();
+    }
+    writer.abort();
+}
+
+/// Parse one inbound JSON frame and spawn its dispatch. Requests run
+/// concurrently — a long turn never serializes the socket.
+fn handle_frame(state: &Arc<AppState>, conn: &Arc<Conn>, text: &str) {
+    let Ok(req) = serde_json::from_str::<Value>(text) else {
+        return;
+    };
+    let Some(method) = req["method"].as_str() else {
+        return;
+    };
+    let id = req.get("id").cloned().unwrap_or(Value::Null);
+    let params = req.get("params").cloned().unwrap_or(json!({}));
+    let state = state.clone();
+    let conn = conn.clone();
+    let method = method.to_string();
+    tokio::spawn(async move {
+        let result = dispatch(&state, &conn, &method, params).await;
+        let frame = match result {
+            Ok(v) => json!({"id": id, "result": v}),
+            Err(e) => json!({"id": id, "error": {"code": -32000, "message": e.to_string()}}),
+        };
+        conn.send(frame);
+    });
+}
+
+async fn dispatch(
+    state: &Arc<AppState>,
+    conn: &Arc<Conn>,
+    method: &str,
+    params: Value,
+) -> Result<Value> {
+    match method {
+        "hello" => Ok(json!({
+            "protocol": 2,
+            "daemon": "damond",
+            "version": env!("CARGO_PKG_VERSION"),
+            "backends": state.sessions.available_backends(),
+            "methods": rpc_methods(),
+        })),
+
+        "backend.list" => {
+            let mut out = Vec::new();
+            for (id, client) in state.sessions.clients() {
+                out.push(json!({
+                    "id": id,
+                    "available": client.is_available().await,
+                    "capabilities": client.capabilities(),
+                }));
+            }
+            Ok(json!({"backends": out}))
+        }
+
+        "session.create" => {
+            let cfg = session_config(&params)?;
+            let backend = params["backend"].as_str();
+            let ms = state.sessions.create(backend, cfg.clone()).await?;
+            state
+                .store
+                .create_session(&ms.id, &cfg.cwd.to_string_lossy(), Some(&ms.provider))
+                .await?;
+            conn.subscribe(&ms).await;
+            Ok(json!({"sessionId": ms.id, "backend": ms.provider}))
+        }
+
+        "session.resume" => {
+            let id = params["sessionId"].as_str().context("sessionId required")?;
+            // Already live? Just subscribe and return.
+            if let Some(ms) = state.sessions.get(id).await {
+                conn.subscribe(&ms).await;
+                return Ok(json!({"sessionId": id, "backend": ms.provider}));
+            }
+            let (provider, native) = state
+                .store
+                .agent_session(id)
+                .await?
+                .context("no persisted backend session for this id")?;
+            let cwd = state
+                .store
+                .session_cwd(id)
+                .await?
+                .map(std::path::PathBuf::from)
+                .unwrap_or_else(|| std::path::PathBuf::from("."));
+            let handle = PersistenceHandle {
+                provider: provider.clone(),
+                native_handle: native,
+                metadata: Value::Null,
+            };
+            let ms = state
+                .sessions
+                .resume(
+                    id,
+                    &handle,
+                    SessionConfig {
+                        cwd,
+                        ..Default::default()
+                    },
+                )
+                .await?;
+            conn.subscribe(&ms).await;
+            Ok(json!({"sessionId": id, "backend": ms.provider}))
+        }
+
+        "session.list" => {
+            let limit = params["limit"].as_u64().unwrap_or(50) as u32;
+            let offset = params["offset"].as_u64().unwrap_or(0) as u32;
+            let rows = state.store.list_sessions_paged(limit, offset).await?;
+            let sessions: Vec<Value> = rows
+                .into_iter()
+                .map(|(id, created_at, backend, title)| {
+                    json!({"sessionId": id, "createdAt": created_at, "backend": backend, "title": title})
+                })
+                .collect();
+            Ok(json!({"sessions": sessions}))
+        }
+
+        "session.messages" => {
+            let id = params["sessionId"].as_str().context("sessionId required")?;
+            let limit = params["limit"].as_u64().unwrap_or(200) as u32;
+            let offset = params["offset"].as_u64().unwrap_or(0) as u32;
+            let msgs = state.store.messages_paged(id, limit, offset).await?;
+            Ok(json!({"messages": msgs}))
+        }
+
+        "session.import" => {
+            let backend = params["backend"].as_str().context("backend required")?;
+            let clients = state.sessions.clients();
+            let client = clients
+                .iter()
+                .find(|(id, _)| id == backend)
+                .map(|(_, c)| c.clone())
+                .context("unknown backend")?;
+            let cwd = params["cwd"]
+                .as_str()
+                .map(std::path::PathBuf::from)
+                .unwrap_or_else(|| std::env::current_dir().unwrap_or_else(|_| ".".into()));
+            let found = client.list_importable_sessions(&cwd).await?;
+            Ok(json!({"sessions": found}))
+        }
+
+        "session.delete" => {
+            let id = params["sessionId"].as_str().context("sessionId required")?;
+            state.sessions.close(id).await.ok();
+            state.store.delete_session(id).await?;
+            Ok(json!({"deleted": true}))
+        }
+
+        "session.rename" => {
+            let id = params["sessionId"].as_str().context("sessionId required")?;
+            let title = params["title"].as_str().context("title required")?;
+            let ok = state.store.rename_session(id, title).await?;
+            Ok(json!({"renamed": ok}))
+        }
+
+        "session.fork" => {
+            let id = params["sessionId"].as_str().context("sessionId required")?;
+            let upto = params["upto"].as_i64();
+            let new_id = state.store.fork_session(id, upto).await?;
+            Ok(json!({"sessionId": new_id}))
+        }
+
+        "session.usage" => {
+            let id = params["sessionId"].as_str();
+            match id {
+                Some(id) => {
+                    let (used, size, cost, turns) = state.store.session_usage(id).await?;
+                    Ok(json!({
+                        "sessionId": id,
+                        "contextUsed": used, "contextSize": size,
+                        "costUsd": cost, "turns": turns,
+                    }))
+                }
+                None => {
+                    let rows = state.store.usage_summary().await?;
+                    let sessions: Vec<Value> = rows
+                        .into_iter()
+                        .map(|(model, used, size, cost, turns)| {
+                            json!({"model": model, "contextUsed": used, "contextSize": size,
+                                   "costUsd": cost, "turns": turns})
+                        })
+                        .collect();
+                    Ok(json!({"sessions": sessions}))
+                }
+            }
+        }
+
+        "session.search" => {
+            let q = params["query"].as_str().context("query required")?;
+            let limit = params["limit"].as_u64().unwrap_or(20) as u32;
+            let hits = state
+                .store
+                .search_filtered(q, limit as usize, None, None, None)
+                .await?;
+            let results: Vec<Value> = hits
+                .into_iter()
+                .map(|(session_id, message_id, snippet)| {
+                    json!({"sessionId": session_id, "messageId": message_id, "snippet": snippet})
+                })
+                .collect();
+            Ok(json!({"results": results}))
+        }
+
+        "turn.start" => {
+            let _slot = PROMPT_SLOTS.acquire().await?;
+            let id = params["sessionId"].as_str().context("sessionId required")?;
+            let ms = state
+                .sessions
+                .get(id)
+                .await
+                .context("session not live — call session.resume first")?;
+            conn.subscribe(&ms).await;
+            run_turn(state, conn, &ms, params).await
+        }
+
+        "turn.steer" => {
+            let id = params["sessionId"].as_str().context("sessionId required")?;
+            let ms = state.sessions.get(id).await.context("session not live")?;
+            let prompt: PromptInput =
+                serde_json::from_value(params["prompt"].clone()).context("prompt required")?;
+            let expected = params["expectedTurn"].as_str().unwrap_or_default();
+            let res = ms.session.steer(prompt, expected).await?;
+            Ok(json!({"result": res}))
+        }
+
+        "turn.cancel" => {
+            let id = params["sessionId"].as_str().context("sessionId required")?;
+            if let Some(ms) = state.sessions.get(id).await {
+                ms.session.interrupt().await?;
+            }
+            Ok(json!({"cancelled": true}))
+        }
+
+        "permission.respond" => {
+            let id = params["sessionId"].as_str().context("sessionId required")?;
+            let ms = state.sessions.get(id).await.context("session not live")?;
+            let request_id = params["requestId"].as_str().context("requestId required")?;
+            let response: PermissionResponse =
+                serde_json::from_value(params["response"].clone()).context("response required")?;
+            ms.session
+                .respond_to_permission(request_id, response)
+                .await?;
+            Ok(json!({}))
+        }
+
+        "session.set_model" => {
+            let id = params["sessionId"].as_str().context("sessionId required")?;
+            let ms = state.sessions.get(id).await.context("session not live")?;
+            let model = params["model"].as_str().context("model required")?;
+            ms.session.set_model(model).await?;
+            Ok(json!({}))
+        }
+
+        "session.set_mode" => {
+            let id = params["sessionId"].as_str().context("sessionId required")?;
+            let ms = state.sessions.get(id).await.context("session not live")?;
+            let mode = params["mode"].as_str().context("mode required")?;
+            ms.session.set_mode(mode).await?;
+            Ok(json!({}))
+        }
+
+        "catalog.models" => {
+            let backend = params["backend"].as_str().context("backend required")?;
+            let clients = state.sessions.clients();
+            let client = clients
+                .iter()
+                .find(|(id, _)| id == backend)
+                .map(|(_, c)| c.clone())
+                .context("unknown backend")?;
+            let catalog = client.fetch_catalog(None).await?;
+            Ok(serde_json::to_value(catalog)?)
+        }
+
+        other => bail!("unknown method: {other}"),
+    }
+}
+
+fn session_config(params: &Value) -> Result<SessionConfig> {
+    let cwd = params["cwd"]
+        .as_str()
+        .map(std::path::PathBuf::from)
+        .unwrap_or_else(|| std::env::current_dir().unwrap_or_else(|_| ".".into()));
+    let mcp = params["mcpServers"]
+        .as_object()
+        .map(|m| {
+            m.iter()
+                .filter_map(|(name, v)| {
+                    Some((
+                        name.clone(),
+                        McpServerConfig {
+                            command: v["command"].as_str()?.to_string(),
+                            args: serde_json::from_value(v["args"].clone()).unwrap_or_default(),
+                            env: serde_json::from_value(v["env"].clone()).unwrap_or_default(),
+                        },
+                    ))
+                })
+                .collect()
+        })
+        .unwrap_or_default();
+    Ok(SessionConfig {
+        cwd,
+        model: params["model"].as_str().map(String::from),
+        mode: params["mode"].as_str().map(String::from),
+        mcp_servers: mcp,
+        ..Default::default()
+    })
+}
+
+/// Drive one turn to completion: forward events to the connection,
+/// persist the timeline, honour disconnect-cancel. Returns the final
+/// result payload — the client sees events first, then the response.
+async fn run_turn(
+    state: &Arc<AppState>,
+    conn: &Arc<Conn>,
+    ms: &Arc<ManagedSession>,
+    params: Value,
+) -> Result<Value> {
+    let prompt: PromptInput =
+        serde_json::from_value(params["prompt"].clone()).context("prompt required")?;
+    let timeout = params["timeoutSecs"]
+        .as_u64()
+        .map(std::time::Duration::from_secs);
+
+    // Persist the user message up front — a crash mid-turn still leaves
+    // the prompt in history.
+    let user_text = prompt_text(&prompt);
+    if !user_text.is_empty() {
+        state
+            .store
+            .append(&ms.id, "user", &json!({"content": user_text}))
+            .await?;
+        let _ = state.store.set_title_if_empty(&ms.id, &user_text).await;
+    }
+
+    let cancel = CancellationToken::new();
+    conn.owned_turns
+        .lock()
+        .await
+        .insert(ms.id.clone(), cancel.clone());
+    let _guard = scopeguard(conn.clone(), ms.id.clone());
+    ms.busy.store(true, std::sync::atomic::Ordering::Relaxed);
+    let _busy = BusyGuard(ms.clone());
+
+    let mut events = ms.session.subscribe();
+    let turn_id = ms.session.start_turn(prompt).await?;
+
+    let mut assistant = String::new();
+    let mut reasoning = String::new();
+    let mut tools: HashMap<String, ToolCall> = HashMap::new();
+    let mut usage = None;
+    let mut stop_reason = "completed";
+
+    let collect = async {
+        loop {
+            match events.recv().await {
+                Ok(ev) => match &ev.kind {
+                    StreamEventKind::Timeline(TimelineItem::AssistantMessage { text }) => {
+                        assistant.push_str(text);
+                    }
+                    StreamEventKind::Timeline(TimelineItem::Reasoning { text }) => {
+                        reasoning.push_str(text);
+                    }
+                    StreamEventKind::Timeline(TimelineItem::ToolCall(t)) => {
+                        tools.insert(t.call_id.clone(), t.clone());
+                    }
+                    StreamEventKind::TurnCompleted { usage: u } => {
+                        usage = u.clone();
+                        break;
+                    }
+                    StreamEventKind::TurnFailed { error, .. } => {
+                        stop_reason = "failed";
+                        bail!("{error}");
+                    }
+                    StreamEventKind::TurnCanceled { .. } => {
+                        stop_reason = "canceled";
+                        break;
+                    }
+                    _ => {}
+                },
+                Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => continue,
+                Err(tokio::sync::broadcast::error::RecvError::Closed) => {
+                    stop_reason = "closed";
+                    break;
+                }
+            }
+        }
+        Ok::<(), anyhow::Error>(())
+    };
+
+    let outcome = if let Some(t) = timeout {
+        tokio::select! {
+            r = collect => r,
+            _ = tokio::time::sleep(t) => {
+                let _ = ms.session.interrupt().await;
+                stop_reason = "timeout";
+                Ok(())
+            }
+            _ = cancel.cancelled() => {
+                let _ = ms.session.interrupt().await;
+                stop_reason = "canceled";
+                Ok(())
+            }
+        }
+    } else {
+        tokio::select! {
+            r = collect => r,
+            _ = cancel.cancelled() => {
+                let _ = ms.session.interrupt().await;
+                stop_reason = "canceled";
+                Ok(())
+            }
+        }
+    };
+
+    // Persist the assembled timeline — one row per artifact, not per delta.
+    if !assistant.is_empty() {
+        let _ = state
+            .store
+            .append(&ms.id, "assistant", &json!({"content": assistant}))
+            .await;
+    }
+    if !reasoning.is_empty() {
+        let _ = state
+            .store
+            .append(&ms.id, "reasoning", &json!({"content": reasoning}))
+            .await;
+    }
+    for t in tools.values() {
+        let _ = state
+            .store
+            .append(&ms.id, "tool", &serde_json::to_value(t)?)
+            .await;
+    }
+    if let Some(u) = &usage {
+        let _ = state
+            .store
+            .record_usage(
+                &ms.id,
+                "",
+                u.context_used.unwrap_or(0),
+                u.context_window.unwrap_or(0),
+                u.cost_usd.unwrap_or(0.0),
+            )
+            .await;
+    }
+    let _ = state.store.touch(&ms.id).await;
+
+    // Refresh the persisted resume token if the backend reported one.
+    if let Some(h) = &ms.handle {
+        let _ = state
+            .store
+            .set_agent_session(&ms.id, &h.provider, &h.native_handle)
+            .await;
+    }
+
+    outcome?;
+    Ok(json!({
+        "turnId": turn_id,
+        "stopReason": stop_reason,
+        "usage": usage,
+    }))
+}
+
+/// Drop-guard: clears the session's busy flag when the turn ends, so the
+/// idle sweep can reap it again.
+struct BusyGuard(Arc<ManagedSession>);
+impl Drop for BusyGuard {
     fn drop(&mut self) {
-        let pending = self.pending.clone();
-        let id = self.id;
-        // Drop may run outside a runtime context (never here, but stay
-        // panic-free); spawn so the async lock can be taken.
-        if let Ok(h) = tokio::runtime::Handle::try_current() {
-            h.spawn(async move {
-                pending.lock().await.remove(&id);
+        self.0
+            .busy
+            .store(false, std::sync::atomic::Ordering::Relaxed);
+    }
+}
+
+/// Drop-guard: removes this connection's turn ownership on exit.
+fn scopeguard(conn: Arc<Conn>, session_id: String) -> impl Drop {
+    struct Guard(Arc<Conn>, String);
+    impl Drop for Guard {
+        fn drop(&mut self) {
+            let conn = self.0.clone();
+            let id = self.1.clone();
+            tokio::spawn(async move {
+                conn.owned_turns.lock().await.remove(&id);
             });
         }
     }
+    Guard(conn, session_id)
 }
 
-/// Outbound send bound: a client that stops reading must not stall the
-/// turn (or the dispatch loop) forever — the message is dropped instead.
-const SEND_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
-
-#[async_trait::async_trait]
-impl ClientChannel for WsClient {
-    async fn notify(&self, method: &str, params: Value) {
-        // Once a send has timed out the client is stalled — drop later
-        // notifications immediately instead of paying SEND_TIMEOUT per
-        // chunk. A later successful request()/respond() send clears the
-        // flag (unstall), so a client that catches up recovers without
-        // reconnecting.
-        if self.stalled.load(Ordering::Relaxed) {
-            return;
-        }
-        let msg = json!({"jsonrpc": "2.0", "method": method, "params": params});
-        match tokio::time::timeout(SEND_TIMEOUT, self.tx.send(msg.to_string())).await {
-            Ok(_) => {}
-            Err(_) => {
-                self.stalled.store(true, Ordering::Relaxed);
-                warn!("dropping notification to stalled client");
-            }
-        }
-    }
-
-    async fn request(&self, method: &str, params: Value) -> anyhow::Result<Value> {
-        let id = self.next_id.fetch_add(1, Ordering::Relaxed);
-        let (tx, rx) = oneshot::channel();
-        self.pending.lock().await.insert(id, tx);
-        // Drop-guard: an external cancel/timeout that drops this future
-        // still frees the pending entry.
-        let _guard = PendingGuard {
-            pending: self.pending.clone(),
-            id,
-        };
-        let msg = json!({"jsonrpc": "2.0", "id": id, "method": method, "params": params});
-        let sent = tokio::time::timeout(SEND_TIMEOUT, self.tx.send(msg.to_string())).await;
-        if !matches!(sent, Ok(Ok(()))) {
-            self.pending.lock().await.remove(&id);
-            bail!("client connection stalled or closed");
-        }
-        self.unstall();
-        // A client that never answers must not hang the turn forever or
-        // leak the pending entry. The bound is the caller's request_timeout
-        // (e.g. permission_timeout_secs + slack) — a fixed cap here would
-        // silently override the configured permission budget.
-        let wait = self.request_timeout();
-        match tokio::time::timeout(wait, rx).await {
-            Ok(Ok(Ok(v))) => Ok(v),
-            // The client answered with a JSON-RPC error object.
-            Ok(Ok(Err(e))) => {
-                bail!(
-                    "client error on {method}: {}",
-                    e["message"].as_str().unwrap_or("unknown")
-                )
-            }
-            Ok(Err(_)) => Err(anyhow::anyhow!("client dropped request")),
-            Err(_) => {
-                self.pending.lock().await.remove(&id);
-                bail!(
-                    "client did not respond to {method} within {}s",
-                    wait.as_secs()
-                )
-            }
-        }
-    }
-
-    fn request_timeout(&self) -> std::time::Duration {
-        self.req_timeout
-    }
-}
-
-impl WsClient {
-    /// Clear the stalled flag after a successful send — swap fires the
-    /// recovery log exactly once, on the true→false edge.
-    fn unstall(&self) {
-        if self.stalled.swap(false, Ordering::Relaxed) {
-            info!("client resumed reading; notifications re-enabled");
-        }
-    }
-
-    async fn respond(&self, id: Value, result: Result<Value, Value>) {
-        let msg = match result {
-            Ok(r) => json!({"jsonrpc": "2.0", "id": id, "result": r}),
-            Err(e) => json!({"jsonrpc": "2.0", "id": id, "error": e}),
-        };
-        // Unstall only on a SUCCESSFUL send. `timeout` yields
-        // Ok(Err(SendError)) when the connection is already gone —
-        // treating that as success cleared `stalled` on a dead client
-        // and logged a false "resumed reading".
-        match tokio::time::timeout(SEND_TIMEOUT, self.tx.send(msg.to_string())).await {
-            Ok(Ok(())) => self.unstall(),
-            Ok(Err(_)) => {} // connection closed — nothing to deliver
-            Err(_elapsed) => warn!("dropping response to stalled client"),
-        }
-    }
-}
-
-/// Run one client session over a generic text transport.
-/// `rx` yields inbound JSON text; `tx` carries outbound JSON text.
-/// Used by both the local WS handler and the relay tunnel.
-/// Process-wide connection counter — identifies which connection owns a
-/// live prompt so disconnect can cancel exactly its own turns.
-static CONN_ID: AtomicU64 = AtomicU64::new(1);
-
-pub async fn handle_socket(
-    rx: mpsc::Receiver<String>,
-    tx: mpsc::Sender<String>,
-    state: Arc<AppState>,
-) {
-    let mut rx = rx;
-    let conn_id = CONN_ID.fetch_add(1, Ordering::Relaxed);
-    // Server→client requests (permission prompts) wait out the configured
-    // permission timeout plus slack — the runtime's outer select enforces
-    // the real budget; this bound only guards the pending map.
-    let req_timeout = state
-        .config
-        .read()
-        .permission_timeout_secs
-        .map(std::time::Duration::from_secs)
-        .unwrap_or(crate::runtime::PERMISSION_TIMEOUT)
-        + std::time::Duration::from_secs(30);
-    let client = Arc::new(WsClient {
-        tx,
-        pending: Arc::new(Mutex::new(HashMap::new())),
-        next_id: AtomicU64::new(1),
-        stalled: std::sync::atomic::AtomicBool::new(false),
-        req_timeout,
-    });
-
-    info!("ws client connected");
-    while let Some(text) = rx.recv().await {
-        let Ok(v) = serde_json::from_str::<Value>(&text) else {
-            warn!("invalid JSON from client");
-            continue;
-        };
-
-        // Response to a server-initiated request. A JSON-RPC error object
-        // is delivered as Err — collapsing it to result:null would hide
-        // the failure and mislead any caller treating null as real data.
-        if v.get("method").is_none() && v.get("id").is_some() {
-            // JSON-RPC permits string ids — a client answering our
-            // request with "5" instead of 5 must still resolve the
-            // pending waiter or the request waits out its full timeout.
-            let resp_id = v["id"]
-                .as_u64()
-                .or_else(|| v["id"].as_str().and_then(|s| s.parse::<u64>().ok()))
-                // Some encoders emit integral ids as JSON floats ("id":5.0),
-                // which as_u64 rejects. Accept only exact integers below
-                // 2^64 — an f64 cannot represent u64::MAX, and `<= u64::MAX
-                // as f64` would admit 2^64, whose saturating cast is a
-                // different id.
-                .or_else(|| {
-                    v["id"].as_f64().and_then(|f| {
-                        (f.fract() == 0.0 && f >= 0.0 && f < u64::MAX as f64).then_some(f as u64)
-                    })
-                });
-            if let Some(id) = resp_id
-                && let Some(tx) = client.pending.lock().await.remove(&id)
-            {
-                let payload = match v.get("error") {
-                    Some(e) => Err(e.clone()),
-                    None => Ok(v.get("result").cloned().unwrap_or(Value::Null)),
-                };
-                let _ = tx.send(payload);
-            }
-            continue;
-        }
-
-        let Some(method) = v["method"].as_str() else {
-            continue;
-        };
-        let id = v.get("id").cloned();
-        let params = v["params"].clone();
-
-        match (method, id) {
-            ("initialize", Some(id)) => {
-                client
-                    .respond(
-                        id,
-                        Ok(json!({
-                            "protocolVersion": 1,
-                            "agentCapabilities": {
-                                "loadSession": true,
-                                "promptCapabilities": {"text": true, "image": true}
-                            },
-                            "agentInfo": {"name": "damond", "version": env!("CARGO_PKG_VERSION")}
-                        })),
-                    )
-                    .await;
-            }
-            ("session/new", Some(id)) => {
-                let cwd = params["cwd"].as_str().unwrap_or("").to_string();
-                // ACP mcpServers: per-session stdio servers overlaid on the
-                // daemon's global [mcp_servers]. Entries: {name, command,
-                // args?, env?, auto_approve?} — env accepts the ACP array
-                // form [{name,value}] or a plain object.
-                let overlay = match parse_session_mcp(&params["mcpServers"], &state).await {
-                    Ok(o) => o,
-                    Err(e) => {
-                        client.respond(id, Err(rpc_error(-32602, &e))).await;
-                        continue;
-                    }
-                };
-                let model = params["model"].as_str().map(String::from);
-                let session_id = uuid::Uuid::new_v4().to_string();
-                match state
-                    .store
-                    .create_session(&session_id, &cwd, model.as_deref())
-                    .await
-                {
-                    Ok(()) => {
-                        if let Some(reg) = overlay {
-                            state
-                                .session_mcp
-                                .lock()
-                                .await
-                                .insert(session_id.clone(), reg);
-                        }
-                        client
-                            .respond(id, Ok(json!({"sessionId": session_id})))
-                            .await;
-                    }
-                    Err(e) => {
-                        client
-                            .respond(id, Err(rpc_error(-32603, &e.to_string())))
-                            .await;
-                    }
-                }
-            }
-            ("session/list", Some(id)) => {
-                let limit = params["limit"]
-                    .as_u64()
-                    .map(|n| u32::try_from(n).unwrap_or(u32::MAX));
-                let offset = params["offset"]
-                    .as_u64()
-                    .map(|n| u32::try_from(n).unwrap_or(u32::MAX));
-                let result = if limit.is_some() || offset.is_some() {
-                    state
-                        .store
-                        .list_sessions_paged(limit.unwrap_or(u32::MAX), offset.unwrap_or(0))
-                        .await
-                } else {
-                    state.store.list_sessions().await
-                };
-                match result {
-                    Ok(sessions) => {
-                        let list: Vec<Value> = sessions
-                            .into_iter()
-                            .map(|(sid, created, model, title)| {
-                                json!({"sessionId": sid, "createdAt": created, "model": model, "title": title})
-                            })
-                            .collect();
-                        client
-                            .respond(id, frame_capped_response(json!({"sessions": list})))
-                            .await;
-                    }
-                    Err(e) => {
-                        client
-                            .respond(id, Err(rpc_error(-32603, &e.to_string())))
-                            .await;
-                    }
-                }
-            }
-            ("session/messages", Some(id)) => {
-                let session_id = params["sessionId"].as_str().unwrap_or("").to_string();
-                let limit = params["limit"]
-                    .as_u64()
-                    .map(|n| u32::try_from(n).unwrap_or(u32::MAX));
-                let offset = params["offset"]
-                    .as_u64()
-                    .map(|n| u32::try_from(n).unwrap_or(u32::MAX));
-                // Paged reads return the same OpenAI-shaped message objects
-                // as the unpaged path — StoredMessage.data is that object.
-                let result = if limit.is_some() || offset.is_some() {
-                    state
-                        .store
-                        .messages_paged(&session_id, limit.unwrap_or(u32::MAX), offset.unwrap_or(0))
-                        .await
-                        .map(|msgs| msgs.into_iter().map(|m| m.data).collect())
-                } else {
-                    state.store.messages(&session_id).await
-                };
-                match result {
-                    Ok(messages) => {
-                        client
-                            .respond(id, frame_capped_response(json!({"messages": messages})))
-                            .await;
-                    }
-                    Err(e) => {
-                        client
-                            .respond(id, Err(rpc_error(-32603, &e.to_string())))
-                            .await;
-                    }
-                }
-            }
-            ("session/delete", Some(id)) => {
-                let session_id = params["sessionId"].as_str().unwrap_or("").to_string();
-                // Cancel a live prompt first — deleting mid-turn would let
-                // the turn keep appending messages to a dead session row.
-                if let Some((_, token)) = state.live_prompts.lock().await.get(&session_id) {
-                    token.cancel();
-                }
-                // The wind-down wait runs in a task, not the dispatch loop:
-                // up to 10s of polling here would stall this connection's
-                // other requests (permission replies, cancels).
-                let (state, client) = (state.clone(), client.clone());
-                tokio::spawn(async move {
-                    // Wait for the turn to release the live_prompts entry
-                    // before the rows are deleted. A turn still registered
-                    // after 10s is wedged — refuse rather than orphaning
-                    // its writes into a dead session row.
-                    let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(10);
-                    let busy = loop {
-                        if !state.live_prompts.lock().await.contains_key(&session_id) {
-                            break false;
-                        }
-                        if tokio::time::Instant::now() >= deadline {
-                            break true;
-                        }
-                        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
-                    };
-                    if busy {
-                        client
-                            .respond(id, Err(rpc_error(-32603, "session busy")))
-                            .await;
-                        return;
-                    }
-                    // Re-check under the lock: a session/prompt may have
-                    // registered between our busy poll and this acquisition.
-                    // The lock is released before the row delete — holding
-                    // it across that store await would stall every
-                    // connection's cancel/prompt. The residual window (a
-                    // prompt registering after this check) is backstopped
-                    // by the store: its first append violates the
-                    // messages→sessions foreign key and the turn errors.
-                    {
-                        let map = state.live_prompts.lock().await;
-                        if map.contains_key(&session_id) {
-                            drop(map);
-                            client
-                                .respond(id, Err(rpc_error(-32603, "session busy")))
-                                .await;
-                            return;
-                        }
-                    }
-                    match state.store.delete_session(&session_id).await {
-                        Ok(()) => {
-                            // Session-scoped tool approvals and MCP
-                            // servers die with the session.
-                            state.mcp.clear_session(&session_id);
-                            if let Some(reg) = state.session_mcp.lock().await.remove(&session_id) {
-                                reg.shutdown().await;
-                            }
-                            client.respond(id, Ok(json!({"deleted": true}))).await;
-                        }
-                        Err(e) => {
-                            client
-                                .respond(id, Err(rpc_error(-32603, &e.to_string())))
-                                .await;
-                        }
-                    }
-                });
-            }
-            ("session/search", Some(id)) => {
-                let query = params["query"].as_str().unwrap_or("").to_string();
-                let limit = params["limit"].as_u64().unwrap_or(10).min(1000) as usize;
-                match state.store.search(&query, limit).await {
-                    Ok(hits) => {
-                        let results: Vec<Value> = hits
-                            .into_iter()
-                            .map(|(sid, mid, snippet)| {
-                                json!({
-                                    "sessionId": sid,
-                                    "messageId": mid,
-                                    "snippet": snippet,
-                                })
-                            })
-                            .collect();
-                        client.respond(id, Ok(json!({"results": results}))).await;
-                    }
-                    Err(e) => {
-                        client
-                            .respond(id, Err(rpc_error(-32603, &e.to_string())))
-                            .await;
-                    }
-                }
-            }
-            ("session/resume", Some(id)) => {
-                let session_id = params["sessionId"].as_str().unwrap_or("").to_string();
-                match state.store.session_exists(&session_id).await {
-                    Ok(true) => {
-                        client
-                            .respond(id, Ok(json!({"sessionId": session_id})))
-                            .await;
-                    }
-                    Ok(false) => {
-                        client
-                            .respond(id, Err(rpc_error(-32602, "session not found")))
-                            .await;
-                    }
-                    Err(e) => {
-                        client
-                            .respond(id, Err(rpc_error(-32603, &e.to_string())))
-                            .await;
-                    }
-                }
-            }
-            ("session/rename", Some(id)) => {
-                let session_id = params["sessionId"].as_str().unwrap_or("").to_string();
-                let title = params["title"].as_str().unwrap_or("").trim().to_string();
-                if title.is_empty() {
-                    client
-                        .respond(id, Err(rpc_error(-32602, "empty title")))
-                        .await;
-                    continue;
-                }
-                match state.store.rename_session(&session_id, &title).await {
-                    Ok(true) => client.respond(id, Ok(json!({}))).await,
-                    Ok(false) => {
-                        client
-                            .respond(id, Err(rpc_error(-32602, "session not found")))
-                            .await;
-                    }
-                    Err(e) => {
-                        client
-                            .respond(id, Err(rpc_error(-32603, &e.to_string())))
-                            .await;
-                    }
-                }
-            }
-            ("session/set_model", Some(id)) => {
-                let session_id = params["sessionId"].as_str().unwrap_or("").to_string();
-                // null/absent model clears the override — the session
-                // falls back to the provider's default_model.
-                let model = params["model"].as_str().map(String::from);
-                match state
-                    .store
-                    .set_session_model(&session_id, model.as_deref())
-                    .await
-                {
-                    Ok(true) => client.respond(id, Ok(json!({}))).await,
-                    Ok(false) => {
-                        client
-                            .respond(id, Err(rpc_error(-32602, "session not found")))
-                            .await;
-                    }
-                    Err(e) => {
-                        client
-                            .respond(id, Err(rpc_error(-32603, &e.to_string())))
-                            .await;
-                    }
-                }
-            }
-            ("session/usage", Some(id)) => {
-                // Per-session totals when sessionId given, per-model
-                // rollup across all sessions otherwise.
-                match params["sessionId"].as_str() {
-                    Some(sid) => match state.store.session_usage(sid).await {
-                        Ok((input, output, turns)) => {
-                            client
-                                .respond(
-                                    id,
-                                    Ok(json!({
-                                        "sessionId": sid,
-                                        "inputTokens": input,
-                                        "outputTokens": output,
-                                        "turns": turns,
-                                    })),
-                                )
-                                .await;
-                        }
-                        Err(e) => {
-                            client
-                                .respond(id, Err(rpc_error(-32603, &e.to_string())))
-                                .await;
-                        }
-                    },
-                    None => match state.store.usage_summary().await {
-                        Ok(rows) => {
-                            let models: Vec<Value> = rows
-                                .into_iter()
-                                .map(|(model, input, output, turns)| {
-                                    json!({
-                                        "model": model,
-                                        "inputTokens": input,
-                                        "outputTokens": output,
-                                        "turns": turns,
-                                    })
-                                })
-                                .collect();
-                            client.respond(id, Ok(json!({"models": models}))).await;
-                        }
-                        Err(e) => {
-                            client
-                                .respond(id, Err(rpc_error(-32603, &e.to_string())))
-                                .await;
-                        }
-                    },
-                }
-            }
-            ("session/load", Some(id)) => {
-                // ACP session/load: attach to an existing session and replay
-                // its history as session/update notifications so the client
-                // renders prior turns exactly like live ones. mcpServers get
-                // the same overlay treatment as session/new.
-                let session_id = params["sessionId"].as_str().unwrap_or("").to_string();
-                let overlay = match parse_session_mcp(&params["mcpServers"], &state).await {
-                    Ok(o) => o,
-                    Err(e) => {
-                        client.respond(id, Err(rpc_error(-32602, &e))).await;
-                        continue;
-                    }
-                };
-                match state.store.session_exists(&session_id).await {
-                    Ok(true) => {}
-                    Ok(false) => {
-                        client
-                            .respond(id, Err(rpc_error(-32602, "session not found")))
-                            .await;
-                        continue;
-                    }
-                    Err(e) => {
-                        client
-                            .respond(id, Err(rpc_error(-32603, &e.to_string())))
-                            .await;
-                        continue;
-                    }
-                }
-                if let Some(reg) = overlay {
-                    state
-                        .session_mcp
-                        .lock()
-                        .await
-                        .insert(session_id.clone(), reg);
-                }
-                match state.store.messages_full(&session_id).await {
-                    Ok(msgs) => {
-                        for m in &msgs {
-                            for update in replay_updates(&m.data) {
-                                client
-                                    .notify(
-                                        "session/update",
-                                        json!({"sessionId": session_id, "update": update}),
-                                    )
-                                    .await;
-                            }
-                        }
-                        client.respond(id, Ok(json!({}))).await;
-                    }
-                    Err(e) => {
-                        client
-                            .respond(id, Err(rpc_error(-32603, &e.to_string())))
-                            .await;
-                    }
-                }
-            }
-            ("session/prompt", Some(id)) => {
-                let session_id = params["sessionId"].as_str().unwrap_or("").to_string();
-                // ACP prompt blocks → OpenAI content parts. Text stays a
-                // plain string when it's the only content (the common
-                // case); any non-text block upgrades content to an array.
-                let content = prompt_content(&params["prompt"]);
-                // An empty prompt would persist an empty user message and
-                // burn a full upstream turn — reject it up front.
-                if content.is_null()
-                    || content.as_str().is_some_and(|s| s.trim().is_empty())
-                    || content.as_array().is_some_and(|a| a.is_empty())
-                {
-                    client
-                        .respond(id, Err(rpc_error(-32602, "empty prompt")))
-                        .await;
-                    continue;
-                }
-                let model = params["model"].as_str().map(String::from);
-                let cancel = CancellationToken::new();
-                // Global in-flight turn cap: every other resource here is
-                // bounded, but an unbounded spawn per prompt lets one
-                // connection exhaust memory/upstream quota via N sessions.
-                let Ok(permit) = PROMPT_SLOTS.try_acquire() else {
-                    client
-                        .respond(id, Err(rpc_error(-32603, "too many concurrent prompts")))
-                        .await;
-                    continue;
-                };
-                // Exists-check OUTSIDE the live_prompts lock: holding that
-                // lock across a store await would make every connection's
-                // cancel/disconnect/prompt wait on one SQLite round-trip.
-                match state.store.session_exists(&session_id).await {
-                    Ok(true) => {}
-                    Ok(false) => {
-                        client
-                            .respond(id, Err(rpc_error(-32602, "session not found")))
-                            .await;
-                        continue;
-                    }
-                    Err(e) => {
-                        client
-                            .respond(id, Err(rpc_error(-32603, &e.to_string())))
-                            .await;
-                        continue;
-                    }
-                }
-                {
-                    let mut map = state.live_prompts.lock().await;
-                    // One live prompt per session across ALL connections:
-                    // a second prompt would interleave writes into the
-                    // same persisted history. The entry stays until the
-                    // spawned task removes it, so a disconnect-cancelled
-                    // turn still blocks a new prompt until it has fully
-                    // wound down.
-                    if map.contains_key(&session_id) {
-                        drop(map);
-                        client
-                            .respond(
-                                id,
-                                Err(rpc_error(
-                                    -32602,
-                                    "session already has a prompt in progress",
-                                )),
-                            )
-                            .await;
-                        continue;
-                    }
-                    // The session may have been deleted between the
-                    // exists-check above and this insert — a concurrent
-                    // session/delete no longer excludes us under one lock.
-                    // The store is the backstop: messages.session_id
-                    // foreign-keys sessions(id), so the turn's first
-                    // append fails and the client sees the error.
-                    map.insert(session_id.clone(), (conn_id, cancel.clone()));
-                }
-                let (state, client) = (state.clone(), client.clone());
-                tokio::spawn(async move {
-                    // Hold the permit for the turn's lifetime — the slot
-                    // frees when this task exits, however it ends.
-                    let _permit = permit;
-                    // catch_unwind: a panic inside the turn must not leak
-                    // the live_prompts entry — the session would reject
-                    // every later prompt as "in progress" until restart.
-                    use futures::FutureExt;
-                    let result = std::panic::AssertUnwindSafe(Box::pin(runtime::run_prompt(
-                        &state,
-                        &session_id,
-                        &content,
-                        model.as_deref(),
-                        &(client.clone() as Arc<dyn ClientChannel>),
-                        cancel.clone(),
-                    )))
-                    .catch_unwind()
-                    .await;
-                    let result = match result {
-                        Ok(r) => r,
-                        Err(_) => Err(anyhow::anyhow!("internal error: prompt turn panicked")),
-                    };
-                    // Remove only our own entry — a disconnect may have
-                    // cancelled this turn while a newer connection already
-                    // started a fresh prompt on the same session.
-                    let mut map = state.live_prompts.lock().await;
-                    if map.get(&session_id).is_some_and(|(c, _)| *c == conn_id) {
-                        map.remove(&session_id);
-                    }
-                    drop(map);
-                    match result {
-                        Ok(outcome) => {
-                            let stop = if cancel.is_cancelled() {
-                                "cancelled"
-                            } else {
-                                match outcome.stop_reason {
-                                    crate::llm::StopReason::Stop => "end_turn",
-                                    crate::llm::StopReason::Length => "max_tokens",
-                                    crate::llm::StopReason::ToolCalls => "tool_use",
-                                    crate::llm::StopReason::MaxTurnRequests => "max_turn_requests",
-                                    crate::llm::StopReason::Other => "end_turn",
-                                }
-                            };
-                            // The model that actually served the turn —
-                            // fallback routing may differ from what the
-                            // client requested, so surfaces it when known.
-                            let mut result = json!({"stopReason": stop});
-                            if let Some(m) = &outcome.model {
-                                result["model"] = json!(m);
-                            }
-                            client.respond(id, Ok(result)).await;
-                        }
-                        Err(e) => {
-                            client
-                                .respond(id, Err(rpc_error(-32603, &format!("{e:#}"))))
-                                .await;
-                        }
-                    }
-                });
-            }
-            ("session/compact", Some(id)) => {
-                let session_id = params["sessionId"].as_str().unwrap_or("").to_string();
-                // Same slot discipline as session/prompt: compaction calls
-                // the provider, so it shares the in-flight cap.
-                let Ok(permit) = PROMPT_SLOTS.try_acquire() else {
-                    client
-                        .respond(id, Err(rpc_error(-32603, "too many concurrent prompts")))
-                        .await;
-                    continue;
-                };
-                match state.store.session_exists(&session_id).await {
-                    Ok(true) => {}
-                    Ok(false) => {
-                        client
-                            .respond(id, Err(rpc_error(-32602, "session not found")))
-                            .await;
-                        continue;
-                    }
-                    Err(e) => {
-                        client
-                            .respond(id, Err(rpc_error(-32603, &e.to_string())))
-                            .await;
-                        continue;
-                    }
-                }
-                let cancel = CancellationToken::new();
-                {
-                    let mut map = state.live_prompts.lock().await;
-                    // Compaction rewrites the session's compaction cursor —
-                    // it must not interleave with a live turn's history
-                    // reads, so it takes the same per-session slot.
-                    if map.contains_key(&session_id) {
-                        drop(map);
-                        client
-                            .respond(
-                                id,
-                                Err(rpc_error(
-                                    -32602,
-                                    "session already has a prompt in progress",
-                                )),
-                            )
-                            .await;
-                        continue;
-                    }
-                    map.insert(session_id.clone(), (conn_id, cancel.clone()));
-                }
-                let (state, client) = (state.clone(), client.clone());
-                tokio::spawn(async move {
-                    let _permit = permit;
-                    let result = runtime::compact_session(&state, &session_id, cancel).await;
-                    let mut map = state.live_prompts.lock().await;
-                    if map.get(&session_id).is_some_and(|(c, _)| *c == conn_id) {
-                        map.remove(&session_id);
-                    }
-                    drop(map);
-                    match result {
-                        Ok(report) => {
-                            let mut v = json!({
-                                "compacted": report.compacted,
-                                "compactedThrough": report.compacted_through,
-                            });
-                            if let Some(r) = report.reason {
-                                v["reason"] = json!(r);
-                            }
-                            client.respond(id, Ok(v)).await;
-                        }
-                        Err(e) => {
-                            client
-                                .respond(id, Err(rpc_error(-32603, &format!("{e:#}"))))
-                                .await;
-                        }
-                    }
-                });
-            }
-            ("session/cancel", id) => {
-                // Any connected client may cancel a session's turn — the
-                // map is shared, so this also reaches prompts started by
-                // other connections (e.g. a relay client cancelling a
-                // local prompt). ACP sends this as a notification, but a
-                // client that includes an id still gets a response —
-                // otherwise it waits forever for one.
-                if let Some(sid) = params["sessionId"].as_str()
-                    && let Some((_, token)) = state.live_prompts.lock().await.get(sid)
-                {
-                    token.cancel();
-                }
-                if let Some(id) = id {
-                    client.respond(id, Ok(json!({}))).await;
-                }
-            }
-            (_, Some(id)) => {
-                client
-                    .respond(id, Err(rpc_error(-32601, "method not found")))
-                    .await;
-            }
-            _ => {}
-        }
-    }
-    // Connection ended: cancel every prompt this connection started so
-    // no turn keeps running (and executing tools) unattended. Entries
-    // stay in the map — the spawned tasks remove them on exit, which
-    // keeps the one-prompt-per-session guard until each turn winds down.
-    {
-        let map = state.live_prompts.lock().await;
-        for (_, (owner, token)) in map.iter() {
-            if *owner == conn_id {
-                token.cancel();
-            }
-        }
-    }
-    info!("ws client disconnected");
-}
-
-/// Outbound JSON-RPC response frame cap — matches the inbound WS
-/// `max_frame_size(4 << 20)`. An unpaged session/list or session/messages
-/// response larger than this would be dropped by the client's receive
-/// cap and kill the link, so it is replaced by an explicit error instead.
-pub(crate) const MAX_RESPONSE_BYTES: usize = 4 << 20;
-
-/// Pass the result through, unless the serialized response would exceed
-/// [`MAX_RESPONSE_BYTES`] — then return a fail-loud error telling the
-/// client to page with limit/offset rather than sending an oversized
-/// frame the client cannot receive.
-fn frame_capped_response(result: Value) -> Result<Value, Value> {
-    let size = serde_json::to_vec(&result)
-        .map(|v| v.len())
-        .unwrap_or(usize::MAX);
-    if size > MAX_RESPONSE_BYTES {
-        Err(rpc_error(
-            -32602,
-            "response exceeds the 4 MiB frame cap; re-request with limit/offset",
-        ))
-    } else {
-        Ok(result)
-    }
-}
-
-fn rpc_error(code: i64, message: &str) -> Value {
-    json!({"code": code, "message": message})
-}
-
-/// Whether an Origin header points at a loopback host: `localhost`,
-/// `*.localhost`, or any loopback IP (127.0.0.0/8, ::1), any port/scheme.
-/// Anything unparseable — including `Origin: null` — is not loopback.
-pub(crate) fn is_localhost_origin(origin: &str) -> bool {
-    let Ok(uri) = origin.parse::<axum::http::Uri>() else {
-        return false;
-    };
-    let Some(host) = uri.host() else { return false };
-    let host = host.trim_end_matches('.');
-    if host.eq_ignore_ascii_case("localhost") || host.to_ascii_lowercase().ends_with(".localhost") {
-        return true;
-    }
-    host.trim_matches(|c| c == '[' || c == ']')
-        .parse::<std::net::IpAddr>()
-        .is_ok_and(|ip| ip.is_loopback())
-}
-
-/// Max stdio servers one session may declare, and max live session
-/// overlays daemon-wide — each overlay owns spawned child processes.
-const MAX_SESSION_MCP_SERVERS: usize = 8;
-const MAX_SESSION_MCP_OVERLAYS: usize = 64;
-
-/// Parse ACP `session/new` mcpServers into a connected overlay registry.
-/// Absent/empty → None. Each entry: {name, command, args?, env?,
-/// auto_approve?}; env accepts the ACP array [{name,value}] or an object.
-/// Names colliding with a configured global server are rejected — the
-/// overlay would silently shadow the operator's server.
-async fn parse_session_mcp(
-    raw: &Value,
-    state: &Arc<AppState>,
-) -> Result<Option<Arc<crate::mcp::McpRegistry>>, String> {
-    let Some(list) = raw.as_array() else {
-        return Ok(None);
-    };
-    if list.is_empty() {
-        return Ok(None);
-    }
-    if list.len() > MAX_SESSION_MCP_SERVERS {
-        return Err(format!(
-            "too many mcpServers ({} > {MAX_SESSION_MCP_SERVERS})",
-            list.len()
-        ));
-    }
-    if state.session_mcp.lock().await.len() >= MAX_SESSION_MCP_OVERLAYS {
-        return Err("too many sessions with mcpServers".into());
-    }
-    let mut cfgs = HashMap::new();
-    for (i, entry) in list.iter().enumerate() {
-        let name = entry["name"]
-            .as_str()
-            .ok_or_else(|| format!("mcpServers[{i}].name required"))?;
-        if name.is_empty() || name.contains('.') {
-            return Err(format!("mcpServers[{i}].name invalid: {name:?}"));
-        }
-        if state.mcp.has_server(name) {
-            return Err(format!(
-                "mcpServers[{i}].name {name:?} collides with a configured server"
-            ));
-        }
-        let command = entry["command"]
-            .as_str()
-            .ok_or_else(|| format!("mcpServers[{i}].command required"))?
-            .to_string();
-        let args = entry["args"]
-            .as_array()
-            .map(|a| {
-                a.iter()
-                    .filter_map(|v| v.as_str().map(String::from))
-                    .collect()
-            })
-            .unwrap_or_default();
-        // ACP sends env as [{name, value}]; accept a plain object too.
-        let env = match &entry["env"] {
-            Value::Array(a) => a
-                .iter()
-                .filter_map(|e| {
-                    Some((
-                        e["name"].as_str()?.to_string(),
-                        e["value"].as_str()?.to_string(),
-                    ))
-                })
-                .collect(),
-            Value::Object(o) => o
-                .iter()
-                .filter_map(|(k, v)| v.as_str().map(|s| (k.clone(), s.to_string())))
-                .collect(),
-            _ => HashMap::new(),
-        };
-        cfgs.insert(
-            name.to_string(),
-            crate::config::McpServerConfig {
-                command,
-                args,
-                env,
-                auto_approve: entry["auto_approve"].as_bool().unwrap_or(false),
-            },
-        );
-    }
-    Ok(Some(Arc::new(
-        crate::mcp::McpRegistry::connect_all(&cfgs).await,
-    )))
-}
-
-/// Convert one persisted message into the session/update shapes a live
-/// turn would have emitted, for session/load replay. Order within a
-/// message mirrors the live emit order (thought → text → tool calls).
-fn replay_updates(m: &Value) -> Vec<Value> {
-    let mut out = Vec::new();
-    match m["role"].as_str() {
-        Some("user") => {
-            for block in content_blocks(&m["content"]) {
-                out.push(json!({
-                    "sessionUpdate": "user_message_chunk",
-                    "content": block,
-                }));
-            }
-        }
-        Some("assistant") => {
-            for b in m["thinking"].as_array().cloned().unwrap_or_default() {
-                if let Some(t) = b["thinking"].as_str().or_else(|| b["text"].as_str()) {
-                    out.push(json!({
-                        "sessionUpdate": "agent_thought_chunk",
-                        "content": {"type": "text", "text": t},
-                    }));
-                }
-            }
-            for block in content_blocks(&m["content"]) {
-                out.push(json!({
-                    "sessionUpdate": "agent_message_chunk",
-                    "content": block,
-                }));
-            }
-            for tc in m["tool_calls"].as_array().cloned().unwrap_or_default() {
-                let f = &tc["function"];
-                out.push(json!({
-                    "sessionUpdate": "tool_call",
-                    "toolCallId": tc["id"],
-                    "title": f["name"].as_str().unwrap_or("tool"),
-                    "rawInput": llm::parse_partial_json(
-                        f["arguments"].as_str().unwrap_or("")
-                    ),
-                    "status": "in_progress",
-                }));
-            }
-        }
-        Some("tool") => {
-            let content = m["content"].as_str().unwrap_or("");
-            let status = if content == "cancelled" {
-                "cancelled"
-            } else if content.starts_with("error:") {
-                "failed"
-            } else {
-                "completed"
-            };
-            out.push(json!({
-                "sessionUpdate": "tool_call_update",
-                "toolCallId": m["tool_call_id"],
-                "status": status,
-                "content": [{"type": "content", "content": {"type": "text", "text": content}}],
-            }));
-        }
-        _ => {}
-    }
-    out
-}
-
-/// Normalize stored message content (string or part array) into ACP
-/// content blocks for replay. Non-text parts the client can't render
-/// degrade to a placeholder instead of vanishing.
-fn content_blocks(content: &Value) -> Vec<Value> {
-    match content {
-        Value::String(s) if !s.is_empty() => vec![json!({"type": "text", "text": s})],
-        Value::Array(parts) => parts
+/// Flatten a prompt to plain text for the title/history row.
+fn prompt_text(prompt: &PromptInput) -> String {
+    match prompt {
+        PromptInput::Text(t) => t.clone(),
+        PromptInput::Blocks(blocks) => blocks
             .iter()
-            .filter_map(|p| match p["type"].as_str() {
-                Some("text") => Some(p.clone()),
-                Some("image_url") => {
-                    let url = p["image_url"]["url"]
-                        .as_str()
-                        .or_else(|| p["image_url"].as_str())
-                        .unwrap_or("");
-                    url.strip_prefix("data:")
-                        .and_then(|rest| rest.split_once(";base64,"))
-                        .map(
-                            |(mime, data)| json!({"type": "image", "data": data, "mimeType": mime}),
-                        )
-                        .or_else(|| {
-                            Some(json!({"type": "text", "text": format!("[image: {url}]")}))
-                        })
-                }
-                Some(other) => Some(json!({"type": "text", "text": format!("[{other}]")})),
-                None => None,
+            .filter_map(|b| match b {
+                PromptBlock::Text { text } => Some(text.clone()),
+                _ => None,
             })
-            .collect(),
-        _ => vec![],
-    }
-}
-
-/// Convert ACP prompt blocks into the OpenAI content shape persisted as
-/// the user message: a lone text block stays a plain string; anything
-/// else becomes a parts array. ACP `image` blocks carry base64 data +
-/// mimeType → OpenAI `image_url` data URLs; `resource`/`resource_link`
-/// degrade to text (their bytes aren't fetched here — a remote URI the
-/// daemon never dereferences must not become a silent fetch).
-fn prompt_content(prompt: &Value) -> Value {
-    let blocks = match prompt.as_array() {
-        Some(b) => b,
-        None => return Value::Null,
-    };
-    let mut parts: Vec<Value> = Vec::new();
-    for b in blocks {
-        match b["type"].as_str() {
-            Some("text") => {
-                if let Some(t) = b["text"].as_str() {
-                    parts.push(json!({"type": "text", "text": t}));
-                }
-            }
-            Some("image") => {
-                let data = b["data"].as_str().unwrap_or("");
-                let mime = b["mimeType"].as_str().unwrap_or("image/png");
-                if !data.is_empty() {
-                    parts.push(json!({
-                        "type": "image_url",
-                        "image_url": {"url": format!("data:{mime};base64,{data}")},
-                    }));
-                }
-            }
-            // resource_link: surface the URI as text — the model sees the
-            // reference even though the daemon doesn't fetch it.
-            Some("resource_link") => {
-                let uri = b["uri"].as_str().unwrap_or("");
-                let name = b["name"].as_str().unwrap_or("resource");
-                if !uri.is_empty() {
-                    parts.push(json!({"type": "text", "text": format!("[{name}: {uri}]")}));
-                }
-            }
-            // Embedded resource with inline text content.
-            Some("resource") => {
-                if let Some(t) = b["resource"]["text"].as_str() {
-                    parts.push(json!({"type": "text", "text": t}));
-                }
-            }
-            _ => {}
-        }
-    }
-    // Text-only input collapses back to the string form every existing
-    // consumer (providers, FTS, titles) already handles.
-    if parts.iter().all(|p| p["type"] == "text") {
-        let text = parts
-            .iter()
-            .filter_map(|p| p["text"].as_str())
             .collect::<Vec<_>>()
-            .join("\n");
-        return json!(text);
+            .join("\n"),
     }
-    Value::Array(parts)
 }
-#[cfg(test)]
-mod tests {
-    use super::*;
 
-    #[test]
-    fn small_response_passes_through() {
-        let r = frame_capped_response(json!({"messages": ["m1"]}));
-        assert!(r.is_ok());
-    }
-
-    #[test]
-    fn oversized_response_becomes_paging_error() {
-        let big = "x".repeat(MAX_RESPONSE_BYTES + 1);
-        let r = frame_capped_response(json!({"messages": [big]})).unwrap_err();
-        assert_eq!(r["code"], -32602);
-        assert!(
-            r["message"]
-                .as_str()
-                .unwrap()
-                .contains("re-request with limit/offset")
-        );
-    }
+/// Self-describing list of every method this daemon handles — the wire
+/// contract, returned by `hello` and printed by `damond --print-rpc-schema`.
+pub fn rpc_methods() -> Vec<Value> {
+    vec![
+        json!({"name": "hello", "result": {"protocol": "number", "backends": "array", "methods": "array"}}),
+        json!({"name": "backend.list", "result": {"backends": "array"}}),
+        json!({"name": "session.create", "params": {"backend": "string?", "cwd": "string?", "model": "string?", "mode": "string?", "mcpServers": "object?"}, "result": {"sessionId": "string", "backend": "string"}}),
+        json!({"name": "session.resume", "params": {"sessionId": "string"}, "result": {"sessionId": "string", "backend": "string"}}),
+        json!({"name": "session.list", "params": {"limit": "number?", "offset": "number?"}, "result": {"sessions": "array"}}),
+        json!({"name": "session.messages", "params": {"sessionId": "string", "limit": "number?", "before": "number?"}, "result": {"messages": "array"}}),
+        json!({"name": "session.import", "params": {"backend": "string", "cwd": "string?"}, "result": {"sessions": "array"}}),
+        json!({"name": "session.delete", "params": {"sessionId": "string"}, "result": {"deleted": "boolean"}}),
+        json!({"name": "session.rename", "params": {"sessionId": "string", "title": "string"}, "result": {"renamed": "boolean"}}),
+        json!({"name": "session.fork", "params": {"sessionId": "string", "upto": "number?"}, "result": {"sessionId": "string"}}),
+        json!({"name": "session.usage", "params": {"sessionId": "string?"}, "result": {"contextUsed": "number", "costUsd": "number"}}),
+        json!({"name": "session.search", "params": {"query": "string", "limit": "number?"}, "result": {"results": "array"}}),
+        json!({"name": "turn.start", "params": {"sessionId": "string", "prompt": "string|array", "timeoutSecs": "number?"}, "result": {"turnId": "string", "stopReason": "string", "usage": "object?"}}),
+        json!({"name": "turn.steer", "params": {"sessionId": "string", "prompt": "string|array"}, "result": {"result": "string"}}),
+        json!({"name": "turn.cancel", "params": {"sessionId": "string"}, "result": {"cancelled": "boolean"}}),
+        json!({"name": "permission.respond", "params": {"sessionId": "string", "response": "object"}, "result": {}}),
+        json!({"name": "session.set_model", "params": {"sessionId": "string", "model": "string"}, "result": {}}),
+        json!({"name": "session.set_mode", "params": {"sessionId": "string", "mode": "string"}, "result": {}}),
+        json!({"name": "catalog.models", "params": {"backend": "string"}, "result": {"models": "array", "modes": "array"}}),
+    ]
 }

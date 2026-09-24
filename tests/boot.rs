@@ -1,5 +1,5 @@
 //! Boot-path smoke test: spawn the real damond binary against a temp
-//! config and prove it binds and answers /v1/models. Guards the
+//! config and prove it binds and answers /health. Guards the
 //! config-parse → bind → serve chain that unit tests can't reach.
 
 use std::io::Write;
@@ -39,16 +39,16 @@ async fn damond_boots_and_serves_models() {
         .spawn()
         .expect("spawn damond");
 
-    // Poll /v1/models until the listener is up (or give up after 15s).
+    // Poll /health until the listener is up (or give up after 15s).
     let client = reqwest::Client::new();
-    let url = format!("http://127.0.0.1:{port}/v1/models");
+    let url = format!("http://127.0.0.1:{port}/health");
     let mut ok = false;
     for _ in 0..150 {
         if let Ok(resp) = client.get(&url).send().await
             && resp.status().is_success()
         {
             let body: serde_json::Value = resp.json().await.unwrap();
-            assert!(body["data"].is_array(), "bad /v1/models body: {body}");
+            assert!(body["status"] == "ok", "bad /health body: {body}");
             ok = true;
             break;
         }
@@ -58,5 +58,5 @@ async fn damond_boots_and_serves_models() {
         tokio::time::sleep(Duration::from_millis(100)).await;
     }
     child.kill().await.unwrap();
-    assert!(ok, "damond never answered /v1/models on {url}");
+    assert!(ok, "damond never answered /health on {url}");
 }

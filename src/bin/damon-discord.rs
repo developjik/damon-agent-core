@@ -42,6 +42,10 @@ async fn main() -> anyhow::Result<()> {
     if matches.value_source("token") == Some(clap::parser::ValueSource::CommandLine) {
         eprintln!("warning: --token is visible in process lists; prefer DAMON_TOKEN env");
     }
+    // Same exposure for the channel token — argv is world-readable.
+    if matches.value_source("bot_token") == Some(clap::parser::ValueSource::CommandLine) {
+        eprintln!("warning: --bot-token is visible in process lists; prefer DISCORD_BOT_TOKEN env");
+    }
     let client = DamonClient::connect(&args.url, args.token.as_deref())
         .await
         .context("cannot connect to damond")?;

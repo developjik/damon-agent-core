@@ -130,6 +130,21 @@ impl DiscordApi {
         }
         Ok(())
     }
+
+    /// POST /channels/{id}/typing — shows "bot is typing…" for ~10s.
+    /// Best-effort: a 4xx (missing access, channel gone) is ignored.
+    pub async fn send_typing(&self, channel_id: &str) -> anyhow::Result<()> {
+        let resp = self
+            .http
+            .post(format!("{}/channels/{channel_id}/typing", self.base))
+            .bearer_auth(&self.token)
+            .send()
+            .await?;
+        if !resp.status().is_success() {
+            return Ok(());
+        }
+        Ok(())
+    }
 }
 
 /// Extract (channel_id, text) from a MESSAGE_CREATE dispatch.
@@ -153,22 +168,63 @@ pub fn incoming_from_message(d: &Value, bot_id: &str) -> Option<Incoming> {
             .trim_start_matches([' ', ',', ':'])
             .trim()
             .to_string();
-        if stripped.is_empty() {
+        // Empty after mention-stripping: a bare mention is ignored, but
+        // a mention + attachment still comes through so recv can answer
+        // with the unsupported-attachments notice instead of an empty
+        // prompt error.
+        if stripped.is_empty() && d["attachments"].as_array().is_none_or(|a| a.is_empty()) {
             return None;
         }
         return Some(Incoming {
             chat_id: channel_id,
+            // Discord threads are channels — the thread's channel_id
+            // already scopes the conversation.
+            thread_id: None,
             sender_id: d["author"]["id"].as_str().map(String::from),
             text: stripped,
             attachments: Vec::new(),
         });
     }
+    // A DM with no text at all is nothing to prompt on — but with
+    // attachments it still comes through so recv can answer with the
+    // unsupported-attachments notice instead of an empty prompt error.
+    if text.is_empty() && d["attachments"].as_array().is_none_or(|a| a.is_empty()) {
+        return None;
+    }
     Some(Incoming {
         chat_id: channel_id,
+        thread_id: None,
         sender_id: d["author"]["id"].as_str().map(String::from),
         text,
         attachments: Vec::new(),
     })
+}
+
+/// True when a MESSAGE_CREATE is addressed to the bot but carries only
+/// attachments — no usable text. recv answers these with a notice
+/// rather than dropping them (guild) or prompting on "" (DM).
+fn attachment_only(d: &Value, bot_id: &str) -> bool {
+    if d["author"]["bot"].as_bool().unwrap_or(false) {
+        return false;
+    }
+    if d["attachments"].as_array().is_none_or(|a| a.is_empty()) {
+        return false;
+    }
+    let text = d["content"].as_str().unwrap_or("");
+    if d["guild_id"].is_string() {
+        let mention = format!("<@{bot_id}>");
+        let nick_mention = format!("<@!{bot_id}>");
+        if !(text.contains(&mention) || text.contains(&nick_mention)) {
+            return false;
+        }
+        return text
+            .replace(&mention, "")
+            .replace(&nick_mention, "")
+            .trim_start_matches([' ', ',', ':'])
+            .trim()
+            .is_empty();
+    }
+    text.trim().is_empty()
 }
 
 type WsStream =
@@ -231,14 +287,23 @@ impl DiscordChannel {
 
     async fn connect(&self) -> anyhow::Result<GatewayConn> {
         let url = self.api.gateway_url().await?;
-        let (ws, _) = tokio_tungstenite::connect_async(format!("{url}/?v=10&encoding=json"))
-            .await
-            .context("gateway connect failed")?;
+        let (ws, _) = tokio::time::timeout(
+            std::time::Duration::from_secs(30),
+            tokio_tungstenite::connect_async(format!("{url}/?v=10&encoding=json")),
+        )
+        .await
+        .context("gateway connect timed out")?
+        .context("gateway connect failed")?;
         let (write, mut read) = ws.split();
         let write = Arc::new(Mutex::new(write));
 
         // First frame must be Hello (op 10) with the heartbeat interval.
-        let hello = read.next().await.context("gateway closed before hello")??;
+        // Bound the wait — a peer that accepts the socket but never
+        // speaks would otherwise park this connect forever.
+        let hello = tokio::time::timeout(std::time::Duration::from_secs(30), read.next())
+            .await
+            .context("gateway hello timed out")?
+            .context("gateway closed before hello")??;
         let hello: Value = serde_json::from_str(hello.to_text()?)?;
         anyhow::ensure!(hello["op"] == 10, "expected hello, got {hello}");
         // A malicious/buggy gateway could send 0 — tokio's interval panics
@@ -341,6 +406,20 @@ impl ChannelApi for DiscordChannel {
                         // op 0 dispatch
                         if v["op"] == 0 && v["t"] == "MESSAGE_CREATE" {
                             let bot_id = self.bot_id.lock().await.clone().unwrap_or_default();
+                            // Attachment-only message for the bot: say
+                            // so instead of dropping it (guild) or
+                            // erroring on an empty prompt (DM).
+                            if attachment_only(&v["d"], &bot_id) {
+                                let cid = v["d"]["channel_id"].as_str().unwrap_or_default();
+                                let _ = self
+                                    .api
+                                    .send_message(
+                                        cid,
+                                        "attachments aren't supported on this channel yet",
+                                    )
+                                    .await;
+                                continue;
+                            }
                             if let Some(msg) = incoming_from_message(&v["d"], &bot_id) {
                                 return Ok(Some(msg));
                             }
@@ -369,9 +448,11 @@ impl ChannelApi for DiscordChannel {
                             continue;
                         }
                     }
-                    Some(Ok(_)) => {} // ping/pong/binary — tungstenite answers pings
+                    Some(Ok(_)) => {
+                        // Binary/ping/pong/close frames — not dispatchable.
+                    }
                     Some(Err(e)) => {
-                        warn!(error = %e, "discord gateway read error; reconnecting");
+                        warn!(error = %e, "discord gateway error; reconnecting");
                         *guard = None;
                     }
                     None => {
@@ -386,6 +467,10 @@ impl ChannelApi for DiscordChannel {
 
     async fn send(&self, chat_id: &str, text: &str) -> anyhow::Result<()> {
         self.api.send_message(chat_id, text).await
+    }
+
+    async fn typing(&self, chat_id: &str) -> anyhow::Result<()> {
+        self.api.send_typing(chat_id).await
     }
 
     fn flush_threshold(&self) -> usize {

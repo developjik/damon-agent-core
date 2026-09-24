@@ -2,190 +2,735 @@
 <html lang="en">
 <head>
 <meta charset="utf-8">
-<meta name="viewport" content="width=device-width, initial-scale=1">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
 <title>damon</title>
 <style>
   :root {
-    --bg: #0d1117; --panel: #161b22; --border: #30363d;
-    --fg: #e6edf3; --muted: #8b949e; --accent: #58a6ff;
-    --user: #1f6feb; --err: #f85149; --ok: #3fb950;
+    color-scheme: dark;
+    --bg: #0a0c10; --bg2: #0e1117; --panel: #11151d; --panel2: #171c26;
+    --border: #232a36; --border2: #2e3746;
+    --fg: #e8edf4; --muted: #7d8794; --faint: #525c69;
+    --accent: #6ea8fe; --accent-dim: rgba(110,168,254,.14);
+    --user: #2f6fed; --user2: #4d8bff; --on-user: #fff;
+    --err: #f47067; --ok: #57ab5a; --warn: #d4a72c; --on-ok: #06110a;
+    --hover: #1a2029; --code-bg: #0a0e14;
+    --danger-bg: #2d1a1c; --danger-fg: #ffb3ae;
+    --glow: 0 0 0 1px rgba(110,168,254,.25), 0 8px 32px rgba(0,0,0,.45);
+    --radius: 14px;
+    --mono: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+  }
+  [data-theme="light"] {
+    color-scheme: light;
+    --bg: #f4f6f9; --bg2: #eef1f5; --panel: #ffffff; --panel2: #f0f3f7;
+    --border: #dde3ea; --border2: #c9d2dc;
+    --fg: #1c2330; --muted: #5d6a7a; --faint: #98a3b1;
+    --accent: #1f6feb; --accent-dim: rgba(31,111,235,.1);
+    --user: #1f6feb; --user2: #3d84f5; --on-user: #fff;
+    --err: #cf222e; --ok: #1a7f37; --warn: #9a6700; --on-ok: #fff;
+    --hover: #e9edf2; --code-bg: #f0f3f7;
+    --danger-bg: #ffebe9; --danger-fg: #a40e26;
+    --glow: 0 0 0 1px rgba(31,111,235,.2), 0 8px 28px rgba(30,40,60,.12);
   }
   * { box-sizing: border-box; margin: 0; }
   html, body { height: 100%; }
   body {
     background: var(--bg); color: var(--fg);
-    font: 14px/1.5 -apple-system, "Segoe UI", Roboto, Helvetica, Arial, sans-serif;
+    font: 14px/1.55 -apple-system, "Segoe UI", Roboto, Helvetica, Arial, sans-serif;
     display: flex; overflow: hidden;
+    transition: background .2s, color .2s;
   }
+  /* Ambient backdrop */
+  body::before {
+    content: ""; position: fixed; inset: 0; pointer-events: none; z-index: 0;
+    background:
+      radial-gradient(60% 40% at 85% -5%, rgba(110,168,254,.07), transparent 60%),
+      radial-gradient(50% 35% at 10% 110%, rgba(87,171,90,.05), transparent 60%);
+  }
+  [data-theme="light"] body::before, [data-theme="light"]::before { opacity: .5; }
+  button { font-family: inherit; transition: background .12s, color .12s, border-color .12s, filter .12s, transform .05s; }
+  button:not(:disabled):active { transform: translateY(.5px) scale(.98); }
+  :focus-visible { outline: 2px solid var(--accent); outline-offset: 1px; }
+  ::placeholder { color: var(--faint); }
+  * { scrollbar-width: thin; scrollbar-color: var(--border2) transparent; }
+  ::-webkit-scrollbar { width: 9px; height: 9px; }
+  ::-webkit-scrollbar-thumb { background: var(--border2); border-radius: 5px; border: 2px solid transparent; background-clip: content-box; }
+  ::-webkit-scrollbar-track { background: transparent; }
+
   /* ---- sidebar ---- */
   #sidebar {
-    width: 250px; min-width: 250px; background: var(--panel);
+    width: 264px; min-width: 264px; background: var(--bg2);
     border-right: 1px solid var(--border);
-    display: flex; flex-direction: column;
+    display: flex; flex-direction: column; z-index: 1;
   }
-  #sidebar h1 {
-    font-size: 15px; padding: 14px 14px 10px; font-weight: 600;
-    border-bottom: 1px solid var(--border);
+  #brand {
+    display: flex; align-items: center; gap: 9px;
+    padding: 15px 16px 13px; border-bottom: 1px solid var(--border);
   }
+  #brand .logo {
+    width: 24px; height: 24px; border-radius: 7px; flex: none;
+    background: linear-gradient(135deg, var(--accent), #8957e5);
+    display: grid; place-items: center;
+    font-size: 13px; font-weight: 800; color: #fff;
+    box-shadow: 0 2px 10px rgba(110,168,254,.35);
+  }
+  #brand h1 { font-size: 14.5px; font-weight: 700; letter-spacing: .01em; flex: 1; }
+  #brand .ver { font-size: 10px; color: var(--faint); font-family: var(--mono); }
+  #agentPanel { border-bottom: 1px solid var(--border); padding: 11px 14px 13px; }
+  .panelHead {
+    font-size: 10.5px; text-transform: uppercase; letter-spacing: .1em;
+    color: var(--faint); margin-bottom: 7px; font-weight: 600;
+  }
+  .agentRow {
+    display: flex; align-items: center; gap: 8px;
+    padding: 4px 2px; font-size: 12.5px; cursor: default;
+  }
+  .agentDot {
+    width: 7px; height: 7px; border-radius: 50%; background: var(--err); flex: none;
+    box-shadow: 0 0 0 3px color-mix(in srgb, var(--err) 18%, transparent);
+  }
+  .agentDot.on { background: var(--ok); box-shadow: 0 0 0 3px color-mix(in srgb, var(--ok) 18%, transparent); }
+  .agentRow .hint { color: var(--faint); font-size: 10.5px; margin-left: auto; }
   #newBtn {
-    margin: 10px; padding: 8px; background: var(--user); color: #fff;
-    border: 0; border-radius: 6px; cursor: pointer; font-size: 13px;
+    margin: 11px 12px 9px; padding: 9px; border: 0; border-radius: 10px; cursor: pointer;
+    font-size: 13px; font-weight: 600; color: var(--on-user);
+    background: linear-gradient(180deg, var(--user2), var(--user));
+    box-shadow: 0 2px 12px color-mix(in srgb, var(--user) 40%, transparent);
   }
-  #newBtn:hover { filter: brightness(1.15); }
-  #sessions { flex: 1; overflow-y: auto; padding: 0 6px 10px; }
+  #newBtn:hover { filter: brightness(1.12); }
+  #search {
+    margin: 0 12px 9px; padding: 7px 10px 7px 30px; background: var(--bg); color: var(--fg);
+    border: 1px solid var(--border); border-radius: 9px;
+    font-family: inherit; font-size: 12px; width: calc(100% - 24px);
+    background-image: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='13' height='13' viewBox='0 0 24 24' fill='none' stroke='%237d8794' stroke-width='2.4' stroke-linecap='round'%3E%3Ccircle cx='11' cy='11' r='7'/%3E%3Cpath d='m20 20-3.5-3.5'/%3E%3C/svg%3E");
+    background-repeat: no-repeat; background-position: 9px center;
+  }
+  #search:focus { outline: none; border-color: var(--accent); box-shadow: 0 0 0 3px var(--accent-dim); }
+  #search::-webkit-search-cancel-button { -webkit-appearance: none; }
+  #sessions { flex: 1; min-height: 0; overflow-y: auto; padding: 0 8px 12px; }
+  .sessGroup {
+    font-size: 10px; text-transform: uppercase; letter-spacing: .09em;
+    color: var(--faint); font-weight: 700; padding: 12px 8px 5px;
+  }
   .sess {
-    display: flex; align-items: center; gap: 6px;
-    padding: 7px 8px; border-radius: 6px; cursor: pointer;
-    color: var(--muted); font-size: 12px;
+    display: flex; align-items: center; gap: 4px;
+    padding: 7px 8px; border-radius: 9px; cursor: pointer;
+    color: var(--muted); font-size: 12px; border: 1px solid transparent;
+    transition: background .1s, color .1s;
   }
-  .sess:hover { background: #21262d; }
-  .sess.active { background: #21262d; color: var(--fg); }
-  .sess .sid { flex: 1; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
-  .sess .model { color: var(--muted); font-size: 10px; }
-  .sess .del {
-    border: 0; background: none; color: var(--muted); cursor: pointer;
-    font-size: 14px; padding: 0 2px; visibility: hidden;
+  .sess:hover { background: var(--hover); }
+  .sess.active {
+    background: var(--accent-dim); color: var(--fg);
+    border-color: color-mix(in srgb, var(--accent) 25%, transparent);
   }
-  .sess:hover .del { visibility: visible; }
-  .sess .del:hover { color: var(--err); }
+  .sessMain { flex: 1; min-width: 0; display: flex; flex-direction: column; gap: 1px; }
+  .sess .sid { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; font-size: 12.5px; }
+  .sess.active .sid { color: var(--fg); font-weight: 550; }
+  .sess .meta {
+    font-size: 10.5px; color: var(--faint);
+    overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
+  }
+  .sess .del, .sess .ren, .sess .fork {
+    border: 0; background: none; color: var(--faint); cursor: pointer;
+    font-size: 13px; padding: 2px 4px; visibility: hidden; flex: none; border-radius: 5px;
+  }
+  .sess:hover .del, .sess:hover .ren, .sess:hover .fork { visibility: visible; }
+  .sess .del:hover { color: var(--err); background: color-mix(in srgb, var(--err) 12%, transparent); }
+  .sess .ren:hover { color: var(--accent); background: var(--accent-dim); }
+  .sess .fork:hover { color: var(--accent); background: var(--accent-dim); }
+  @media (hover: none) {
+    .sess .del, .sess .ren, .sess .fork { visibility: visible; }
+  }
+
   /* ---- main ---- */
-  #main { flex: 1; display: flex; flex-direction: column; min-width: 0; }
+  #main { flex: 1; display: flex; flex-direction: column; min-width: 0; position: relative; z-index: 1; }
+  #topbar {
+    height: 50px; flex: none; display: flex; align-items: center; gap: 10px;
+    padding: 0 16px; border-bottom: 1px solid var(--border);
+    background: color-mix(in srgb, var(--bg2) 82%, transparent);
+    backdrop-filter: blur(12px); -webkit-backdrop-filter: blur(12px);
+  }
+  #menuBtn {
+    display: none; border: 0; background: none; color: var(--muted);
+    font-size: 18px; cursor: pointer; padding: 4px 8px; border-radius: 7px;
+  }
+  #menuBtn:hover { color: var(--fg); background: var(--hover); }
+  #crumb { display: flex; align-items: center; gap: 9px; min-width: 0; flex: 1; }
+  #crumbAgent {
+    display: none; font-size: 10.5px; font-weight: 700; color: var(--accent);
+    background: var(--accent-dim); border: 1px solid color-mix(in srgb, var(--accent) 30%, transparent);
+    padding: 2px 9px; border-radius: 20px; letter-spacing: .02em;
+  }
+  #crumbAgent:not(:empty) { display: inline-block; }
+  #crumbId {
+    font-size: 13.5px; font-weight: 600;
+    overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
+  }
+  #usage { font-size: 11px; color: var(--faint); font-family: var(--mono); flex: none; }
+  #usage:empty { display: none; }
+  #themeBtn, #setBtn {
+    border: 1px solid var(--border); background: var(--panel); color: var(--muted);
+    width: 30px; height: 30px; border-radius: 8px; cursor: pointer; font-size: 14px;
+    display: grid; place-items: center; flex: none;
+  }
+  #themeBtn:hover, #setBtn:hover { color: var(--fg); border-color: var(--border2); }
+  #conn {
+    display: flex; align-items: center; gap: 7px; color: var(--muted); font-size: 11px;
+    flex: none; padding: 4px 10px; border-radius: 20px;
+    border: 1px solid var(--border); background: var(--panel);
+  }
+  #connDot { width: 7px; height: 7px; border-radius: 50%; background: var(--muted); }
+  #connDot.on { background: var(--ok); box-shadow: 0 0 6px var(--ok); }
+  #connDot.off, #connDot.pending { animation: blink 1.2s infinite; }
+  #connDot.off { background: var(--err); }
+  #connDot.pending { background: var(--warn); }
   #banner {
-    display: none; padding: 6px 14px; font-size: 12px;
-    background: #3d2323; color: #ffb3ae; border-bottom: 1px solid var(--border);
+    display: none; padding: 7px 16px; font-size: 12px; font-weight: 500;
+    background: var(--danger-bg); color: var(--danger-fg); border-bottom: 1px solid var(--err);
   }
   #banner.show { display: block; }
-  #log { flex: 1; overflow-y: auto; padding: 18px 20px; }
-  .msg { max-width: 78%; margin: 0 0 12px; padding: 9px 13px; border-radius: 10px; white-space: pre-wrap; word-wrap: break-word; }
-  .msg.user { margin-left: auto; background: var(--user); color: #fff; }
-  .msg.assistant { background: var(--panel); border: 1px solid var(--border); }
-  .msg.error { background: #3d2323; border: 1px solid var(--err); color: #ffb3ae; font-size: 13px; }
-  .msg.thought { background: none; border: 1px dashed var(--border); color: var(--muted); font-style: italic; font-size: 12px; }
-  .tool { color: var(--muted); font: 12px/1.4 ui-monospace, SFMono-Regular, Menlo, monospace; margin: 0 0 8px; padding-left: 4px; }
+  #log { flex: 1; min-height: 0; overflow-y: auto; padding: 22px 24px 12px; scroll-behavior: smooth; }
+
+  /* ---- messages ---- */
+  .msg {
+    max-width: min(76%, 720px); margin: 0 0 14px; padding: 10px 15px;
+    border-radius: var(--radius); white-space: pre-wrap; word-wrap: break-word;
+    animation: rise .18s ease-out; position: relative;
+  }
+  @keyframes rise { from { opacity: 0; transform: translateY(5px); } }
+  .msg.user {
+    margin-left: auto; color: var(--on-user);
+    background: linear-gradient(160deg, var(--user2), var(--user));
+    border-bottom-right-radius: 5px;
+    box-shadow: 0 3px 14px color-mix(in srgb, var(--user) 32%, transparent);
+  }
+  .msg.assistant {
+    background: var(--panel); border: 1px solid var(--border);
+    border-bottom-left-radius: 5px; white-space: normal;
+    box-shadow: 0 1px 4px rgba(0,0,0,.14);
+  }
+  .msg.assistant p, .msg.assistant ul, .msg.assistant ol,
+  .msg.assistant blockquote, .msg.assistant h3, .msg.assistant h4 { margin: 0 0 9px; }
+  .msg.assistant > :last-child { margin-bottom: 0; }
+  .msg.assistant h3 { font-size: 15px; }
+  .msg.assistant h4 { font-size: 14px; }
+  .msg.assistant ul, .msg.assistant ol { padding-left: 22px; }
+  .msg.assistant li { margin: 2px 0; }
+  .msg.assistant blockquote {
+    padding: 3px 13px; border-left: 3px solid var(--accent); color: var(--muted);
+    background: var(--accent-dim); border-radius: 0 8px 8px 0;
+  }
+  .msg.assistant hr { border: 0; border-top: 1px solid var(--border); margin: 13px 0; }
+  .msg.assistant a { color: var(--accent); }
+  .msg .tblwrap { overflow-x: auto; margin: 7px 0; }
+  .msg table { border-collapse: collapse; font-size: 12.5px; }
+  .msg th, .msg td { border: 1px solid var(--border2); padding: 5px 11px; text-align: left; }
+  .msg th { background: var(--panel2); font-weight: 650; }
+  .msg tbody tr:nth-child(even) { background: color-mix(in srgb, var(--panel2) 45%, transparent); }
+  .msg.streaming::after {
+    content: "▍"; margin-left: 2px; color: var(--accent);
+    animation: caret 1s steps(2) infinite;
+  }
+  @keyframes caret { 50% { opacity: 0; } }
+  .msg.error {
+    background: var(--danger-bg); border: 1px solid var(--err);
+    color: var(--danger-fg); font-size: 13px;
+  }
+  .thought {
+    max-width: min(76%, 720px); margin: 0 0 10px;
+    border: 1px dashed var(--border2); border-radius: 10px;
+    color: var(--muted); font-size: 12px; overflow: hidden;
+    animation: rise .18s ease-out;
+  }
+  .thought > summary {
+    padding: 6px 11px; cursor: pointer; user-select: none; list-style: none;
+    font-size: 10.5px; font-weight: 700; text-transform: uppercase;
+    letter-spacing: .08em; color: var(--faint);
+    display: flex; align-items: center; gap: 7px;
+  }
+  .thought > summary::-webkit-details-marker { display: none; }
+  .thought > summary::before { content: "▸"; transition: transform .15s; }
+  .thought[open] > summary::before { transform: rotate(90deg); }
+  .thought[open] > summary { border-bottom: 1px dashed var(--border2); }
+  .thoughtBody {
+    padding: 8px 12px; font-style: italic; white-space: pre-wrap;
+    word-wrap: break-word; max-height: 300px; overflow-y: auto;
+  }
+  .msg .stamp {
+    position: absolute; bottom: -16px; font-size: 10px; color: var(--faint);
+    opacity: 0; transition: opacity .15s; pointer-events: none; white-space: nowrap;
+  }
+  .msg.user .stamp { right: 4px; }
+  .msg.assistant .stamp { left: 4px; }
+  .msg:hover .stamp { opacity: 1; }
+  .msg img.att { max-width: 320px; border-radius: 9px; display: block; margin-top: 7px; }
+  .msg .msgcopy {
+    position: absolute; top: -9px; right: 8px; padding: 2px 8px;
+    font-size: 10px; font-weight: 600; color: var(--muted);
+    background: var(--panel2); border: 1px solid var(--border); border-radius: 6px;
+    cursor: pointer; opacity: 0; transition: opacity .15s;
+  }
+  .msg:hover .msgcopy, .msg .msgcopy:focus-visible { opacity: 1; }
+  .msg .msgcopy.did { color: var(--ok); border-color: var(--ok); opacity: 1; }
+  .msg.user .msgcopy { color: #dbe7ff; background: rgba(0,0,0,.28); border-color: rgba(255,255,255,.28); }
+  .sess .meta mark { background: var(--accent-dim); color: var(--accent); border-radius: 3px; padding: 0 1px; }
+
+  /* ---- tool call cards ---- */
+  .toolcard {
+    max-width: min(76%, 720px); margin: 0 0 10px; border-radius: 10px;
+    background: var(--bg2); border: 1px solid var(--border);
+    font: 12px/1.45 var(--mono); overflow: hidden;
+    animation: rise .18s ease-out;
+  }
+  .toolcard > .tcHead {
+    display: flex; align-items: center; gap: 8px;
+    padding: 7px 11px; cursor: pointer; user-select: none;
+    color: var(--muted);
+  }
+  .toolcard > .tcHead:hover { background: var(--hover); color: var(--fg); }
+  .tcIcon { flex: none; width: 14px; text-align: center; }
+  .tcName { color: var(--fg); font-weight: 600; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+  .tcStatus { margin-left: auto; flex: none; font-size: 10.5px; font-weight: 600; padding: 1px 8px; border-radius: 12px; }
+  .tcStatus.st-in_progress, .tcStatus.st-running { color: var(--accent); background: var(--accent-dim); }
+  .tcStatus.st-in_progress::before, .tcStatus.st-running::before { content: "● "; animation: blink 1.1s infinite; }
+  .tcStatus.st-completed { color: var(--ok); background: color-mix(in srgb, var(--ok) 13%, transparent); }
+  .tcStatus.st-failed, .tcStatus.st-cancelled, .tcStatus.st-canceled { color: var(--err); background: color-mix(in srgb, var(--err) 13%, transparent); }
+  .tcStatus.st-pending { color: var(--muted); background: var(--hover); }
+  .tcChevron { flex: none; font-size: 9px; color: var(--faint); transition: transform .15s; }
+  .toolcard.open .tcChevron { transform: rotate(90deg); }
+  .tcBody {
+    display: none; border-top: 1px solid var(--border);
+    padding: 8px 11px; max-height: 260px; overflow: auto;
+    white-space: pre-wrap; word-wrap: break-word; color: var(--muted);
+  }
+  .toolcard.open .tcBody { display: block; }
+  /* legacy flat tool line (kept for stored tool_calls) */
+  .tool {
+    color: var(--muted); font: 12px/1.4 var(--mono);
+    margin: 0 0 8px; padding-left: 4px;
+  }
   .tool .st-in_progress { color: var(--accent); }
   .tool .st-completed { color: var(--ok); }
   .tool .st-failed, .tool .st-cancelled { color: var(--err); }
-  .msg pre, .toolmsg pre {
-    background: #010409; border: 1px solid var(--border); border-radius: 6px;
-    padding: 8px 10px; margin: 6px 0; overflow-x: auto;
-    font: 12px/1.45 ui-monospace, SFMono-Regular, Menlo, monospace; white-space: pre;
+  .codewrap { position: relative; }
+  .codewrap .copy, .diffwrap .copy {
+    position: absolute; top: 7px; right: 7px; padding: 3px 9px;
+    font-size: 10.5px; font-weight: 600; color: var(--muted); background: var(--panel2);
+    border: 1px solid var(--border); border-radius: 6px; cursor: pointer;
+    opacity: 0; backdrop-filter: blur(6px);
   }
-  .msg code {
-    background: #010409; border-radius: 4px; padding: 1px 5px;
-    font: 12px ui-monospace, SFMono-Regular, Menlo, monospace;
+  .codewrap:hover .copy, .codewrap .copy:focus-visible, .diffwrap:hover .copy, .diffwrap .copy:focus-visible { opacity: 1; }
+  .codewrap .copy.did, .diffwrap .copy.did { color: var(--ok); border-color: var(--ok); opacity: 1; }
+  .codewrap .codeLang {
+    position: absolute; top: 7px; left: 11px; font-size: 10px; font-weight: 700;
+    color: var(--faint); text-transform: uppercase; letter-spacing: .07em;
+    font-family: var(--mono); pointer-events: none;
   }
-  .msg pre code { background: none; padding: 0; }
+  .msg pre, .toolmsg pre, .tcBody pre {
+    background: var(--code-bg); border: 1px solid var(--border); border-radius: 9px;
+    padding: 9px 12px; margin: 7px 0; overflow-x: auto;
+    font: 12px/1.5 var(--mono); white-space: pre;
+  }
+  .msg code, .toolmsg code, .tcBody code {
+    background: var(--code-bg); border: 1px solid var(--border); border-radius: 5px; padding: 1px 5px;
+    font: 11.5px var(--mono);
+  }
+  .msg pre code, .toolmsg pre code, .tcBody pre code { background: none; border: 0; padding: 0; }
+
+  /* ---- tool input diff (edit/write details) ---- */
+  .diffblock {
+    margin: 6px 0 2px; border: 1px solid var(--border); border-radius: 9px;
+    overflow: hidden; background: var(--bg2);
+  }
+  .diffblock > summary {
+    display: flex; align-items: center; gap: 8px; padding: 5px 10px;
+    cursor: pointer; user-select: none; color: var(--muted); list-style: none;
+  }
+  .diffblock > summary::-webkit-details-marker { display: none; }
+  .diffblock > summary:hover { background: var(--hover); color: var(--fg); }
+  .diffblock > summary::before {
+    content: "▸"; flex: none; font-size: 9px; color: var(--faint);
+    transition: transform .15s;
+  }
+  .diffblock[open] > summary::before { transform: rotate(90deg); }
+  .diffIcon { flex: none; width: 14px; text-align: center; }
+  .diffFile {
+    color: var(--fg); font-weight: 600;
+    overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
+  }
+  .diffStats { margin-left: auto; flex: none; font-size: 10.5px; font-weight: 700; }
+  .diffStats .da { color: var(--ok); }
+  .diffStats .dd { color: var(--err); margin-left: 5px; }
+  .diffBody { border-top: 1px solid var(--border); }
+  .diffwrap { position: relative; }
+  .diffwrap pre {
+    margin: 0; border: 0; border-radius: 0; background: var(--code-bg); padding: 5px 0;
+  }
+  .diffblock .dl { display: block; padding: 0 10px; white-space: pre; }
+  .diffblock .dl .sg { display: inline-block; width: 1.2em; }
+  .diffblock .dl-del { background: color-mix(in srgb, var(--err) 10%, transparent); }
+  .diffblock .dl-del .sg { color: var(--err); }
+  .diffblock .dl-add { background: color-mix(in srgb, var(--ok) 10%, transparent); }
+  .diffblock .dl-add .sg { color: var(--ok); }
+  .diffblock .dl-ctx { color: var(--muted); }
+  .diffblock .dl-ctx .sg { color: var(--faint); }
+  .diffblock .diffNone { padding: 7px 10px; color: var(--faint); }
+  .diffblock .diffMore {
+    padding: 4px 10px 5px; font-size: 10.5px; color: var(--faint);
+    border-top: 1px dashed var(--border);
+  }
+
   .toolmsg {
-    max-width: 78%; margin: 0 0 12px; padding: 7px 11px; border-radius: 8px;
-    background: #0d1117; border: 1px solid var(--border);
-    color: var(--muted); font: 12px/1.4 ui-monospace, SFMono-Regular, Menlo, monospace;
+    max-width: min(76%, 720px); margin: 0 0 12px; padding: 8px 12px; border-radius: 9px;
+    background: var(--bg2); border: 1px solid var(--border);
+    color: var(--muted); font: 12px/1.45 var(--mono);
     white-space: pre-wrap; word-wrap: break-word;
   }
-  .sys { text-align: center; color: var(--muted); font-size: 12px; margin: 10px 0; }
+  .sys {
+    text-align: center; color: var(--faint); font-size: 11px; margin: 12px 0;
+    display: flex; align-items: center; gap: 12px;
+  }
+  .sys::before, .sys::after { content: ""; flex: 1; height: 1px; background: var(--border); }
+
+  /* ---- empty state + jump ---- */
+  #empty {
+    position: absolute; left: 0; right: 0; top: 50px; bottom: 110px;
+    display: none; flex-direction: column; align-items: center; justify-content: center;
+    gap: 14px; color: var(--muted); pointer-events: none; text-align: center; padding: 0 20px;
+  }
+  #empty.show { display: flex; }
+  #empty .hero {
+    width: 58px; height: 58px; border-radius: 17px;
+    background: linear-gradient(135deg, var(--accent), #8957e5);
+    display: grid; place-items: center; font-size: 28px; font-weight: 800; color: #fff;
+    box-shadow: 0 8px 32px rgba(110,168,254,.35);
+    animation: float 4s ease-in-out infinite;
+  }
+  @keyframes float { 0%,100% { transform: translateY(0); } 50% { transform: translateY(-6px); } }
+  #empty .title { font-size: 17px; font-weight: 700; color: var(--fg); }
+  #empty .sub { font-size: 12.5px; color: var(--muted); max-width: 340px; }
+  #empty button { pointer-events: auto; }
+  #emptyNewBtn {
+    padding: 9px 18px; border: 0; border-radius: 10px; cursor: pointer;
+    font-size: 13px; font-weight: 600; color: var(--on-user);
+    background: linear-gradient(180deg, var(--user2), var(--user));
+    box-shadow: 0 3px 14px color-mix(in srgb, var(--user) 38%, transparent);
+  }
+  #emptyNewBtn:hover { filter: brightness(1.12); }
+  #jumpBtn {
+    display: none; position: absolute; right: 22px; bottom: 118px; z-index: 3;
+    height: 34px; min-width: 34px; padding: 0 10px; border-radius: 18px;
+    border: 1px solid var(--border2); background: var(--panel); color: var(--fg);
+    cursor: pointer; font-size: 14px; box-shadow: var(--glow);
+    align-items: center; gap: 5px;
+  }
+  #jumpBtn.show { display: inline-flex; }
+  #jumpBtn:hover { border-color: var(--accent); color: var(--accent); }
+
   /* ---- permission card ---- */
   #perm {
-    display: none; margin: 0 20px 10px; padding: 12px 14px;
-    background: var(--panel); border: 1px solid var(--accent); border-radius: 8px;
+    display: none; margin: 0 24px 10px; padding: 13px 15px;
+    background: var(--panel); border: 1px solid var(--accent); border-radius: 12px;
+    box-shadow: var(--glow); animation: rise .18s ease-out;
   }
   #perm.show { display: block; }
-  #permTitle { font-weight: 600; margin-bottom: 4px; }
+  #permTitle { font-weight: 650; margin-bottom: 5px; font-size: 13.5px; }
+  #permTitle::before { content: "⚠ "; color: var(--warn); }
+  .kindChip {
+    font-size: 10px; font-weight: 700; text-transform: uppercase; letter-spacing: .06em;
+    color: var(--warn); background: color-mix(in srgb, var(--warn) 14%, transparent);
+    border: 1px solid color-mix(in srgb, var(--warn) 35%, transparent);
+    padding: 1px 7px; border-radius: 10px; margin-right: 7px; vertical-align: 1px;
+  }
+  .kindChip:empty { display: none; }
   #permInput {
-    color: var(--muted); font: 12px ui-monospace, Menlo, monospace;
-    white-space: pre-wrap; word-wrap: break-word; max-height: 120px; overflow-y: auto; margin-bottom: 10px;
+    color: var(--muted); font: 11.5px/1.5 var(--mono);
+    white-space: pre-wrap; word-wrap: break-word; max-height: 130px; overflow-y: auto;
+    margin-bottom: 11px; background: var(--code-bg); border: 1px solid var(--border);
+    border-radius: 8px; padding: 8px 10px;
   }
-  #permBtns { display: flex; gap: 8px; }
+  #permInput:empty { display: none; }
+  #permBtns { display: flex; gap: 8px; flex-wrap: wrap; }
   #permBtns button {
-    padding: 6px 14px; border-radius: 6px; border: 1px solid var(--border);
-    background: #21262d; color: var(--fg); cursor: pointer; font-size: 13px;
+    padding: 7px 15px; border-radius: 9px; border: 1px solid var(--border);
+    background: var(--panel2); color: var(--fg); cursor: pointer; font-size: 12.5px; font-weight: 600;
   }
-  #permBtns button.allow { background: var(--ok); border-color: var(--ok); color: #06110a; }
+  #permBtns button.allow { background: var(--ok); border-color: var(--ok); color: var(--on-ok); }
+  #permBtns button.allow:hover { filter: brightness(1.1); }
   #permBtns button.reject { background: none; color: var(--err); border-color: var(--err); }
+  #permBtns button.reject:hover { background: color-mix(in srgb, var(--err) 10%, transparent); }
+
+  /* ---- typing indicator ---- */
+  #typing {
+    display: none; align-items: center; gap: 9px;
+    padding: 5px 26px 3px; color: var(--muted); font-size: 12px;
+  }
+  #typing.show { display: flex; }
+  .dots { display: inline-flex; gap: 3px; }
+  .dots i { width: 5px; height: 5px; border-radius: 50%; background: var(--accent); animation: blink 1.2s infinite ease-in-out; }
+  .dots i:nth-child(2) { animation-delay: .2s; }
+  .dots i:nth-child(3) { animation-delay: .4s; }
+  @keyframes blink { 0%, 80%, 100% { opacity: .25; } 40% { opacity: 1; } }
+  #typingTime { font-family: var(--mono); color: var(--faint); font-size: 11px; }
+
   /* ---- composer ---- */
-  #composer { border-top: 1px solid var(--border); padding: 12px 20px; display: flex; gap: 8px; align-items: flex-end; }
-  #input {
-    flex: 1; resize: none; background: var(--panel); color: var(--fg);
-    border: 1px solid var(--border); border-radius: 8px; padding: 9px 12px;
-    font: inherit; max-height: 160px; min-height: 38px;
+  /* ---- queued prompts + attachments ---- */
+  #queueBar { display: flex; gap: 7px; padding: 0 26px 7px; flex-wrap: wrap; }
+  #queueBar:empty { display: none; }
+  .qchip {
+    display: inline-flex; align-items: center; gap: 7px; max-width: 280px;
+    padding: 4px 6px 4px 10px; border-radius: 16px; font-size: 11.5px;
+    background: var(--accent-dim); color: var(--accent);
+    border: 1px solid color-mix(in srgb, var(--accent) 30%, transparent);
   }
-  #input:focus { outline: none; border-color: var(--accent); }
-  #model {
-    width: 130px; background: var(--panel); color: var(--fg);
-    border: 1px solid var(--border); border-radius: 8px; padding: 9px 10px; font: 12px inherit;
-  }
-  #search {
-    margin: 0 10px 8px; padding: 7px 9px; background: var(--bg); color: var(--fg);
-    border: 1px solid var(--border); border-radius: 6px; font-size: 12px;
-  }
-  #search:focus { outline: none; border-color: var(--accent); }
-  #attachBtn {
-    background: var(--panel); color: var(--muted); border: 1px solid var(--border);
-    border-radius: 8px; padding: 9px 10px; cursor: pointer; font-size: 14px;
-  }
-  #attachBtn:hover { color: var(--fg); }
-  #attachBar { display: flex; gap: 8px; padding: 0 14px; }
+  .qchip .qt { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+  .qchip .qx { border: 0; background: none; color: inherit; cursor: pointer; font-size: 13px; padding: 0 3px; }
+  .qchip .qx:hover { color: var(--err); }
+  #attachBar { display: flex; gap: 8px; padding: 0 26px 7px; flex-wrap: wrap; }
+  #attachBar:empty { display: none; }
   #attachBar .thumb { position: relative; }
-  #attachBar img { height: 48px; border-radius: 6px; border: 1px solid var(--border); }
+  #attachBar img { height: 52px; border-radius: 8px; border: 1px solid var(--border2); }
   #attachBar .rm {
-    position: absolute; top: -6px; right: -6px; width: 16px; height: 16px;
+    position: absolute; top: -6px; right: -6px; width: 17px; height: 17px;
     border-radius: 50%; border: 0; background: var(--err); color: #fff;
-    font-size: 10px; line-height: 1; cursor: pointer;
+    font-size: 11px; line-height: 1; cursor: pointer;
   }
-  .msg img.att { max-width: 320px; border-radius: 8px; display: block; margin-top: 6px; }
-  .hit { color: var(--muted); font-size: 11px; }
+  #composer {
+    border-top: 1px solid var(--border); padding: 13px 24px;
+    padding-bottom: calc(13px + env(safe-area-inset-bottom));
+    display: flex; gap: 9px; align-items: flex-end;
+    background: color-mix(in srgb, var(--bg2) 75%, transparent);
+    backdrop-filter: blur(12px); -webkit-backdrop-filter: blur(12px);
+  }
+  #agent {
+    background: var(--panel); color: var(--fg); border: 1px solid var(--border);
+    border-radius: 11px; padding: 10px 9px; font-family: inherit; font-size: 12px;
+    max-width: 128px; cursor: pointer; height: 40px;
+  }
+  #agent:focus { outline: none; border-color: var(--accent); }
+  #agent option:disabled { color: var(--faint); }
+  #inputWrap {
+    flex: 1; display: flex; align-items: flex-end; gap: 6px;
+    background: var(--panel); border: 1px solid var(--border); border-radius: 13px;
+    padding: 4px 4px 4px 13px; transition: border-color .15s, box-shadow .15s;
+  }
+  #inputWrap:focus-within { border-color: var(--accent); box-shadow: 0 0 0 3px var(--accent-dim); }
+  #inputWrap.dropping { border-color: var(--accent); border-style: dashed; box-shadow: 0 0 0 3px var(--accent-dim); }
+  #input {
+    flex: 1; resize: none; background: none; color: var(--fg);
+    border: 0; padding: 7px 0; font: inherit; max-height: 160px; min-height: 30px;
+  }
+  #input:focus { outline: none; }
+  #attachBtn {
+    background: none; color: var(--faint); border: 0;
+    border-radius: 9px; padding: 7px 8px; cursor: pointer; font-size: 15px; flex: none;
+  }
+  #attachBtn:hover { color: var(--fg); background: var(--hover); }
   #sendBtn, #cancelBtn {
-    padding: 9px 18px; border-radius: 8px; border: 0; cursor: pointer; font-size: 13px;
+    flex: none; min-width: 40px; height: 40px; border-radius: 11px;
+    border: 0; cursor: pointer; font-size: 13px; font-weight: 700;
+    display: grid; place-items: center; padding: 0 14px;
   }
-  #sendBtn { background: var(--user); color: #fff; }
-  #sendBtn:disabled { opacity: .45; cursor: default; }
-  #cancelBtn { background: var(--err); color: #fff; display: none; }
+  #sendBtn {
+    background: linear-gradient(180deg, var(--user2), var(--user)); color: var(--on-user);
+    box-shadow: 0 2px 10px color-mix(in srgb, var(--user) 40%, transparent);
+  }
+  #sendBtn:hover { filter: brightness(1.14); }
+  #sendBtn:disabled { opacity: .45; cursor: default; box-shadow: none; }
+  #cancelBtn { background: var(--err); color: #fff; }
+
   /* ---- auth overlay ---- */
   #auth {
-    position: fixed; inset: 0; background: rgba(1,4,9,.85);
-    display: none; align-items: center; justify-content: center; z-index: 10;
+    position: fixed; inset: 0; background: rgba(4,6,10,.8);
+    backdrop-filter: blur(8px); -webkit-backdrop-filter: blur(8px);
+    display: none; align-items: center; justify-content: center; z-index: 30;
   }
   #auth.show { display: flex; }
   #authCard {
-    background: var(--panel); border: 1px solid var(--border); border-radius: 10px;
-    padding: 24px; width: 340px;
+    background: var(--panel); border: 1px solid var(--border2); border-radius: 16px;
+    padding: 26px; width: 350px; box-shadow: 0 16px 60px rgba(0,0,0,.5);
+    animation: rise .2s ease-out;
   }
-  #authCard h2 { font-size: 15px; margin-bottom: 6px; }
-  #authCard p { color: var(--muted); font-size: 12px; margin-bottom: 14px; }
+  #authCard .logo {
+    width: 38px; height: 38px; border-radius: 11px; margin-bottom: 14px;
+    background: linear-gradient(135deg, var(--accent), #8957e5);
+    display: grid; place-items: center; font-size: 19px; font-weight: 800; color: #fff;
+  }
+  #authCard h2 { font-size: 15.5px; margin-bottom: 6px; }
+  #authCard p { color: var(--muted); font-size: 12px; margin-bottom: 15px; line-height: 1.5; }
   #token {
     width: 100%; background: var(--bg); color: var(--fg);
-    border: 1px solid var(--border); border-radius: 6px; padding: 9px 10px;
-    font: 13px ui-monospace, Menlo, monospace; margin-bottom: 10px;
+    border: 1px solid var(--border); border-radius: 9px; padding: 10px 11px;
+    font: 13px var(--mono); margin-bottom: 10px;
   }
+  #token:focus { outline: none; border-color: var(--accent); box-shadow: 0 0 0 3px var(--accent-dim); }
   #authErr { color: var(--err); font-size: 12px; min-height: 16px; margin-bottom: 8px; }
-  #authBtn { width: 100%; padding: 9px; border: 0; border-radius: 6px; background: var(--user); color: #fff; cursor: pointer; }
+  #authBtn {
+    width: 100%; padding: 10px; border: 0; border-radius: 10px; cursor: pointer; font-weight: 650;
+    color: var(--on-user); background: linear-gradient(180deg, var(--user2), var(--user));
+  }
+  #authBtn:hover { filter: brightness(1.12); }
+
+  /* ---- responsive drawer ---- */
+  #backdrop { display: none; }
+  @media (max-width: 760px) {
+    #sidebar {
+      position: fixed; inset: 0 auto 0 0; z-index: 20;
+      transform: translateX(-103%); transition: transform .2s ease;
+    }
+    body.drawer-open #sidebar { transform: none; box-shadow: 0 0 50px rgba(0,0,0,.55); }
+    #backdrop {
+      display: none; position: fixed; inset: 0; z-index: 15;
+      background: rgba(0,0,0,.5); border: 0; padding: 0; cursor: pointer;
+      backdrop-filter: blur(2px);
+    }
+    body.drawer-open #backdrop { display: block; }
+    #menuBtn { display: inline-flex; }
+    #connText, #usage { display: none; }
+    .msg, .toolmsg, .toolcard { max-width: 94%; }
+    #log { padding: 15px 13px 9px; }
+    #composer { padding: 10px 13px; }
+    #attachBar { padding: 0 15px 6px; }
+    #perm { margin: 0 13px 9px; }
+    #jumpBtn { bottom: 104px; right: 14px; }
+    #agent { max-width: 96px; }
+  }
+
+  /* ---- settings drawer (mirrors the mobile sidebar drawer, from the right) ---- */
+  #sBackdrop {
+    display: none; position: fixed; inset: 0; z-index: 24;
+    background: rgba(0,0,0,.5); border: 0; padding: 0; cursor: pointer;
+    backdrop-filter: blur(2px);
+  }
+  body.settings-open #sBackdrop { display: block; }
+  #setPanel {
+    position: fixed; top: 0; right: 0; bottom: 0; z-index: 25;
+    width: min(340px, 92vw);
+    background: var(--bg2); border-left: 1px solid var(--border);
+    display: flex; flex-direction: column;
+    transform: translateX(103%); transition: transform .2s ease;
+  }
+  body.settings-open #setPanel { transform: none; box-shadow: 0 0 50px rgba(0,0,0,.55); }
+  .setHead {
+    display: flex; align-items: center; justify-content: space-between;
+    padding: 14px 16px 12px; border-bottom: 1px solid var(--border); flex: none;
+  }
+  .setHead h2 { font-size: 14.5px; font-weight: 700; letter-spacing: .01em; }
+  #setClose {
+    border: 1px solid var(--border); background: var(--panel); color: var(--muted);
+    width: 26px; height: 26px; border-radius: 7px; cursor: pointer; font-size: 12px;
+    display: grid; place-items: center;
+  }
+  #setClose:hover { color: var(--fg); border-color: var(--border2); }
+  #setBody {
+    flex: 1; min-height: 0; overflow-y: auto;
+    padding: 4px 16px 18px; display: flex; flex-direction: column; gap: 17px;
+  }
+  .setRow {
+    display: flex; align-items: baseline; justify-content: space-between; gap: 12px;
+    padding: 3px 0; font-size: 12.5px;
+  }
+  .setRow .k { color: var(--faint); flex: none; }
+  .setRow .v {
+    color: var(--fg); font: 11.5px var(--mono); text-align: right;
+    overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
+  }
+  .setRow .v.on { color: var(--ok); }
+  .setRow .v.off { color: var(--err); }
+  .statRow {
+    display: flex; align-items: center; gap: 8px;
+    padding: 4px 0; font-size: 12.5px;
+  }
+  .statDot {
+    width: 7px; height: 7px; border-radius: 50%; flex: none;
+    background: var(--muted);
+    box-shadow: 0 0 0 3px color-mix(in srgb, var(--muted) 15%, transparent);
+  }
+  .statDot.st-ok { background: var(--ok); box-shadow: 0 0 0 3px color-mix(in srgb, var(--ok) 18%, transparent); }
+  .statDot.st-cooling { background: var(--warn); box-shadow: 0 0 0 3px color-mix(in srgb, var(--warn) 18%, transparent); animation: blink 1.2s infinite; }
+  .statDot.st-crashed { background: var(--err); box-shadow: 0 0 0 3px color-mix(in srgb, var(--err) 18%, transparent); }
+  .statName { font-weight: 550; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+  .statMeta { margin-left: auto; flex: none; color: var(--faint); font-size: 10.5px; }
+  .setToggle {
+    display: flex; align-items: center; gap: 9px;
+    font-size: 12.5px; cursor: pointer; padding: 2px 0;
+  }
+  .setToggle input { accent-color: var(--accent); width: 15px; height: 15px; cursor: pointer; flex: none; }
+  .setHint { font-size: 11px; color: var(--faint); margin-top: 5px; line-height: 1.5; }
+
+  .setHint.warn { color: var(--warn); }
+
+  @media (prefers-reduced-motion: reduce) {
+    * { animation: none !important; transition: none !important; }
+    #log { scroll-behavior: auto; }
+  }
 </style>
 </head>
 <body>
-  <div id="sidebar">
-    <h1>damon</h1>
+  <button id="backdrop" aria-label="Close menu" tabindex="-1"></button>
+  <aside id="sidebar">
+    <div id="brand">
+      <div class="logo">d</div>
+      <h1>damon</h1>
+      <span class="ver">agent core</span>
+    </div>
+    <div id="agentPanel">
+      <div class="panelHead">agents</div>
+      <div id="agentList"></div>
+    </div>
     <button id="newBtn">+ New session</button>
-    <input id="search" placeholder="search history…" title="Full-text search over all sessions">
+    <input id="search" type="search" placeholder="search history…" title="Full-text search over all sessions (Ctrl/Cmd+K)">
     <div id="sessions"></div>
-  </div>
+  </aside>
   <div id="main">
+    <header id="topbar">
+      <button id="menuBtn" aria-label="Toggle session list">☰</button>
+      <div id="crumb">
+        <span id="crumbAgent"></span>
+        <span id="crumbId">no session</span>
+      </div>
+      <span id="usage" title="Session context usage and cost"></span>
+      <button id="themeBtn" title="Toggle theme" aria-label="Toggle theme">◐</button>
+      <button id="setBtn" title="Settings & status" aria-label="Open settings and status" aria-haspopup="dialog" aria-expanded="false" aria-controls="setPanel">⚙</button>
+      <div id="conn">
+        <span id="connDot" class="pending"></span>
+        <span id="connText">connecting</span>
+      </div>
+    </header>
     <div id="banner"></div>
-    <div id="log"></div>
+    <div id="log" role="log" aria-live="polite"></div>
+    <div id="empty">
+      <div class="hero">d</div>
+      <div class="title">No conversation yet</div>
+      <div class="sub">Pick an agent below and start a session — or resume one from the sidebar.</div>
+      <button id="emptyNewBtn">Start a new session</button>
+    </div>
+    <button id="jumpBtn" aria-label="Jump to latest message" title="Jump to latest">↓</button>
     <div id="perm">
-      <div id="permTitle"></div>
+      <div id="permTitle"><span id="permKind" class="kindChip"></span><span id="permName"></span></div>
       <div id="permInput"></div>
       <div id="permBtns"></div>
     </div>
-    <div id="composer">
-      <input id="model" placeholder="model (optional)" title="Model override sent with each prompt">
-      <input id="attach" type="file" accept="image/*" style="display:none">
-      <button id="attachBtn" title="Attach an image">📎</button>
-      <textarea id="input" rows="1" placeholder="Message — Enter to send, Shift+Enter for newline"></textarea>
-      <button id="sendBtn">Send</button>
-      <button id="cancelBtn">Cancel</button>
+    <div id="typing">
+      <span class="dots" aria-hidden="true"><i></i><i></i><i></i></span>
+      <span>working</span>
+      <span id="typingTime"></span>
     </div>
+    <div id="queueBar"></div>
     <div id="attachBar"></div>
+    <div id="composer">
+      <select id="agent" title="Agent for the next session (each conversation is pinned to one agent)"></select>
+      <div id="inputWrap">
+        <textarea id="input" rows="1" placeholder="Message — Enter to send, Shift+Enter for newline"></textarea>
+        <input id="attach" type="file" accept="image/*" style="display:none">
+        <button id="attachBtn" title="Attach an image" aria-label="Attach an image">📎</button>
+      </div>
+      <button id="sendBtn" title="Send (Enter)">➤</button>
+      <button id="cancelBtn" style="display:none" title="Stop the running turn">■</button>
+    </div>
   </div>
   <div id="auth">
-    <div id="authCard">
+    <div id="authCard" role="dialog" aria-modal="true" aria-label="Authentication">
+      <div class="logo">d</div>
       <h2>Authentication required</h2>
       <p>This daemon has an auth token configured. Paste it to continue — it is exchanged for a one-shot WebSocket ticket and kept only in this tab's session storage.</p>
       <input id="token" type="password" placeholder="auth token" autocomplete="off">
@@ -193,6 +738,35 @@
       <button id="authBtn">Connect</button>
     </div>
   </div>
+
+  <button id="sBackdrop" aria-label="Close settings" tabindex="-1"></button>
+  <aside id="setPanel" role="dialog" aria-modal="true" aria-label="Settings and status" inert>
+    <div class="setHead">
+      <h2>settings</h2>
+      <button id="setClose" aria-label="Close settings">✕</button>
+    </div>
+    <div id="setBody">
+      <section>
+        <div class="panelHead">daemon</div>
+        <div class="setRow"><span class="k">agent</span><span class="v" id="dmAgent">—</span></div>
+        <div class="setRow"><span class="k">version</span><span class="v" id="dmVersion">—</span></div>
+        <div class="setRow"><span class="k">origin</span><span class="v" id="dmUrl">—</span></div>
+        <div class="setRow"><span class="k">connection</span><span class="v" id="dmConn">—</span></div>
+      </section>
+      <section>
+        <div class="panelHead">agents</div>
+        <div id="setStatusList"></div>
+      </section>
+      <section>
+        <div class="panelHead">notifications</div>
+        <label class="setToggle">
+          <input type="checkbox" id="notifyToggle">
+          <span>Desktop notifications</span>
+        </label>
+        <div class="setHint" id="notifyHint"></div>
+      </section>
+    </div>
+  </aside>
 
 <script>
 "use strict";
@@ -203,67 +777,289 @@ const pending = new Map();     // id -> {resolve, timer}
 let activeSession = null;      // sessionId shown in the log
 let busy = false;              // a prompt turn is running on activeSession
 let streamEl = null;           // assistant bubble receiving chunks
+let streamBody = null;         // content div inside streamEl (copy/stamp survive)
 let streamText = "";
 let thoughtEl = null, thoughtText = "";
-const toolEls = new Map();     // toolCallId -> status line element
+let todoEl = null;             // live todo card for the running turn
+const toolEls = new Map();     // call_id -> toolcard element
 let token = sessionStorage.getItem("damon_token") || "";
 let retries = 0;               // consecutive failed direct dials
 let backoff = 1000;
 let reconnectTimer = null;
 let manualClose = false;
+let sessionsCache = [];        // last session.list payload, for the crumb
+let stick = true;              // autoscroll: user is at (or near) the bottom
+let daemonInfo = null;         // hello payload: {daemon, version, …}
+let busyTick = null, busySince = 0;
+const PLACEHOLDER = "Message — Enter to send, Shift+Enter for newline";
+const liveTurns = new Set();   // sessionIds with a turn in flight (this conn)
+const missedTurns = new Set(); // turns whose updates were dropped while viewing another session
 
 const $ = id => document.getElementById(id);
 const log = $("log"), banner = $("banner"), input = $("input");
+
+// ---------- theme ----------
+// Default dark; stored choice wins; toggle flips and persists.
+(function initTheme() {
+  const t = localStorage.getItem("damon_theme");
+  if (t === "light") document.documentElement.setAttribute("data-theme", "light");
+})();
+$("themeBtn").onclick = () => {
+  const light = document.documentElement.getAttribute("data-theme") === "light";
+  if (light) {
+    document.documentElement.removeAttribute("data-theme");
+    localStorage.setItem("damon_theme", "dark");
+  } else {
+    document.documentElement.setAttribute("data-theme", "light");
+    localStorage.setItem("damon_theme", "light");
+  }
+};
 
 // ---------- helpers ----------
 function esc(s) {
   return String(s).replace(/&/g, "&amp;").replace(/</g, "&lt;")
     .replace(/>/g, "&gt;").replace(/"/g, "&quot;");
 }
-// Markdown-lite: HTML is escaped first, then fenced code blocks and
-// inline code get markup. Everything else stays plain text.
+// Markdown-lite: a conservative subset — fenced code, headings, lists,
+// blockquotes, hr, pipe tables, links, bold, italic, strikethrough,
+// inline code. Every fragment is escaped exactly once; no nesting.
 function mdLite(src) {
-  const parts = String(src).split(/```/);
+  const chunks = String(src).split(/```/);
   let out = "";
-  for (let i = 0; i < parts.length; i++) {
-    if (i % 2 === 1) {
-      let code = parts[i].replace(/^[a-zA-Z0-9_-]*\n/, ""); // drop lang tag
-      out += "<pre><code>" + esc(code) + "</code></pre>";
-    } else {
-      out += esc(parts[i]).replace(/`([^`\n]+)`/g, (m, c) => "<code>" + c + "</code>");
-    }
+  for (let i = 0; i < chunks.length; i++) {
+    if (i % 2 === 1) out += codeBlockHtml(chunks[i]);
+    else out += mdBlocks(chunks[i]);
   }
   return out;
 }
-function bubble(cls, html) {
+function codeBlockHtml(raw) {
+  const nl = raw.indexOf("\n");
+  const lang = nl === -1 ? "" : raw.slice(0, nl).trim();
+  const code = nl === -1 ? "" : raw.slice(nl + 1);
+  const tag = /^[a-zA-Z0-9_-]{1,20}$/.test(lang)
+    ? '<span class="codeLang">' + esc(lang) + "</span>" : "";
+  return '<div class="codewrap"><button type="button" class="copy" aria-label="Copy code">copy</button>' +
+    tag + "<pre><code>" + esc(code) + "</code></pre></div>";
+}
+function mdInline(raw) {
+  // Inline code spans go into a stash first so their content never sees
+  // the emphasis/link rules.
+  const stash = [];
+  let s = String(raw).replace(/`([^`\n]+)`/g, (m, c) => {
+    stash.push("<code>" + esc(c) + "</code>");
+    return "\x00" + (stash.length - 1) + "\x00";
+  });
+  s = esc(s);
+  // Links: [text](https://…) first, then bare URLs. The bare-URL pass
+  // cannot match inside the href="" produced above (preceding char is ").
+  s = s.replace(/\[([^\]\n]+)\]\((https?:\/\/[^)\s]+)\)/g,
+    '<a href="$2" target="_blank" rel="noopener noreferrer">$1</a>');
+  s = s.replace(/(^|[\s(])(https?:\/\/[^\s<)"']+)/g,
+    '$1<a href="$2" target="_blank" rel="noopener noreferrer">$2</a>');
+  s = s.replace(/\*\*([^*\n]+)\*\*/g, "<strong>$1</strong>");
+  s = s.replace(/~~([^~\n]+)~~/g, "<del>$1</del>");
+  // Emphasis needs non-space bounds so `2 * 3 * 4` stays arithmetic.
+  s = s.replace(/(^|[\s(])(\*|_)(\S(?:[^*\n_]*?\S)?)\2(?=$|[\s.,;:!?)\]}])/g,
+    "$1<em>$3</em>");
+  s = s.replace(/\x00(\d+)\x00/g, (m, i) => stash[+i]);
+  return s;
+}
+function mdBlocks(src) {
+  const lines = String(src).split("\n");
+  let out = "", para = [], list = null, quote = [];
+  const flushPara = () => {
+    if (para.length) {
+      out += "<p>" + para.map(mdInline).join("<br>") + "</p>";
+      para = [];
+    }
+  };
+  const flushList = () => {
+    if (list) {
+      out += "<" + list.tag + ">" + list.items.map(t => "<li>" + mdInline(t) + "</li>").join("") +
+        "</" + list.tag + ">";
+      list = null;
+    }
+  };
+  const flushQuote = () => {
+    if (quote.length) {
+      out += "<blockquote>" + mdBlocks(quote.join("\n")) + "</blockquote>";
+      quote = [];
+    }
+  };
+  const flushAll = () => { flushPara(); flushList(); flushQuote(); };
+  // GFM-style pipe table: header line containing "|", a delimiter row of
+  // -/: cells, then body rows until a non-pipe line.
+  const isDelim = l => {
+    const t = l.trim();
+    return t.length > 2 && /^[|:\-\s]+$/.test(t) && t.includes("-");
+  };
+  const cells = l => {
+    let t = l.trim();
+    if (t.startsWith("|")) t = t.slice(1);
+    if (t.endsWith("|")) t = t.slice(0, -1);
+    return t.split("|").map(c => c.trim());
+  };
+  const aligns = l => cells(l).map(c =>
+    c.startsWith(":") && c.endsWith(":") ? "center" :
+    c.endsWith(":") ? "right" : "left");
+  for (let i = 0; i < lines.length; i++) {
+    const line = lines[i];
+    const h = line.match(/^\s{0,3}(#{1,6})\s+(.*?)\s*#*\s*$/);
+    const ul = line.match(/^\s{0,3}[-*+]\s+(.*)$/);
+    const ol = line.match(/^\s{0,3}\d{1,9}[.)]\s+(.*)$/);
+    const q = line.match(/^\s{0,3}>\s?(.*)$/);
+    if (/^\s{0,3}(?:-{3,}|\*{3,}|_{3,})\s*$/.test(line)) { flushAll(); out += "<hr>"; continue; }
+    if (h) { flushAll(); out += "<h" + (h[1].length <= 3 ? 3 : 4) + ">" + mdInline(h[2]) + "</h" + (h[1].length <= 3 ? 3 : 4) + ">"; continue; }
+    if (line.includes("|") && i + 1 < lines.length && isDelim(lines[i + 1])) {
+      const head = cells(line), al = aligns(lines[i + 1]);
+      if (head.length === al.length) {
+        flushAll();
+        let t = '<div class="tblwrap"><table><thead><tr>';
+        head.forEach((c, j) => { t += '<th style="text-align:' + al[j] + '">' + mdInline(c) + "</th>"; });
+        t += "</tr></thead><tbody>";
+        for (i += 2; i < lines.length && lines[i].includes("|") && lines[i].trim(); i++) {
+          t += "<tr>";
+          cells(lines[i]).forEach((c, j) => {
+            t += '<td style="text-align:' + (al[j] || "left") + '">' + mdInline(c) + "</td>";
+          });
+          t += "</tr>";
+        }
+        i--;
+        out += t + "</tbody></table></div>";
+        continue;
+      }
+    }
+    if (ul || ol) {
+      flushPara(); flushQuote();
+      const tag = ul ? "ul" : "ol";
+      if (!list || list.tag !== tag) { flushList(); list = { tag, items: [] }; }
+      let item = (ul || ol)[1];
+      item = item.replace(/^\[( |x|X)\]\s+/, (m, c) => c === " " ? "☐ " : "☑ ");
+      list.items.push(item);
+      continue;
+    }
+    if (q) { flushPara(); flushList(); quote.push(q[1]); continue; }
+    if (!line.trim()) { flushAll(); continue; }
+    flushList(); flushQuote();
+    para.push(line);
+  }
+  flushAll();
+  return out;
+}
+// Only autoscroll when the user hasn't scrolled up to read.
+function atBottom() { return log.scrollHeight - log.scrollTop - log.clientHeight < 80; }
+function stickScroll(force) {
+  syncEmpty(); // every append/clear path funnels through here
+  if (force) stick = true;
+  if (stick) log.scrollTop = log.scrollHeight;
+  $("jumpBtn").classList.toggle("show", !stick && log.children.length > 0);
+}
+function bubble(cls, html, raw) {
   const d = document.createElement("div");
   d.className = "msg " + cls;
   d.innerHTML = html;
+  if (raw !== undefined) {
+    d.dataset.raw = raw;
+    const cp = document.createElement("button");
+    cp.type = "button";
+    cp.className = "msgcopy";
+    cp.textContent = "copy";
+    cp.title = "Copy message text";
+    d.appendChild(cp);
+  }
+  const stamp = document.createElement("span");
+  stamp.className = "stamp";
+  stamp.textContent = new Date().toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" });
+  d.appendChild(stamp);
   log.appendChild(d);
-  log.scrollTop = log.scrollHeight;
+  stickScroll();
   return d;
+}
+// Streaming markdown re-render, coalesced to one paint per frame —
+// token-sized chunks would otherwise re-parse the whole buffer per event.
+let renderQueued = false;
+function renderStream() {
+  if (renderQueued) return;
+  renderQueued = true;
+  requestAnimationFrame(() => {
+    renderQueued = false;
+    // Render into the dedicated body div — writing streamEl.innerHTML
+    // would wipe the copy button and timestamp bubble() appended.
+    if (streamBody) streamBody.innerHTML = mdLite(streamText);
+    if (thoughtEl) thoughtEl.querySelector(".thoughtBody").textContent = thoughtText;
+    stickScroll();
+  });
 }
 function sysline(text) {
   const d = document.createElement("div");
   d.className = "sys";
   d.textContent = text;
   log.appendChild(d);
-  log.scrollTop = log.scrollHeight;
+  stickScroll();
 }
 function errBubble(text) { bubble("error", esc(text)); }
+function syncEmpty() {
+  $("empty").classList.toggle("show", log.children.length === 0);
+}
+let permSession = null;        // sessionId that owns the visible permission card
+let pendingAsk = null;         // {reqId, params} — re-shown when its session is re-selected
+function hidePerm() { permSession = null; $("perm").classList.remove("show"); }
+function clearAsk() { pendingAsk = null; hidePerm(); }
 function setBusy(on) {
   busy = on;
-  input.disabled = on;
-  $("sendBtn").style.display = on ? "none" : "";
-  $("cancelBtn").style.display = on ? "" : "none";
-  if (!on) input.focus();
+  $("cancelBtn").style.display = on ? "grid" : "none";
+  // Typing stays enabled so a next message can be drafted mid-turn.
+  input.placeholder = on ? "Agent is working — you can type ahead" : PLACEHOLDER;
+  document.querySelectorAll(".msg.streaming").forEach(el => el.classList.remove("streaming"));
+  $("typing").classList.toggle("show", on);
+  document.title = on ? "damon — working…" : "damon";
+  clearInterval(busyTick); busyTick = null;
+  if (on) {
+    busySince = Date.now();
+    $("typingTime").textContent = "0s";
+    busyTick = setInterval(() => {
+      $("typingTime").textContent = Math.floor((Date.now() - busySince) / 1000) + "s";
+    }, 1000);
+  } else {
+    $("typingTime").textContent = "";
+    input.focus();
+  }
 }
 function setBanner(text) {
   banner.textContent = text || "";
   banner.classList.toggle("show", !!text);
 }
+function setConn(state, text) {
+  $("connDot").className = state;
+  $("connText").textContent = text;
+}
+function relTime(createdAt) {
+  if (!createdAt) return "";
+  // SQLite datetime('now') → "YYYY-MM-DD HH:MM:SS" in UTC.
+  const t = Date.parse(/[T]/.test(createdAt) ? createdAt : createdAt.replace(" ", "T") + "Z");
+  if (!isFinite(t)) return "";
+  const s = (Date.now() - t) / 1000;
+  if (s < 60) return "now";
+  if (s < 3600) return Math.floor(s / 60) + "m";
+  if (s < 86400) return Math.floor(s / 3600) + "h";
+  if (s < 7 * 86400) return Math.floor(s / 86400) + "d";
+  const d = new Date(t);
+  return (d.getMonth() + 1) + "/" + d.getDate();
+}
+// Sidebar grouping bucket for a session timestamp.
+function sessGroup(createdAt) {
+  const t = Date.parse(createdAt && /[T]/.test(createdAt) ? createdAt : String(createdAt || "").replace(" ", "T") + "Z");
+  if (!isFinite(t)) return "older";
+  const days = (Date.now() - t) / 86400000;
+  if (days < 1) return "today";
+  if (days < 2) return "yesterday";
+  if (days < 7) return "this week";
+  if (days < 30) return "this month";
+  return "older";
+}
+const SESS_GROUPS = ["today", "yesterday", "this week", "this month", "older"];
 
-// ---------- JSON-RPC ----------
+// ---------- protocol (v2) ----------
 function send(obj) {
   if (ws && ws.readyState === WebSocket.OPEN) ws.send(JSON.stringify(obj));
 }
@@ -277,14 +1073,8 @@ function request(method, params) {
       reject(new Error("daemon not responding"));
     }, 120000);
     pending.set(id, { resolve, reject, timer });
-    send({ jsonrpc: "2.0", id, method, params: params || {} });
+    send({ id, method, params: params || {} });
   });
-}
-function notify(method, params) {
-  send({ jsonrpc: "2.0", method, params: params || {} });
-}
-function respond(id, result) {
-  send({ jsonrpc: "2.0", id, result });
 }
 
 // ---------- connection ----------
@@ -302,8 +1092,19 @@ async function fetchTicket() {
   if (!j.ticket) throw new Error("ticket response malformed");
   return j.ticket;
 }
+// Distinguishes "daemon wants a token" (401/403 on an unauthenticated
+// ticket request) from "daemon is just down" — the old heuristic showed
+// the auth card for any daemon that stayed unreachable, which sent
+// open-daemon users hunting for a token that does not exist.
+async function probablyAuthGated() {
+  try {
+    const r = await fetch("/v1/ws_ticket", { method: "POST" });
+    return r.status === 401 || r.status === 403;
+  } catch { return false; }
+}
 async function connect() {
   clearTimeout(reconnectTimer); reconnectTimer = null;
+  setConn("pending", "connecting");
   let ticket = "";
   if (token) {
     try { ticket = await fetchTicket(); }
@@ -322,8 +1123,14 @@ async function connect() {
     retries = 0; backoff = 1000;
     setBanner("");
     try {
-      await request("initialize", { protocolVersion: 1, clientCapabilities: {} });
+      const r = await request("hello");
+      daemonInfo = Object.assign(daemonInfo || {}, r);
+      setConn("on", "connected");
+      await refreshAgents();
       await refreshSessions();
+      // Every turn this connection owned was cancelled server-side on
+      // disconnect — clear the tracking before any reattach.
+      liveTurns.clear();
       if (activeSession) {
         // Reattach: reload history; a turn interrupted by the drop was
         // cancelled server-side on disconnect.
@@ -332,23 +1139,34 @@ async function connect() {
         sysline("reconnected");
       }
     } catch (e) {
+      setConn("off", "handshake failed");
       errBubble("handshake failed: " + e.message);
     }
   };
   ws.onmessage = ev => {
     let v;
     try { v = JSON.parse(ev.data); } catch { return; }
-    if (v.method && v.id !== undefined && v.id !== null) onServerRequest(v);
-    else if (v.method) onNotify(v);
-    else if (v.id !== undefined) onResponse(v);
+    if (v.id !== undefined) onResponse(v);
+    else if (v.event === "session.event") onSessionEvent(v);
+    else if (v.hello) daemonInfo = Object.assign(daemonInfo || {}, v.hello);
   };
   ws.onclose = () => {
     ws = null;
-    for (const [id, p] of pending) { clearTimeout(p.timer); p.reject(new Error("disconnected")); }
+    pendingAsk = null;
+    // Fail every in-flight request — clearing the map alone would leave
+    // their promises (and awaiters) hanging until the 120s timeout.
+    for (const p of pending.values()) {
+      clearTimeout(p.timer);
+      p.reject(new Error("connection closed"));
+    }
     pending.clear();
+    liveTurns.clear(); // server cancelled this connection's turns on close
+    missedTurns.clear();
+    setConn("off", "reconnecting");
     if (manualClose) { manualClose = false; return; }
     setBanner("disconnected — retrying");
-    if (!token && ++retries >= 2) showAuth(""); // probably auth-gated
+    if (!token && ++retries >= 2)
+      probablyAuthGated().then(gated => { if (gated) showAuth(""); });
     scheduleReconnect();
   };
   ws.onerror = () => { /* onclose follows */ };
@@ -372,177 +1190,776 @@ function onResponse(v) {
   if (v.error) p.reject(new Error(v.error.message || JSON.stringify(v.error)));
   else p.resolve(v.result);
 }
-function onNotify(v) {
-  if (v.method !== "session/update") return;
-  const sid = v.params && v.params.sessionId;
-  const u = v.params && v.params.update;
-  if (!u || sid !== activeSession) return;
-  switch (u.sessionUpdate) {
-    case "agent_message_chunk": {
-      const t = u.content && u.content.text;
-      if (!t) break;
-      if (!streamEl) { streamEl = bubble("assistant", ""); streamText = ""; }
-      streamText += t;
-      streamEl.innerHTML = mdLite(streamText);
-      log.scrollTop = log.scrollHeight;
-      break;
+// ---------- tool diff viewer ----------
+// Edit/write tool inputs (claude/codex-style key sets) arrive verbatim in
+// rawInput; recognized shapes render as an inline unified diff instead of
+// a JSON dump. Unrecognized shapes return null -> plain dump fallback.
+const DIFF_PATH_KEYS = ["path", "file_path", "filePath", "target_file"];
+const DIFF_OLD_KEYS = ["oldText", "old_str", "oldString", "old_string"];
+const DIFF_NEW_KEYS = ["newText", "new_str", "newString", "new_string"];
+const DIFF_CTX = 3;            // context lines kept on each side of a change
+const DIFF_MAX_LINES = 400;    // render cap for full-file payloads
+function firstString(o, keys) {
+  for (const k of keys) if (typeof o[k] === "string") return o[k];
+  return null;
+}
+function baseName(p) {
+  const s = String(p).replace(/[\\/]+$/, "");
+  const i = Math.max(s.lastIndexOf("/"), s.lastIndexOf("\\"));
+  return i === -1 ? s : s.slice(i + 1) || s;
+}
+function parseDiffInput(rawInput) {
+  if (typeof rawInput === "string") {
+    try { rawInput = JSON.parse(rawInput); } catch { return null; }
+  }
+  if (!rawInput || typeof rawInput !== "object") return null;
+  const path = firstString(rawInput, DIFF_PATH_KEYS);
+  if (!path) return null;
+  const oldText = firstString(rawInput, DIFF_OLD_KEYS);
+  const newText = firstString(rawInput, DIFF_NEW_KEYS);
+  if (oldText !== null && newText !== null)
+    return { kind: "edit", path, oldText, newText };
+  // Write: full new content, no old text -> everything reads as additions.
+  const content = firstString(rawInput, ["content", ...DIFF_NEW_KEYS]);
+  if (content !== null) return { kind: "write", path, oldText: null, newText: content };
+  return null;
+}
+// Prefix/suffix trim: common head/tail become context lines, the differing
+// middles become the -/+ runs. Sufficient for single-hunk edit tools.
+function splitDiff(oldText, newText) {
+  const a = oldText === null ? [] : String(oldText).split("\n");
+  const b = String(newText).split("\n");
+  let p = 0;
+  while (p < a.length && p < b.length && a[p] === b[p]) p++;
+  let s = 0;
+  while (s < a.length - p && s < b.length - p &&
+         a[a.length - 1 - s] === b[b.length - 1 - s]) s++;
+  return {
+    pre: a.slice(Math.max(0, p - DIFF_CTX), p),
+    del: a.slice(p, a.length - s),
+    add: b.slice(p, b.length - s),
+    suf: a.slice(a.length - s, a.length - s + DIFF_CTX),
+  };
+}
+function diffLineEl(cls, sign, text) {
+  const sp = document.createElement("span");
+  sp.className = "dl " + cls;
+  const sg = document.createElement("span");
+  sg.className = "sg";
+  sg.textContent = sign;
+  sp.appendChild(sg);
+  sp.appendChild(document.createTextNode(text));
+  return sp;
+}
+function renderToolDiff(rawInput) {
+  const d = parseDiffInput(rawInput);
+  if (!d) return null;
+  const block = document.createElement("details");
+  block.className = "diffblock";
+  block.open = true;
+  const sum = document.createElement("summary");
+  const icon = document.createElement("span");
+  icon.className = "diffIcon";
+  icon.textContent = d.kind === "write" ? "✍" : "✎";
+  const file = document.createElement("span");
+  file.className = "diffFile";
+  file.textContent = baseName(d.path);
+  sum.title = d.path;
+  sum.appendChild(icon);
+  sum.appendChild(file);
+  const body = document.createElement("div");
+  body.className = "diffBody";
+  if (d.oldText === d.newText) {
+    const none = document.createElement("div");
+    none.className = "diffNone";
+    none.textContent = "no changes";
+    body.appendChild(none);
+  } else {
+    const diff = splitDiff(d.oldText, d.newText);
+    const rows = [];
+    for (const l of diff.pre) rows.push(["dl-ctx", " ", l]);
+    for (const l of diff.del) rows.push(["dl-del", "-", l]);
+    for (const l of diff.add) rows.push(["dl-add", "+", l]);
+    for (const l of diff.suf) rows.push(["dl-ctx", " ", l]);
+    const stats = document.createElement("span");
+    stats.className = "diffStats";
+    const da = document.createElement("span");
+    da.className = "da";
+    da.textContent = "+" + diff.add.length;
+    const dd = document.createElement("span");
+    dd.className = "dd";
+    dd.textContent = "-" + diff.del.length;
+    stats.appendChild(da);
+    stats.appendChild(dd);
+    sum.appendChild(stats);
+    const wrap = document.createElement("div");
+    wrap.className = "diffwrap";
+    const cp = document.createElement("button");
+    cp.type = "button";
+    cp.className = "copy";
+    cp.setAttribute("aria-label", "Copy diff");
+    cp.textContent = "copy";
+    const pre = document.createElement("pre");
+    const code = document.createElement("code");
+    for (const r of rows.slice(0, DIFF_MAX_LINES)) code.appendChild(diffLineEl(r[0], r[1], r[2]));
+    // The clipboard gets the complete unified text, uncapped.
+    wrap._copyText = rows.map(r => r[1] + " " + r[2]).join("\n");
+    pre.appendChild(code);
+    wrap.appendChild(cp);
+    wrap.appendChild(pre);
+    if (rows.length > DIFF_MAX_LINES) {
+      const more = document.createElement("div");
+      more.className = "diffMore";
+      more.textContent = "+" + (rows.length - DIFF_MAX_LINES) + " more lines";
+      wrap.appendChild(more);
     }
-    case "agent_thought_chunk": {
-      const t = u.content && u.content.text;
-      if (!t) break;
-      if (!thoughtEl) { thoughtEl = bubble("thought", ""); thoughtText = ""; }
-      thoughtText += t;
-      thoughtEl.textContent = "thinking: " + thoughtText;
-      log.scrollTop = log.scrollHeight;
-      break;
+    body.appendChild(wrap);
+  }
+  block.appendChild(sum);
+  block.appendChild(body);
+  return block;
+}
+window.__renderToolDiff = renderToolDiff;
+
+// Render a unified_diff string (v2 edit detail) with the same chrome as
+// the reconstructed edit/write diffs — +/- lines colored, capped.
+function renderUnifiedDiff(path, diffText) {
+  const block = document.createElement("details");
+  block.className = "diffblock";
+  block.open = true;
+  const sum = document.createElement("summary");
+  const icon = document.createElement("span");
+  icon.className = "diffIcon";
+  icon.textContent = "✎";
+  const file = document.createElement("span");
+  file.className = "diffFile";
+  file.textContent = baseName(path);
+  sum.title = path;
+  sum.appendChild(icon);
+  sum.appendChild(file);
+  const lines = String(diffText).split("\n");
+  const rows = [];
+  let adds = 0, dels = 0;
+  for (const l of lines) {
+    if (l.startsWith("+++") || l.startsWith("---")) continue;
+    if (l.startsWith("+")) { adds++; rows.push(["dl-add", "+", l.slice(1)]); }
+    else if (l.startsWith("-")) { dels++; rows.push(["dl-del", "-", l.slice(1)]); }
+    else rows.push(["dl-ctx", " ", l]);
+  }
+  const stats = document.createElement("span");
+  stats.className = "diffStats";
+  const da = document.createElement("span");
+  da.className = "da";
+  da.textContent = "+" + adds;
+  const dd = document.createElement("span");
+  dd.className = "dd";
+  dd.textContent = "-" + dels;
+  stats.appendChild(da);
+  stats.appendChild(dd);
+  sum.appendChild(stats);
+  const body = document.createElement("div");
+  body.className = "diffBody";
+  const wrap = document.createElement("div");
+  wrap.className = "diffwrap";
+  const cp = document.createElement("button");
+  cp.type = "button";
+  cp.className = "copy";
+  cp.setAttribute("aria-label", "Copy diff");
+  cp.textContent = "copy";
+  const pre = document.createElement("pre");
+  const code = document.createElement("code");
+  for (const r of rows.slice(0, DIFF_MAX_LINES)) code.appendChild(diffLineEl(r[0], r[1], r[2]));
+  wrap._copyText = diffText;
+  pre.appendChild(code);
+  wrap.appendChild(cp);
+  wrap.appendChild(pre);
+  if (rows.length > DIFF_MAX_LINES) {
+    const more = document.createElement("div");
+    more.className = "diffMore";
+    more.textContent = "+" + (rows.length - DIFF_MAX_LINES) + " more lines";
+    wrap.appendChild(more);
+  }
+  body.appendChild(wrap);
+  block.appendChild(sum);
+  block.appendChild(body);
+  return block;
+}
+
+// The input half of a ToolCallDetail — what the call was asked to do.
+// Output fields (output/content/result/log) are deliberately absent so
+// streaming output updates don't churn the input slot's signature.
+function toolInput(d) {
+  switch (d.type) {
+    case "shell": return d.command;
+    case "read": return d.path;
+    case "edit": return { path: d.path, unified_diff: d.unified_diff };
+    case "write": return { path: d.path, content: d.content }; // renders as an all-additions diff
+    case "search": return d.query;
+    case "fetch": return d.url;
+    case "sub_agent": return d.description;
+    case "plan": return d.text;
+    default: return d.input; // unknown
+  }
+}
+function toolOutputText(d) {
+  let t = null;
+  switch (d.type) {
+    case "shell": t = d.output; break;
+    case "read": case "search": t = d.content; break;
+    case "fetch": t = d.result; break;
+    case "sub_agent": t = d.log; break;
+    case "unknown": t = d.output; break;
+  }
+  if (t === null || t === undefined) return "";
+  if (typeof t !== "string") t = JSON.stringify(t, null, 2);
+  if (d.type === "shell" && typeof d.exit_code === "number" && d.exit_code !== 0)
+    t += (t ? "\n" : "") + "[exit " + d.exit_code + "]";
+  return t;
+}
+
+// Collapsible tool-call card. A `tool_call` timeline item creates it;
+// later items with the same call_id refresh status and output. Details
+// arrive as snapshots, but some backends stream deltas — the rendered
+// text is compared so cumulative payloads replace and true deltas append.
+function toolCard(u) {
+  const id = u.call_id || "?";
+  let el = toolEls.get(id);
+  if (!el) {
+    el = document.createElement("div");
+    el.className = "toolcard";
+    const head = document.createElement("div");
+    head.className = "tcHead";
+    head.innerHTML =
+      '<span class="tcIcon">⚙</span><span class="tcName">' + esc(id) + '</span>' +
+      '<span class="tcStatus"></span><span class="tcChevron">▶</span>';
+    head.onclick = () => el.classList.toggle("open");
+    const body = document.createElement("div");
+    body.className = "tcBody";
+    const out = document.createElement("div");
+    out.className = "tcOut";
+    body.appendChild(out);
+    el.appendChild(head); el.appendChild(body);
+    toolEls.set(id, el);
+    log.appendChild(el);
+  }
+  if (u.name) el.querySelector(".tcName").textContent = u.name;
+  const st = u.status || "running";
+  const stEl = el.querySelector(".tcStatus");
+  stEl.className = "tcStatus st-" + st;
+  stEl.textContent = st.replace("_", " ");
+  const body = el.querySelector(".tcBody");
+  const out = el.querySelector(".tcOut");
+  const d = u.detail;
+  if (d && typeof d === "object") {
+    const text = toolOutputText(d);
+    if (text) {
+      const prev = out.dataset.text || "";
+      const merged = text.startsWith(prev) ? text : prev + (prev ? "\n" : "") + text;
+      out.dataset.text = merged;
+      out.textContent = "";
+      const pre = document.createElement("pre");
+      pre.textContent = merged.length > 4000 ? merged.slice(0, 4000) + "…" : merged;
+      out.appendChild(pre);
+      el.classList.add("open");
     }
-    case "tool_call_update": {
-      const id = u.toolCallId || "?";
-      const name = (u.title || u.name || id);
-      let el = toolEls.get(id);
-      if (!el) {
-        el = document.createElement("div");
-        el.className = "tool";
-        toolEls.set(id, el);
-        log.appendChild(el);
+    // Call input: edit diffs render colored, write content becomes an
+    // all-additions diff, unknown shapes try the rawInput recognizer and
+    // fall back to a JSON dump. Rebuilt only when the input changes.
+    const input = toolInput(d);
+    if (input !== null && input !== undefined &&
+        body.dataset.inSig !== JSON.stringify(input)) {
+      body.dataset.inSig = JSON.stringify(input);
+      const slot = document.createElement("div");
+      slot.className = "tcIn";
+      const diffEl = d.type === "edit" && d.unified_diff
+        ? renderUnifiedDiff(d.path, d.unified_diff)
+        : renderToolDiff(input);
+      if (diffEl) {
+        slot.appendChild(diffEl);
+        el.classList.add("open");
+      } else {
+        const pre = document.createElement("pre");
+        const s = typeof input === "string" ? input : JSON.stringify(input, null, 2);
+        pre.textContent = s.length > 4000 ? s.slice(0, 4000) + "…" : s;
+        slot.appendChild(pre);
       }
-      const st = u.status || "";
-      el.innerHTML = "&#9881; " + esc(name) + ' — <span class="st-' + esc(st) + '">' + esc(st) + "</span>";
-      log.scrollTop = log.scrollHeight;
+      const prev = body.querySelector(":scope > .tcIn");
+      if (prev) prev.replaceWith(slot);
+      else body.insertBefore(slot, out); // call input above the output
+    }
+  }
+  stickScroll();
+}
+
+// ---------- session.event stream ----------
+// One timeline item (flattened into the event: kind tag + fields).
+function onTimeline(sid, ev) {
+  switch (ev.kind) {
+    case "assistant_message": {
+      const t = ev.text;
+      if (!t) break;
+      if (!streamEl) {
+        streamEl = bubble("assistant", "", "");
+        streamBody = document.createElement("div");
+        streamEl.insertBefore(streamBody, streamEl.firstChild);
+        streamText = "";
+        streamEl.classList.add("streaming");
+      }
+      streamText += t;
+      streamEl.dataset.raw = streamText;
+      renderStream();
+      break;
+    }
+    case "reasoning": {
+      const t = ev.text;
+      if (!t) break;
+      if (!thoughtEl) {
+        thoughtEl = document.createElement("details");
+        thoughtEl.className = "thought";
+        thoughtEl.open = true;
+        thoughtEl.innerHTML = "<summary>thinking</summary><div class=\"thoughtBody\"></div>";
+        log.appendChild(thoughtEl);
+        thoughtText = "";
+      }
+      thoughtText += t;
+      renderStream();
+      break;
+    }
+    case "tool_call":
+      toolCard(ev);
+      break;
+    case "user_message":
+      // Our own turns already rendered their bubble in sendPrompt.
+      if (!liveTurns.has(sid) && ev.text) bubble("user", esc(ev.text), ev.text);
+      break;
+    case "todo": {
+      const items = Array.isArray(ev.items) ? ev.items : [];
+      if (!todoEl) {
+        todoEl = document.createElement("details");
+        todoEl.className = "thought";
+        todoEl.open = true;
+        todoEl.innerHTML = "<summary>tasks</summary><div class=\"thoughtBody\"></div>";
+        log.appendChild(todoEl);
+      }
+      todoEl.querySelector(".thoughtBody").textContent = items.map(it => {
+        const mark = it.status === "completed" ? "☑" : it.status === "in_progress" ? "◐" : "☐";
+        return mark + " " + it.content;
+      }).join("\n");
+      stickScroll();
+      break;
+    }
+    case "error":
+      errBubble(ev.message || "agent error");
+      break;
+    case "compaction": {
+      const d = document.createElement("details");
+      d.className = "thought";
+      d.innerHTML = "<summary>context compacted</summary><div class=\"thoughtBody\"></div>";
+      d.querySelector(".thoughtBody").textContent = ev.summary || "";
+      log.appendChild(d);
+      stickScroll();
       break;
     }
   }
 }
-function onServerRequest(v) {
-  if (v.method === "session/request_permission") {
-    showPermission(v.id, v.params || {});
-  } else {
-    // Unknown server request — answer with method-not-found so the
-    // daemon isn't left waiting for its timeout.
-    send({ jsonrpc: "2.0", id: v.id,
-           error: { code: -32601, message: "method not found" } });
+function onSessionEvent(v) {
+  const sid = v.sessionId;
+  const ev = v.data;
+  if (!ev || typeof ev !== "object") return;
+  // Permission asks resolve out-of-band — they must reach the card even
+  // while another session is on screen, and clear when resolved.
+  if (ev.type === "permission_requested") {
+    if (sid === activeSession) showPermission(sid, ev);
+    else {
+      pendingAsk = { sid, ev };
+      attention(ev.title || ev.name || "permission requested",
+        "damon — allow this tool?", "damon — permission?");
+    }
+    return;
+  }
+  if (ev.type === "permission_resolved") {
+    if (pendingAsk && pendingAsk.ev.id === ev.request_id) clearAsk();
+    return;
+  }
+  // Turns another client started still move the UI when we're watching
+  // that session; our own turns are driven by the turn.start await.
+  if (ev.type === "turn_started" && !liveTurns.has(sid)) {
+    if (sid === activeSession) setBusy(true);
+    return;
+  }
+  if ((ev.type === "turn_completed" || ev.type === "turn_failed" ||
+       ev.type === "turn_canceled") && !liveTurns.has(sid)) {
+    if (sid === activeSession) {
+      setBusy(false);
+      if (ev.type === "turn_failed") sysline("turn failed: " + (ev.error || "unknown"));
+      else if (ev.type === "turn_canceled") sysline("cancelled");
+      loadMessages(sid); // re-render the finished turn from the store
+    }
+    if (ev.type !== "turn_canceled") refreshSessions();
+    refreshUsage();
+    flushQueue();
+    return;
+  }
+  if (ev.type === "attention_required") {
+    // The only completion signal for turns other clients started.
+    if (!liveTurns.has(sid) && ev.reason !== "permission")
+      attention("damon — done", ev.reason === "error" ? "turn failed" : "turn finished");
+    return;
+  }
+  // Events for a session we're not viewing can't be rendered — flag the
+  // turn so sendPrompt's finally reloads it from the store on return.
+  if (sid !== activeSession) {
+    if (liveTurns.has(sid)) missedTurns.add(sid);
+    return;
+  }
+  switch (ev.type) {
+    case "timeline":
+      onTimeline(sid, ev);
+      break;
+    case "usage_updated":
+      refreshUsage();
+      break;
+    case "mode_changed":
+      if (ev.mode) sysline("mode: " + ev.mode);
+      break;
+    case "model_changed":
+      sysline("model: " + ev.model);
+      break;
   }
 }
 
 // ---------- permission card ----------
-function showPermission(reqId, params) {
-  const tc = params.toolCall || {};
-  $("permTitle").textContent = "Allow tool: " + (tc.title || tc.toolCallId || "?");
+// ev is the flattened PermissionRequest: {id, kind, name, title?, input?,
+// detail?, actions[]}. Actions are the buttons the agent offered; each
+// maps to a permission.respond with its own behavior + action_id.
+function showPermission(sid, ev) {
+  permSession = sid;
+  pendingAsk = { sid, ev };
+  $("permKind").textContent = ev.kind || "";
+  $("permName").textContent = "Allow " + (ev.title || ev.name || "?");
   $("permInput").textContent =
-    tc.rawInput !== undefined ? JSON.stringify(tc.rawInput, null, 2) : "";
+    ev.input !== undefined && ev.input !== null ? JSON.stringify(ev.input, null, 2) : "";
   const btns = $("permBtns");
   btns.textContent = "";
-  const opts = Array.isArray(params.options) && params.options.length
-    ? params.options
-    : [{ optionId: "allow-once", name: "Allow" },
-       { optionId: "reject-once", name: "Deny" }];
-  for (const o of opts) {
+  const acts = Array.isArray(ev.actions) && ev.actions.length
+    ? ev.actions
+    : [{ id: "allow", label: "Allow", behavior: "allow" },
+       { id: "deny", label: "Deny", behavior: "deny" }];
+  for (const a of acts) {
     const b = document.createElement("button");
-    b.textContent = o.name || o.optionId;
-    b.className = String(o.optionId).startsWith("allow") ? "allow" : "reject";
+    b.textContent = a.label || a.id;
+    b.className = a.behavior === "allow" ? "allow" : "reject";
     b.onclick = () => {
-      respond(reqId, { outcome: { outcome: "selected", optionId: o.optionId } });
-      $("perm").classList.remove("show");
+      const response = a.behavior === "deny"
+        ? { behavior: "deny", action_id: a.id, interrupt: false }
+        : { behavior: "allow", action_id: a.id };
+      request("permission.respond",
+              { sessionId: sid, requestId: ev.id, response })
+        .catch(e => errBubble("permission.respond failed: " + e.message));
+      clearAsk();
     };
     btns.appendChild(b);
   }
   $("perm").classList.add("show");
+  // Hidden tab: desktop notification (title = tool title) or title flash.
+  attention(ev.title || ev.name || "permission requested",
+    "damon — allow this tool?", "damon — permission?");
+  const first = btns.querySelector("button");
+  if (first) first.focus();
 }
 
 // ---------- sessions ----------
+function makeSessRow(o) {
+  // o: {label, labelTitle, meta, active, onClick, onDelete, onRename, onFork}
+  const row = document.createElement("div");
+  row.className = "sess" + (o.active ? " active" : "");
+  const main = document.createElement("div");
+  main.className = "sessMain";
+  const label = document.createElement("span");
+  label.className = "sid";
+  label.textContent = o.label;
+  if (o.labelTitle) label.title = o.labelTitle;
+  main.appendChild(label);
+  if (o.meta || o.metaHtml) {
+    const meta = document.createElement("span");
+    meta.className = "meta";
+    if (o.metaHtml) meta.innerHTML = o.metaHtml; else meta.textContent = o.meta;
+    main.appendChild(meta);
+  }
+  row.appendChild(main);
+  if (o.onRename) {
+    const ren = document.createElement("button");
+    ren.className = "ren";
+    ren.textContent = "✎";
+    ren.title = "rename session";
+    ren.setAttribute("aria-label", "rename session");
+    ren.onclick = ev => { ev.stopPropagation(); o.onRename(); };
+    row.appendChild(ren);
+  }
+  if (o.onFork) {
+    const fork = document.createElement("button");
+    fork.className = "fork";
+    fork.textContent = "⑂";
+    fork.title = "fork session";
+    fork.setAttribute("aria-label", "fork session");
+    fork.onclick = ev => { ev.stopPropagation(); o.onFork(); };
+    row.appendChild(fork);
+  }
+  if (o.onDelete) {
+    const del = document.createElement("button");
+    del.className = "del";
+    del.textContent = "×";
+    del.title = "delete session";
+    del.setAttribute("aria-label", "delete session");
+    del.onclick = ev => { ev.stopPropagation(); o.onDelete(); };
+    row.appendChild(del);
+  }
+  row.onclick = o.onClick;
+  return row;
+}
+async function renameSession(s) {
+  const t = prompt("Rename session", s.title || "");
+  if (t === null) return;
+  const title = t.trim();
+  if (!title || title === s.title) return;
+  try {
+    await request("session.rename", { sessionId: s.sessionId, title });
+    refreshSessions();
+  } catch (e) { errBubble("rename failed: " + e.message); }
+}
+async function deleteSession(s) {
+  if (!confirm("Delete session " + s.sessionId.slice(0, 8) + "?")) return;
+  try {
+    await request("session.delete", { sessionId: s.sessionId });
+    liveTurns.delete(s.sessionId);
+    missedTurns.delete(s.sessionId);
+    if (permSession === s.sessionId || (pendingAsk && pendingAsk.sid === s.sessionId)) clearAsk();
+    if (activeSession === s.sessionId) {
+      activeSession = null;
+      log.textContent = "";
+      toolEls.clear();
+      updateCrumb();
+      syncEmpty();
+      $("usage").textContent = "";
+    }
+    refreshSessions();
+  } catch (e) { errBubble("delete failed: " + e.message); }
+}
+async function forkSession(s) {
+  try {
+    const r = await request("session.fork", { sessionId: s.sessionId });
+    refreshSessions();
+    if (r.sessionId) selectSession(r.sessionId);
+  } catch (e) { errBubble("fork failed: " + e.message); }
+}
 async function refreshSessions() {
   try {
-    const r = await request("session/list", {});
+    const r = await request("session.list", { limit: 500 });
+    // Rows are [id, created_at, agent, title] tuples, oldest-first; the
+    // sidebar reads newest-first and downstream code wants objects.
+    sessionsCache = (r.sessions || []).map(row =>
+      Array.isArray(row)
+        ? { sessionId: row[0], createdAt: row[1], agent: row[2], title: row[3] }
+        : row
+    ).reverse();
     const list = $("sessions");
     list.textContent = "";
-    for (const s of (r.sessions || [])) {
-      const row = document.createElement("div");
-      row.className = "sess" + (s.sessionId === activeSession ? " active" : "");
-      const label = document.createElement("span");
-      label.className = "sid";
-      label.textContent = s.title || s.sessionId.slice(0, 8);
-      label.title = s.sessionId + (s.createdAt ? " — " + s.createdAt : "");
-      row.appendChild(label);
-      if (s.model) {
-        const m = document.createElement("span");
-        m.className = "model";
-        m.textContent = s.model;
-        row.appendChild(m);
+    let lastGroup = null;
+    for (const s of sessionsCache) {
+      const g = sessGroup(s.createdAt);
+      if (g !== lastGroup) {
+        lastGroup = g;
+        const h = document.createElement("div");
+        h.className = "sessGroup";
+        h.textContent = g;
+        list.appendChild(h);
       }
-      const del = document.createElement("button");
-      del.className = "del";
-      del.textContent = "×";
-      del.title = "delete session";
-      del.onclick = async ev => {
-        ev.stopPropagation();
-        if (!confirm("Delete session " + s.sessionId.slice(0, 8) + "?")) return;
-        try {
-          await request("session/delete", { sessionId: s.sessionId });
-          if (activeSession === s.sessionId) { activeSession = null; log.textContent = ""; }
-          refreshSessions();
-        } catch (e) { errBubble("delete failed: " + e.message); }
-      };
-      row.appendChild(del);
-      row.onclick = () => selectSession(s.sessionId);
-      list.appendChild(row);
+      const bits = [];
+      if (s.agent || s.model) bits.push(s.agent || s.model);
+      const rt = relTime(s.createdAt);
+      if (rt) bits.push(rt);
+      list.appendChild(makeSessRow({
+        label: s.title || s.sessionId.slice(0, 8),
+        labelTitle: s.sessionId + (s.createdAt ? " — " + s.createdAt : ""),
+        meta: bits.join(" · "),
+        active: s.sessionId === activeSession,
+        onClick: () => selectSession(s.sessionId),
+        onRename: () => renameSession(s),
+        onFork: () => forkSession(s),
+        onDelete: () => deleteSession(s),
+      }));
     }
+    updateCrumb();
   } catch (e) {
-    errBubble("session/list failed: " + e.message);
+    errBubble("session.list failed: " + e.message);
   }
+}
+function updateCrumb() {
+  const s = sessionsCache.find(x => x.sessionId === activeSession);
+  $("crumbAgent").textContent = s ? (s.agent || "") : "";
+  const title = s
+    ? (s.title || activeSession.slice(0, 8))
+    : (activeSession ? activeSession.slice(0, 8) : "no session");
+  $("crumbId").textContent = title;
+  if (!busy) document.title = s ? "damon — " + title : "damon";
+}
+async function refreshUsage() {
+  if (!activeSession) { $("usage").textContent = ""; return; }
+  try {
+    const r = await request("session.usage", { sessionId: activeSession });
+    const fmt = n => n >= 1000 ? (n / 1000).toFixed(1) + "k" : String(n);
+    const bits = [];
+    if (r.contextSize) bits.push(fmt(r.contextUsed || 0) + "/" + fmt(r.contextSize) + " ctx");
+    else if (r.contextUsed) bits.push(fmt(r.contextUsed) + " ctx");
+    if (r.costUsd) bits.push("$" + r.costUsd.toFixed(4));
+    bits.push((r.turns || 0) + (r.turns === 1 ? " turn" : " turns"));
+    $("usage").textContent = bits.join(" · ");
+  } catch { $("usage").textContent = ""; }
 }
 async function selectSession(sid) {
   if (sid === activeSession) return;
   try {
-    await request("session/resume", { sessionId: sid });
+    await request("session.resume", { sessionId: sid });
     activeSession = sid;
-    setBusy(false);
+    if (permSession && permSession !== sid) hidePerm();
+    setBusy(liveTurns.has(sid));
+    if (pendingAsk && pendingAsk.sid === sid)
+      showPermission(pendingAsk.sid, pendingAsk.ev);
     await loadMessages(sid);
+    updateCrumb();
     refreshSessions();
+    refreshUsage();
+    flushQueue();
   } catch (e) {
     errBubble("resume failed: " + e.message);
+    refreshSessions(); // clear the stale active highlight
+  }
+}
+// ---------- agents ----------
+let agents = [];               // [{id, available, capabilities}]
+async function refreshAgents() {
+  try {
+    const r = await request("backend.list", {});
+    agents = r.backends || [];
+  } catch (e) {
+    agents = [];               // selector stays empty
+  }
+  // Sidebar status panel.
+  const list = $("agentList");
+  if (list) {
+    list.textContent = "";
+    for (const a of agents) {
+      const row = document.createElement("div");
+      row.className = "agentRow";
+      const dot = document.createElement("span");
+      dot.className = "agentDot" + (a.available ? " on" : "");
+      row.appendChild(dot);
+      const name = document.createElement("span");
+      name.textContent = a.id;
+      row.appendChild(name);
+      if (!a.available) {
+        const hint = document.createElement("span");
+        hint.className = "hint";
+        hint.textContent = "not installed";
+        hint.title = "";
+        row.appendChild(hint);
+      }
+      row.title = a.id + (a.available ? "" : " — not installed");
+      list.appendChild(row);
+    }
+  }
+  // Settings drawer (when open) re-renders its agent rows from the same payload.
+  if (document.body.classList.contains("settings-open")) renderAgentStatus();
+  // Composer selector: available agents selectable, others shown disabled.
+  const sel = $("agent");
+  if (sel) {
+    const prev = sel.value;
+    sel.textContent = "";
+    const avail = agents.filter(a => a.available);
+    const missing = agents.filter(a => !a.available);
+    for (const a of avail) {
+      const o = document.createElement("option");
+      o.value = a.id;
+      o.textContent = a.id;
+      o.title = a.id;
+      sel.appendChild(o);
+    }
+    for (const a of missing) {
+      const o = document.createElement("option");
+      o.disabled = true;
+      o.textContent = a.id + " (not installed)";
+      o.title = "";
+      sel.appendChild(o);
+    }
+    if (avail.length && avail.some(a => a.id === prev)) sel.value = prev;
   }
 }
 async function newSession() {
   try {
-    const r = await request("session/new", { cwd: "web", mcpServers: [] });
+    // No cwd: the daemon falls back to its own working directory.
+    const params = {};
+    const agent = $("agent") && $("agent").value;
+    if (agent) params.backend = agent;
+    const r = await request("session.create", params);
     activeSession = r.sessionId;
     log.textContent = "";
     toolEls.clear();
+    stick = true;
+    hidePerm(); // a card from another session must not bleed into the new one
     setBusy(false);
-    sysline("session " + r.sessionId.slice(0, 8));
+    $("crumbAgent").textContent = agent || "";
+    $("crumbId").textContent = r.sessionId.slice(0, 8);
+    $("usage").textContent = "";
+    sysline((agent ? agent + " — " : "session ") + r.sessionId.slice(0, 8));
+    syncEmpty();
     refreshSessions();
+    closeDrawer();
     input.focus();
+    flushQueue();
   } catch (e) {
-    errBubble("session/new failed: " + e.message);
+    errBubble("session.create failed: " + e.message);
   }
 }
-// History arrives as OpenAI-shaped message objects.
+// History arrives as StoredMessage rows: {id, session_id, role, data}
+// where data holds the OpenAI-shaped payload (content, tool_calls, …) —
+// or, for v2 turns, a serialized ToolCall under role "tool".
 async function loadMessages(sid) {
   log.textContent = "";
   toolEls.clear();
-  streamEl = thoughtEl = null;
+  streamEl = streamBody = thoughtEl = todoEl = null;
   try {
-    const r = await request("session/messages", { sessionId: sid });
-    for (const m of (r.messages || [])) renderStored(m);
-    log.scrollTop = log.scrollHeight;
+    // session.messages is paged (default 200) — walk pages so long
+    // transcripts load in full.
+    const msgs = [];
+    for (let offset = 0; ; offset += 200) {
+      const r = await request("session.messages", { sessionId: sid, limit: 200, offset });
+      const page = r.messages || [];
+      msgs.push(...page);
+      if (page.length < 200) break;
+    }
+    for (const m of msgs) renderStored(m);
+    stickScroll(true);
+    syncEmpty();
   } catch (e) {
-    errBubble("session/messages failed: " + e.message);
+    errBubble("session.messages failed: " + e.message);
   }
 }
 function msgText(m) {
-  if (typeof m.content === "string") return m.content;
-  if (Array.isArray(m.content))
-    return m.content.map(p => (p && (p.text || p.content)) || "").join("\n");
+  const d = m.data || m;
+  if (typeof d.content === "string") return d.content;
+  if (Array.isArray(d.content))
+    return d.content.map(p => (p && (p.text || p.content)) || "").join("\n");
   return "";
 }
 function renderStored(m) {
+  const d = m.data || m;
   const text = msgText(m);
   switch (m.role) {
     case "user": {
-      const ub = text.trim() ? bubble("user", esc(text)) : bubble("user", "");
+      const ub = text.trim() ? bubble("user", esc(text), text) : bubble("user", "");
       // Image parts persist as OpenAI image_url data URLs — render them.
-      if (Array.isArray(m.content))
-        for (const p of m.content) {
+      if (Array.isArray(d.content))
+        for (const p of d.content) {
           const u = p && p.image_url && (p.image_url.url || p.image_url);
           if (typeof u === "string" && u.startsWith("data:")) {
             const im = document.createElement("img");
@@ -554,78 +1971,186 @@ function renderStored(m) {
       break;
     }
     case "assistant": {
-      if (Array.isArray(m.tool_calls)) {
-        for (const tc of m.tool_calls) {
-          const d = document.createElement("div");
-          d.className = "tool";
-          const name = tc.function && tc.function.name || tc.name || "tool";
-          d.innerHTML = "&#9881; " + esc(name) + ' — <span class="st-completed">completed</span>';
-          log.appendChild(d);
+      if (Array.isArray(d.tool_calls)) {
+        for (const tc of d.tool_calls) {
+          // Legacy OpenAI-shaped tool_calls — adapt to the v2 card.
+          toolCard({
+            call_id: tc.id || tc.name || "tool",
+            name: tc.function && tc.function.name || tc.name || "tool",
+            detail: { type: "unknown", input: (() => {
+              try { return JSON.parse(tc.function && tc.function.arguments || ""); }
+              catch { return tc.function && tc.function.arguments; }
+            })(), output: null },
+            status: "completed",
+          });
         }
       }
-      if (text.trim()) bubble("assistant", mdLite(text));
+      if (text.trim()) bubble("assistant", mdLite(text), text);
+      break;
+    }
+    case "reasoning": {
+      // v2 persists reasoning as its own row — render collapsed.
+      if (!text.trim()) break;
+      const el = document.createElement("details");
+      el.className = "thought";
+      el.innerHTML = "<summary>thinking</summary><div class=\"thoughtBody\"></div>";
+      el.querySelector(".thoughtBody").textContent = text;
+      log.appendChild(el);
       break;
     }
     case "tool": {
-      const d = document.createElement("div");
-      d.className = "toolmsg";
-      const t = text.length > 2000 ? text.slice(0, 2000) + "…" : text;
-      d.textContent = t;
-      log.appendChild(d);
+      if (d.call_id) {
+        // v2 stores the ToolCall itself — render through the same card.
+        toolCard(d);
+        break;
+      }
+      // Legacy stored tool results fold into their card when the id
+      // matches a tool_call rendered just above; else a flat block.
+      const id = d.tool_call_id;
+      const card = id && toolEls.get(id);
+      if (card) {
+        const out = card.querySelector(".tcOut");
+        const pre = document.createElement("pre");
+        const t = text.length > 4000 ? text.slice(0, 4000) + "…" : text;
+        pre.textContent = t;
+        if (out.children.length) out.appendChild(document.createElement("hr"));
+        out.appendChild(pre);
+        const st = text === "cancelled" ? "cancelled" : text.startsWith("error:") ? "failed" : "completed";
+        const stEl = card.querySelector(".tcStatus");
+        stEl.className = "tcStatus st-" + st;
+        stEl.textContent = st;
+      } else {
+        const d2 = document.createElement("div");
+        d2.className = "toolmsg";
+        const t = text.length > 2000 ? text.slice(0, 2000) + "…" : text;
+        d2.textContent = t;
+        log.appendChild(d2);
+      }
       break;
     }
     default:
-      if (text.trim()) bubble("assistant", mdLite(text));
+      if (text.trim()) bubble("assistant", mdLite(text), text);
   }
-  log.scrollTop = log.scrollHeight;
+  stickScroll();
+}
+
+// ---------- prompt queue ----------
+// The daemon allows one live prompt per session ("session already has a
+// prompt in progress"), so a message sent mid-turn would be rejected after
+// its bubble already rendered — silently dropped input. Queue instead and
+// flush when the turn settles.
+const promptQueue = []; // {sessionId, text, imgs}
+function renderQueueBar() {
+  const bar = $("queueBar");
+  bar.textContent = "";
+  promptQueue.forEach((q, i) => {
+    const chip = document.createElement("span");
+    chip.className = "qchip";
+    const t = document.createElement("span");
+    t.className = "qt";
+    t.textContent = q.text || "[" + q.imgs.length + " image" + (q.imgs.length > 1 ? "s" : "") + "]";
+    t.title = t.textContent;
+    chip.appendChild(t);
+    const x = document.createElement("button");
+    x.className = "qx";
+    x.textContent = "×";
+    x.title = "remove from queue";
+    x.setAttribute("aria-label", "remove queued message");
+    x.onclick = () => { promptQueue.splice(i, 1); renderQueueBar(); };
+    chip.appendChild(x);
+    bar.appendChild(chip);
+  });
+}
+function flushQueue() {
+  if (busy || !promptQueue.length) return;
+  const i = promptQueue.findIndex(q =>
+    (!q.sessionId || q.sessionId === activeSession) && !liveTurns.has(q.sessionId));
+  if (i === -1) return;
+  const q = promptQueue.splice(i, 1)[0];
+  renderQueueBar();
+  sendPrompt(q.text, q.imgs);
 }
 
 // ---------- prompt ----------
-async function sendPrompt() {
-  const text = input.value;
-  if ((!text.trim() && !attachments.length) || busy) return;
+async function sendPrompt(text, imgs) {
+  if (text === undefined) {
+    text = input.value;
+    imgs = attachments.splice(0);
+    if (!text.trim() && !imgs.length) return;
+    if (busy) {
+      promptQueue.push({ sessionId: activeSession, text, imgs });
+      input.value = "";
+      input.style.height = "auto";
+      renderAttachBar();
+      renderQueueBar();
+      return;
+    }
+    input.value = "";
+    input.style.height = "auto";
+    renderAttachBar();
+  }
   if (!activeSession) await newSession();
   if (!activeSession) return;
-  const imgs = attachments.splice(0);
-  input.value = "";
-  input.style.height = "auto";
-  const ub = bubble("user", esc(text));
+  const sid = activeSession;
+  const ub = bubble("user", esc(text), text);
   for (const a of imgs) {
     const im = document.createElement("img");
     im.className = "att";
     im.src = "data:" + a.mimeType + ";base64," + a.data;
     ub.appendChild(im);
   }
-  renderAttachBar();
+  liveTurns.add(sid);
   setBusy(true);
-  streamEl = thoughtEl = null; streamText = thoughtText = "";
+  streamEl = streamBody = thoughtEl = todoEl = null; streamText = thoughtText = "";
   toolEls.clear();
   const blocks = [{ type: "text", text }];
   for (const a of imgs)
-    blocks.push({ type: "image", data: a.data, mimeType: a.mimeType });
-  const params = { sessionId: activeSession, prompt: blocks };
-  const model = $("model").value.trim();
-  if (model) params.model = model;
+    blocks.push({ type: "image", data: a.data, mime: a.mimeType });
+  const params = { sessionId: sid, prompt: blocks };
   try {
-    const r = await request("session/prompt", params);
-    if (r && r.stopReason === "cancelled") sysline("cancelled");
-    else if (r && r.stopReason && r.stopReason !== "end_turn")
+    const r = await request("turn.start", params);
+    if (r && r.stopReason === "canceled") sysline("cancelled");
+    else if (r && r.stopReason && r.stopReason !== "completed")
       sysline("stopped: " + r.stopReason);
+    // Hidden-tab attention: notification or title flash ("✳ damon — done").
+    notifyTurnDone(r && r.stopReason);
   } catch (e) {
     errBubble(e.message);
+    notifyTurnDone(null, e.message);
   } finally {
-    setBusy(false);
-    streamEl = thoughtEl = null;
+    liveTurns.delete(sid);
+    if (permSession === sid || (pendingAsk && pendingAsk.sid === sid)) clearAsk();
+    const missed = missedTurns.delete(sid);
+    if (sid === activeSession) {
+      // Final synchronous render before the streaming handles are dropped —
+      // the last rAF batch may still be pending.
+      if (streamBody) streamBody.innerHTML = mdLite(streamText);
+      if (thoughtEl) {
+        thoughtEl.querySelector(".thoughtBody").textContent = thoughtText;
+        thoughtEl.open = false; // collapse the finished reasoning
+      }
+      setBusy(false);
+      streamEl = streamBody = thoughtEl = todoEl = null;
+      // Chunks dropped while another session was on screen — re-render
+      // the completed turn from the store.
+      if (missed) loadMessages(sid);
+    }
+    refreshSessions(); // pick up the auto title assigned to this turn
+    refreshUsage();
+    flushQueue();
   }
 }
 function cancelPrompt() {
-  if (activeSession) notify("session/cancel", { sessionId: activeSession });
+  if (activeSession)
+    request("turn.cancel", { sessionId: activeSession })
+      .catch(e => errBubble("turn.cancel failed: " + e.message));
 }
 
 // ---------- auth overlay ----------
 function showAuth(err) {
   $("authErr").textContent = err || "";
   $("auth").classList.add("show");
+  setConn("off", "auth required");
   $("token").focus();
 }
 async function submitToken() {
@@ -645,18 +2170,282 @@ async function submitToken() {
   }
 }
 
+// ---------- settings drawer ----------
+let settingsTimer = null;      // 10s live refresh while the drawer is open
+let settingsOpener = null;     // element to refocus on close
+
+function renderDaemonInfo() {
+  const info = daemonInfo || {};
+  $("dmAgent").textContent = info.daemon || "—";
+  $("dmVersion").textContent = info.version || "—";
+  const served = location.protocol === "http:" || location.protocol === "https:";
+  $("dmUrl").textContent = served ? location.origin : "local file";
+  const dot = $("connDot");
+  const conn = $("dmConn");
+  if (dot.classList.contains("on")) {
+    conn.textContent = "connected";
+    conn.className = "v on";
+  } else if (dot.classList.contains("off")) {
+    conn.textContent = $("connText").textContent || "disconnected";
+    conn.className = "v off";
+  } else {
+    conn.textContent = "connecting…";
+    conn.className = "v";
+  }
+}
+function renderAgentStatus() {
+  const box = $("setStatusList");
+  box.textContent = "";
+  if (!agents.length) {
+    const d = document.createElement("div");
+    d.className = "setHint";
+    d.textContent = "no agents reported by this daemon";
+    box.appendChild(d);
+    return;
+  }
+  for (const a of agents) {
+    const row = document.createElement("div");
+    row.className = "statRow";
+    const st = a.available ? "ok" : "missing";
+    const dot = document.createElement("span");
+    dot.className = "statDot st-" + st;
+    row.appendChild(dot);
+    const name = document.createElement("span");
+    name.className = "statName";
+    name.textContent = a.id;
+    row.appendChild(name);
+    const meta = document.createElement("span");
+    meta.className = "statMeta";
+    meta.textContent = a.available ? "" : "not installed";
+    row.appendChild(meta);
+    box.appendChild(row);
+  }
+}
+function openSettings() {
+  settingsOpener = document.activeElement instanceof Element ? document.activeElement : null;
+  document.body.classList.add("settings-open");
+  $("setPanel").inert = false;
+  $("setBtn").setAttribute("aria-expanded", "true");
+  $("notifyToggle").checked = notifyOn;
+  updateNotifyHint();
+  renderDaemonInfo();
+  refreshAgents(); // its hook re-renders the agent rows
+  clearInterval(settingsTimer);
+  settingsTimer = setInterval(() => {
+    renderDaemonInfo();
+    refreshAgents();
+  }, 10000);
+  $("setClose").focus();
+}
+function closeSettings() {
+  if (!document.body.classList.contains("settings-open")) return;
+  document.body.classList.remove("settings-open");
+  clearInterval(settingsTimer); settingsTimer = null;
+  $("setPanel").inert = true;
+  $("setBtn").setAttribute("aria-expanded", "false");
+  const opener = settingsOpener; settingsOpener = null;
+  if (opener && document.contains(opener)) opener.focus();
+  else $("setBtn").focus();
+}
+// Tab trap: the drawer is modal while open.
+$("setPanel").addEventListener("keydown", e => {
+  if (e.key !== "Tab") return;
+  const f = [...$("setPanel").querySelectorAll(
+    "button, input, select, textarea, a[href], [tabindex]:not([tabindex='-1'])"
+  )].filter(el => !el.disabled && el.offsetParent !== null);
+  if (!f.length) return;
+  const first = f[0], last = f[f.length - 1];
+  if (e.shiftKey && document.activeElement === first) { e.preventDefault(); last.focus(); }
+  else if (!e.shiftKey && document.activeElement === last) { e.preventDefault(); first.focus(); }
+});
+$("setBtn").onclick = () => {
+  if (document.body.classList.contains("settings-open")) closeSettings();
+  else openSettings();
+};
+$("setClose").onclick = closeSettings;
+$("sBackdrop").onclick = closeSettings;
+
+// ---------- desktop notifications + title flash ----------
+const NOTIFY_KEY = "damon_notify";
+let notifyOn = localStorage.getItem(NOTIFY_KEY) === "1";
+
+function updateNotifyHint() {
+  const hint = $("notifyHint");
+  hint.classList.remove("warn");
+  if (!("Notification" in window)) {
+    hint.textContent = "Not supported in this browser — the tab title flashes instead.";
+    hint.classList.add("warn");
+  } else if (Notification.permission === "denied") {
+    hint.textContent = "Blocked by the browser — allow notifications for this origin, then enable again.";
+    hint.classList.add("warn");
+  } else if (!notifyOn) {
+    hint.textContent = "Notify on turn completion and permission requests while this tab is hidden.";
+  } else {
+    hint.textContent = "Active — notifies while this tab is hidden.";
+  }
+}
+// The change event is a real user gesture, so the permission prompt
+// has the transient activation requestPermission requires.
+$("notifyToggle").addEventListener("change", async () => {
+  const box = $("notifyToggle");
+  if (!box.checked) {
+    notifyOn = false;
+    localStorage.setItem(NOTIFY_KEY, "0");
+    updateNotifyHint();
+    return;
+  }
+  if ("Notification" in window && Notification.permission === "default") {
+    try { await Notification.requestPermission(); } catch { /* callback-style impls */ }
+  }
+  if ("Notification" in window && Notification.permission === "granted") {
+    notifyOn = true;
+    localStorage.setItem(NOTIFY_KEY, "1");
+  } else {
+    notifyOn = false;
+    localStorage.setItem(NOTIFY_KEY, "0");
+    box.checked = false;
+  }
+  updateNotifyHint();
+});
+function deskNotify(title, body) {
+  if (!notifyOn || !document.hidden) return false;
+  if (!("Notification" in window) || Notification.permission !== "granted") return false;
+  try {
+    const n = new Notification(title, { body, tag: "damon", icon: "/icon.svg" });
+    n.onclick = () => { window.focus(); n.close(); };
+    return true;
+  } catch { return false; }
+}
+// Fallback attention when notifications are off/unavailable: alternate
+// the tab title until the tab is focused or made visible again.
+let flashTimer = null, flashBase = null, flashLabel = "";
+function stopFlashTitle() {
+  if (!flashTimer) return;
+  clearInterval(flashTimer); flashTimer = null;
+  window.removeEventListener("focus", stopFlashTitle);
+  if (!busy) updateCrumb(); else document.title = "damon — working…";
+}
+function flashTitle(label) {
+  if (!document.hidden) return;
+  stopFlashTitle();
+  flashBase = document.title;
+  flashLabel = label;
+  document.title = "✳ " + label;
+  flashTimer = setInterval(() => {
+    if (document.title === flashBase) {
+      document.title = "✳ " + flashLabel;
+    } else {
+      // Adopt whatever title the app set meanwhile (busy → done).
+      if (document.title !== "✳ " + flashLabel) flashBase = document.title;
+      document.title = flashBase;
+    }
+  }, 900);
+  window.addEventListener("focus", stopFlashTitle);
+}
+document.addEventListener("visibilitychange", () => {
+  if (!document.hidden) stopFlashTitle();
+});
+// Single attention entry point: prefer a desktop notification, fall
+// back to the title flash.
+function attention(title, body, flashWith) {
+  if (!document.hidden) return;
+  if (deskNotify(title, body)) return;
+  flashTitle(flashWith || title);
+}
+function notifyTurnDone(stopReason, err) {
+  const s = sessionsCache.find(x => x.sessionId === activeSession);
+  const label = (s && s.title) || (activeSession ? activeSession.slice(0, 8) : "session");
+  const body = err ? "turn failed — " + err
+    : stopReason === "canceled" ? "cancelled"
+    : stopReason && stopReason !== "completed" ? "stopped: " + stopReason
+    : label;
+  attention("damon — done", body);
+}
+
 // ---------- wiring ----------
 $("newBtn").onclick = newSession;
-$("sendBtn").onclick = sendPrompt;
+$("emptyNewBtn").onclick = newSession;
+$("sendBtn").onclick = () => sendPrompt();
 $("cancelBtn").onclick = cancelPrompt;
 $("authBtn").onclick = submitToken;
 $("token").addEventListener("keydown", e => { if (e.key === "Enter") submitToken(); });
 input.addEventListener("keydown", e => {
-  if (e.key === "Enter" && !e.shiftKey) { e.preventDefault(); sendPrompt(); }
+  // Enter during IME composition (Korean/Japanese/Chinese) commits the
+  // candidate, it must not send the message.
+  if (e.key === "Enter" && !e.shiftKey && !e.isComposing && e.keyCode !== 229) {
+    e.preventDefault();
+    sendPrompt();
+  }
 });
 input.addEventListener("input", () => {
   input.style.height = "auto";
   input.style.height = Math.min(input.scrollHeight, 160) + "px";
+});
+log.addEventListener("scroll", () => {
+  stick = atBottom();
+  $("jumpBtn").classList.toggle("show", !stick && log.children.length > 0);
+});
+$("jumpBtn").onclick = () => {
+  stick = true;
+  log.scrollTop = log.scrollHeight;
+  $("jumpBtn").classList.remove("show");
+};
+// Copy buttons on code blocks and message bubbles (delegated — stream
+// content re-renders).
+log.addEventListener("click", e => {
+  const btn = e.target.closest("button.copy, button.msgcopy");
+  if (!btn) return;
+  let text = "";
+  if (btn.classList.contains("msgcopy")) {
+    const msg = btn.closest(".msg");
+    text = (msg && msg.dataset.raw !== undefined) ? msg.dataset.raw
+      : (msg ? msg.innerText : "");
+  } else {
+    const dw = btn.closest(".diffwrap");
+    if (dw && dw._copyText !== undefined) {
+      text = dw._copyText; // diff blocks carry their own unified text
+    } else {
+      const code = btn.parentElement && btn.parentElement.querySelector("pre code");
+      if (!code) return;
+      text = code.textContent;
+    }
+  }
+  const done = () => {
+    btn.textContent = "copied";
+    btn.classList.add("did");
+    setTimeout(() => { btn.textContent = "copy"; btn.classList.remove("did"); }, 1400);
+  };
+  if (navigator.clipboard && window.isSecureContext)
+    navigator.clipboard.writeText(text).then(done, () => fallbackCopy(text, done));
+  else fallbackCopy(text, done);
+});
+function fallbackCopy(text, done) {
+  const ta = document.createElement("textarea");
+  ta.value = text;
+  ta.style.position = "fixed";
+  ta.style.opacity = "0";
+  document.body.appendChild(ta);
+  ta.select();
+  try { document.execCommand("copy"); done(); } catch { /* best effort */ }
+  ta.remove();
+}
+function closeDrawer() { document.body.classList.remove("drawer-open"); }
+$("menuBtn").onclick = () => document.body.classList.toggle("drawer-open");
+$("backdrop").onclick = closeDrawer;
+document.addEventListener("keydown", e => {
+  if ((e.metaKey || e.ctrlKey) && e.key.toLowerCase() === "k") {
+    e.preventDefault();
+    $("search").focus();
+    $("search").select();
+  } else if (e.key === "Escape") {
+    closeDrawer();
+    closeSettings();
+  }
+});
+// A closed tab mid-turn kills the connection and cancels the turn —
+// warn while an agent is working.
+window.addEventListener("beforeunload", e => {
+  if (busy) { e.preventDefault(); e.returnValue = ""; }
 });
 
 // ---------- search ----------
@@ -669,27 +2458,27 @@ async function runSearch() {
   const q = $("search").value.trim();
   if (!q) { refreshSessions(); return; }
   try {
-    const r = await request("session/search", { query: q, limit: 20 });
+    const r = await request("session.search", { query: q, limit: 20 });
     const list = $("sessions");
     list.textContent = "";
     for (const hit of (r.results || [])) {
-      const row = document.createElement("div");
-      row.className = "sess" + (hit.sessionId === activeSession ? " active" : "");
-      const label = document.createElement("span");
-      label.className = "sid";
-      label.textContent = hit.sessionId.slice(0, 8);
-      row.appendChild(label);
-      const snip = document.createElement("span");
-      snip.className = "hit";
-      snip.textContent = hit.snippet || "";
-      row.appendChild(snip);
-      row.onclick = () => selectSession(hit.sessionId);
-      list.appendChild(row);
+      // Results are [sessionId, messageId, snippet] tuples.
+      const sid = Array.isArray(hit) ? hit[0] : hit.sessionId;
+      const snippet = Array.isArray(hit) ? hit[2] : hit.snippet;
+      const s = sessionsCache.find(x => x.sessionId === sid);
+      list.appendChild(makeSessRow({
+        label: (s && s.title) || sid.slice(0, 8),
+        labelTitle: sid,
+        // FTS5 snippet marks matches with \x01/\x02 — escape, then highlight.
+        metaHtml: esc(snippet || "").replace(/\x01/g, "<mark>").replace(/\x02/g, "</mark>"),
+        active: sid === activeSession,
+        onClick: () => selectSession(sid),
+        onDelete: () => deleteSession({ sessionId: sid }),
+      }));
     }
     if (!(r.results || []).length) {
       const d = document.createElement("div");
-      d.className = "hit";
-      d.style.padding = "8px";
+      d.className = "sessGroup";
       d.textContent = "no matches";
       list.appendChild(d);
     }
@@ -698,9 +2487,11 @@ async function runSearch() {
 
 // ---------- image attachments ----------
 const attachments = []; // {data, mimeType, name}
-$("attachBtn").onclick = () => $("attach").click();
-$("attach").addEventListener("change", async ev => {
-  for (const f of ev.target.files || []) {
+const MAX_ATTACH = 2.5 * 1024 * 1024; // base64 inflates ~4/3 — stays inside the daemon's 3 MB relay frame budget
+async function addFiles(files) {
+  for (const f of files || []) {
+    if (!f.type || !f.type.startsWith("image/")) continue;
+    if (f.size > MAX_ATTACH) { errBubble(f.name + " is over 2.5 MB — skipped"); continue; }
     const buf = await f.arrayBuffer();
     let bin = "";
     const bytes = new Uint8Array(buf);
@@ -708,8 +2499,30 @@ $("attach").addEventListener("change", async ev => {
       bin += String.fromCharCode.apply(null, bytes.subarray(i, i + 8192));
     attachments.push({ data: btoa(bin), mimeType: f.type || "image/png", name: f.name });
   }
-  ev.target.value = "";
   renderAttachBar();
+}
+$("attachBtn").onclick = () => $("attach").click();
+$("attach").addEventListener("change", async ev => {
+  await addFiles(ev.target.files);
+  ev.target.value = "";
+});
+// Paste from the clipboard and drop anywhere on the composer.
+input.addEventListener("paste", e => {
+  const files = [...(e.clipboardData ? e.clipboardData.files : [])]
+    .filter(f => f.type && f.type.startsWith("image/"));
+  if (files.length) { e.preventDefault(); addFiles(files); }
+});
+const dropZone = $("inputWrap");
+["dragenter", "dragover"].forEach(ev => dropZone.addEventListener(ev, e => {
+  e.preventDefault();
+  dropZone.classList.add("dropping");
+}));
+["dragleave", "drop"].forEach(ev => dropZone.addEventListener(ev, e => {
+  e.preventDefault();
+  dropZone.classList.remove("dropping");
+}));
+dropZone.addEventListener("drop", e => {
+  if (e.dataTransfer) addFiles(e.dataTransfer.files);
 });
 function renderAttachBar() {
   const bar = $("attachBar");
@@ -723,12 +2536,64 @@ function renderAttachBar() {
     const rm = document.createElement("button");
     rm.className = "rm";
     rm.textContent = "×";
+    rm.setAttribute("aria-label", "remove attachment");
     rm.onclick = () => { attachments.splice(i, 1); renderAttachBar(); };
     wrap.appendChild(img); wrap.appendChild(rm);
     bar.appendChild(wrap);
   });
 }
+
+// ---------- PWA ----------
+// Manifest/favicon links are injected only when actually served by
+// damond (http/https) — a file:// open (diffDemo smoke) must not emit
+// references to /manifest.webmanifest and /icon.svg that cannot
+// resolve. No service worker by design: current Chrome/Edge install
+// apps without one, and offline caching is out of scope for a daemon
+// UI — the daemon itself is the network dependency.
+if (location.protocol === "http:" || location.protocol === "https:") {
+  const man = document.createElement("link");
+  man.rel = "manifest";
+  man.href = "/manifest.webmanifest";
+  document.head.appendChild(man);
+  const fav = document.createElement("link");
+  fav.rel = "icon";
+  fav.type = "image/svg+xml";
+  fav.href = "/icon.svg";
+  document.head.appendChild(fav);
+  const meta = document.createElement("meta");
+  meta.name = "theme-color";
+  meta.content = "#0a0c10";
+  document.head.appendChild(meta);
+}
+
+setConn("pending", "connecting");
+syncEmpty();
 connect();
+
+// ---------- diff demo (?diffDemo=1) ----------
+// Smoke hook: three synthetic tool cards (edit, write, shell) so the
+// diff viewer can be checked in a browser without a daemon.
+if (new URLSearchParams(location.search).get("diffDemo") === "1") {
+  sysline("diff viewer demo");
+  toolCard({
+    call_id: "demo-edit", name: "Edit", status: "completed",
+    detail: {
+      type: "edit", path: "src/greet.js",
+      unified_diff: '@@ -1,4 +1,5 @@\n function greet(name) {\n-  const msg = "Hello, " + name;\n+  const msg = `Hello, ${name}!`;\n   console.log(msg);\n+  return msg;\n }',
+    },
+  });
+  toolCard({
+    call_id: "demo-write", name: "Write", status: "completed",
+    detail: {
+      type: "write", path: "notes/demo.md",
+      content: "# Demo\n\nWritten by the diff viewer smoke hook.\n\n- edit cards show a -/+ hunk with context\n- write cards show all-additions\n- unrecognized shapes keep the JSON dump\n",
+    },
+  });
+  toolCard({
+    call_id: "demo-bash", name: "Bash", status: "completed",
+    detail: { type: "shell", command: "cargo test --color always", output: "test result: ok. 42 passed", exit_code: 0 },
+  });
+}
 </script>
 </body>
 </html>
