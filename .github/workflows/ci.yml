@@ -222,7 +222,7 @@ jobs:
       - name: Install Linux deps
         run: sudo apt-get update && sudo apt-get install -y libdbus-1-dev pkg-config
       - run: cargo install cargo-llvm-cov --locked
-      - run: cargo llvm-cov report --lcov --output-path lcov.info
+      - run: cargo llvm-cov --lcov --output-path lcov.info
       - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
         with:
           name: lcov
