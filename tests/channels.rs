@@ -885,12 +885,19 @@ async fn cwd_pref_applies_to_the_next_new_session() {
         )
         .await;
     wait_for_sent(&ch.sent, "cwd must be an absolute path").await;
+    // A path that IS absolute (windows needs a drive letter) but does not
+    // exist must hit the is_dir check, not the is_absolute one.
+    let absent = if cfg!(windows) {
+        r"C:\no\such\dir-xyz"
+    } else {
+        "/no/such/dir-xyz"
+    };
     bridge
         .handle_message(
             "chat".into(),
             None,
             None,
-            "!cwd /no/such/dir-xyz".into(),
+            format!("!cwd {absent}"),
             Vec::new(),
         )
         .await;
