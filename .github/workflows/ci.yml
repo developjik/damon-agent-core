@@ -27,7 +27,10 @@ jobs:
       # The declared MSRV (Cargo.toml rust-version) and the pinned
       # toolchain must stay in lockstep — a silent drift would let PRs
       # pass on a newer rustc than the floor users build with.
+      # shell: bash — the comparison is POSIX shell syntax; on Windows
+      # the default run shell is pwsh, which cannot parse it.
       - name: Declared MSRV matches the pinned toolchain
+        shell: bash
         run: |
           msrv=$(grep -m1 '^rust-version' Cargo.toml | cut -d'"' -f2)
           pin=$(grep -m1 '^channel' rust-toolchain.toml | cut -d'"' -f2)
