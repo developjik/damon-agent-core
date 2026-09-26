@@ -39,7 +39,7 @@ base64 = "0.22"
 getrandom = "0.3"
 rand_core = "0.6"
 x25519-dalek = { version = "2", features = ["static_secrets"] }
-aes-gcm = "0.10"
+aes-gcm = "0.11"
 
 tokio-util = "0.7.19"
 axum-server = { version = "0.8.0", features = ["tls-rustls"] }
