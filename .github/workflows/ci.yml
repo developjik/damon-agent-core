@@ -170,14 +170,14 @@ jobs:
 
           sed -i "s/^  version \".*\"/  version \"$version\"/" Formula/damon.rb
           for target in $targets; do
-            # The release CDN can serve a stale tarball right after the
-            # assets are replaced (observed on v0.2.0). The published
-            # .sha256 asset is computed by the build leg from the exact
-            # artifact it uploaded, so a mismatch means we cached a
-            # previous build — wait and re-download.
-            curl --proto '=https' --tlsv1.2 --retry 5 --retry-all-errors -fsSL "$base/damon-$target.tar.gz.sha256" -o "$tmp/$target.published"
+            # The release legs run in PARALLEL — this leg's formula step
+            # needs every other leg's sidecar, and the slowest (windows)
+            # can upload minutes later. Wait up to ~10 minutes per asset:
+            # curl retries (10s apart, 600s budget) cover both the upload
+            # race and the stale-CDN case below.
+            curl --proto '=https' --tlsv1.2 --retry 60 --retry-delay 10 --retry-max-time 600 --retry-all-errors -fsSL "$base/damon-$target.tar.gz.sha256" -o "$tmp/$target.published"
             for attempt in 1 2 3 4 5; do
-              curl --proto '=https' --tlsv1.2 --retry 5 --retry-all-errors -fsSL "$base/damon-$target.tar.gz" -o "$tmp/$target.tar.gz"
+              curl --proto '=https' --tlsv1.2 --retry 60 --retry-delay 10 --retry-max-time 600 --retry-all-errors -fsSL "$base/damon-$target.tar.gz" -o "$tmp/$target.tar.gz"
               computed="$(sha256sum "$tmp/$target.tar.gz" | cut -d' ' -f1)"
               published="$(cut -d' ' -f1 < "$tmp/$target.published")"
               [ "$computed" = "$published" ] && break
