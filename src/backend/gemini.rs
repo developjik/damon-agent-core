@@ -720,9 +720,6 @@ FRAMES"#,
         std::fs::set_permissions(path, perms).unwrap();
     }
 
-    #[cfg(not(unix))]
-    fn make_executable(_path: &std::path::Path) {}
-
     /// Test-only accessors so assertions read intent, not pattern noise.
     trait ToolCallTestExt {
         fn detail_input(&self) -> &Value;
