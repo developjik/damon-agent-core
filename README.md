@@ -17,7 +17,7 @@ The name is a pun on *daemon*, and literally the architecture.
 
 If you already subscribe to an agent CLI, **there is nothing to configure**. Damon detects the installed CLIs and inherits their logins and tools. Token rotation, provider translation, API keys — not Damon's problem anymore.
 
-- **Zero-config backends** — a catalog CLI binary on PATH registers itself: `claude` (stream-json), `codex` (app-server), `omp` (RPC mode). Any other agent plugs in via an explicit `[backends.X]` block.
+- **Zero-config backends** — a catalog CLI binary on PATH registers itself: `claude` (stream-json), `codex` (app-server), `omp` (RPC mode), `cursor-agent`, `amp`, `kimi`, `qwen` (stream-json). Any other agent plugs in via an explicit `[backends.X]` block.
 - **Permissions flow to your surface** — the agent's permission ask is relayed to the web UI, CLI, or a Telegram/Discord/Slack `allow`/`deny` reply.
 - **Searchable history** — every conversation lands in SQLite + FTS5. `damon search "error timeout"` full-text-searches all of it.
 - **Chat channels built in** — Telegram, Discord, and Slack adapters ship as separate binaries. Per-chat session mapping, streamed replies.
@@ -120,6 +120,7 @@ Each chat maps to its own agent session, replies stream, and tool-permission req
 
 ## Docs
 
+- **[Project homepage](https://developjik.github.io/damon-agent-core/)** — what Damon is, at a glance
 - [docs/protocol-v2.md](docs/protocol-v2.md) — wire protocol (methods, events, types)
 - [docs/install.md](docs/install.md) ([ko](docs/install.ko.md)) — install paths, service registration
 - [docs/integration.md](docs/integration.md) ([ko](docs/integration.ko.md)) — agent wiring, minimal clients

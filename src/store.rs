@@ -21,21 +21,6 @@ pub struct StoredMessage {
     pub data: Value,
 }
 
-/// One `sessions` table row — the source for session exports.
-#[derive(Debug, Clone)]
-pub struct SessionRow {
-    pub id: String,
-    pub created_at: String,
-    pub last_active_at: Option<String>,
-    pub cwd: String,
-    pub model: Option<String>,
-    pub agent: Option<String>,
-    pub agent_session: Option<String>,
-    pub title: Option<String>,
-    pub compacted_through: i64,
-    pub summary: Option<String>,
-}
-
 /// The searchable text of one stored message, for the FTS index:
 /// `content` text (plain string, text parts of an array, or nested ACP
 /// `content` blocks) plus tool I/O — OpenAI-style `tool_calls` names
@@ -445,6 +430,29 @@ impl Store {
             .filter(|(a, s)| !a.is_empty() && !s.is_empty()))
     }
 
+    /// Find the Damon session id already bound to a native backend
+    /// session — import dedup so resuming the same handle twice does
+    /// not mint duplicate rows.
+    pub async fn session_by_agent_session(
+        &self,
+        agent: &str,
+        agent_session: &str,
+    ) -> anyhow::Result<Option<String>> {
+        let agent = agent.to_string();
+        let agent_session = agent_session.to_string();
+        Ok(self
+            .conn
+            .call(move |c| {
+                c.query_row(
+                    "SELECT id FROM sessions WHERE agent = ?1 AND agent_session = ?2",
+                    rusqlite::params![agent, agent_session],
+                    |r| r.get(0),
+                )
+                .optional()
+            })
+            .await?)
+    }
+
     /// The session's working directory — the cwd the agent's tools run
     /// in.
     pub async fn session_cwd(&self, id: &str) -> anyhow::Result<Option<String>> {
@@ -499,23 +507,14 @@ impl Store {
     }
 
     /// Full-text search over message content. Returns (session_id,
-    /// message_id, snippet) ordered by rank.
-    pub async fn search(
-        &self,
-        query: &str,
-        limit: usize,
-    ) -> anyhow::Result<Vec<(String, i64, String)>> {
-        self.search_filtered(query, limit, None, None, None).await
-    }
-
-    /// `search` with optional narrowing: `session_id` restricts hits to
+    /// message_id, snippet) ordered by rank, with optional narrowing:
+    /// `session_id` restricts hits to
     /// one session; `before`/`after` bound the SESSION's `created_at`
     /// inclusively (messages carry no timestamps, so the session's
     /// creation is the coarsest honest bound). ISO-8601 strings — a `T`
     /// date/time separator is normalized to the space form
     /// `datetime('now')` writes, so plain string comparison holds;
-    /// date-only bounds compare as their midnight. No filters → the
-    /// same results as [`Store::search`].
+    /// date-only bounds compare as their midnight.
     pub async fn search_filtered(
         &self,
         query: &str,
@@ -696,110 +695,7 @@ impl Store {
         }
     }
 
-    /// Messages for a session in insertion order, as OpenAI-shaped JSON.
-    /// Respects compaction: messages at or before `compacted_through` are
-    /// replaced by the stored summary (as a leading user message).
-    pub async fn messages(&self, session_id: &str) -> anyhow::Result<Vec<Value>> {
-        let sid = session_id.to_string();
-        let (_cutoff, summary, rows) = self
-            .conn
-            .call(move |c| {
-                // Read cutoff + rows in one transaction — a concurrent
-                // compaction write (another process) between the two
-                // reads would pair a stale summary with the wrong window.
-                let tx = c.transaction()?;
-                let (cutoff, summary): (i64, Option<String>) = match tx.query_row(
-                    "SELECT compacted_through, summary FROM sessions WHERE id = ?1",
-                    rusqlite::params![sid],
-                    |row| Ok((row.get(0)?, row.get(1)?)),
-                ) {
-                    Ok(v) => v,
-                    // Missing session → no cutoff; other errors must surface.
-                    Err(rusqlite::Error::QueryReturnedNoRows) => (0, None),
-                    Err(e) => return Err(e.into()),
-                };
-                let mut stmt = tx.prepare(
-                    "SELECT data FROM messages WHERE session_id = ?1 AND id > ?2 ORDER BY id",
-                )?;
-                let rows = stmt
-                    .query_map(rusqlite::params![sid, cutoff], |row| {
-                        row.get::<_, String>(0)
-                    })?
-                    .collect::<Result<Vec<String>, _>>()?;
-                Ok::<(i64, Option<String>, Vec<String>), tokio_rusqlite::Error>((
-                    cutoff, summary, rows,
-                ))
-            })
-            .await?;
-        let mut out: Vec<Value> = Vec::new();
-        if let Some(s) = summary {
-            out.push(serde_json::json!({
-                "role": "user",
-                "content": format!("[Earlier conversation summary]\n{s}"),
-            }));
-        }
-        for s in rows {
-            out.push(serde_json::from_str(&s)?);
-        }
-        Ok(out)
-    }
-
-    /// All messages with their row ids, ignoring compaction — the
-    /// session/load replay and export source.
-    pub async fn messages_full(&self, session_id: &str) -> anyhow::Result<Vec<StoredMessage>> {
-        let sid = session_id.to_string();
-        self.conn
-            .call(move |c| {
-                let mut stmt = c.prepare(
-                    "SELECT id, session_id, role, data FROM messages
-                     WHERE session_id = ?1 ORDER BY id",
-                )?;
-                let rows = stmt
-                    .query_map(rusqlite::params![sid], |row| {
-                        Ok((
-                            row.get::<_, i64>(0)?,
-                            row.get::<_, String>(1)?,
-                            row.get::<_, String>(2)?,
-                            row.get::<_, String>(3)?,
-                        ))
-                    })?
-                    .collect::<Result<Vec<_>, _>>()?;
-                Ok::<Vec<_>, tokio_rusqlite::Error>(rows)
-            })
-            .await?
-            .into_iter()
-            .map(|(id, session_id, role, data)| {
-                Ok(StoredMessage {
-                    id,
-                    session_id,
-                    role,
-                    data: serde_json::from_str(&data)?,
-                })
-            })
-            .collect()
-    }
-
-    /// All sessions as `(id, created_at, agent, title)` — agent/title are
-    /// empty strings when unset.
-    pub async fn list_sessions(&self) -> anyhow::Result<Vec<(String, String, String, String)>> {
-        self.conn
-            .call(|c| {
-                let mut stmt = c.prepare(
-                    "SELECT id, created_at, COALESCE(agent, ''), COALESCE(title, '')
-                     FROM sessions ORDER BY created_at, id",
-                )?;
-                let rows = stmt
-                    .query_map([], |row| {
-                        Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?))
-                    })?
-                    .collect::<Result<Vec<_>, _>>()?;
-                Ok::<Vec<(String, String, String, String)>, tokio_rusqlite::Error>(rows)
-            })
-            .await
-            .map_err(Into::into)
-    }
-
-    /// Set the session title only when none exists — the first user
+    /// Set the title only when none exists — the first user
     /// message wins, later prompts and explicit renames are untouched.
     pub async fn set_title_if_empty(&self, session_id: &str, title: &str) -> anyhow::Result<()> {
         let sid = session_id.to_string();
@@ -973,22 +869,6 @@ impl Store {
             .map_err(Into::into)
     }
 
-    /// Whether a session row exists.
-    pub async fn session_exists(&self, id: &str) -> anyhow::Result<bool> {
-        let id = id.to_string();
-        self.conn
-            .call(move |c| {
-                let n: i64 = c.query_row(
-                    "SELECT COUNT(*) FROM sessions WHERE id = ?1",
-                    rusqlite::params![id],
-                    |row| row.get(0),
-                )?;
-                Ok::<bool, tokio_rusqlite::Error>(n > 0)
-            })
-            .await
-            .map_err(Into::into)
-    }
-
     /// Delete a session and all of its messages.
     pub async fn delete_session(&self, id: &str) -> anyhow::Result<()> {
         let id = id.to_string();
@@ -1096,7 +976,8 @@ impl Store {
         Ok(())
     }
 
-    /// Like `list_sessions`, but paginated — same 4-tuple shape.
+    /// All sessions as `(id, created_at, agent, title)` — agent/title
+    /// are empty strings when unset. Paginated; ordered by `created_at, id`.
     pub async fn list_sessions_paged(
         &self,
         limit: u32,
@@ -1119,9 +1000,9 @@ impl Store {
             .map_err(Into::into)
     }
 
-    /// Like `messages_full`, but paginated by row id. Respects the
-    /// compaction cutoff like `messages` — paged reads must not leak
-    /// rows the unpaged path hides (the summary row is not injected).
+    /// Session messages with their row ids, paginated by row id.
+    /// Respects the compaction cutoff — rows at or before it are hidden
+    /// (the summary row is not injected).
     pub async fn messages_paged(
         &self,
         session_id: &str,
@@ -1161,38 +1042,6 @@ impl Store {
                 })
             })
             .collect()
-    }
-
-    /// One session's full row — the export source. None when the id is
-    /// unknown.
-    pub async fn session_row(&self, id: &str) -> anyhow::Result<Option<SessionRow>> {
-        let sid = id.to_string();
-        Ok(self
-            .conn
-            .call(move |c| {
-                c.query_row(
-                    "SELECT id, created_at, last_active_at, cwd, model, agent,
-                            agent_session, title, compacted_through, summary
-                     FROM sessions WHERE id = ?1",
-                    rusqlite::params![sid],
-                    |r| {
-                        Ok(SessionRow {
-                            id: r.get(0)?,
-                            created_at: r.get(1)?,
-                            last_active_at: r.get(2)?,
-                            cwd: r.get(3)?,
-                            model: r.get(4)?,
-                            agent: r.get(5)?,
-                            agent_session: r.get(6)?,
-                            title: r.get(7)?,
-                            compacted_through: r.get(8)?,
-                            summary: r.get(9)?,
-                        })
-                    },
-                )
-                .optional()
-            })
-            .await?)
     }
 
     /// Write a consistent snapshot of the whole database to `to` via

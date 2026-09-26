@@ -112,7 +112,6 @@ impl AgentClient for CodexClient {
         &self,
         handle: &PersistenceHandle,
         config: SessionConfig,
-        _purpose: ResumePurpose,
     ) -> Result<Arc<dyn AgentSession>> {
         let session = CodexSession::spawn(&self.resolved, config).await?;
         session.attach_thread(&handle.native_handle).await?;
@@ -178,7 +177,6 @@ pub struct CodexSession {
     thread_id: Mutex<Option<String>>,
     current_turn: Mutex<Option<String>>,
     pending_asks: Mutex<HashMap<String, PendingAsk>>,
-    timeline: Mutex<Vec<TimelineItem>>,
     /// itemId → running ToolCall so item/completed can finalize it.
     open_items: Mutex<HashMap<String, ToolCall>>,
 }
@@ -208,7 +206,6 @@ impl CodexSession {
             thread_id: Mutex::new(None),
             current_turn: Mutex::new(None),
             pending_asks: Mutex::new(HashMap::new()),
-            timeline: Mutex::new(Vec::new()),
             open_items: Mutex::new(HashMap::new()),
         });
 
@@ -657,7 +654,6 @@ impl CodexSession {
     }
 
     async fn emit_timeline(&self, item: TimelineItem) {
-        self.timeline.lock().await.push(item.clone());
         let turn = self.current_turn.lock().await.clone();
         self.emit(StreamEvent {
             turn_id: turn,
@@ -783,7 +779,7 @@ impl AgentSession for CodexSession {
         &self,
         request_id: &str,
         response: PermissionResponse,
-    ) -> Result<PermissionResult> {
+    ) -> Result<()> {
         let Some(ask) = self.pending_asks.lock().await.remove(request_id) else {
             bail!("no pending permission {request_id}");
         };
@@ -801,18 +797,7 @@ impl AgentSession for CodexSession {
         self.emit(StreamEvent::new(StreamEventKind::PermissionResolved {
             request_id: request_id.to_string(),
         }));
-        Ok(PermissionResult::default())
-    }
-
-    fn pending_permissions(&self) -> Vec<PermissionRequest> {
-        match self.pending_asks.try_lock() {
-            Ok(asks) => asks.values().map(|a| a.request.clone()).collect(),
-            Err(_) => vec![],
-        }
-    }
-
-    async fn history(&self) -> Result<Vec<TimelineItem>> {
-        Ok(self.timeline.lock().await.clone())
+        Ok(())
     }
 
     fn persistence_handle(&self) -> Option<PersistenceHandle> {

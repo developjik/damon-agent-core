@@ -480,6 +480,23 @@ class DamonClient:
         r = await self._call("session.resume", {"sessionId": session_id})
         return r["sessionId"]
 
+    async def resume_by_handle(
+        self,
+        handle: dict[str, Any],
+        title: Optional[str] = None,
+        cwd: Optional[str] = None,
+    ) -> str:
+        """Resume a native session by its persistence handle — the import
+        path for sessions the backend made outside the daemon. Returns
+        the Damon ``sessionId`` (deduped: same handle → same session)."""
+        params: dict[str, Any] = {"handle": handle}
+        if title is not None:
+            params["title"] = title
+        if cwd is not None:
+            params["cwd"] = cwd
+        r = await self._call("session.resume", params)
+        return r["sessionId"]
+
     async def import_sessions(
         self, backend: str, cwd: Optional[str] = None
     ) -> list[dict[str, Any]]:

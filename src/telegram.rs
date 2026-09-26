@@ -412,19 +412,15 @@ fn unsupported_message(u: &Value) -> Option<(i64, Option<i64>)> {
     None
 }
 
-/// Telegram bridge: thin wrapper over the generic channel bridge that
-/// keeps the update-driven API used by tests and embedders.
+/// Telegram bridge: thin wrapper over the generic channel bridge.
 pub struct Bridge {
     inner: Arc<ChannelBridge>,
-    /// Kept for the unsupported-type notice in handle_update — the
-    /// generic bridge has no public send surface.
-    tg: Arc<dyn TelegramApi>,
 }
 
 impl Bridge {
     pub fn new(tg: Arc<dyn TelegramApi>, client: DamonClient) -> Arc<Self> {
-        let inner = ChannelBridge::new(Arc::new(TelegramChannel::new(tg.clone())), client);
-        Arc::new(Self { inner, tg })
+        let inner = ChannelBridge::new(Arc::new(TelegramChannel::new(tg)), client);
+        Arc::new(Self { inner })
     }
 
     /// Restrict the bridge to these sender/chat ids — see
@@ -436,38 +432,6 @@ impl Bridge {
     /// poll loop, no second copy to drift.
     pub async fn run(self: &Arc<Self>) -> anyhow::Result<()> {
         self.inner.run().await
-    }
-
-    /// Exposed for tests and embedders that drive updates manually.
-    pub fn client(&self) -> &DamonClient {
-        self.inner.client()
-    }
-
-    /// Single consumer of client.events(); fans out to per-session channels.
-    pub async fn spawn_event_router(self: &Arc<Self>) {
-        self.inner.spawn_event_router().await;
-    }
-
-    /// Handle one raw Telegram update.
-    pub async fn handle_update(self: &Arc<Self>, u: Value) {
-        if let Some(msg) = incoming_from_update(&u) {
-            self.inner
-                .handle_message(
-                    msg.chat_id,
-                    msg.thread_id,
-                    msg.sender_id,
-                    msg.text,
-                    msg.attachments,
-                )
-                .await;
-        } else if let Some((chat_id, thread_id)) = unsupported_message(&u) {
-            // Same notice as the recv path — media we can't prompt on
-            // must not be met with silence.
-            let _ = self
-                .tg
-                .send_message(chat_id, "unsupported message type", thread_id)
-                .await;
-        }
     }
 }
 

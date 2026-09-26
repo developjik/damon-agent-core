@@ -39,7 +39,7 @@ Register `NPM_TOKEN` and you're done — the job publishes with
 
 ## 3. Version sync (required before tagging)
 
-Three places must match the tag. Run:
+Five places must match the tag. Run:
 
 ```sh
 scripts/set-version.sh 0.1.0

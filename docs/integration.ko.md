@@ -33,7 +33,7 @@ ANTHROPIC_MODEL = "claude-sonnet-4-5"
 
 `session.create`의 `backend` 파라미터로 세션마다 백엔드를 고른다. 생략하면 `default_backend` 설정 → 첫 번째 사용 가능 백엔드.
 
-MCP 서버는 `[mcp_servers]`(전역)와 `session.create`의 `mcpServers`(세션별) 모두 **에이전트에게 전달**된다 — 에이전트가 직접 구동하고 권한을 승인한다. Damon은 MCP 서버를 직접 띄우지 않는다.
+MCP 서버는 `session.create`의 `mcpServers`가 **에이전트에게 전달**된다 — 에이전트가 직접 구동하고 권한을 승인한다. Damon은 MCP 서버를 직접 띄우지 않는다.
 
 ## 인증
 
@@ -41,9 +41,7 @@ MCP 서버는 `[mcp_servers]`(전역)와 `session.create`의 `mcpServers`(세션
 
 브라우저 Origin: `auth_token`이 없으면 `Origin` 헤더를 달고 오는 요청은 루프백 origin이어야 한다. 토큰이 있으면 모든 origin이 통과한다 — 토큰이 게이트다.
 
-`GET /metrics`(토큰 게이트 뒤)는 Prometheus 카운터를 노출한다: `damon_requests_total`, `damon_prompts_total`, `damon_active_sessions`, `damon_live_sessions`, `damon_permission_waits_total`, `damon_permission_wait_ms_total`, 그리고 백엔드별 `damon_turn_duration_ms_sum`/`_count`/`damon_turn_errors_total`.
-
-`GET /v1/events`(토큰 게이트 뒤)는 데몬 생명주기 이벤트의 Server-Sent Events fan-out이다. 지연된 구독자는 `lagged` 코멘트 프레임을 받는다 — 재접속해 리싱크한다.
+`GET /metrics`(토큰 게이트 뒤)는 Prometheus 카운터를 노출한다: `damon_requests_total`, `damon_live_sessions`.
 
 ## WS 프로토콜 (v2)
 
@@ -54,7 +52,7 @@ MCP 서버는 `[mcp_servers]`(전역)와 `session.create`의 `mcpServers`(세션
 - `hello` → `{protocol, backends, methods}` — 접속 시 push로도 도착
 - `backend.list` → `{backends: [{id, available, capabilities}]}`
 - `session.create {backend?, cwd?, model?, mode?, mcpServers?}` → `{sessionId, backend}`
-- `session.resume {sessionId}` → `{sessionId, backend}` — 백엔드의 네이티브 resume 토큰으로 재접속
+- `session.resume {sessionId}` → `{sessionId, backend}` — 백엔드의 네이티브 resume 토큰으로 재접속. `{handle:{provider,native_handle}, cwd?, title?}`로 호출하면 데몬 밖 네이티브 세션을 임포트(같은 handle은 같은 세션으로 dedup)
 - `session.list {limit?, offset?}` → `{sessions: [...]}`
 - `session.messages {sessionId, limit?, offset?}` → `{messages: [...]}`
 - `session.import {backend, cwd?}` → `{sessions: [...]}` — 데몬 밖에서 만든 네이티브 세션
@@ -72,7 +70,7 @@ MCP 서버는 `[mcp_servers]`(전역)와 `session.create`의 `mcpServers`(세션
 
 데몬 → 클라이언트 push:
 
-- `{"event":"session.event","sessionId","data":<StreamEvent>}` — 이 연결이 건드린 세션(create/resume/turn)의 모든 이벤트. StreamEvent 종류: `turn_started`, `timeline`(assistant_message/reasoning/tool_call/todo/…), `permission_requested`, `turn_completed`, `turn_failed`, `turn_canceled`, `attention_required`, `usage_updated`, `model_changed`, `mode_changed`, `thread_started`, `subagent`.
+- `{"event":"session.event","sessionId","data":<StreamEvent>}` — 이 연결이 건드린 세션(create/resume/turn)의 모든 이벤트. StreamEvent 종류: `turn_started`, `timeline`(assistant_message/reasoning/tool_call/todo/…), `permission_requested`, `turn_completed`, `turn_failed`, `turn_canceled`, `attention_required`, `model_changed`, `mode_changed`, `thread_started`, `subagent`.
 
 `turn.start`의 `stopReason`: `completed` | `failed` | `canceled` | `timeout`.
 

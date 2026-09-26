@@ -1,6 +1,56 @@
 # Changelog
 
-## Unreleased
+## 0.4.0 — 2026-09-26
+
+### Removed — dead-code sweep (breaking)
+
+- **Rust client:** `DamonClient::{notify, dropped_events, backend_list,
+  turn_steer, set_model, set_mode, catalog_models}` deleted — no in-repo
+  caller, and the wire methods stay available via `request()` / the npm
+  and python clients.
+- **Store:** `session_row`/`SessionRow`, `search`, `messages`,
+  `messages_full`, `list_sessions`, `session_exists` deleted — the RPC
+  surface uses `search_filtered`/`messages_paged`/`list_sessions_paged`.
+- **Backend traits/types:** `AgentSession::{pending_permissions, history}`
+  (implemented but never called), `ResumePurpose` (all resume paths were
+  interactive), `PermissionResult` (callers discarded it),
+  `SessionConfig.{system_prompt, env}` (never populated),
+  `TimelineItem::Error`, `StreamEventKind::UsageUpdated`,
+  `AttentionReason::Error`, `ToolCallStatus::Canceled`,
+  `PermissionKind::{plan, mode, other}` (no producer — the UI branches
+  and docs describing them are gone too), `NdjsonTransport::{pending,
+  exited, pid, uptime, stderr_tail}` plus the unread stderr ring.
+- **Config:** the `[mcp_servers.*]` section is no longer parsed — it was
+  deserialized but never forwarded (only `session.create`'s
+  `mcpServers` reaches an agent). Existing config files carrying the
+  section now fail with an unknown-field error instead of silently
+  ignoring it.
+- **HTTP:** `GET /v1/events` (SSE) removed — nothing ever produced a
+  daemon event, so the stream only sent keepalives. `GET /metrics` now
+  emits `damon_requests_total` and `damon_live_sessions` only; the other
+  counters were always 0.
+- **npm:** `__test.detectX25519` export removed (test hook never used by
+  the tests).
+- **Dependencies:** `tokio-stream` (prod) and `sysinfo`, `tempfile`,
+  `http-body-util`, `rcgen` (dev) had no usage and are dropped.
+
+### Fixed — cursor permission escalation
+
+- **`cursor` no longer maps `acceptEdits` to `--force`.** `--force`
+  auto-approves every command not explicitly denied — far beyond the
+  edit-only auto-approval `acceptEdits` promises. Only
+  `bypassPermissions` maps to `--force` now, and the mode catalog
+  advertises `default`/`plan`/`bypassPermissions` instead of the
+  non-existent cursor `acceptEdits`.
+
+### Added — omp permission modes
+
+- **`omp` honors `session.create {mode}`** — `bypassPermissions` →
+  `--approval-mode yolo`, `acceptEdits` → `--approval-mode write`
+  (omp 18.2.6's native flag). omp's RPC protocol has no runtime
+  approval-mode command, so the mode is fixed at spawn
+  (`dynamic_modes` stays false) and unknown modes defer to omp's own
+  `tools.approvalMode` setting.
 
 ### Changed — native-CLI backend architecture (breaking)
 
@@ -407,7 +457,42 @@ history, channels, and remote access instead:
 - **`damon-relay --help`/`--version`** — the relay used to ignore argv
   entirely and start the server on `--help`; unknown args now exit 2.
 
-## 0.2.0 — unreleased
+### Added — chat surface parity
+
+- **Subagent events render everywhere** — `subagent` stream events
+  (OMP today) were silently dropped by every chat surface. The web UI
+  shows a collapsible 🤖 card per subagent (name/status plus the raw
+  frame), chat channels post `🤖 name status`, and the CLI prints
+  `[subagent name status]`.
+- **Model/mode pickers in the web UI** — the composer gains model and
+  mode selects fed by `catalog.models`; a change applies to the live
+  session via `session.set_model`/`session.set_mode`, or rides along on
+  the next `session.create`.
+- **Native session import** — `session.resume` now accepts
+  `{handle:{provider,native_handle}, cwd?, title?}`: the daemon mints a
+  session row bound to the handle (deduped — re-importing the same
+  native session returns the same session) and resumes it. The web UI
+  sidebar has an Import button listing `session.import` results, the
+  CLI has `damon import <backend> [--attach N]`, and the Rust/Node/
+  Python clients expose `resume_by_handle`/`resumeByHandle`.
+- **Cancel from every surface** — chat channels gain `!cancel`, and
+  the CLI REPL accepts `/cancel` (or `cancel`/`/stop`) mid-turn. Other
+  input typed mid-turn is carried over as the next prompt instead of
+  being swallowed.
+
+### Fixed — interrupt classification
+
+- **Claude cancels reported as failures** — an interrupted turn's
+  result frame arrives `is_error:true` with subtype
+  `error_during_execution`, so `turn.cancel` surfaced as
+  `[turn error] unknown error`. The dialect now maps
+  `terminal_reason:"aborted_streaming"` (and `subtype:"interrupted"`)
+  to `TurnCanceled`.
+- **`mode_changed` fell through to `model_changed`** in the web UI
+  event switch, printing a bogus `model: undefined` line on every mode
+  change.
+
+## 0.2.0 — 2026-09-19
 
 ### Breaking
 

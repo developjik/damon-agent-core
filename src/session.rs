@@ -26,8 +26,6 @@ pub struct ManagedSession {
     /// Latest persistence handle (native session id), refreshed on
     /// ThreadStarted events.
     pub handle: Option<PersistenceHandle>,
-    /// Working directory the session runs in.
-    pub cwd: std::path::PathBuf,
     /// A turn is in flight — the idle sweep must not reap this session.
     pub busy: std::sync::atomic::AtomicBool,
 }
@@ -151,14 +149,13 @@ impl SessionManager {
     ) -> Result<Arc<ManagedSession>> {
         let provider = self.resolve_provider(backend)?;
         let client = self.clients.read()[&provider].clone();
-        let session = client.create_session(config.clone()).await?;
+        let session = client.create_session(config).await?;
         let id = uuid::Uuid::new_v4().to_string();
         let managed = Arc::new(ManagedSession {
             id: id.clone(),
             provider,
             handle: session.persistence_handle(),
             session,
-            cwd: config.cwd,
             busy: std::sync::atomic::AtomicBool::new(false),
         });
         self.sessions
@@ -181,15 +178,12 @@ impl SessionManager {
             .get(&handle.provider)
             .cloned()
             .with_context(|| format!("backend `{}` not available", handle.provider))?;
-        let session = client
-            .resume_session(handle, config.clone(), ResumePurpose::Interactive)
-            .await?;
+        let session = client.resume_session(handle, config).await?;
         let managed = Arc::new(ManagedSession {
             id: session_id.to_string(),
             provider: handle.provider.clone(),
             handle: Some(handle.clone()),
             session,
-            cwd: config.cwd,
             busy: std::sync::atomic::AtomicBool::new(false),
         });
         self.sessions

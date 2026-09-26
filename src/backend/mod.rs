@@ -11,9 +11,14 @@ pub mod registry;
 pub mod transport;
 pub mod types;
 
+pub mod amp;
 pub mod claude;
 pub mod codex;
+pub mod cursor;
+pub mod kimi;
 pub mod omp;
+pub mod qwen;
+pub mod streamjson;
 
 pub use types::*;
 
@@ -41,13 +46,11 @@ pub trait AgentClient: Send + Sync {
     /// Start a fresh session. The returned object owns its process.
     async fn create_session(&self, config: SessionConfig) -> Result<Arc<dyn AgentSession>>;
 
-    /// Reattach to the provider's durable session. `purpose` selects
-    /// driving the agent vs read-only history.
+    /// Reattach to the provider's durable session.
     async fn resume_session(
         &self,
         handle: &PersistenceHandle,
         config: SessionConfig,
-        purpose: ResumePurpose,
     ) -> Result<Arc<dyn AgentSession>>;
 
     /// Native sessions created outside the daemon (e.g. a `claude` run
@@ -95,19 +98,12 @@ pub trait AgentSession: Send + Sync {
     /// native session. Resume via the persistence handle afterwards.
     async fn close(&self) -> Result<()>;
 
-    /// Answer a pending permission ask. Some resolutions schedule a
-    /// follow-up turn (plan approval → implementation).
+    /// Answer a pending permission ask.
     async fn respond_to_permission(
         &self,
         request_id: &str,
         response: PermissionResponse,
-    ) -> Result<PermissionResult>;
-
-    /// Permission asks currently awaiting an answer.
-    fn pending_permissions(&self) -> Vec<PermissionRequest>;
-
-    /// The session's transcript so far, normalized.
-    async fn history(&self) -> Result<Vec<TimelineItem>>;
+    ) -> Result<()>;
 
     /// The resume token for this session, once the backend has one.
     fn persistence_handle(&self) -> Option<PersistenceHandle>;

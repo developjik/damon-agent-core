@@ -18,8 +18,19 @@ Damon drives coding agents through their native CLIs as stdio subprocesses. Mode
 | `claude` | Claude Code (Claude Pro/Max) | `claude -p --output-format stream-json --input-format stream-json --verbose` | `claude` CLI login |
 | `codex` | Codex CLI (ChatGPT Plus/Pro) | `codex app-server` | `codex` CLI login |
 | `omp` | Oh My Pi (any provider keys it manages) | `omp --mode rpc` | OMP's own auth store |
+| `cursor` | Cursor Agent (Cursor subscription) | `cursor-agent -p --output-format stream-json --trust` | `cursor-agent login` or `CURSOR_API_KEY` |
+| `amp` | Amp (Sourcegraph) | `amp --execute --stream-json --stream-json-input` | `amp` CLI login |
+| `kimi` | Kimi Code (Moonshot) | `kimi -p --output-format stream-json` | `kimi login` |
+| `qwen` | Qwen Code (Alibaba) | `qwen -p --output-format stream-json` | `qwen` CLI login |
 
 Detection: the binary on PATH registers the backend automatically.
+
+Session shapes differ per backend: `claude` and `amp` keep one process per
+session (bidirectional stream-json — permission relay, steering, interrupts
+work). `cursor`, `kimi`, and `qwen` are one-shot per turn — each prompt
+respawns the CLI with a resume flag (`--resume`/`--session`), so mid-turn
+steering and permission relay are unavailable; headless runs use the CLI's
+own auto-approval policy.
 
 Overrides — replace a launch line or point at a local build:
 
@@ -33,7 +44,7 @@ ANTHROPIC_MODEL = "claude-sonnet-4-5"
 
 `session.create`'s `backend` parameter picks the backend per session. Omitted → the `default_backend` setting → the first available backend.
 
-MCP servers — both `[mcp_servers]` (global) and `session.create`'s `mcpServers` (per-session) — are **forwarded to the agent**, which spawns and permissions them itself. Damon never launches MCP servers directly.
+MCP servers — `session.create`'s `mcpServers` — are **forwarded to the agent**, which spawns and permissions them itself. Damon never launches MCP servers directly.
 
 ## Auth
 
@@ -41,9 +52,7 @@ Only needed when `auth_token` is set. `/ws` takes the same bearer token via the 
 
 Browser Origin: without `auth_token`, requests carrying an `Origin` header must be loopback origins. With a token, all origins pass — the token is the gate.
 
-`GET /metrics` (behind the token gate) exposes Prometheus counters: `damon_requests_total`, `damon_prompts_total`, `damon_active_sessions`, `damon_live_sessions`, `damon_permission_waits_total`, `damon_permission_wait_ms_total`, plus per-backend `damon_turn_duration_ms_sum`/`_count`/`damon_turn_errors_total`.
-
-`GET /v1/events` (behind the token gate) is a Server-Sent Events fan-out of daemon lifecycle events. A lagging subscriber sees a `lagged` comment frame — reconnect to resync.
+`GET /metrics` (behind the token gate) exposes Prometheus counters: `damon_requests_total` and `damon_live_sessions`.
 
 ## WS protocol (v2)
 
@@ -54,7 +63,7 @@ Client → daemon requests:
 - `hello` → `{protocol, backends, methods}` — also pushed on connect
 - `backend.list` → `{backends: [{id, available, capabilities}]}`
 - `session.create {backend?, cwd?, model?, mode?, mcpServers?}` → `{sessionId, backend}`
-- `session.resume {sessionId}` → `{sessionId, backend}` — reattaches via the backend's native resume token
+- `session.resume {sessionId}` → `{sessionId, backend}` — reattaches via the backend's native resume token. Call with `{handle:{provider,native_handle}, cwd?, title?}` to import a native session made outside the daemon (same handle dedups to the same session)
 - `session.list {limit?, offset?}` → `{sessions: [...]}`
 - `session.messages {sessionId, limit?, offset?}` → `{messages: [...]}`
 - `session.import {backend, cwd?}` → `{sessions: [...]}` — native sessions created outside the daemon
@@ -72,7 +81,7 @@ Client → daemon requests:
 
 Daemon → client pushes:
 
-- `{"event":"session.event","sessionId","data":<StreamEvent>}` — every event for sessions this connection has touched (create/resume/turn). StreamEvent kinds: `turn_started`, `timeline` (assistant_message/reasoning/tool_call/todo/…), `permission_requested`, `turn_completed`, `turn_failed`, `turn_canceled`, `attention_required`, `usage_updated`, `model_changed`, `mode_changed`, `thread_started`, `subagent`.
+- `{"event":"session.event","sessionId","data":<StreamEvent>}` — every event for sessions this connection has touched (create/resume/turn). StreamEvent kinds: `turn_started`, `timeline` (assistant_message/reasoning/tool_call/todo/…), `permission_requested`, `turn_completed`, `turn_failed`, `turn_canceled`, `attention_required`, `model_changed`, `mode_changed`, `thread_started`, `subagent`.
 
 `turn.start` `stopReason`: `completed` | `failed` | `canceled` | `timeout`.
 

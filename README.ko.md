@@ -120,6 +120,7 @@ damon-slack    --app-token xapp-… --bot-token xoxb-…
 
 ## 문서
 
+- **[프로젝트 홈페이지](https://developjik.github.io/damon-agent-core/)** — Damon 한눈에 보기
 - [docs/protocol-v2.md](docs/protocol-v2.md) — 와이어 프로토콜 (메서드, 이벤트, 타입)
 - [docs/install.ko.md](docs/install.ko.md) ([en](docs/install.md)) — 설치 경로, 서비스 등록
 - [docs/integration.ko.md](docs/integration.ko.md) ([en](docs/integration.md)) — 에이전트 연결, 최소 클라이언트

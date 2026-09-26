@@ -23,7 +23,6 @@ pub fn mock_config(auth_token: Option<&str>) -> Config {
         data_dir: None,
         tls_cert: None,
         tls_key: None,
-        mcp_servers: HashMap::new(),
         backends: Default::default(),
         default_backend: Some("mock".to_string()),
         relay: None,
@@ -71,7 +70,6 @@ impl AgentClient for MockClient {
         &self,
         handle: &PersistenceHandle,
         _config: SessionConfig,
-        _purpose: ResumePurpose,
     ) -> Result<Arc<dyn AgentSession>> {
         let s = MockSession::new();
         *s.handle.lock().await = Some(handle.clone());
@@ -253,24 +251,14 @@ impl AgentSession for MockSession {
         &self,
         request_id: &str,
         response: PermissionResponse,
-    ) -> Result<PermissionResult> {
+    ) -> Result<()> {
         if let Some(p) = self.pending.lock().await.remove(request_id) {
             let _ = p.answer.send(response);
             self.emit(StreamEvent::new(StreamEventKind::PermissionResolved {
                 request_id: request_id.to_string(),
             }));
         }
-        Ok(PermissionResult::default())
-    }
-
-    fn pending_permissions(&self) -> Vec<PermissionRequest> {
-        // Lock-free read isn't possible with tokio::Mutex; tests poll
-        // events instead. Return empty — the asks arrive via subscribe().
-        vec![]
-    }
-
-    async fn history(&self) -> Result<Vec<TimelineItem>> {
-        Ok(vec![])
+        Ok(())
     }
 
     fn persistence_handle(&self) -> Option<PersistenceHandle> {

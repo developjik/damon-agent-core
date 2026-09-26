@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
-# Sync the release version across Cargo.toml, npm/package.json, and
-# Formula/damon.rb. Usage: scripts/set-version.sh 0.2.0
+# Sync the release version across Cargo.toml, npm/package.json,
+# Formula/damon.rb, and the python package. Usage: scripts/set-version.sh 0.2.0
 set -euo pipefail
 
 if [ $# -ne 1 ]; then
@@ -43,6 +43,13 @@ sed_i \
   -e "s|/releases/download/v[0-9][0-9A-Za-z.-]*/|/releases/download/v$VERSION/|g" \
   "$ROOT/Formula/damon.rb"
 
+# python/pyproject.toml — top-level `version = "…"` in [project]
+# (the only line in the file starting with `version =`).
+sed_i "s/^version = \".*\"/version = \"$VERSION\"/" "$ROOT/python/pyproject.toml"
+
+# python/src/damon_agent/__init__.py — __version__ literal.
+sed_i "s/^__version__ = \".*\"/__version__ = \"$VERSION\"/" "$ROOT/python/src/damon_agent/__init__.py"
+
 echo "version set to $VERSION in:"
-echo "  Cargo.toml, npm/package.json, Formula/damon.rb"
+echo "  Cargo.toml, npm/package.json, Formula/damon.rb, python/pyproject.toml, python/src/damon_agent/__init__.py"
 echo "note: the ci.yml release job rewrites Formula sha256 from the published tarballs"

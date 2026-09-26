@@ -34,26 +34,6 @@ type AuthTokenCache = (Option<String>, Option<(Instant, Result<String, String>)>
 #[derive(Default)]
 pub struct Metrics {
     pub requests_total: std::sync::atomic::AtomicU64,
-    pub prompts_total: std::sync::atomic::AtomicU64,
-    pub active_sessions: std::sync::atomic::AtomicI64,
-    /// Permission asks answered (any outcome) and their total wait —
-    /// divide for the mean; a rising wait means users are slow or
-    /// prompts stall on asks.
-    pub permission_waits_total: std::sync::atomic::AtomicU64,
-    pub permission_wait_ms_total: std::sync::atomic::AtomicU64,
-}
-
-/// One daemon event for the SSE fan-out: (event type, JSON data).
-/// Arc'd so every subscriber clones a pointer, not the payload.
-pub type DaemonEvent = Arc<(String, String)>;
-
-/// Per-agent turn counters — `latency_ms` is a sum; divide by `turns` for
-/// the mean.
-#[derive(Default)]
-pub struct AgentStat {
-    pub turns: u64,
-    pub errors: u64,
-    pub latency_ms: u64,
 }
 
 /// Shared daemon state: config, store, and the session manager that
@@ -79,12 +59,6 @@ pub struct AppState {
     /// Per-source-IP token buckets for token-gated routes on non-loopback
     /// binds.
     rate_buckets: tokio::sync::Mutex<HashMap<IpAddr, (f64, Instant)>>,
-    /// Per-backend turn counters for /metrics — populated at turn end.
-    /// parking_lot: the update is a few integer adds, never an await.
-    pub backend_stats: parking_lot::Mutex<HashMap<String, AgentStat>>,
-    /// Daemon event fan-out for GET /v1/events (SSE). Bounded broadcast —
-    /// a lagging subscriber sees a gap, never stalls the daemon.
-    pub events: tokio::sync::broadcast::Sender<DaemonEvent>,
 }
 
 impl AppState {
@@ -109,10 +83,6 @@ impl AppState {
             metrics: Metrics::default(),
             ws_tickets: tokio::sync::Mutex::new(HashMap::new()),
             rate_buckets: tokio::sync::Mutex::new(HashMap::new()),
-            backend_stats: parking_lot::Mutex::new(HashMap::new()),
-            // 256-event ring: a subscriber that falls behind gets a
-            // Lagged error and reconnects; the daemon never waits on it.
-            events: tokio::sync::broadcast::channel(256).0,
         });
         // Idle session sweep: backend sessions unused for
         // agent_idle_secs are closed (they reattach via the persistence
@@ -276,10 +246,6 @@ pub fn router(state: Arc<AppState>) -> Router {
     // not an OpenAI-compatible proxy.
     let v1 = Router::new()
         .route("/ws_ticket", post(ws_ticket))
-        // Daemon event stream (SSE): turn/session/agent lifecycle events
-        // for automations that can't hold a WS open. Token-gated like
-        // the rest of /v1.
-        .route("/events", get(events_sse))
         .route_layer(axum::middleware::from_fn_with_state(
             state.clone(),
             require_token,
@@ -338,28 +304,12 @@ async fn health(State(state): State<Arc<AppState>>) -> Json<serde_json::Value> {
 
 /// GET /metrics — Prometheus text exposition of the process counters.
 async fn metrics(State(state): State<Arc<AppState>>) -> Response {
-    let m = &state.metrics;
     use std::sync::atomic::Ordering::Relaxed;
-    let mut body = format!(
-        "damon_requests_total {}\ndamon_prompts_total {}\ndamon_active_sessions {}\ndamon_live_sessions {}\ndamon_permission_waits_total {}\ndamon_permission_wait_ms_total {}\n",
-        m.requests_total.load(Relaxed),
-        m.prompts_total.load(Relaxed),
-        m.active_sessions.load(Relaxed),
+    let body = format!(
+        "damon_requests_total {}\ndamon_live_sessions {}\n",
+        state.metrics.requests_total.load(Relaxed),
         state.sessions.busy_ids().await.len(),
-        m.permission_waits_total.load(Relaxed),
-        m.permission_wait_ms_total.load(Relaxed),
     );
-    // Per-backend turn stats — Prometheus label form, one line per backend.
-    let stats = state.backend_stats.lock();
-    let mut backends: Vec<(&String, &AgentStat)> = stats.iter().collect();
-    backends.sort_by_key(|(id, _)| (*id).clone());
-    for (id, s) in backends {
-        let label = prom_label(id);
-        body.push_str(&format!(
-            "damon_turn_duration_ms_sum{{backend=\"{label}\"}} {}\ndamon_turn_duration_ms_count{{backend=\"{label}\"}} {}\ndamon_turn_errors_total{{backend=\"{label}\"}} {}\n",
-            s.latency_ms, s.turns, s.errors
-        ));
-    }
     (
         [(
             axum::http::header::CONTENT_TYPE,
@@ -368,42 +318,6 @@ async fn metrics(State(state): State<Arc<AppState>>) -> Response {
         body,
     )
         .into_response()
-}
-
-/// Escape a value for a Prometheus label — quotes and backslashes only.
-fn prom_label(v: &str) -> String {
-    v.replace('\\', "\\\\").replace('"', "\\\"")
-}
-
-/// GET /v1/events — Server-Sent Events fan-out of daemon lifecycle
-/// events (turn/session/agent). Token-gated with the rest of /v1.
-/// A lagging subscriber sees a broadcast Lagged gap, never stalls the
-/// daemon; the client should reconnect to resync.
-async fn events_sse(
-    State(state): State<Arc<AppState>>,
-) -> axum::response::sse::Sse<
-    impl futures::Stream<Item = Result<axum::response::sse::Event, std::convert::Infallible>>,
-> {
-    use axum::response::sse::{Event, KeepAlive};
-    let rx = state.events.subscribe();
-    let stream = futures::stream::unfold(rx, |mut rx| async move {
-        match rx.recv().await {
-            Ok(ev) => {
-                let (ty, data) = &*ev;
-                let e = Event::default().event(ty).data(data.as_str());
-                Some((Ok(e), rx))
-            }
-            Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => {
-                // Surface the gap as a named event so EventSource
-                // consumers can listen for it and resync — a comment
-                // frame would be invisible to addEventListener.
-                let e = Event::default().event("lagged");
-                Some((Ok(e), rx))
-            }
-            Err(tokio::sync::broadcast::error::RecvError::Closed) => None,
-        }
-    });
-    axum::response::sse::Sse::new(stream).keep_alive(KeepAlive::default())
 }
 
 /// POST /v1/ws_ticket — issue a one-shot ticket usable as /ws?ticket=

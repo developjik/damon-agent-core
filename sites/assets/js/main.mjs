@@ -5,12 +5,12 @@
 const I18N = {
   ko: {
     "meta.title": "Damon — 데몬 하나. 모든 코딩 에이전트.",
-    "nav.features": "기능", "nav.arch": "구조", "nav.quick": "시작하기",
+    "nav.features": "기능", "nav.arch": "구조", "nav.quick": "시작하기", "nav.tools": "도구",
     "nav.chan": "채널", "nav.eco": "생태계",
     "hero.badge": "Rust 기반 로컬 에이전트 컨트롤 데몬",
     "hero.title1": "데몬 하나.",
     "hero.title2": "모든 코딩 에이전트.",
-    "hero.lead": "Damon은 Claude Code·Codex CLI·Oh My Pi를 네이티브 CLI로 구동하는 Rust 상주 데몬입니다. 모델·툴·인증은 에이전트 몫 — Damon은 세션, 권한 릴레이, 검색 가능한 히스토리, 채팅 채널, 원격 접근을 소유합니다.",
+    "hero.lead": "Damon은 Claude Code·Codex CLI·Oh My Pi·Cursor·Amp·Kimi·Qwen을 각자의 네이티브 CLI로 구동하는 Rust 상주 데몬입니다. 모델·툴·인증은 에이전트 몫 — Damon은 세션, 권한 릴레이, 검색 가능한 히스토리, 채팅 채널, 원격 접근을 소유합니다.",
     "hero.install.label": "설치",
     "hero.cta.quick": "퀵스타트",
     "hero.cta.gh": "GitHub에서 보기",
@@ -19,7 +19,7 @@ const I18N = {
     "feat.title": "에이전트는 그대로, 제어는 한 곳에서",
     "feat.lead": "이미 에이전트 CLI를 구독 중이라면 설정할 게 하나도 없습니다. Damon은 설치된 CLI를 감지해 로그인과 툴을 그대로 물려받습니다.",
     "f1t": "설정 없는 백엔드",
-    "f1d": "PATH의 claude·codex·omp를 자동 등록합니다. 다른 에이전트도 <code>[backends.X]</code> 블록 하나면 연결됩니다.",
+    "f1d": "PATH의 claude·codex·omp·cursor·amp·kimi·qwen이면 자동 등록됩니다. 다른 에이전트도 <code>[backends.X]</code> 블록 하나면 연결됩니다.",
     "f2t": "권한은 당신 채널로",
     "f2d": "에이전트의 권한 요청을 웹 UI·CLI·텔레그램/디스코드/슬랙의 <code>allow</code>/<code>deny</code> 답장으로 릴레이합니다.",
     "f3t": "검색 가능한 히스토리",
@@ -74,6 +74,18 @@ const I18N = {
     "eco.py.d": "asyncio 기반 공식 클라이언트.",
     "eco.py.link": "python/ 디렉터리 →",
     "eco.rs.d": "crates.io의 코어 크레이트.",
+    "strip.title": "PATH에 있으면 자동 등록 — 일곱 개 네이티브 백엔드",
+    "strip.more": "그 외 어떤 에이전트 CLI도 <code>[backends.X]</code> 블록 하나로",
+    "tools.kicker": "세션 도구상자",
+    "tools.title": "히스토리는 자산입니다",
+    "tools.lead": "모든 대화가 SQLite에 쌓입니다 — 검색하고, 분기하고, 내보내고, 백업하세요. 데몬이 살아 있는 동안에도 안전합니다.",
+    "tools.t1": "대화", "tools.t2": "탐색", "tools.t3": "보존",
+    "tools.c1": "이전 세션 이어서",
+    "tools.c2": "데몬 밖에서 만든 세션 흡수",
+    "tools.c3": "토큰 사용량",
+    "tools.c4": "히스토리 복사해 분기",
+    "tools.c5": "Markdown 트랜스크립트",
+    "tools.c6": "실행 중에도 안전한 스냅샷",
     "foot.tag": "이름은 daemon의 말장난이자, 말 그대로 실제 아키텍처입니다.",
     "foot.license": "듀얼 라이선스 MIT 또는 Apache-2.0",
     "copy.aria": "명령 복사",
@@ -82,12 +94,12 @@ const I18N = {
   },
   en: {
     "meta.title": "Damon — One daemon. Every coding agent.",
-    "nav.features": "Features", "nav.arch": "Architecture", "nav.quick": "Quickstart",
+    "nav.features": "Features", "nav.arch": "Architecture", "nav.quick": "Quickstart", "nav.tools": "Toolbox",
     "nav.chan": "Channels", "nav.eco": "Ecosystem",
     "hero.badge": "Local agent-control daemon in Rust",
     "hero.title1": "One daemon.",
     "hero.title2": "Every coding agent.",
-    "hero.lead": "Damon is a resident Rust daemon that drives Claude Code, Codex CLI, and Oh My Pi through their native CLIs. Model, tools, and auth belong to the agents — Damon owns sessions, permission relaying, searchable history, chat channels, and remote access.",
+    "hero.lead": "Damon is a resident Rust daemon that drives Claude Code, Codex CLI, Oh My Pi, Cursor, Amp, Kimi, and Qwen through their native CLIs. Model, tools, and auth belong to the agents — Damon owns sessions, permission relaying, searchable history, chat channels, and remote access.",
     "hero.install.label": "Install",
     "hero.cta.quick": "Quickstart",
     "hero.cta.gh": "View on GitHub",
@@ -96,7 +108,7 @@ const I18N = {
     "feat.title": "Agents stay theirs, control stays yours",
     "feat.lead": "If you already subscribe to an agent CLI, there is nothing to configure. Damon detects installed CLIs and inherits their logins and tools.",
     "f1t": "Zero-config backends",
-    "f1d": "claude, codex, and omp on PATH register themselves. Any other agent plugs in via one <code>[backends.X]</code> block.",
+    "f1d": "claude, codex, omp, cursor, amp, kimi, and qwen on PATH register themselves. Any other agent plugs in via one <code>[backends.X]</code> block.",
     "f2t": "Permissions flow to your surface",
     "f2d": "The agent's permission ask is relayed to the web UI, CLI, or an <code>allow</code>/<code>deny</code> reply in Telegram, Discord, or Slack.",
     "f3t": "Searchable history",
@@ -151,6 +163,18 @@ const I18N = {
     "eco.py.d": "The official asyncio client.",
     "eco.py.link": "python/ directory →",
     "eco.rs.d": "The core crate on crates.io.",
+    "strip.title": "On PATH, self-registered — seven native backends",
+    "strip.more": "Any other agent CLI: one <code>[backends.X]</code> block",
+    "tools.kicker": "Session toolbox",
+    "tools.title": "History is an asset",
+    "tools.lead": "Every conversation lands in SQLite — search it, fork it, export it, back it up. Safe even while the daemon runs.",
+    "tools.t1": "Chat", "tools.t2": "Mine", "tools.t3": "Keep",
+    "tools.c1": "pick up an old session",
+    "tools.c2": "adopt sessions made outside damon",
+    "tools.c3": "token usage",
+    "tools.c4": "branch from a copy",
+    "tools.c5": "Markdown transcript",
+    "tools.c6": "safe while damond runs",
     "foot.tag": "The name is a pun on daemon — and literally the architecture.",
     "foot.license": "Dual-licensed MIT or Apache-2.0",
     "copy.aria": "Copy command",
@@ -226,6 +250,32 @@ document.addEventListener("click", async (e) => {
   }
 });
 
+/* --------------------------- scroll reveal --------------------------- */
+
+const REVEAL_SELS =
+  ".section .card, .term, .ui-note, .backend-strip, .arch-api, .arch-core, .arch-row, .docs-links";
+const revealOK = "IntersectionObserver" in window
+  && !matchMedia("(prefers-reduced-motion: reduce)").matches;
+if (revealOK) {
+  const els = [...document.querySelectorAll(REVEAL_SELS)];
+  els.forEach((el) => {
+    el.classList.add("reveal");
+    const sibs = [...el.parentElement.children].filter((c) => c.classList.contains("reveal"));
+    el.style.transitionDelay = `${Math.min(sibs.length - 1, 5) * 60}ms`;
+  });
+  const io = new IntersectionObserver((entries) => {
+    for (const en of entries) {
+      if (!en.isIntersecting) continue;
+      const el = en.target;
+      el.classList.add("in");
+      el.addEventListener("transitionend",
+        () => { el.style.transitionDelay = ""; }, { once: true });
+      io.unobserve(el);
+    }
+  }, { rootMargin: "0px 0px -6% 0px", threshold: 0.06 });
+  els.forEach((el) => io.observe(el));
+}
+
 /* ----------------------------- 3D scene ----------------------------- */
 
 // Scene graph: Damon core at center, agent CLIs on the inner orbit,
@@ -251,6 +301,18 @@ const NODES = {
     { name: { ko: "Oh My Pi", en: "Oh My Pi" },
       desc: { ko: "RPC 모드 백엔드", en: "RPC-mode backend" },
       color: "#a78bfa", target: "#features" },
+    { name: { ko: "Cursor Agent", en: "Cursor Agent" },
+      desc: { ko: "Cursor 구독 그대로 사용", en: "your Cursor subscription, as-is" },
+      color: "#e8ecf4", target: "#features" },
+    { name: { ko: "Amp", en: "Amp" },
+      desc: { ko: "Sourcegraph Amp dialect", en: "Sourcegraph Amp dialect" },
+      color: "#fbbf24", target: "#features" },
+    { name: { ko: "Kimi Code", en: "Kimi Code" },
+      desc: { ko: "Moonshot 코딩 에이전트", en: "Moonshot's coding agent" },
+      color: "#fb7185", target: "#features" },
+    { name: { ko: "Qwen Code", en: "Qwen Code" },
+      desc: { ko: "Alibaba 코딩 에이전트", en: "Alibaba's coding agent" },
+      color: "#67e8f9", target: "#features" },
   ],
   clients: [
     { name: { ko: "CLI", en: "CLI" },
@@ -274,8 +336,8 @@ const NODES = {
   ],
 };
 
-const AGENT_R = 5.3;
-const CLIENT_R = 8.4;
+const AGENT_R = 4.8;
+const CLIENT_R = 6.0;
 
 function roundRectPath(ctx, x, y, w, h, r) {
   ctx.beginPath();
@@ -287,9 +349,9 @@ function roundRectPath(ctx, x, y, w, h, r) {
   ctx.closePath();
 }
 
-function makeLabelSprite(THREE, text, accent) {
+function makeLabelSprite(THREE, text, accent, baseH = 0.62) {
   const s = 2; // supersample for crisp text
-  const font = `600 ${13 * s}px -apple-system, BlinkMacSystemFont, "Segoe UI", "Apple SD Gothic Neo", "Noto Sans KR", sans-serif`;
+  const font = `650 ${14 * s}px -apple-system, BlinkMacSystemFont, "Segoe UI", "Apple SD Gothic Neo", "Noto Sans KR", sans-serif`;
   const c = document.createElement("canvas");
   let ctx = c.getContext("2d");
   ctx.font = font;
@@ -299,13 +361,13 @@ function makeLabelSprite(THREE, text, accent) {
   ctx = c.getContext("2d");
   ctx.font = font;
   ctx.clearRect(0, 0, c.width, c.height);
-  ctx.fillStyle = "rgba(9, 13, 22, 0.88)";
+  ctx.fillStyle = "rgba(9, 13, 22, 0.74)";
   ctx.strokeStyle = accent;
-  ctx.lineWidth = 1.2 * s;
+  ctx.lineWidth = 1.0 * s;
   roundRectPath(ctx, 1 * s, 1 * s, c.width - 2 * s, c.height - 2 * s, 11 * s);
   ctx.fill();
   ctx.stroke();
-  ctx.fillStyle = "#e6ebf5";
+  ctx.fillStyle = "#f2f6fc";
   ctx.textAlign = "center";
   ctx.textBaseline = "middle";
   ctx.fillText(text, c.width / 2, c.height / 2 + s);
@@ -315,7 +377,6 @@ function makeLabelSprite(THREE, text, accent) {
     map: tex, transparent: true, depthTest: false,
   }));
   sprite.renderOrder = 20;
-  const baseH = 0.62;
   sprite.scale.set(baseH * c.width / c.height, baseH, 1);
   return sprite;
 }
@@ -366,15 +427,16 @@ async function initScene() {
   container.appendChild(renderer.domElement);
 
   const scene = new THREE.Scene();
-  scene.fog = new THREE.Fog(0x0a0e16, 20, 52);
+  scene.fog = new THREE.Fog(0x0a0e16, 26, 60);
 
   const camera = new THREE.PerspectiveCamera(
     42, container.clientWidth / container.clientHeight, 0.1, 120);
-  camera.position.set(6.5, 5, 17.5);
+  camera.position.set(5.5, 4.5, 28);
 
   const controls = new OrbitControls(camera, renderer.domElement);
-  controls.target.set(0, 0.4, 0);
-  controls.enableDamping = true;
+  // Target far left of the system center: the whole orbit renders in the
+  // right half of the hero, clear of the copy column (mask finishes the job).
+  controls.target.set(-9.3, 0.3, 0);
   controls.dampingFactor = 0.06;
   controls.enablePan = false;
   controls.minDistance = 9;
@@ -441,7 +503,7 @@ async function initScene() {
   /* ----- nodes ----- */
   const pickables = [coreMesh];
 
-  function addNode(def, parent, geom, baseScale) {
+  function addNode(def, parent, geom, baseScale, labelH) {
     const color = new THREE.Color(def.color);
     const mesh = new THREE.Mesh(geom, new THREE.MeshStandardMaterial({
       color, emissive: color, emissiveIntensity: 0.35,
@@ -456,7 +518,7 @@ async function initScene() {
     halo.scale.setScalar(2.1 * baseScale);
     mesh.add(halo);
     def.halo = halo;
-    const label = makeLabelSprite(THREE, def.name[lang], def.color);
+    const label = makeLabelSprite(THREE, def.name[lang], def.color, labelH);
     label.position.y = 1.15 * baseScale;
     mesh.add(label);
     def.label = label;
@@ -467,9 +529,9 @@ async function initScene() {
   }
 
   NODES.agents.forEach((def) =>
-    addNode(def, agentPivot, new THREE.SphereGeometry(0.5, 24, 24), 1));
+    addNode(def, agentPivot, new THREE.SphereGeometry(0.42, 24, 24), 0.95, 0.5));
   NODES.clients.forEach((def) =>
-    addNode(def, clientPivot, new THREE.IcosahedronGeometry(0.36, 0), 0.72));
+    addNode(def, clientPivot, new THREE.IcosahedronGeometry(0.36, 0), 0.72, 0.55));
 
   /* ----- connections + packets ----- */
   const connections = [];
@@ -592,11 +654,11 @@ async function initScene() {
     const time = clock.elapsedTime;
 
     NODES.agents.forEach((n, i) => {
-      const a = time * 0.14 * motion + (i * Math.PI * 2) / 3;
+      const a = time * 0.14 * motion + (i * Math.PI * 2) / NODES.agents.length;
       n.mesh.position.set(Math.cos(a) * AGENT_R, 0, Math.sin(a) * AGENT_R);
     });
     NODES.clients.forEach((n, i) => {
-      const a = -time * 0.09 * motion + (i * Math.PI * 2) / 6;
+      const a = -time * 0.09 * motion + (i * Math.PI * 2) / NODES.clients.length;
       n.mesh.position.set(Math.cos(a) * CLIENT_R, 0, Math.sin(a) * CLIENT_R);
     });
 

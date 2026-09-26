@@ -1,6 +1,6 @@
 [package]
 name = "damon-core"
-version = "0.3.0"
+version = "0.4.0"
 edition = "2024"
 license = "MIT OR Apache-2.0"
 description = "Damon agent core — local control daemon for coding agents"
@@ -25,7 +25,6 @@ serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 thiserror = "2"
 tokio = { version = "1", features = ["full"] }
-tokio-stream = { version = "0.1", features = ["time"] }
 toml = "0.9"
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
@@ -47,11 +46,7 @@ rustls = { version = "0.23.45", features = ["ring"] }
 
 
 [dev-dependencies]
-sysinfo = "0.33"
-tempfile = "3"
-http-body-util = "0.1"
 tower = { version = "0.5", features = ["util"] }
-rcgen = "0.14.10"
 
 
 [features]

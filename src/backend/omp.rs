@@ -90,8 +90,18 @@ impl AgentClient for OmpClient {
         let _ = probe.close().await;
         Ok(ProviderCatalog {
             models,
-            modes: vec![],
-            default_mode: None,
+            // omp's RPC protocol has no set_approval_mode command, so modes
+            // are launch-time only (see mode_args below) — hence
+            // dynamic_modes: false.
+            modes: ["default", "acceptEdits", "bypassPermissions"]
+                .iter()
+                .map(|m| ModeDef {
+                    id: m.to_string(),
+                    name: m.to_string(),
+                    description: None,
+                })
+                .collect(),
+            default_mode: Some("default".to_string()),
         })
     }
 
@@ -103,7 +113,6 @@ impl AgentClient for OmpClient {
         &self,
         handle: &PersistenceHandle,
         config: SessionConfig,
-        _purpose: ResumePurpose,
     ) -> Result<Arc<dyn AgentSession>> {
         let session = OmpSession::spawn(&self.resolved, config).await?;
         session
@@ -134,6 +143,21 @@ struct ChunkBuf {
     parts: Vec<Option<Vec<u8>>>,
 }
 
+/// Damon permission modes → omp's native `--approval-mode` (omp 18.2.6:
+/// always-ask | write | yolo). The RPC protocol cannot change it at
+/// runtime, so the mode is fixed at spawn; unknown modes defer to omp's
+/// own `tools.approvalMode` setting.
+fn mode_args(mode: Option<&str>) -> Vec<String> {
+    match mode {
+        Some("bypassPermissions") => ["--approval-mode", "yolo"],
+        Some("acceptEdits") => ["--approval-mode", "write"],
+        _ => return vec![],
+    }
+    .iter()
+    .map(|s| s.to_string())
+    .collect()
+}
+
 pub struct OmpSession {
     transport: Arc<NdjsonTransport>,
     caps: Capabilities,
@@ -143,7 +167,6 @@ pub struct OmpSession {
     session_file: Mutex<Option<String>>,
     current_turn: Mutex<Option<String>>,
     pending_asks: Mutex<HashMap<String, PendingAsk>>,
-    timeline: Mutex<Vec<TimelineItem>>,
     /// toolCallId → running ToolCall for tool_execution_* correlation.
     open_tools: Mutex<HashMap<String, ToolCall>>,
     /// In-flight rpc_chunk reassembly (protocol v2).
@@ -153,8 +176,9 @@ pub struct OmpSession {
 impl OmpSession {
     async fn spawn(resolved: &ResolvedBackend, config: SessionConfig) -> Result<Arc<Self>> {
         let env: HashMap<String, String> = resolved.env.iter().cloned().collect();
-        let transport =
-            NdjsonTransport::spawn(&resolved.command, &resolved.args, &env, &config.cwd).await?;
+        let mut args = resolved.args.clone();
+        args.extend(mode_args(config.mode.as_deref()));
+        let transport = NdjsonTransport::spawn(&resolved.command, &args, &env, &config.cwd).await?;
 
         let (events, _) = broadcast::channel(512);
         let session = Arc::new(Self {
@@ -175,7 +199,6 @@ impl OmpSession {
             session_file: Mutex::new(None),
             current_turn: Mutex::new(None),
             pending_asks: Mutex::new(HashMap::new()),
-            timeline: Mutex::new(Vec::new()),
             open_tools: Mutex::new(HashMap::new()),
             chunks: Mutex::new(HashMap::new()),
         });
@@ -513,7 +536,6 @@ impl OmpSession {
     }
 
     async fn emit_timeline(&self, item: TimelineItem) {
-        self.timeline.lock().await.push(item.clone());
         let turn = self.current_turn.lock().await.clone();
         self.emit(StreamEvent {
             turn_id: turn,
@@ -624,7 +646,7 @@ impl AgentSession for OmpSession {
         &self,
         request_id: &str,
         response: PermissionResponse,
-    ) -> Result<PermissionResult> {
+    ) -> Result<()> {
         let Some(ask) = self.pending_asks.lock().await.remove(request_id) else {
             bail!("no pending permission {request_id}");
         };
@@ -655,18 +677,7 @@ impl AgentSession for OmpSession {
         self.emit(StreamEvent::new(StreamEventKind::PermissionResolved {
             request_id: request_id.to_string(),
         }));
-        Ok(PermissionResult::default())
-    }
-
-    fn pending_permissions(&self) -> Vec<PermissionRequest> {
-        match self.pending_asks.try_lock() {
-            Ok(asks) => asks.values().map(|a| a.request.clone()).collect(),
-            Err(_) => vec![],
-        }
-    }
-
-    async fn history(&self) -> Result<Vec<TimelineItem>> {
-        Ok(self.timeline.lock().await.clone())
+        Ok(())
     }
 
     fn persistence_handle(&self) -> Option<PersistenceHandle> {
@@ -693,5 +704,25 @@ impl AgentSession for OmpSession {
             model: model.to_string(),
         }));
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn mode_args_map_to_approval_mode() {
+        assert_eq!(
+            mode_args(Some("bypassPermissions")),
+            vec!["--approval-mode".to_string(), "yolo".to_string()]
+        );
+        assert_eq!(
+            mode_args(Some("acceptEdits")),
+            vec!["--approval-mode".to_string(), "write".to_string()]
+        );
+        // Unknown/default modes defer to omp's own tools.approvalMode.
+        assert!(mode_args(None).is_empty());
+        assert!(mode_args(Some("plan")).is_empty());
     }
 }

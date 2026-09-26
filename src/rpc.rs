@@ -270,6 +270,63 @@ async fn dispatch(
         }
 
         "session.resume" => {
+            // Import path: a PersistenceHandle points at a native session
+            // that has no Damon row yet — mint one, bind it, resume.
+            if let Some(hv) = params.get("handle") {
+                let handle: PersistenceHandle = serde_json::from_value(hv.clone())
+                    .context("handle must be {provider, native_handle, metadata?}")?;
+                if handle.provider.is_empty() || handle.native_handle.is_empty() {
+                    bail!("handle requires provider and native_handle");
+                }
+                // Re-importing the same native session returns the
+                // existing row instead of duplicating it.
+                let id = match state
+                    .store
+                    .session_by_agent_session(&handle.provider, &handle.native_handle)
+                    .await?
+                {
+                    Some(existing) => existing,
+                    None => {
+                        let id = uuid::Uuid::new_v4().to_string();
+                        let cwd = params["cwd"]
+                            .as_str()
+                            .map(String::from)
+                            .or_else(|| handle.metadata["cwd"].as_str().map(String::from))
+                            .unwrap_or_else(|| ".".to_string());
+                        state
+                            .store
+                            .create_session(&id, &cwd, Some(&handle.provider))
+                            .await?;
+                        state
+                            .store
+                            .set_agent_session(&id, &handle.provider, &handle.native_handle)
+                            .await?;
+                        if let Some(title) = params["title"].as_str() {
+                            let _ = state.store.rename_session(&id, title).await;
+                        }
+                        id
+                    }
+                };
+                let cwd = state
+                    .store
+                    .session_cwd(&id)
+                    .await?
+                    .map(std::path::PathBuf::from)
+                    .unwrap_or_else(|| std::path::PathBuf::from("."));
+                let ms = state
+                    .sessions
+                    .resume(
+                        &id,
+                        &handle,
+                        SessionConfig {
+                            cwd,
+                            ..Default::default()
+                        },
+                    )
+                    .await?;
+                conn.subscribe(&ms).await;
+                return Ok(json!({"sessionId": id, "backend": ms.provider}));
+            }
             let id = params["sessionId"].as_str().context("sessionId required")?;
             // Already live? Just subscribe and return.
             if let Some(ms) = state.sessions.get(id).await {
@@ -507,7 +564,6 @@ fn session_config(params: &Value) -> Result<SessionConfig> {
         model: params["model"].as_str().map(String::from),
         mode: params["mode"].as_str().map(String::from),
         mcp_servers: mcp,
-        ..Default::default()
     })
 }
 
@@ -714,7 +770,7 @@ pub fn rpc_methods() -> Vec<Value> {
         json!({"name": "hello", "result": {"protocol": "number", "backends": "array", "methods": "array"}}),
         json!({"name": "backend.list", "result": {"backends": "array"}}),
         json!({"name": "session.create", "params": {"backend": "string?", "cwd": "string?", "model": "string?", "mode": "string?", "mcpServers": "object?"}, "result": {"sessionId": "string", "backend": "string"}}),
-        json!({"name": "session.resume", "params": {"sessionId": "string"}, "result": {"sessionId": "string", "backend": "string"}}),
+        json!({"name": "session.resume", "params": {"sessionId": "string — or", "handle": "{provider, native_handle}", "cwd": "string?", "title": "string?"}, "result": {"sessionId": "string", "backend": "string"}}),
         json!({"name": "session.list", "params": {"limit": "number?", "offset": "number?"}, "result": {"sessions": "array"}}),
         json!({"name": "session.messages", "params": {"sessionId": "string", "limit": "number?", "before": "number?"}, "result": {"messages": "array"}}),
         json!({"name": "session.import", "params": {"backend": "string", "cwd": "string?"}, "result": {"sessions": "array"}}),

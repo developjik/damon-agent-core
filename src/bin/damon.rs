@@ -90,7 +90,18 @@ enum Cmd {
         #[arg(long)]
         upto: Option<i64>,
     },
-    /// Export a session as Markdown (--md) or JSON to stdout
+    /// List native sessions a backend made outside damon; --attach N
+    /// imports one into the chat REPL
+    Import {
+        /// Backend id to scan (e.g. claude, codex, omp)
+        backend: String,
+        /// Directory to scan (default: current directory)
+        #[arg(long)]
+        cwd: Option<String>,
+        /// 1-based index from the printed list — resume it and chat
+        #[arg(long)]
+        attach: Option<usize>,
+    },
     Export {
         /// Session id to export
         id: String,
@@ -309,6 +320,41 @@ async fn main() -> anyhow::Result<()> {
                 outln(format!("forked {id} → {new_id}"));
             }
         }
+        Cmd::Import {
+            backend,
+            cwd,
+            attach,
+        } => {
+            let found = client.import_sessions(&backend, cwd.as_deref()).await?;
+            match attach {
+                None => {
+                    if args.json {
+                        outln(json!({"sessions": found}).to_string());
+                    } else if found.is_empty() {
+                        outln("no importable sessions");
+                    } else {
+                        for (i, s) in found.iter().enumerate() {
+                            let title = s["title"].as_str().unwrap_or("");
+                            let handle = s["handle"]["native_handle"].as_str().unwrap_or("");
+                            let dir = s["cwd"].as_str().unwrap_or("");
+                            outln(format!("{}: {title}\t{handle}\t{dir}", i + 1));
+                        }
+                        eprintln!("attach one: damon import {backend} --attach N");
+                    }
+                }
+                Some(n) => {
+                    let s = found.get(n.wrapping_sub(1)).with_context(|| {
+                        format!("no session #{n} — run `damon import {backend}` to list")
+                    })?;
+                    let session_id = client
+                        .resume_by_handle(&s["handle"], s["title"].as_str(), s["cwd"].as_str())
+                        .await?;
+                    let mut events = client.events().await;
+                    resume_and_replay(&client, &session_id).await?;
+                    chat_loop(&client, &mut events, &session_id).await?;
+                }
+            }
+        }
         Cmd::Search { query, limit } => {
             let results = client.search(&query, limit).await?;
             if args.json {
@@ -343,7 +389,7 @@ async fn main() -> anyhow::Result<()> {
             // One-shot prompt: no REPL reader exists yet — create the
             // single stdin reader here for permission answers.
             let mut stdin = tokio::io::BufReader::new(tokio::io::stdin()).lines();
-            run_turn(&client, &mut events, &session_id, &text, &mut stdin).await?;
+            let _pending = run_turn(&client, &mut events, &session_id, &text, &mut stdin).await?;
             outln("");
         }
         Cmd::Export { id, md } => {
@@ -616,10 +662,19 @@ async fn chat_loop(
 ) -> anyhow::Result<()> {
     eprintln!("session: {session_id}  (Ctrl-D to quit)");
     let mut stdin = tokio::io::BufReader::new(tokio::io::stdin()).lines();
+    let mut pending: Option<String> = None;
     loop {
         eprint!("> ");
-        let Some(line) = stdin.next_line().await? else {
-            break;
+        // A line typed mid-turn is carried over as the next prompt —
+        // the type-ahead the old blocking read gave for free.
+        let line = match pending.take() {
+            Some(l) => l,
+            None => {
+                let Some(l) = stdin.next_line().await? else {
+                    break;
+                };
+                l
+            }
         };
         if line.trim().is_empty() {
             continue;
@@ -627,11 +682,14 @@ async fn chat_loop(
         // A failed turn (provider error, "session not found", "prompt in
         // progress") must not kill the REPL — only a dead event stream
         // means the connection is gone for good.
-        if let Err(e) = run_turn(client, events, session_id, &line, &mut stdin).await {
-            if events.is_closed() {
-                return Err(e);
+        match run_turn(client, events, session_id, &line, &mut stdin).await {
+            Ok(next) => pending = next,
+            Err(e) => {
+                if events.is_closed() {
+                    return Err(e);
+                }
+                eprintln!("[turn error] {e:#}");
             }
-            eprintln!("[turn error] {e:#}");
         }
     }
     Ok(())
@@ -647,14 +705,47 @@ async fn run_turn(
     session_id: &str,
     text: &str,
     stdin: &mut tokio::io::Lines<tokio::io::BufReader<tokio::io::Stdin>>,
-) -> anyhow::Result<()> {
+) -> anyhow::Result<Option<String>> {
     client.turn_start(session_id, text).await?;
     // Tool-call updates repeat only the call_id — remember the name
     // from the first event so status lines stay readable.
     let mut tool_names: std::collections::HashMap<String, String> =
         std::collections::HashMap::new();
+    // A non-command line typed mid-turn becomes the next prompt once
+    // this turn ends — the type-ahead the old blocking read gave.
+    let mut pending: Option<String> = None;
+    // EOF (`damon prompt` with no tty, piped stdin) disables the stdin
+    // branch — otherwise it wins every select! and kills the turn.
+    let mut stdin_open = true;
     loop {
-        match events.recv().await {
+        // Race stdin against the event stream: `/cancel` (or `cancel`)
+        // stops the running turn; other input is queued for next turn.
+        let event = tokio::select! {
+            line = async {
+                if stdin_open { stdin.next_line().await } else { std::future::pending().await }
+            } => {
+                match line {
+                    Ok(Some(l)) => {
+                        let cmd = l.trim();
+                        if cmd == "/cancel" || cmd == "cancel" || cmd == "/stop" {
+                            if let Err(e) = client.turn_cancel(session_id).await {
+                                eprintln!("[cancel failed] {e:#}");
+                            }
+                        } else if !cmd.is_empty() {
+                            pending = Some(l);
+                        }
+                        continue;
+                    }
+                    Ok(None) => {
+                        stdin_open = false;
+                        continue;
+                    }
+                    Err(e) => anyhow::bail!("stdin: {e}"),
+                }
+            }
+            ev = events.recv() => ev,
+        };
+        match event {
             Some(ClientEvent::TurnDone {
                 session_id: sid,
                 result,
@@ -666,7 +757,7 @@ async fn run_turn(
                     }
                     Err(e) => anyhow::bail!("{}", e["message"].as_str().unwrap_or("rpc error")),
                 }
-                return Ok(());
+                return Ok(pending);
             }
             Some(ClientEvent::Event {
                 session_id: sid,
@@ -690,11 +781,22 @@ async fn run_turn(
                             event["status"].as_str().unwrap_or("")
                         );
                     }
-                    Some("error") => {
-                        eprintln!("\n[error] {}", event["message"].as_str().unwrap_or("?"));
-                    }
                     _ => {}
                 },
+                Some("subagent") => {
+                    let f = &event["event"];
+                    let name = f["name"]
+                        .as_str()
+                        .or_else(|| f["agent"].as_str())
+                        .or_else(|| f["description"].as_str())
+                        .unwrap_or("subagent");
+                    let status = f["status"]
+                        .as_str()
+                        .or_else(|| f["state"].as_str())
+                        .or_else(|| f["type"].as_str())
+                        .unwrap_or("");
+                    eprintln!("\n[subagent {name} {status}]");
+                }
                 Some("permission_requested") => {
                     answer_permission(client, session_id, &event, stdin).await?;
                 }

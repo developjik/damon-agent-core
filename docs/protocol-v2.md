@@ -30,7 +30,7 @@ they leak into logs). Loopback + no configured token → open.
 | `hello` | — | `{protocol, daemon, version, backends[], methods[]}` |
 | `backend.list` | — | `{backends: [{id, available, capabilities}]}` |
 | `session.create` | `{backend?, cwd?, model?, mode?, mcpServers?}` | `{sessionId, backend}` |
-| `session.resume` | `{sessionId}` | `{sessionId, backend}` |
+| `session.resume` | `{sessionId}` — or `{handle:{provider,native_handle}, cwd?, title?}` to import a native session | `{sessionId, backend}` |
 | `session.list` | `{limit?, offset?}` | `{sessions: [{sessionId, createdAt, backend, title}]}` |
 | `session.messages` | `{sessionId, limit?, offset?}` | `{messages: [StoredMessage]}` |
 | `session.import` | `{backend, cwd?}` | `{sessions: [ImportableSession]}` |
@@ -60,14 +60,14 @@ the response. Disconnect cancels the turns that connection started.
 - `thread_started {native_handle}` — resume token arrived
 - `turn_started`, `turn_completed {usage?}`, `turn_failed {error, code?}`,
   `turn_canceled {reason}`
-- `usage_updated {usage}`, `mode_changed {mode?}`, `model_changed {model}`
+- `mode_changed {mode?}`, `model_changed {model}`
 - `timeline` + flattened `TimelineItem` (`kind` tag):
   `user_message`/`assistant_message`/`reasoning {text}`,
   `tool_call {call_id,name,status,detail}`, `todo {items}`,
-  `error {message}`, `compaction {summary}`, `unknown {raw}`
+  `compaction {summary}`, `unknown {raw}`
 - `permission_requested {id,kind,name,title?,input?,detail?,actions[]}`
 - `permission_resolved {request_id}`
-- `attention_required {reason: finished|error|permission}`
+- `attention_required {reason: finished|permission}`
 - `subagent {event}`
 
 `ToolCall.detail` is `{type: shell|read|edit|web|task|other, …}`.

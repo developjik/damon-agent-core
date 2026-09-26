@@ -1,11 +1,11 @@
 # damon-agent
 
 Prebuilt binaries + zero-dependency Node client for **Damon**, a local
-agent-control daemon. Damon is an ACP host: it drives coding agents
-(Claude Code, Codex, Gemini CLI, Copilot, …) over the Agent Client
-Protocol — the model, tools, credentials, and context management belong
-to the agents; Damon owns sessions, permission relaying, searchable
-history, and remote access. Your app attaches as a thin client.
+agent-control daemon. Damon drives coding agents (Claude Code, Codex
+CLI, Cursor, Amp, Kimi, Qwen, Oh My Pi) through their native CLIs —
+the model, tools, credentials, and context management belong to the
+agents; Damon owns sessions, permission relaying, searchable history,
+chat channels, and remote access. Your app attaches as a thin client.
 
 - Docs, config reference, protocol: <https://github.com/developjik/damon-agent-core>
 - Install: `npm install -g damon-agent` (postinstall downloads the

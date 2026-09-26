@@ -97,6 +97,11 @@
     box-shadow: 0 2px 12px color-mix(in srgb, var(--user) 40%, transparent);
   }
   #newBtn:hover { filter: brightness(1.12); }
+  #importBtn {
+    margin: -4px 12px 9px; padding: 6px; border: 1px solid var(--border); border-radius: 9px;
+    cursor: pointer; font-size: 11.5px; color: var(--muted); background: transparent;
+  }
+  #importBtn:hover { color: var(--fg); border-color: var(--accent); }
   #search {
     margin: 0 12px 9px; padding: 7px 10px 7px 30px; background: var(--bg); color: var(--fg);
     border: 1px solid var(--border); border-radius: 9px;
@@ -293,7 +298,7 @@
   .tcStatus.st-in_progress, .tcStatus.st-running { color: var(--accent); background: var(--accent-dim); }
   .tcStatus.st-in_progress::before, .tcStatus.st-running::before { content: "● "; animation: blink 1.1s infinite; }
   .tcStatus.st-completed { color: var(--ok); background: color-mix(in srgb, var(--ok) 13%, transparent); }
-  .tcStatus.st-failed, .tcStatus.st-cancelled, .tcStatus.st-canceled { color: var(--err); background: color-mix(in srgb, var(--err) 13%, transparent); }
+  .tcStatus.st-failed { color: var(--err); background: color-mix(in srgb, var(--err) 13%, transparent); }
   .tcStatus.st-pending { color: var(--muted); background: var(--hover); }
   .tcChevron { flex: none; font-size: 9px; color: var(--faint); transition: transform .15s; }
   .toolcard.open .tcChevron { transform: rotate(90deg); }
@@ -310,7 +315,7 @@
   }
   .tool .st-in_progress { color: var(--accent); }
   .tool .st-completed { color: var(--ok); }
-  .tool .st-failed, .tool .st-cancelled { color: var(--err); }
+  .tool .st-failed { color: var(--err); }
   .codewrap { position: relative; }
   .codewrap .copy, .diffwrap .copy {
     position: absolute; top: 7px; right: 7px; padding: 3px 9px;
@@ -678,6 +683,7 @@
       <div id="agentList"></div>
     </div>
     <button id="newBtn">+ New session</button>
+    <button id="importBtn" title="Import a session the agent made outside damon">⇩ Import</button>
     <input id="search" type="search" placeholder="search history…" title="Full-text search over all sessions (Ctrl/Cmd+K)">
     <div id="sessions"></div>
   </aside>
@@ -719,6 +725,8 @@
     <div id="attachBar"></div>
     <div id="composer">
       <select id="agent" title="Agent for the next session (each conversation is pinned to one agent)"></select>
+      <select id="modelSel" title="Model — applies to the active session, or the next one"></select>
+      <select id="modeSel" title="Mode — applies to the active session, or the next one"></select>
       <div id="inputWrap">
         <textarea id="input" rows="1" placeholder="Message — Enter to send, Shift+Enter for newline"></textarea>
         <input id="attach" type="file" accept="image/*" style="display:none">
@@ -782,6 +790,7 @@ let streamText = "";
 let thoughtEl = null, thoughtText = "";
 let todoEl = null;             // live todo card for the running turn
 const toolEls = new Map();     // call_id -> toolcard element
+const subagentEls = new Map(); // subagent id -> card element
 let token = sessionStorage.getItem("damon_token") || "";
 let retries = 0;               // consecutive failed direct dials
 let backoff = 1000;
@@ -1491,6 +1500,48 @@ function toolCard(u) {
   stickScroll();
 }
 
+// Subagent lifecycle/progress card. OMP emits raw frames
+// (subagent_lifecycle / subagent_progress / subagent_event); the shape
+// is backend-owned, so the card keys on any id-ish field, summarizes
+// from common fields, and keeps the last payload as inspectable JSON.
+function subagentCard(f) {
+  const id = f.id || f.agentId || f.agent_id || f.subagentId || f.name || "?";
+  let el = subagentEls.get(id);
+  if (!el) {
+    el = document.createElement("div");
+    el.className = "toolcard";
+    const head = document.createElement("div");
+    head.className = "tcHead";
+    head.innerHTML =
+      '<span class="tcIcon">🤖</span><span class="tcName">' + esc(id) + '</span>' +
+      '<span class="tcStatus"></span><span class="tcChevron">▶</span>';
+    head.onclick = () => el.classList.toggle("open");
+    const body = document.createElement("div");
+    body.className = "tcBody";
+    const out = document.createElement("div");
+    out.className = "tcOut";
+    body.appendChild(out);
+    el.appendChild(head); el.appendChild(body);
+    subagentEls.set(id, el);
+    log.appendChild(el);
+  }
+  const label = f.name || f.agent || f.description || id;
+  el.querySelector(".tcName").textContent = label;
+  const st = f.status || f.state || (f.type === "subagent_lifecycle" ? "running" : "");
+  const stEl = el.querySelector(".tcStatus");
+  stEl.className = "tcStatus st-" + (st || "running");
+  stEl.textContent = String(st).replace(/_/g, " ");
+  const text = f.message || f.text || f.progress || "";
+  const out = el.querySelector(".tcOut");
+  const dump = text ? text + "\n\n" + JSON.stringify(f, null, 2)
+                    : JSON.stringify(f, null, 2);
+  out.textContent = "";
+  const pre = document.createElement("pre");
+  pre.textContent = dump.length > 4000 ? dump.slice(0, 4000) + "…" : dump;
+  out.appendChild(pre);
+  stickScroll();
+}
+
 // ---------- session.event stream ----------
 // One timeline item (flattened into the event: kind tag + fields).
 function onTimeline(sid, ev) {
@@ -1548,9 +1599,6 @@ function onTimeline(sid, ev) {
       stickScroll();
       break;
     }
-    case "error":
-      errBubble(ev.message || "agent error");
-      break;
     case "compaction": {
       const d = document.createElement("details");
       d.className = "thought";
@@ -1603,7 +1651,7 @@ function onSessionEvent(v) {
   if (ev.type === "attention_required") {
     // The only completion signal for turns other clients started.
     if (!liveTurns.has(sid) && ev.reason !== "permission")
-      attention("damon — done", ev.reason === "error" ? "turn failed" : "turn finished");
+      attention("damon — done", "turn finished");
     return;
   }
   // Events for a session we're not viewing can't be rendered — flag the
@@ -1616,14 +1664,17 @@ function onSessionEvent(v) {
     case "timeline":
       onTimeline(sid, ev);
       break;
-    case "usage_updated":
-      refreshUsage();
-      break;
     case "mode_changed":
       if (ev.mode) sysline("mode: " + ev.mode);
       break;
     case "model_changed":
       sysline("model: " + ev.model);
+      break;
+    case "subagent":
+      subagentCard(ev.event || {});
+      break;
+    case "thread_started":
+      sysline("session linked");
       break;
   }
 }
@@ -1893,6 +1944,55 @@ async function refreshAgents() {
     }
     if (avail.length && avail.some(a => a.id === prev)) sel.value = prev;
   }
+  refreshCatalog();
+}
+
+// Model/mode pickers for the composer agent. catalog.models is a
+// per-backend probe; failures leave the pickers with just "auto".
+let catalog = { models: [], modes: [] };
+async function refreshCatalog() {
+  const agent = $("agent") && $("agent").value;
+  catalog = { models: [], modes: [] };
+  if (agent) {
+    try {
+      const r = await request("catalog.models", { backend: agent });
+      catalog = {
+        models: Array.isArray(r.models) ? r.models : [],
+        modes: Array.isArray(r.modes) ? r.modes : [],
+      };
+    } catch (e) { /* backend may not offer a catalog — auto only */ }
+  }
+  fillSelect($("modelSel"), "auto model", catalog.models.filter(m => m.selectable !== false));
+  fillSelect($("modeSel"), "auto mode", catalog.modes);
+}
+function fillSelect(sel, autoLabel, defs) {
+  if (!sel) return;
+  const prev = sel.value;
+  sel.textContent = "";
+  const auto = document.createElement("option");
+  auto.value = "";
+  auto.textContent = autoLabel;
+  sel.appendChild(auto);
+  for (const d of defs) {
+    const o = document.createElement("option");
+    o.value = d.id;
+    o.textContent = d.name || d.id;
+    if (d.description) o.title = d.description;
+    sel.appendChild(o);
+  }
+  if ([...sel.options].some(o => o.value === prev)) sel.value = prev;
+}
+// A picker change applies to the live session when there is one —
+// otherwise it rides along on the next session.create.
+async function applyPick(kind) {
+  const sel = kind === "model" ? $("modelSel") : $("modeSel");
+  const v = sel && sel.value;
+  if (!v || !activeSession) return;
+  try {
+    await request("session.set_" + kind, { sessionId: activeSession, [kind]: v });
+  } catch (e) {
+    errBubble("set_" + kind + " failed: " + e.message);
+  }
 }
 async function newSession() {
   try {
@@ -1900,6 +2000,10 @@ async function newSession() {
     const params = {};
     const agent = $("agent") && $("agent").value;
     if (agent) params.backend = agent;
+    const model = $("modelSel") && $("modelSel").value;
+    const mode = $("modeSel") && $("modeSel").value;
+    if (model) params.model = model;
+    if (mode) params.mode = mode;
     const r = await request("session.create", params);
     activeSession = r.sessionId;
     log.textContent = "";
@@ -2368,6 +2472,10 @@ $("emptyNewBtn").onclick = newSession;
 $("sendBtn").onclick = () => sendPrompt();
 $("cancelBtn").onclick = cancelPrompt;
 $("authBtn").onclick = submitToken;
+$("agent").onchange = refreshCatalog;
+$("modelSel").onchange = () => applyPick("model");
+$("modeSel").onchange = () => applyPick("mode");
+$("importBtn").onclick = runImport;
 $("token").addEventListener("keydown", e => { if (e.key === "Enter") submitToken(); });
 input.addEventListener("keydown", e => {
   // Enter during IME composition (Korean/Japanese/Chinese) commits the
@@ -2483,6 +2591,57 @@ async function runSearch() {
       list.appendChild(d);
     }
   } catch (e) { errBubble("search failed: " + e.message); }
+}
+
+// ---------- import ----------
+// session.import lists native sessions the agent made outside damon;
+// clicking one resumes it by handle (the daemon mints/binds a row).
+async function runImport() {
+  const agent = $("agent") && $("agent").value;
+  if (!agent) { errBubble("pick an agent first"); return; }
+  try {
+    const r = await request("session.import", { backend: agent });
+    const list = $("sessions");
+    list.textContent = "";
+    const head = document.createElement("div");
+    head.className = "sessGroup";
+    head.textContent = "importable — " + agent;
+    list.appendChild(head);
+    const found = r.sessions || [];
+    for (const s of found) {
+      const label = s.title || (s.handle && s.handle.native_handle || "").slice(0, 24) || "session";
+      const when = s.modified_at ? relTime(new Date(s.modified_at * 1000).toISOString()) : "";
+      const dir = s.cwd ? baseName(s.cwd) : "";
+      list.appendChild(makeSessRow({
+        label,
+        labelTitle: (s.handle && s.handle.native_handle) || "",
+        meta: [when, dir].filter(Boolean).join(" · "),
+        onClick: () => importSession(s),
+      }));
+    }
+    if (!found.length) {
+      const d = document.createElement("div");
+      d.className = "sessGroup";
+      d.textContent = "nothing to import";
+      list.appendChild(d);
+    }
+  } catch (e) { errBubble("import failed: " + e.message); }
+}
+async function importSession(s) {
+  try {
+    const r = await request("session.resume", {
+      handle: s.handle,
+      title: s.title || undefined,
+      cwd: s.cwd || undefined,
+    });
+    activeSession = r.sessionId;
+    setBusy(liveTurns.has(r.sessionId));
+    await loadMessages(r.sessionId);
+    updateCrumb();
+    refreshSessions();
+    refreshUsage();
+    closeDrawer();
+  } catch (e) { errBubble("import failed: " + e.message); }
 }
 
 // ---------- image attachments ----------

@@ -27,12 +27,8 @@ pub struct SessionConfig {
     pub model: Option<String>,
     /// Provider mode: plan / default / full-access etc.
     pub mode: Option<String>,
-    /// Provider-agnostic system/developer instruction.
-    pub system_prompt: Option<String>,
     /// MCP servers handed to the agent in its native config shape.
     pub mcp_servers: HashMap<String, McpServerConfig>,
-    /// Extra environment for the spawned process.
-    pub env: HashMap<String, String>,
 }
 
 /// One stdio MCP server, normalized. Backends translate to their own
@@ -56,14 +52,6 @@ pub struct PersistenceHandle {
     pub native_handle: String,
     #[serde(default)]
     pub metadata: Value,
-}
-
-/// What a resumed session is for: driving the agent, or reading what it
-/// already did. History resumes may be read-only for archived sessions.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum ResumePurpose {
-    Interactive,
-    History,
 }
 
 /// What a backend can do. Surfaces hide features a backend lacks instead
@@ -216,9 +204,6 @@ pub enum StreamEventKind {
     TurnCanceled {
         reason: String,
     },
-    UsageUpdated {
-        usage: Usage,
-    },
     ModeChanged {
         mode: Option<String>,
     },
@@ -246,7 +231,6 @@ pub enum StreamEventKind {
 #[serde(rename_all = "snake_case")]
 pub enum AttentionReason {
     Finished,
-    Error,
     Permission,
 }
 
@@ -266,9 +250,6 @@ pub enum TimelineItem {
     ToolCall(ToolCall),
     Todo {
         items: Vec<TaskItem>,
-    },
-    Error {
-        message: String,
     },
     Compaction {
         summary: String,
@@ -308,7 +289,6 @@ pub enum ToolCallStatus {
     Running,
     Completed,
     Failed,
-    Canceled,
 }
 
 /// Normalized tool-call rendering detail. `Unknown` preserves the raw
@@ -362,10 +342,7 @@ pub enum ToolCallDetail {
 #[serde(rename_all = "snake_case")]
 pub enum PermissionKind {
     Tool,
-    Plan,
     Question,
-    Mode,
-    Other,
 }
 
 /// A permission ask, normalized. `actions` are the buttons the agent
@@ -423,13 +400,6 @@ pub enum PermissionResponse {
         /// Interrupt the whole turn, not just this call.
         interrupt: bool,
     },
-}
-
-/// Some resolutions trigger a follow-up turn (Codex plan approval →
-/// implementation). The backend returns the prompt it scheduled.
-#[derive(Clone, Debug, Default, Serialize)]
-pub struct PermissionResult {
-    pub follow_up_prompt: Option<PromptInput>,
 }
 
 // ---------------------------------------------------------------------------

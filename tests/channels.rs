@@ -120,16 +120,22 @@ async fn bridge_delivers_response_and_maps_sessions() {
         }
         if std::time::Instant::now() >= deadline {
             let sent = ch.sent.lock().await;
-            let sessions = store.list_sessions().await.unwrap_or_default();
+            let sessions = store
+                .list_sessions_paged(u32::MAX, 0)
+                .await
+                .unwrap_or_default();
             let mut dump = String::new();
             for (sid, ..) in &sessions {
-                let msgs = store.messages(sid).await.unwrap_or_default();
+                let msgs = store
+                    .messages_paged(sid, u32::MAX, 0)
+                    .await
+                    .unwrap_or_default();
                 dump.push_str(&format!("session {sid}: {} msgs\n", msgs.len()));
                 for m in msgs {
                     dump.push_str(&format!(
                         "  {} {}\n",
-                        m["role"],
-                        &m.to_string()[..m.to_string().len().min(120)]
+                        m.data["role"],
+                        &m.data.to_string()[..m.data.to_string().len().min(120)]
                     ));
                 }
             }
@@ -140,7 +146,7 @@ async fn bridge_delivers_response_and_maps_sessions() {
 
     let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
     loop {
-        let sessions = store.list_sessions().await.unwrap();
+        let sessions = store.list_sessions_paged(u32::MAX, 0).await.unwrap();
         if sessions.len() >= 2 {
             break;
         }
@@ -558,7 +564,11 @@ async fn bridge_allowlist_drops_unlisted_senders() {
         "unlisted sender got a response"
     );
     assert!(
-        store.list_sessions().await.unwrap().is_empty(),
+        store
+            .list_sessions_paged(u32::MAX, 0)
+            .await
+            .unwrap()
+            .is_empty(),
         "unlisted sender created a session"
     );
 

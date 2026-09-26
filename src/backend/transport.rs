@@ -1,20 +1,19 @@
 //! Protocol-agnostic stdio NDJSON transport for agent backends.
 //!
 //! One child process, newline-delimited JSON both ways. This layer owns
-//! only framing and process plumbing — spawn, capped line reads, a
-//! bounded stderr ring, EOF/exit detection, and a shared pending-request
-//! map. Request/response correlation differs per protocol (Claude uses
-//! `request_id`, Codex JSON-RPC `id`, OMP typed frames with `id`), so
-//! each backend matches its own responses; the map is shared.
+//! only framing and process plumbing — spawn, capped line reads, stderr
+//! draining, and a shared pending-request map. Request/response
+//! correlation differs per protocol (Claude uses `request_id`, Codex
+//! JSON-RPC `id`, OMP typed frames with `id`), so each backend matches
+//! its own responses; the map is shared.
 //!
 //! Generalized from the old ACP `AgentProcess`: same spawn discipline,
 //! same line caps, same stderr drain — minus every ACP method name.
 
-use std::collections::{HashMap, VecDeque};
+use std::collections::HashMap;
 use std::path::Path;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-use std::time::Instant;
 
 use anyhow::{Context, bail};
 use serde_json::{Value, json};
@@ -30,13 +29,11 @@ const MAX_LINE_BYTES: usize = 4 * 1024 * 1024;
 /// stderr lines are diagnostics, not protocol: keep the head of each
 /// line and drop the tail instead of dropping the whole line.
 const STDERR_LINE_CAP: usize = 8 * 1024;
-/// Lines of stderr retained per process for post-mortem debugging.
-const STDERR_RING_CAP: usize = 256;
 
 /// Pending request waiters keyed by the protocol's own id shape
 /// (stringified — JSON-RPC numeric ids and Claude's string request_ids
 /// share the map).
-pub type PendingMap = Arc<Mutex<HashMap<String, oneshot::Sender<Result<Value, Value>>>>>;
+type PendingMap = Arc<Mutex<HashMap<String, oneshot::Sender<Result<Value, Value>>>>>;
 
 /// A live backend subprocess with NDJSON plumbing.
 pub struct NdjsonTransport {
@@ -46,13 +43,7 @@ pub struct NdjsonTransport {
     pending: PendingMap,
     closed: AtomicBool,
     child: Mutex<Child>,
-    pid: Option<u32>,
-    started_at: Instant,
     last_used: AtomicU64,
-    stderr_ring: parking_lot::Mutex<VecDeque<String>>,
-    /// Set when the stdout reader hits EOF — distinguishes "process
-    /// died" from "still starting up" for error messages.
-    exited: AtomicBool,
 }
 
 impl NdjsonTransport {
@@ -88,7 +79,6 @@ impl NdjsonTransport {
         let mut child = cmd
             .spawn()
             .with_context(|| format!("cannot spawn `{command}`"))?;
-        let pid = child.id();
         let stdin = child.stdin.take().context("stdin not piped")?;
         let stdout = child.stdout.take().context("stdout not piped")?;
         let stderr = child.stderr.take().context("stderr not piped")?;
@@ -100,30 +90,19 @@ impl NdjsonTransport {
             pending: Arc::new(Mutex::new(HashMap::new())),
             closed: AtomicBool::new(false),
             child: Mutex::new(child),
-            pid,
-            started_at: Instant::now(),
             last_used: AtomicU64::new(epoch_secs()),
-            stderr_ring: parking_lot::Mutex::new(VecDeque::new()),
-            exited: AtomicBool::new(false),
         });
 
         // stderr must never block protocol I/O: a dedicated task drains
-        // it line by line into the bounded ring.
+        // it line by line. Nothing consumes the lines today — bounded
+        // reads keep a chatty backend from ballooning memory.
         {
-            let me = me.clone();
             tokio::spawn(async move {
                 let mut reader = BufReader::new(stderr);
                 let mut buf: Vec<u8> = Vec::new();
                 loop {
                     match read_capped_line(&mut reader, &mut buf, STDERR_LINE_CAP).await {
-                        Ok((true, _)) => {
-                            let line = String::from_utf8_lossy(&buf).into_owned();
-                            let mut ring = me.stderr_ring.lock();
-                            if ring.len() >= STDERR_RING_CAP {
-                                ring.pop_front();
-                            }
-                            ring.push_back(line);
-                        }
+                        Ok((true, _)) => {}
                         Ok((false, _)) => return, // EOF
                         Err(_) => return,
                     }
@@ -157,33 +136,9 @@ impl NdjsonTransport {
         self.frames.subscribe()
     }
 
-    /// The shared pending-request map for backends that do
-    /// request/response correlation.
-    pub fn pending(&self) -> PendingMap {
-        self.pending.clone()
-    }
-
     /// Whether the subprocess is still alive.
     pub fn is_alive(&self) -> bool {
         !self.closed.load(Ordering::SeqCst)
-    }
-
-    /// Whether stdout reached EOF (the process exited or closed pipes).
-    pub fn exited(&self) -> bool {
-        self.exited.load(Ordering::SeqCst)
-    }
-
-    pub fn pid(&self) -> Option<u32> {
-        self.pid
-    }
-
-    pub fn uptime(&self) -> std::time::Duration {
-        self.started_at.elapsed()
-    }
-
-    /// The newest stderr lines the process produced (bounded ring).
-    pub fn stderr_tail(&self) -> Vec<String> {
-        self.stderr_ring.lock().iter().cloned().collect()
     }
 
     /// Mark the process as used right now — the idle sweep kills
@@ -258,7 +213,6 @@ async fn read_loop(stdout: tokio::process::ChildStdout, me: Arc<NdjsonTransport>
             }
         }
     }
-    me.exited.store(true, Ordering::SeqCst);
     me.closed.store(true, Ordering::SeqCst);
     // Unblock every pending request — a dead process never answers.
     let mut pending = me.pending.lock().await;

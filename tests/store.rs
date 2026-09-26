@@ -268,12 +268,38 @@ async fn cleanup_older_than_removes_old_sessions_and_messages() {
         .unwrap();
     assert_eq!(removed, ["old"]);
 
-    assert!(!store.session_exists("old").await.unwrap());
-    assert!(store.session_exists("new").await.unwrap());
-    assert!(store.messages_full("old").await.unwrap().is_empty());
-    assert_eq!(store.messages_full("new").await.unwrap().len(), 1);
+    let ids: Vec<String> = store
+        .list_sessions_paged(u32::MAX, 0)
+        .await
+        .unwrap()
+        .into_iter()
+        .map(|(id, ..)| id)
+        .collect();
+    assert!(!ids.iter().any(|id| id == "old"));
+    assert!(ids.iter().any(|id| id == "new"));
+    assert!(
+        store
+            .messages_paged("old", u32::MAX, 0)
+            .await
+            .unwrap()
+            .is_empty()
+    );
+    assert_eq!(
+        store
+            .messages_paged("new", u32::MAX, 0)
+            .await
+            .unwrap()
+            .len(),
+        1
+    );
     // FTS rows for the removed session are gone too.
-    assert!(store.search("old msg", 10).await.unwrap().is_empty());
+    assert!(
+        store
+            .search_filtered("old msg", 10, None, None, None)
+            .await
+            .unwrap()
+            .is_empty()
+    );
 
     // Second run is a no-op.
     assert!(
@@ -305,40 +331,89 @@ async fn search_tokenizes_terms_phrases_and_operators() {
         .unwrap();
 
     // Bare terms AND together — both words required, order-free.
-    let hits = store.search("error timeout", 10).await.unwrap();
+    let hits = store
+        .search_filtered("error timeout", 10, None, None, None)
+        .await
+        .unwrap();
     assert_eq!(hits.len(), 2);
 
     // Explicit operators pass through.
-    let hits = store.search("error AND timeout", 10).await.unwrap();
+    let hits = store
+        .search_filtered("error AND timeout", 10, None, None, None)
+        .await
+        .unwrap();
     assert_eq!(hits.len(), 2);
-    let hits = store.search("timeout OR unrelated", 10).await.unwrap();
+    let hits = store
+        .search_filtered("timeout OR unrelated", 10, None, None, None)
+        .await
+        .unwrap();
     assert_eq!(hits.len(), 3);
-    let hits = store.search("error NOT timeout", 10).await.unwrap();
+    let hits = store
+        .search_filtered("error NOT timeout", 10, None, None, None)
+        .await
+        .unwrap();
     assert_eq!(hits.len(), 0);
 
     // Quoted phrase matches the exact sequence only.
-    let hits = store.search("\"timeout in relay\"", 10).await.unwrap();
+    let hits = store
+        .search_filtered("\"timeout in relay\"", 10, None, None, None)
+        .await
+        .unwrap();
     assert_eq!(hits.len(), 1);
-    let hits = store.search("\"in timeout\"", 10).await.unwrap();
+    let hits = store
+        .search_filtered("\"in timeout\"", 10, None, None, None)
+        .await
+        .unwrap();
     assert_eq!(hits.len(), 0);
 
     // FTS5 metacharacters in terms stay literal — no parse error. Inside
     // quotes FTS5 tokenizes `*`/`:`/`,` away, so these degrade to the
     // contained terms rather than matching operators.
-    assert_eq!(store.search("error*", 10).await.unwrap().len(), 2);
-    assert!(store.search("content:error", 10).await.unwrap().is_empty());
+    assert_eq!(
+        store
+            .search_filtered("error*", 10, None, None, None)
+            .await
+            .unwrap()
+            .len(),
+        2
+    );
     assert!(
         store
-            .search("NEAR(error, timeout)", 10)
+            .search_filtered("content:error", 10, None, None, None)
+            .await
+            .unwrap()
+            .is_empty()
+    );
+    assert!(
+        store
+            .search_filtered("NEAR(error, timeout)", 10, None, None, None)
             .await
             .unwrap()
             .is_empty()
     );
 
     // Operator-only or empty queries return nothing instead of erroring.
-    assert!(store.search("AND OR", 10).await.unwrap().is_empty());
-    assert!(store.search("NOT", 10).await.unwrap().is_empty());
-    assert!(store.search("\"\"", 10).await.unwrap().is_empty());
+    assert!(
+        store
+            .search_filtered("AND OR", 10, None, None, None)
+            .await
+            .unwrap()
+            .is_empty()
+    );
+    assert!(
+        store
+            .search_filtered("NOT", 10, None, None, None)
+            .await
+            .unwrap()
+            .is_empty()
+    );
+    assert!(
+        store
+            .search_filtered("\"\"", 10, None, None, None)
+            .await
+            .unwrap()
+            .is_empty()
+    );
 }
 
 #[tokio::test]
@@ -351,7 +426,7 @@ async fn list_sessions_paged_applies_limit_and_offset() {
             .unwrap();
     }
 
-    let all = store.list_sessions().await.unwrap();
+    let all = store.list_sessions_paged(u32::MAX, 0).await.unwrap();
     assert_eq!(all.len(), 5);
 
     let page = store.list_sessions_paged(2, 0).await.unwrap();
@@ -377,7 +452,7 @@ async fn messages_paged_applies_limit_and_offset() {
             .unwrap();
     }
 
-    let all = store.messages_full("s").await.unwrap();
+    let all = store.messages_paged("s", u32::MAX, 0).await.unwrap();
     assert_eq!(all.len(), 5);
 
     let page = store.messages_paged("s", 2, 0).await.unwrap();
@@ -408,19 +483,28 @@ async fn search_handles_unary_and_exclusion_not() {
 
     // `X AND NOT Y` must keep the exclusion, not silently drop the NOT
     // and invert the result set.
-    let hits = store.search("rust AND NOT gc", 10).await.unwrap();
+    let hits = store
+        .search_filtered("rust AND NOT gc", 10, None, None, None)
+        .await
+        .unwrap();
     assert_eq!(hits.len(), 1);
-    let all = store.messages_full("s").await.unwrap();
+    let all = store.messages_paged("s", u32::MAX, 0).await.unwrap();
     let hit = all.iter().find(|m| m.id == hits[0].1).unwrap();
     assert_eq!(hit.data["content"], "rust memory safe");
 
     // Leading NOT: FTS5 has no unary NOT, so the query degrades to the
     // bare term — a parseable MATCH, not an error.
-    let hits = store.search("NOT safe", 10).await.unwrap();
+    let hits = store
+        .search_filtered("NOT safe", 10, None, None, None)
+        .await
+        .unwrap();
     assert_eq!(hits.len(), 1);
 
     // Trailing NOT dies without an operand; the term still matches.
-    let hits = store.search("gc NOT", 10).await.unwrap();
+    let hits = store
+        .search_filtered("gc NOT", 10, None, None, None)
+        .await
+        .unwrap();
     assert_eq!(hits.len(), 1);
 }
 
@@ -456,13 +540,16 @@ async fn session_title_and_model_overrides() {
     // First title wins; a second set_title_if_empty is a no-op.
     store.set_title_if_empty("s1", "first").await.unwrap();
     store.set_title_if_empty("s1", "second").await.unwrap();
-    let sessions = store.list_sessions().await.unwrap();
+    let sessions = store.list_sessions_paged(u32::MAX, 0).await.unwrap();
     assert_eq!(sessions[0].3, "first");
 
     // Explicit rename overwrites.
     assert!(store.rename_session("s1", "renamed").await.unwrap());
     assert!(!store.rename_session("ghost", "x").await.unwrap());
-    assert_eq!(store.list_sessions().await.unwrap()[0].3, "renamed");
+    assert_eq!(
+        store.list_sessions_paged(u32::MAX, 0).await.unwrap()[0].3,
+        "renamed"
+    );
 
     let _ = std::fs::remove_file(&path);
 }
@@ -528,25 +615,44 @@ async fn search_finds_tool_text() {
         .unwrap();
 
     assert_eq!(
-        store.search("flaky-widget", 10).await.unwrap().len(),
+        store
+            .search_filtered("flaky-widget", 10, None, None, None)
+            .await
+            .unwrap()
+            .len(),
         1,
         "tool arguments indexed"
     );
     assert_eq!(
-        store.search("run_tests", 10).await.unwrap().len(),
+        store
+            .search_filtered("run_tests", 10, None, None, None)
+            .await
+            .unwrap()
+            .len(),
         1,
         "tool name indexed"
     );
-    let tool_hits = store.search("quux-42", 10).await.unwrap();
+    let tool_hits = store
+        .search_filtered("quux-42", 10, None, None, None)
+        .await
+        .unwrap();
     assert_eq!(tool_hits.len(), 1, "tool result text indexed");
     assert_eq!(tool_hits[0].0, "s", "hit belongs to the prompting session");
     assert_eq!(
-        store.search("zeta-9", 10).await.unwrap().len(),
+        store
+            .search_filtered("zeta-9", 10, None, None, None)
+            .await
+            .unwrap()
+            .len(),
         1,
         "array text part indexed"
     );
     assert!(
-        store.search("QUFB", 10).await.unwrap().is_empty(),
+        store
+            .search_filtered("QUFB", 10, None, None, None)
+            .await
+            .unwrap()
+            .is_empty(),
         "image data not indexed"
     );
 }
@@ -567,7 +673,7 @@ async fn search_filtered_by_session_and_time_bounds() {
         .unwrap();
     backdate(&path, "old", 30);
     let created: std::collections::HashMap<String, String> = store
-        .list_sessions()
+        .list_sessions_paged(u32::MAX, 0)
         .await
         .unwrap()
         .into_iter()
@@ -576,8 +682,15 @@ async fn search_filtered_by_session_and_time_bounds() {
     let old_at = &created["old"];
     let new_at = &created["new"];
 
-    // No filters → the same results as search().
-    assert_eq!(store.search("needle", 10).await.unwrap().len(), 2);
+    // No filters → all matches.
+    assert_eq!(
+        store
+            .search_filtered("needle", 10, None, None, None)
+            .await
+            .unwrap()
+            .len(),
+        2
+    );
 
     // sessionId narrows to one session.
     let hits = store
@@ -670,19 +783,29 @@ async fn fork_upto_boundary_and_fts_reindex() {
 
     // upto = second message id → exactly the first two messages copy.
     let fork = store.fork_session("s", Some(ids[1])).await.unwrap();
-    let msgs = store.messages_full(&fork).await.unwrap();
+    let msgs = store.messages_paged(&fork, u32::MAX, 0).await.unwrap();
     assert_eq!(msgs.len(), 2, "upto must bound the copy: {msgs:?}");
     assert_eq!(msgs[0].data["content"], "fork-marker-0");
     assert_eq!(msgs[1].data["content"], "fork-marker-1");
     let fork2 = store.fork_session(&fork, Some(msgs[1].id)).await.unwrap();
-    assert_eq!(store.messages_full(&fork2).await.unwrap().len(), 2);
+    assert_eq!(
+        store
+            .messages_paged(&fork2, u32::MAX, 0)
+            .await
+            .unwrap()
+            .len(),
+        2
+    );
 
     // Unknown session → error, no row created.
     assert!(store.fork_session("ghost", None).await.is_err());
 
     // Copied messages are re-indexed for FTS under the fork's session
     // id — a fork's history is searchable as its own.
-    let hits = store.search("fork-marker-1", 10).await.unwrap();
+    let hits = store
+        .search_filtered("fork-marker-1", 10, None, None, None)
+        .await
+        .unwrap();
     assert!(
         hits.iter().any(|(sid, _, _)| sid == &fork),
         "fork's copied messages must be searchable: {hits:?}"

@@ -23,10 +23,6 @@ pub struct Config {
     pub data_dir: Option<PathBuf>,
     pub tls_cert: Option<String>,
     pub tls_key: Option<String>,
-    /// MCP servers forwarded to every agent session (agents own their
-    /// tool execution; Damon just passes the list on).
-    #[serde(default)]
-    pub mcp_servers: HashMap<String, McpServerConfig>,
     /// Per-backend launch overrides: `[backends.claude] command = "…"`
     /// for a custom adapter, or an absolute path to a locally installed
     /// agent CLI.
@@ -69,18 +65,6 @@ pub struct RelayConfig {
     /// Registration secret when the relay sets DAMON_RELAY_SECRET.
     /// Supports env:/keychain:/!cmd secret refs.
     pub secret: Option<String>,
-}
-
-/// One stdio MCP server, forwarded to agents on session setup in the ACP
-/// `mcpServers` shape. Tool permissions are the agent's own concern.
-#[derive(Clone, Debug, Deserialize, PartialEq)]
-#[serde(deny_unknown_fields)]
-pub struct McpServerConfig {
-    pub command: String,
-    #[serde(default)]
-    pub args: Vec<String>,
-    #[serde(default)]
-    pub env: HashMap<String, String>,
 }
 
 /// A secret that lives outside the config file.
@@ -349,11 +333,6 @@ const STARTER_CONFIG: &str = r#"# Damon agent core configuration.
 # args = ["-p", "--output-format", "stream-json", "--input-format", "stream-json", "--verbose"]
 # [backends.claude.env]
 # ANTHROPIC_MODEL = "claude-sonnet-4-5"
-
-# MCP servers forwarded to every agent session:
-# [mcp_servers.filesystem]
-# command = "npx"
-# args = ["-y", "@modelcontextprotocol/server-filesystem", "/tmp"]
 "#;
 
 /// Shared, hot-reloadable config. Sync lock: guards are held only for
@@ -431,7 +410,6 @@ mod tests {
     fn parses_minimal_and_agent_overrides() {
         let cfg: Config = toml::from_str("").unwrap();
         assert_eq!(cfg.bind.to_string(), "127.0.0.1:9470");
-        assert!(cfg.mcp_servers.is_empty());
 
         let cfg: Config = toml::from_str(
             r#"
@@ -439,8 +417,6 @@ mod tests {
             [backends.claude]
             command = "/opt/claude"
             args = ["--flag"]
-            [mcp_servers.fs]
-            command = "npx"
             "#,
         )
         .unwrap();
@@ -449,7 +425,6 @@ mod tests {
             cfg.backends["claude"].command.as_deref(),
             Some("/opt/claude")
         );
-        assert_eq!(cfg.mcp_servers["fs"].command, "npx");
     }
 
     #[test]

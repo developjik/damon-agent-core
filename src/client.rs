@@ -57,9 +57,6 @@ pub struct DamonClient {
     events: Arc<Mutex<mpsc::Receiver<ClientEvent>>>,
     /// Connection liveness, driven by the reconnect supervisor.
     conn: watch::Receiver<ConnState>,
-    /// Session events dropped because the event channel was full —
-    /// a slow consumer loses streamed events; poll this to detect it.
-    dropped: Arc<AtomicU64>,
     /// The daemon's permission timeout, learned from the `hello` push
     /// (`permissionTimeoutSecs`); defaults until then.
     permission_timeout_secs: Arc<AtomicU64>,
@@ -68,9 +65,9 @@ pub struct DamonClient {
 /// Tunables for `connect_with_options` / `connect_relay_with_options`.
 #[derive(Clone, Debug)]
 pub struct ConnectOptions {
-    /// Capacity of the ClientEvent channel. Session events are
-    /// dropped (counted via `dropped_events()`) when a slow consumer lets
-    /// this fill — raise it for consumers that batch-render.
+    /// Capacity of the ClientEvent channel. Session events are dropped
+    /// (warn-once logged) when a slow consumer lets this fill — raise it
+    /// for consumers that batch-render.
     pub event_capacity: usize,
 }
 
@@ -219,7 +216,7 @@ impl DamonClient {
                 pending: pending.clone(),
                 event_tx,
                 conn_tx,
-                dropped: dropped.clone(),
+                dropped,
                 permission_timeout_secs: permission_timeout_secs.clone(),
             }
             .run(rx),
@@ -231,7 +228,6 @@ impl DamonClient {
             next_id: Arc::new(AtomicU64::new(1)),
             events: Arc::new(Mutex::new(event_rx)),
             conn: conn_rx,
-            dropped,
             permission_timeout_secs,
         }
     }
@@ -273,18 +269,6 @@ impl DamonClient {
         bail!("connection closed")
     }
 
-    /// Fire-and-forget frame — no response is expected or routed.
-    /// No v2 method is a notification; kept for envelope parity.
-    pub async fn notify(&self, method: &str, params: Value) -> anyhow::Result<()> {
-        let msg = json!({"method": method, "params": params});
-        self.writer
-            .lock()
-            .await
-            .send_text(msg.to_string())
-            .await
-            .context("send failed")
-    }
-
     /// Block until the transport is connected, or `RECONNECT_WAIT` elapses.
     async fn wait_connected(&self) -> anyhow::Result<()> {
         let mut rx = self.conn.clone();
@@ -301,13 +285,6 @@ impl DamonClient {
                 Err(_) => bail!("timed out waiting for reconnect"),
             }
         }
-    }
-
-    /// Session events dropped because the event channel filled —
-    /// nonzero means a slow consumer lost streamed events. Raise
-    /// `ConnectOptions::event_capacity` or consume faster.
-    pub fn dropped_events(&self) -> u64 {
-        self.dropped.load(Ordering::Relaxed)
     }
 
     /// Live connection state — a watch channel driven by the reconnect
@@ -338,12 +315,6 @@ impl DamonClient {
     /// until the first push arrives.
     pub fn permission_timeout(&self) -> Duration {
         Duration::from_secs(self.permission_timeout_secs.load(Ordering::Relaxed))
-    }
-
-    /// Available backends: `[{id, available, capabilities}]`.
-    pub async fn backend_list(&self) -> anyhow::Result<Vec<Value>> {
-        let v = self.request("backend.list", json!({})).await?;
-        Ok(v["backends"].as_array().cloned().unwrap_or_default())
     }
 
     /// Create a session. `backend` picks the agent (None = daemon
@@ -421,6 +392,27 @@ impl DamonClient {
             .request("session.import", json!({"backend": backend, "cwd": cwd}))
             .await?;
         Ok(v["sessions"].as_array().cloned().unwrap_or_default())
+    }
+
+    /// Resume a native session by its persistence handle — the import
+    /// path for sessions the backend made outside the daemon. The
+    /// daemon mints (or reuses) a Damon session id bound to the handle.
+    pub async fn resume_by_handle(
+        &self,
+        handle: &Value,
+        title: Option<&str>,
+        cwd: Option<&str>,
+    ) -> anyhow::Result<String> {
+        let v = self
+            .request(
+                "session.resume",
+                json!({"handle": handle, "title": title, "cwd": cwd}),
+            )
+            .await?;
+        v["sessionId"]
+            .as_str()
+            .map(String::from)
+            .context("no sessionId in response")
     }
 
     /// Rename a session (sets its title).
@@ -537,15 +529,6 @@ impl DamonClient {
         Ok(())
     }
 
-    /// Steer a running turn with additional input.
-    pub async fn turn_steer(&self, session_id: &str, prompt: Value) -> anyhow::Result<Value> {
-        self.request(
-            "turn.steer",
-            json!({"sessionId": session_id, "prompt": prompt}),
-        )
-        .await
-    }
-
     /// Cancel the session's running turn.
     pub async fn turn_cancel(&self, session_id: &str) -> anyhow::Result<()> {
         self.request("turn.cancel", json!({"sessionId": session_id}))
@@ -569,32 +552,6 @@ impl DamonClient {
         )
         .await?;
         Ok(())
-    }
-
-    /// Change the session's model mid-flight.
-    pub async fn set_model(&self, session_id: &str, model: &str) -> anyhow::Result<()> {
-        self.request(
-            "session.set_model",
-            json!({"sessionId": session_id, "model": model}),
-        )
-        .await?;
-        Ok(())
-    }
-
-    /// Change the session's mode mid-flight.
-    pub async fn set_mode(&self, session_id: &str, mode: &str) -> anyhow::Result<()> {
-        self.request(
-            "session.set_mode",
-            json!({"sessionId": session_id, "mode": mode}),
-        )
-        .await?;
-        Ok(())
-    }
-
-    /// Backend catalog: `{models[], modes[], commands[]}`.
-    pub async fn catalog_models(&self, backend: &str) -> anyhow::Result<Value> {
-        self.request("catalog.models", json!({"backend": backend}))
-            .await
     }
 }
 
@@ -774,8 +731,8 @@ async fn handle_frame(
     if v.get("event").is_some() {
         // Events are lossy by design — a slow consumer must never
         // backpressure the pump into stalling RPC responses. Every drop
-        // is counted on `dropped_events()`; warn once per power of two
-        // so a wedged consumer doesn't spam the log.
+        // is counted; warn once per power of two so a wedged consumer
+        // doesn't spam the log.
         let ev = ClientEvent::Event {
             session_id: v["sessionId"].as_str().unwrap_or("").to_string(),
             event: v["data"].clone(),

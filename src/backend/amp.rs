@@ -1,21 +1,18 @@
-//! Claude Code dialect — `claude -p` in bidirectional stream-json mode
-//! (`--output-format stream-json --input-format stream-json`).
+//! Amp dialect — `amp --execute --stream-json --stream-json-input`.
 //!
-//! Wire shape (observed against claude 2.1.270):
-//! - stdout: `system.init` (session_id, tools, model, permissionMode),
-//!   `assistant` messages (content blocks incl. tool_use), `user`
-//!   messages carrying tool_result blocks, `system.*` housekeeping
-//!   (hooks, thinking_tokens), and a final `result` frame per turn.
-//! - stdin: `{"type":"user","message":{...}}` prompts, plus
-//!   `control_request`/`control_response` frames for the SDK control
-//!   protocol (can_use_tool permission asks, interrupt, set_model,
-//!   set_permission_mode).
+//! Amp's stream-json is Claude Code compatible: same `system.init`,
+//! `assistant`/`user`/`result` frames, same `tool_use`/`tool_result`
+//! content blocks. Differences:
+//! - session ids look like `T-<uuid>`
+//! - input frames accept `steer: true` for mid-turn steering
+//! - `result` frames carry `usage` but no `total_cost_usd`
+//! - resume is `amp threads continue <id>` (a subcommand, not a flag)
+//! - `--stream-json-thinking` adds `thinking`/`redacted_thinking` blocks
 //!
-//! One process = one conversation. Resume spawns a fresh process with
-//! `--resume <session_id>`; Claude's own transcript file is the durable
-//! record.
+//! UNVERIFIED: no `amp` binary on the dev machine — permission asks and
+//! the interrupt control frame are written in Claude's shape and may
+//! need adjustment against a real install.
 
-use std::path::Path;
 use std::sync::Arc;
 
 use anyhow::Result;
@@ -25,59 +22,71 @@ use serde_json::{Value, json};
 use super::streamjson::{ControlOp, SessionCtx, StreamJsonDialect};
 use super::types::*;
 
-pub struct ClaudeDialect;
+pub struct AmpDialect;
 
-impl ClaudeDialect {
+impl AmpDialect {
     pub fn dialect() -> Arc<dyn StreamJsonDialect> {
         Arc::new(Self)
     }
 }
 
+/// Base args for an execute-mode stream-json session.
+fn exec_args() -> Vec<String> {
+    [
+        "--execute",
+        "--stream-json",
+        "--stream-json-input",
+        "--stream-json-thinking",
+    ]
+    .iter()
+    .map(|s| s.to_string())
+    .collect()
+}
+
 #[async_trait]
-impl StreamJsonDialect for ClaudeDialect {
+impl StreamJsonDialect for AmpDialect {
     fn launch_args(&self, config: &SessionConfig, resume: Option<&str>) -> Vec<String> {
         let mut args = vec![];
-        if let Some(mode) = &config.mode {
-            args.push("--permission-mode".to_string());
-            args.push(mode.clone());
+        if let Some(id) = resume {
+            // `amp threads continue <id>` reattaches to a thread.
+            args.extend(["threads", "continue"].iter().map(|s| s.to_string()));
+            args.push(id.to_string());
         }
+        args.extend(exec_args());
         if let Some(model) = &config.model {
             args.push("--model".to_string());
             args.push(model.clone());
         }
-        if let Some(id) = resume {
-            args.push("--resume".to_string());
-            args.push(id.to_string());
-        }
-        if !config.mcp_servers.is_empty() {
-            // Claude takes MCP servers as a JSON config flag.
-            let servers: Value = config
-                .mcp_servers
-                .iter()
-                .map(|(name, s)| {
-                    (
-                        name.clone(),
-                        json!({"command": s.command, "args": s.args, "env": s.env}),
-                    )
-                })
-                .collect::<serde_json::Map<String, Value>>()
-                .into();
-            args.push("--mcp-config".to_string());
-            args.push(json!({"mcpServers": servers}).to_string());
-        }
         args
     }
 
-    async fn on_frame(&self, session: &Arc<dyn SessionCtx>, f: &Value) {
+    async fn on_frame(&self, ctx: &Arc<dyn SessionCtx>, f: &Value) {
         let ty = f["type"].as_str().unwrap_or_default();
         match ty {
-            "system" => self.on_system(session, f).await,
-            "assistant" => self.on_assistant(session, f).await,
-            "user" => self.on_user(session, f).await,
-            "result" => self.on_result(session, f).await,
-            "control_request" => self.on_control_request(session, f).await,
+            "system" => {
+                match f["subtype"].as_str().unwrap_or_default() {
+                    "init" => {
+                        let id = f["session_id"].as_str().unwrap_or_default().to_string();
+                        ctx.set_native_handle(id).await;
+                    }
+                    // system error subtypes end the turn as failed.
+                    "error_max_turns" | "error_during_execution" => {
+                        ctx.finish_turn(StreamEventKind::TurnFailed {
+                            error: f["error"].as_str().unwrap_or("amp error").to_string(),
+                            code: f["subtype"].as_str().map(|s| s.to_string()),
+                        })
+                        .await;
+                    }
+                    _ => {}
+                }
+            }
+            "assistant" => self.on_assistant(ctx, f).await,
+            "user" => self.on_user(ctx, f).await,
+            "result" => self.on_result(ctx, f).await,
+            // UNVERIFIED: amp may emit Claude-shaped control_request
+            // frames for permission asks; handle them the same way.
+            "control_request" => self.on_control_request(ctx, f).await,
             "control_response" => {
-                // Answer to a control request WE sent (interrupt, set_model).
                 let id = f["response"]["request_id"]
                     .as_str()
                     .unwrap_or_default()
@@ -90,7 +99,7 @@ impl StreamJsonDialect for ClaudeDialect {
                 } else {
                     Ok(resp.clone())
                 };
-                session.resolve_wire(&id, result).await;
+                ctx.resolve_wire(&id, result).await;
             }
             _ => {}
         }
@@ -124,6 +133,7 @@ impl StreamJsonDialect for ClaudeDialect {
         wire_id: &str,
         response: &PermissionResponse,
     ) -> Value {
+        // Claude-shaped control_response; UNVERIFIED against real amp.
         let resp = match response {
             PermissionResponse::Allow { updated_input, .. } => json!({
                 "behavior": "allow",
@@ -141,6 +151,8 @@ impl StreamJsonDialect for ClaudeDialect {
     }
 
     fn control_frame(&self, request_id: &str, op: &ControlOp) -> Option<Value> {
+        // UNVERIFIED: Claude-shaped control requests. Fire-and-forget
+        // (below) so a dialect that ignores them can't wedge the caller.
         let request = match op {
             ControlOp::Interrupt => json!({"subtype": "interrupt"}),
             ControlOp::SetModel(model) => json!({"subtype": "set_model", "model": model}),
@@ -155,89 +167,27 @@ impl StreamJsonDialect for ClaudeDialect {
         }))
     }
 
-    fn catalog(&self) -> ProviderCatalog {
-        // Claude has no model-listing wire call; the init frame reports
-        // the active model. Modes are the CLI's permission modes.
-        ProviderCatalog {
-            models: vec![],
-            modes: ["default", "acceptEdits", "plan", "bypassPermissions"]
-                .iter()
-                .map(|m| ModeDef {
-                    id: m.to_string(),
-                    name: m.to_string(),
-                    description: None,
-                })
-                .collect(),
-            default_mode: Some("default".to_string()),
-        }
-    }
-
-    /// Claude persists every session as `~/.claude/projects/<cwd-slug>/*.jsonl`.
-    async fn list_importable(&self, cwd: &Path) -> Result<Vec<ImportableSession>> {
-        let home = directories::BaseDirs::new()
-            .map(|b| b.home_dir().to_path_buf())
-            .unwrap_or_default();
-        let slug = cwd.to_string_lossy().replace('/', "-");
-        let dir = home.join(".claude").join("projects").join(slug);
-        let mut out = vec![];
-        let mut entries = match tokio::fs::read_dir(&dir).await {
-            Ok(e) => e,
-            Err(_) => return Ok(out),
-        };
-        while let Some(entry) = entries.next_entry().await? {
-            let path = entry.path();
-            if path.extension().and_then(|e| e.to_str()) != Some("jsonl") {
-                continue;
-            }
-            let Some(stem) = path.file_stem().and_then(|s| s.to_str()) else {
-                continue;
-            };
-            let modified = entry
-                .metadata()
-                .await
-                .ok()
-                .and_then(|m| m.modified().ok())
-                .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
-                .map(|d| d.as_secs());
-            out.push(ImportableSession {
-                handle: PersistenceHandle {
-                    provider: "claude".to_string(),
-                    native_handle: stem.to_string(),
-                    metadata: json!({"transcript": path.to_string_lossy()}),
-                },
-                title: None,
-                cwd: Some(cwd.to_path_buf()),
-                modified_at: modified,
-            });
-        }
-        Ok(out)
+    fn control_is_fire_and_forget(&self) -> bool {
+        true
     }
 
     fn capabilities(&self) -> Capabilities {
         Capabilities {
             streaming: true,
             session_persistence: true,
-            session_listing: true,
-            dynamic_modes: true,
-            mcp_servers: true,
+            session_listing: false,
+            dynamic_modes: false,
+            mcp_servers: false,
             reasoning_stream: true,
             steer: true,
-            rewind: true,
+            rewind: false,
             subagent_events: true,
         }
     }
 }
 
-impl ClaudeDialect {
-    async fn on_system(&self, session: &Arc<dyn SessionCtx>, f: &Value) {
-        if f["subtype"].as_str() == Some("init") {
-            let id = f["session_id"].as_str().unwrap_or_default().to_string();
-            session.set_native_handle(id).await;
-        }
-        // Other system subtypes (hooks, thinking_tokens) are housekeeping.
-    }
-
-    async fn on_assistant(&self, session: &Arc<dyn SessionCtx>, f: &Value) {
+impl AmpDialect {
+    async fn on_assistant(&self, ctx: &Arc<dyn SessionCtx>, f: &Value) {
         let Some(blocks) = f["message"]["content"].as_array() else {
             return;
         };
@@ -260,12 +210,11 @@ impl ClaudeDialect {
                 }),
                 _ => TimelineItem::Unknown { raw: block.clone() },
             };
-            session.emit_timeline(item).await;
+            ctx.emit_timeline(item).await;
         }
     }
 
-    async fn on_user(&self, session: &Arc<dyn SessionCtx>, f: &Value) {
-        // tool_result blocks arrive as user messages.
+    async fn on_user(&self, ctx: &Arc<dyn SessionCtx>, f: &Value) {
         let Some(blocks) = f["message"]["content"].as_array() else {
             return;
         };
@@ -282,7 +231,7 @@ impl ClaudeDialect {
                 Value::String(s) => s.clone(),
                 other => other.to_string(),
             };
-            let item = TimelineItem::ToolCall(ToolCall {
+            ctx.emit_timeline(TimelineItem::ToolCall(ToolCall {
                 call_id,
                 name: String::new(),
                 status: if is_error {
@@ -294,44 +243,37 @@ impl ClaudeDialect {
                     input: Value::Null,
                     output: Value::String(output),
                 },
-            });
-            session.emit_timeline(item).await;
+            }))
+            .await;
         }
     }
 
-    async fn on_result(&self, session: &Arc<dyn SessionCtx>, f: &Value) {
+    async fn on_result(&self, ctx: &Arc<dyn SessionCtx>, f: &Value) {
         let usage = Usage {
             input_tokens: f["usage"]["input_tokens"].as_u64(),
             cached_input_tokens: f["usage"]["cache_read_input_tokens"].as_u64(),
             output_tokens: f["usage"]["output_tokens"].as_u64(),
-            cost_usd: f["total_cost_usd"].as_f64(),
-            context_window: None,
+            cost_usd: None,
+            context_window: f["usage"]["max_tokens"].as_u64(),
             context_used: None,
         };
-        let kind = if f["subtype"].as_str() == Some("interrupted")
-            || f["terminal_reason"].as_str() == Some("aborted_streaming")
-        {
-            // Interrupt reports is_error:true with subtype
-            // "error_during_execution" — the aborted_streaming terminal
-            // reason is what marks a user cancel.
-            StreamEventKind::TurnCanceled {
-                reason: "interrupted".to_string(),
-            }
-        } else if f["is_error"].as_bool().unwrap_or(false) {
+        let kind = if f["is_error"].as_bool().unwrap_or(false) {
             StreamEventKind::TurnFailed {
-                error: f["result"].as_str().unwrap_or("unknown error").to_string(),
+                error: f["error"]
+                    .as_str()
+                    .or_else(|| f["result"].as_str())
+                    .unwrap_or("unknown error")
+                    .to_string(),
                 code: f["subtype"].as_str().map(|s| s.to_string()),
             }
         } else {
             StreamEventKind::TurnCompleted { usage: Some(usage) }
         };
-        session.finish_turn(kind).await;
+        ctx.finish_turn(kind).await;
     }
 
-    /// Agent → daemon control requests. `can_use_tool` becomes a
-    /// PermissionRequest; anything else gets a minimal success response
-    /// so the agent isn't blocked on a handshake we don't implement.
-    async fn on_control_request(&self, session: &Arc<dyn SessionCtx>, f: &Value) {
+    /// UNVERIFIED: assumes Claude's can_use_tool control_request shape.
+    async fn on_control_request(&self, ctx: &Arc<dyn SessionCtx>, f: &Value) {
         let request_id = f["request_id"].as_str().unwrap_or_default().to_string();
         let req = &f["request"];
         match req["subtype"].as_str().unwrap_or_default() {
@@ -364,12 +306,10 @@ impl ClaudeDialect {
                         .cloned()
                         .unwrap_or_default(),
                 };
-                session.register_ask(ask, request_id).await;
+                ctx.register_ask(ask, request_id).await;
             }
             _ => {
-                // Unknown control request — answer success so the agent
-                // isn't stuck waiting on a handshake we don't implement.
-                let _ = session
+                let _ = ctx
                     .send_raw(json!({
                         "type": "control_response",
                         "response": {"request_id": request_id, "response": {}}
@@ -380,8 +320,9 @@ impl ClaudeDialect {
     }
 }
 
-/// Map a tool_use input to normalized detail. Unknown tools keep the raw
-/// input so nothing is silently dropped.
+/// Amp tool names differ from Claude's (`create_file`, `edit_file`,
+/// `finder`, `oracle`, `todo_write`, …) — map what we know, keep the
+/// raw input for the rest.
 fn map_tool_input(name: &str, input: &Value) -> ToolCallDetail {
     match name {
         "Bash" => ToolCallDetail::Shell {
@@ -389,19 +330,34 @@ fn map_tool_input(name: &str, input: &Value) -> ToolCallDetail {
             output: None,
             exit_code: None,
         },
-        "Read" => ToolCallDetail::Read {
-            path: input["file_path"].as_str().unwrap_or_default().to_string(),
+        "Read" | "read_mcp_resource" => ToolCallDetail::Read {
+            path: input["path"]
+                .as_str()
+                .or_else(|| input["file_path"].as_str())
+                .unwrap_or_default()
+                .to_string(),
             content: None,
         },
-        "Edit" | "MultiEdit" => ToolCallDetail::Edit {
-            path: input["file_path"].as_str().unwrap_or_default().to_string(),
+        "edit_file" | "Edit" => ToolCallDetail::Edit {
+            path: input["path"]
+                .as_str()
+                .or_else(|| input["file_path"].as_str())
+                .unwrap_or_default()
+                .to_string(),
             unified_diff: None,
         },
-        "Write" => ToolCallDetail::Write {
-            path: input["file_path"].as_str().unwrap_or_default().to_string(),
-            content: input["content"].as_str().map(|s| s.to_string()),
+        "create_file" | "Write" => ToolCallDetail::Write {
+            path: input["path"]
+                .as_str()
+                .or_else(|| input["file_path"].as_str())
+                .unwrap_or_default()
+                .to_string(),
+            content: input["content"]
+                .as_str()
+                .or_else(|| input["fileText"].as_str())
+                .map(|s| s.to_string()),
         },
-        "Grep" | "Glob" | "WebSearch" => ToolCallDetail::Search {
+        "Grep" | "glob" | "finder" | "web_search" => ToolCallDetail::Search {
             query: input["pattern"]
                 .as_str()
                 .or_else(|| input["query"].as_str())
@@ -409,7 +365,7 @@ fn map_tool_input(name: &str, input: &Value) -> ToolCallDetail {
                 .to_string(),
             content: None,
         },
-        "WebFetch" => ToolCallDetail::Fetch {
+        "read_web_page" | "WebFetch" => ToolCallDetail::Fetch {
             url: input["url"].as_str().unwrap_or_default().to_string(),
             result: None,
         },
@@ -420,12 +376,114 @@ fn map_tool_input(name: &str, input: &Value) -> ToolCallDetail {
                 .to_string(),
             log: String::new(),
         },
-        "TodoWrite" => ToolCallDetail::Plan {
+        "todo_write" | "TodoWrite" => ToolCallDetail::Plan {
             text: input["todos"].to_string(),
         },
         _ => ToolCallDetail::Unknown {
             input: input.clone(),
             output: Value::Null,
         },
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::backend::streamjson::tests::TestCtx;
+    use serde_json::json;
+
+    #[tokio::test]
+    async fn init_captures_thread_id() {
+        let t = TestCtx::new();
+        let ctx = t.as_ctx();
+        let d = AmpDialect;
+        d.on_frame(
+            &ctx,
+            &json!({"type":"system","subtype":"init","session_id":"T-abc-123"}),
+        )
+        .await;
+        assert_eq!(t.native.lock().await.as_deref(), Some("T-abc-123"));
+    }
+
+    #[tokio::test]
+    async fn assistant_text_and_tool_use() {
+        let t = TestCtx::new();
+        let ctx = t.as_ctx();
+        let d = AmpDialect;
+        d.on_frame(
+            &ctx,
+            &json!({
+                "type":"assistant",
+                "message":{"role":"assistant","content":[
+                    {"type":"text","text":"reading file"},
+                    {"type":"tool_use","id":"tu1","name":"Read","input":{"file_path":"/x.rs"}}
+                ]}
+            }),
+        )
+        .await;
+        let events = t.events.lock().await;
+        assert_eq!(events.len(), 2);
+        assert!(matches!(
+            events[0].kind,
+            StreamEventKind::Timeline(TimelineItem::AssistantMessage { .. })
+        ));
+        assert!(matches!(
+            events[1].kind,
+            StreamEventKind::Timeline(TimelineItem::ToolCall(_))
+        ));
+    }
+
+    #[tokio::test]
+    async fn result_finishes_with_usage() {
+        let t = TestCtx::new();
+        let ctx = t.as_ctx();
+        let d = AmpDialect;
+        d.on_frame(
+            &ctx,
+            &json!({
+                "type":"result","subtype":"success","is_error":false,
+                "usage":{"input_tokens":10,"output_tokens":5}
+            }),
+        )
+        .await;
+        let events = t.events.lock().await;
+        let Some(StreamEventKind::TurnCompleted { usage }) = events.last().map(|e| &e.kind) else {
+            panic!("expected TurnCompleted");
+        };
+        assert_eq!(usage.as_ref().unwrap().input_tokens, Some(10));
+    }
+
+    #[tokio::test]
+    async fn permission_ask_registers_and_replies() {
+        let t = TestCtx::new();
+        let ctx = t.as_ctx();
+        let d = AmpDialect;
+        d.on_frame(
+            &ctx,
+            &json!({
+                "type":"control_request","request_id":"r1",
+                "request":{"subtype":"can_use_tool","tool_name":"Bash","input":{"command":"ls"}}
+            }),
+        )
+        .await;
+        assert_eq!(t.asks.lock().await.len(), 1);
+        // The response frame shape is Claude-compatible.
+        let frame = d.permission_response_frame(
+            &t.asks.lock().await[0],
+            "r1",
+            &PermissionResponse::Allow {
+                action_id: None,
+                updated_input: None,
+            },
+        );
+        assert_eq!(frame["type"], "control_response");
+    }
+
+    #[test]
+    fn launch_args_resume_uses_threads_continue() {
+        let d = AmpDialect;
+        let args = d.launch_args(&SessionConfig::default(), Some("T-9"));
+        assert_eq!(&args[..3], &["threads", "continue", "T-9"]);
+        assert!(args.contains(&"--stream-json-input".to_string()));
     }
 }

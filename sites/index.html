@@ -4,10 +4,10 @@
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>Damon — 데몬 하나. 모든 코딩 에이전트.</title>
-<meta name="description" content="Damon은 Claude Code·Codex CLI·Oh My Pi를 네이티브 CLI로 구동하는 Rust 로컬 에이전트 컨트롤 데몬입니다. 세션, 권한 릴레이, 검색 가능한 히스토리, 채팅 채널, 원격 접근을 한 곳에서.">
+<meta name="description" content="Damon은 Claude Code·Codex CLI·Oh My Pi·Cursor·Amp·Kimi·Qwen을 네이티브 CLI로 구동하는 Rust 로컬 에이전트 컨트롤 데몬입니다. 세션, 권한 릴레이, 검색 가능한 히스토리, 채팅 채널, 원격 접근을 한 곳에서.">
 <meta name="theme-color" content="#0a0e16">
 <meta property="og:title" content="Damon — One daemon. Every coding agent.">
-<meta property="og:description" content="Rust local agent-control daemon. Sessions, permission relay, searchable history, chat channels, remote access — one resident daemon for Claude Code, Codex CLI, and Oh My Pi.">
+<meta property="og:description" content="Rust local agent-control daemon driving seven coding-agent CLIs natively — Claude Code, Codex CLI, Oh My Pi, Cursor, Amp, Kimi, Qwen. Sessions, permission relay, searchable history, chat channels, remote access — one resident daemon.">
 <meta property="og:type" content="website">
 <link rel="icon" href="./favicon.svg" type="image/svg+xml">
 <link rel="stylesheet" href="./assets/css/main.css">
@@ -32,6 +32,7 @@
       <a href="#features" data-i18n="nav.features">기능</a>
       <a href="#architecture" data-i18n="nav.arch">구조</a>
       <a href="#quickstart" data-i18n="nav.quick">시작하기</a>
+      <a href="#toolbox" data-i18n="nav.tools">도구</a>
       <a href="#channels" data-i18n="nav.chan">채널</a>
       <a href="#ecosystem" data-i18n="nav.eco">생태계</a>
     </nav>
@@ -55,9 +56,8 @@
       <circle cx="200" cy="200" r="60" fill="none" stroke="#5b8cff" stroke-width="1.2" opacity=".8"/>
       <circle cx="200" cy="200" r="110" fill="none" stroke="#7dd3fc" stroke-width=".8" opacity=".4"/>
       <circle cx="200" cy="200" r="160" fill="none" stroke="#7dd3fc" stroke-width=".6" opacity=".25"/>
-      <circle cx="200" cy="200" r="16" fill="#5b8cff"/>
-      <circle cx="200" cy="90" r="7" fill="#d97757"/><circle cx="295" cy="245" r="7" fill="#10a37f"/><circle cx="105" cy="245" r="7" fill="#a78bfa"/>
-      <circle cx="200" cy="40" r="5" fill="#7dd3fc"/><circle cx="360" cy="200" r="5" fill="#7dd3fc"/><circle cx="200" cy="360" r="5" fill="#7dd3fc"/><circle cx="40" cy="200" r="5" fill="#7dd3fc"/>
+      <circle cx="200" cy="90" r="6.5" fill="#d97757"/><circle cx="286" cy="131" r="6.5" fill="#10a37f"/><circle cx="307" cy="224" r="6.5" fill="#a78bfa"/><circle cx="248" cy="299" r="6.5" fill="#e8ecf4"/><circle cx="152" cy="299" r="6.5" fill="#fbbf24"/><circle cx="93" cy="224" r="6.5" fill="#fb7185"/><circle cx="114" cy="131" r="6.5" fill="#67e8f9"/>
+      <circle cx="200" cy="40" r="4.5" fill="#7dd3fc"/><circle cx="339" cy="120" r="4.5" fill="#7dd3fc"/><circle cx="339" cy="280" r="4.5" fill="#7dd3fc"/><circle cx="200" cy="360" r="4.5" fill="#7dd3fc"/><circle cx="61" cy="280" r="4.5" fill="#7dd3fc"/><circle cx="61" cy="120" r="4.5" fill="#7dd3fc"/>
     </svg>
   </div>
   <div class="hero-scrim" aria-hidden="true"></div>
@@ -65,7 +65,7 @@
     <div class="hero-copy">
       <p class="kicker" data-i18n="hero.badge">Rust 기반 로컬 에이전트 컨트롤 데몬</p>
       <h1><span data-i18n="hero.title1">데몬 하나.</span><br><span class="grad" data-i18n="hero.title2">모든 코딩 에이전트.</span></h1>
-      <p class="lead" data-i18n="hero.lead">Damon은 Claude Code·Codex CLI·Oh My Pi를 네이티브 CLI로 구동하는 Rust 상주 데몬입니다. 모델·툴·인증은 에이전트 몫 — Damon은 세션, 권한 릴레이, 검색 가능한 히스토리, 채팅 채널, 원격 접근을 소유합니다.</p>
+      <p class="lead" data-i18n="hero.lead">Damon은 Claude Code·Codex CLI·Oh My Pi·Cursor·Amp·Kimi·Qwen을 각자의 네이티브 CLI로 구동하는 Rust 상주 데몬입니다. 모델·툴·인증은 에이전트 몫 — Damon은 세션, 권한 릴레이, 검색 가능한 히스토리, 채팅 채널, 원격 접근을 소유합니다.</p>
       <div class="badges">
         <img src="https://github.com/developjik/damon-agent-core/actions/workflows/ci.yml/badge.svg" alt="ci">
         <img src="https://img.shields.io/crates/v/damon-core.svg" alt="crates.io">
@@ -102,7 +102,7 @@
       <article class="card">
         <div class="card-icon"><svg viewBox="0 0 24 24"><path d="M4 17l6-6-6-6M12 19h8" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"/></svg></div>
         <h3 data-i18n="f1t">설정 없는 백엔드</h3>
-        <p data-i18n="f1d">PATH의 claude·codex·omp를 자동 등록합니다. 다른 에이전트도 <code>[backends.X]</code> 블록 하나면 연결됩니다.</p>
+        <p data-i18n="f1d">PATH의 claude·codex·omp·cursor·amp·kimi·qwen이면 자동 등록됩니다. 다른 에이전트도 <code>[backends.X]</code> 블록 하나면 연결됩니다.</p>
       </article>
       <article class="card">
         <div class="card-icon"><svg viewBox="0 0 24 24"><path d="M12 22s8-4 8-10V5l-8-3-8 3v7c0 6 8 10 8 10z" fill="none" stroke="currentColor" stroke-width="2" stroke-linejoin="round"/><path d="M9 12l2 2 4-4" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"/></svg></div>
@@ -134,6 +134,20 @@
         <h3 data-i18n="f7t">상주하도록 설계</h3>
         <p data-i18n="f7d">Rust 데몬 본체는 가볍게 유지됩니다. 에이전트 프로세스는 에이전트의 몫입니다.</p>
       </article>
+    </div>
+
+    <div class="backend-strip">
+      <p class="backend-strip-title" data-i18n="strip.title">PATH에 있으면 자동 등록 — 일곱 개 네이티브 백엔드</p>
+      <div class="backend-chips">
+        <span class="bchip" style="--c:#d97757"><i></i>Claude Code<em>stream-json</em></span>
+        <span class="bchip" style="--c:#10a37f"><i></i>Codex CLI<em>app-server</em></span>
+        <span class="bchip" style="--c:#a78bfa"><i></i>Oh My Pi<em>RPC</em></span>
+        <span class="bchip" style="--c:#e8ecf4"><i></i>Cursor Agent<em>stream-json</em></span>
+        <span class="bchip" style="--c:#fbbf24"><i></i>Amp<em>amp dialect</em></span>
+        <span class="bchip" style="--c:#fb7185"><i></i>Kimi Code<em>stream-json</em></span>
+        <span class="bchip" style="--c:#67e8f9"><i></i>Qwen Code<em>stream-json</em></span>
+      </div>
+      <p class="backend-strip-more" data-i18n="strip.more">그 외 어떤 에이전트 CLI도 <code>[backends.X]</code> 블록 하나로</p>
     </div>
   </div>
 </section>
@@ -172,6 +186,11 @@
         <span class="chip chip-agent" style="--c:#d97757">Claude Code</span>
         <span class="chip chip-agent" style="--c:#10a37f">Codex CLI</span>
         <span class="chip chip-agent" style="--c:#a78bfa">Oh My Pi</span>
+        <span class="chip chip-agent" style="--c:#e8ecf4">Cursor Agent</span>
+        <span class="chip chip-agent" style="--c:#fbbf24">Amp</span>
+        <span class="chip chip-agent" style="--c:#fb7185">Kimi Code</span>
+        <span class="chip chip-agent" style="--c:#67e8f9">Qwen Code</span>
+        <span class="chip chip-dim">+ [backends.X]</span>
       </div>
       <p class="arch-note" data-i18n="arch.agents.note">모델·툴·구독 인증·컨텍스트는 전부 에이전트 소유</p>
     </div>
@@ -212,7 +231,7 @@
           <button class="copy-btn" type="button" data-copy="curl localhost:9470/health" aria-label="copy"><svg viewBox="0 0 24 24" width="14" height="14" aria-hidden="true"><rect x="9" y="9" width="12" height="12" rx="2" fill="none" stroke="currentColor" stroke-width="2"/><path d="M5 15V5a2 2 0 0 1 2-2h10" fill="none" stroke="currentColor" stroke-width="2"/></svg></button>
         </div>
         <pre><code><span class="ps1">$</span> curl localhost:9470/health
-<span class="out">{"backends":["claude","omp"],"status":"ok"}</span></code></pre>
+<span class="out">{"backends":["amp","claude","codex","cursor","kimi","omp","qwen"],"status":"ok"}</span><span class="blink" aria-hidden="true">▍</span></code></pre>
       </div>
 
       <div class="term">
@@ -230,6 +249,44 @@
         <p data-i18n="quick.ui.p">세션, 스트리밍, 권한 프롬프트까지 — 설치 불필요.</p>
       </div>
       <code class="ui-url">http://127.0.0.1:9470/ui</code>
+    </div>
+  </div>
+</section>
+
+<!-- ================= TOOLBOX ================= -->
+<section class="section" id="toolbox">
+  <div class="container">
+    <p class="kicker" data-i18n="tools.kicker">세션 도구상자</p>
+    <h2 data-i18n="tools.title">히스토리는 자산입니다</h2>
+    <p class="section-lead" data-i18n="tools.lead">모든 대화가 SQLite에 쌓입니다 — 검색하고, 분기하고, 내보내고, 백업하세요. 데몬이 살아 있는 동안에도 안전합니다.</p>
+
+    <div class="qs-grid">
+      <div class="term">
+        <div class="term-head"><span></span><span></span><span></span><em data-i18n="tools.t1">대화</em>
+          <button class="copy-btn" type="button" data-copy="damon chat --backend cursor" aria-label="copy"><svg viewBox="0 0 24 24" width="14" height="14" aria-hidden="true"><rect x="9" y="9" width="12" height="12" rx="2" fill="none" stroke="currentColor" stroke-width="2"/><path d="M5 15V5a2 2 0 0 1 2-2h10" fill="none" stroke="currentColor" stroke-width="2"/></svg></button>
+        </div>
+        <pre><code><span class="ps1">$</span> damon chat --backend cursor
+<span class="ps1">$</span> damon resume a1b2    <span class="cmt" data-i18n="tools.c1">이전 세션 이어서</span>
+<span class="ps1">$</span> damon import claude  <span class="cmt" data-i18n="tools.c2">데몬 밖에서 만든 세션 흡수</span></code></pre>
+      </div>
+
+      <div class="term">
+        <div class="term-head"><span></span><span></span><span></span><em data-i18n="tools.t2">탐색</em>
+          <button class="copy-btn" type="button" data-copy="damon search &quot;error timeout&quot; --limit 5" aria-label="copy"><svg viewBox="0 0 24 24" width="14" height="14" aria-hidden="true"><rect x="9" y="9" width="12" height="12" rx="2" fill="none" stroke="currentColor" stroke-width="2"/><path d="M5 15V5a2 2 0 0 1 2-2h10" fill="none" stroke="currentColor" stroke-width="2"/></svg></button>
+        </div>
+        <pre><code><span class="ps1">$</span> damon search "error timeout" --limit 5
+<span class="ps1">$</span> damon usage --session a1b2  <span class="cmt" data-i18n="tools.c3">토큰 사용량</span>
+<span class="ps1">$</span> damon sessions</code></pre>
+      </div>
+
+      <div class="term">
+        <div class="term-head"><span></span><span></span><span></span><em data-i18n="tools.t3">보존</em>
+          <button class="copy-btn" type="button" data-copy="damon backup" aria-label="copy"><svg viewBox="0 0 24 24" width="14" height="14" aria-hidden="true"><rect x="9" y="9" width="12" height="12" rx="2" fill="none" stroke="currentColor" stroke-width="2"/><path d="M5 15V5a2 2 0 0 1 2-2h10" fill="none" stroke="currentColor" stroke-width="2"/></svg></button>
+        </div>
+        <pre><code><span class="ps1">$</span> damon fork a1b2         <span class="cmt" data-i18n="tools.c4">히스토리 복사해 분기</span>
+<span class="ps1">$</span> damon export a1b2 --md   <span class="cmt" data-i18n="tools.c5">Markdown 트랜스크립트</span>
+<span class="ps1">$</span> damon backup             <span class="cmt" data-i18n="tools.c6">실행 중에도 안전한 스냅샷</span></code></pre>
+      </div>
     </div>
   </div>
 </section>

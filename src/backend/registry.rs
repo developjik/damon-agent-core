@@ -1,4 +1,4 @@
-//! Backend registry — the three supported agents, their detection on
+//! Backend registry — the supported agents, their detection on
 //! this machine, and launch-line resolution against config overrides.
 //!
 //! Unlike the old ACP catalog there is no generic "any binary speaks the
@@ -10,7 +10,7 @@ use std::collections::BTreeMap;
 use std::path::PathBuf;
 use std::sync::Arc;
 
-use crate::backend::{AgentClient, claude, codex, omp};
+use crate::backend::{AgentClient, amp, claude, codex, cursor, kimi, omp, qwen};
 use crate::config::AgentConfig;
 
 /// One backend entry: how to detect it and how to launch a session.
@@ -63,6 +63,44 @@ pub const BACKENDS: &[BackendSpec] = &[
         args: &["--mode", "rpc"],
         env: &[],
         auth_hint: "configure `omp` once; its provider auth follows",
+    },
+    BackendSpec {
+        id: "cursor",
+        title: "Cursor Agent (Cursor subscription)",
+        detect: "cursor-agent",
+        command: "cursor-agent",
+        args: &["-p", "--output-format", "stream-json", "--trust"],
+        env: &[],
+        auth_hint: "log in with `cursor-agent login` or set CURSOR_API_KEY",
+    },
+    BackendSpec {
+        id: "amp",
+        title: "Amp (Sourcegraph)",
+        detect: "amp",
+        command: "amp",
+        // Launch args come from the dialect — `threads continue` is a
+        // subcommand that must precede the exec flags.
+        args: &[],
+        env: &[],
+        auth_hint: "log in with `amp` once; the login follows",
+    },
+    BackendSpec {
+        id: "kimi",
+        title: "Kimi Code (Moonshot)",
+        detect: "kimi",
+        command: "kimi",
+        args: &["-p", "--output-format", "stream-json"],
+        env: &[],
+        auth_hint: "log in with `kimi login` once; the token follows",
+    },
+    BackendSpec {
+        id: "qwen",
+        title: "Qwen Code (Alibaba)",
+        detect: "qwen",
+        command: "qwen",
+        args: &["-p", "--output-format", "stream-json"],
+        env: &[],
+        auth_hint: "log in with `qwen` once; the OAuth flow follows",
     },
 ];
 
@@ -125,7 +163,26 @@ pub fn resolve_backends(overrides: &BTreeMap<String, AgentConfig>) -> Vec<Resolv
 /// protocols.
 pub fn client_for(resolved: &ResolvedBackend) -> Option<Arc<dyn AgentClient>> {
     match resolved.id.as_str() {
-        "claude" => Some(Arc::new(claude::ClaudeClient::new(resolved.clone()))),
+        "claude" => Some(Arc::new(crate::backend::streamjson::StreamJsonClient::new(
+            resolved.clone(),
+            claude::ClaudeDialect::dialect(),
+        ))),
+        "cursor" => Some(Arc::new(crate::backend::streamjson::StreamJsonClient::new(
+            resolved.clone(),
+            cursor::CursorDialect::dialect(),
+        ))),
+        "amp" => Some(Arc::new(crate::backend::streamjson::StreamJsonClient::new(
+            resolved.clone(),
+            amp::AmpDialect::dialect(),
+        ))),
+        "kimi" => Some(Arc::new(crate::backend::streamjson::StreamJsonClient::new(
+            resolved.clone(),
+            kimi::KimiDialect::dialect(),
+        ))),
+        "qwen" => Some(Arc::new(crate::backend::streamjson::StreamJsonClient::new(
+            resolved.clone(),
+            qwen::QwenDialect::dialect(),
+        ))),
         "codex" => Some(Arc::new(codex::CodexClient::new(resolved.clone()))),
         "omp" => Some(Arc::new(omp::OmpClient::new(resolved.clone()))),
         _ => None,
@@ -155,10 +212,13 @@ mod tests {
     use super::*;
 
     #[test]
-    fn catalog_has_three_backends() {
-        assert_eq!(BACKENDS.len(), 3);
+    fn catalog_has_seven_backends() {
+        assert_eq!(BACKENDS.len(), 7);
         let ids: Vec<_> = BACKENDS.iter().map(|b| b.id).collect();
-        assert_eq!(ids, ["claude", "codex", "omp"]);
+        assert_eq!(
+            ids,
+            ["claude", "codex", "omp", "cursor", "amp", "kimi", "qwen"]
+        );
     }
 
     #[test]

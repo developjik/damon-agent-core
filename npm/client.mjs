@@ -249,7 +249,7 @@ export class DamonClient {
     return r.sessionId;
   }
 
-  /** List sessions: [{sessionId, createdAt, model}].
+  /** List sessions: [{sessionId, createdAt, backend, title}].
    *  Pass {limit, offset} to page. */
   async listSessions({ limit, offset } = {}) {
     const r = await this.#call("session.list", { limit, offset });
@@ -265,6 +265,14 @@ export class DamonClient {
   /** Resume an existing session; returns sessionId. Throws if unknown. */
   async resumeSession(sessionId) {
     const r = await this.#call("session.resume", { sessionId });
+    return r.sessionId;
+  }
+
+  /** Resume a native session by its persistence handle — the import
+   *  path for sessions the backend made outside the daemon. Returns
+   *  the Damon sessionId (deduped: same handle → same session). */
+  async resumeByHandle(handle, { title, cwd } = {}) {
+    const r = await this.#call("session.resume", { handle, title, cwd });
     return r.sessionId;
   }
 
@@ -841,7 +849,7 @@ async function ticketedUrl(wsUrl, token, fetchFn) {
 
 /** Pure internals for tests — NOT a public or stable API. */
 export const __test = {
-  detectX25519, x25519Keypair, x25519Shared, importX25519Public,
+  x25519Keypair, x25519Shared, importX25519Public,
   proof, deriveKeys, importAesKey, sealFrame, openFrame, seqNonce,
   b64, unb64, constantTimeEq, relayEncode,
 };

@@ -408,6 +408,21 @@ impl Bridge {
                     None => Some("no session to delete".to_string()),
                 }
             }
+            "cancel" => {
+                let sid = self
+                    .chat_sessions
+                    .lock()
+                    .await
+                    .get(conv_id)
+                    .map(|e| e.session_id.clone());
+                match sid {
+                    Some(sid) => match self.client.turn_cancel(&sid).await {
+                        Ok(()) => Some("cancel requested".to_string()),
+                        Err(e) => Some(format!("cancel failed: {e:#}")),
+                    },
+                    None => Some("no session to cancel".to_string()),
+                }
+            }
             "agent" => Some(
                 "backends are fixed per session — use !new to start one on the \
                  default backend (set `default_backend` in config)"
@@ -496,7 +511,8 @@ impl Bridge {
             }
             "help" => Some(
                 "commands: !new (reset session) · !fork (branch session) · \
-                 !delete (remove session) · !usage (token totals) · \
+                 !delete (remove session) · !cancel (stop the running turn) · \
+                 !usage (token totals) · \
                  allow/deny/always (answer a permission prompt)"
                     .to_string(),
             ),
@@ -741,15 +757,31 @@ impl Bridge {
                                         )
                                         .await;
                                 }
-                                Some("error") => {
-                                    let msg = event["message"].as_str().unwrap_or("unknown error");
-                                    let _ = self
-                                        .ch
-                                        .send_in_thread(chat_id, thread_id, &format!("⚠️ {msg}"))
-                                        .await;
-                                }
                                 _ => {}
                             },
+                            Some("subagent") => {
+                                // Raw backend frame — summarize from the
+                                // common fields, fall back to its type.
+                                let f = &event["event"];
+                                let name = f["name"]
+                                    .as_str()
+                                    .or_else(|| f["agent"].as_str())
+                                    .or_else(|| f["description"].as_str())
+                                    .unwrap_or("subagent");
+                                let status = f["status"]
+                                    .as_str()
+                                    .or_else(|| f["state"].as_str())
+                                    .or_else(|| f["type"].as_str())
+                                    .unwrap_or("");
+                                let _ = self
+                                    .ch
+                                    .send_in_thread(
+                                        chat_id,
+                                        thread_id,
+                                        &format!("🤖 {name} {status}"),
+                                    )
+                                    .await;
+                            }
                             Some("permission_requested") => {
                                 let request_id = event["id"].as_str().unwrap_or_default();
                                 if request_id.is_empty() {

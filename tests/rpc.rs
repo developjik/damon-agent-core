@@ -204,7 +204,14 @@ async fn cancel_hung_turn_unblocks_session_delete() {
     let reply = read_reply(&mut ws, 90).await;
     assert_eq!(reply["result"]["deleted"], true, "reply: {reply}");
     // The row is gone — the session was actually deleted.
-    assert!(!store.session_exists(&session_id).await.unwrap());
+    assert!(
+        store
+            .list_sessions_paged(u32::MAX, 0)
+            .await
+            .unwrap()
+            .iter()
+            .all(|(id, ..)| id != &session_id)
+    );
     assert!(state.sessions.get(&session_id).await.is_none());
 }
 
@@ -872,8 +879,11 @@ async fn session_fork_copies_history() {
     assert_ne!(fork_id, session_id, "fork returned the same session id");
 
     // The fork exists and has the same message count as the original.
-    let orig_msgs = store.messages(&session_id).await.unwrap();
-    let fork_msgs = store.messages(&fork_id).await.unwrap();
+    let orig_msgs = store
+        .messages_paged(&session_id, u32::MAX, 0)
+        .await
+        .unwrap();
+    let fork_msgs = store.messages_paged(&fork_id, u32::MAX, 0).await.unwrap();
     assert_eq!(
         orig_msgs.len(),
         fork_msgs.len(),
@@ -882,7 +892,14 @@ async fn session_fork_copies_history() {
     assert!(fork_msgs.len() >= 2, "fork has no messages");
 
     // The original session is still there.
-    assert!(store.session_exists(&session_id).await.unwrap());
+    assert!(
+        store
+            .list_sessions_paged(u32::MAX, 0)
+            .await
+            .unwrap()
+            .iter()
+            .any(|(id, ..)| id == &session_id)
+    );
 }
 
 /// session.resume after the daemon-side mapping is lost (daemon
@@ -948,6 +965,59 @@ async fn session_resume_reattaches_backend_session() {
     )
     .await;
     let reply = read_reply(&mut ws, 5).await;
+    assert_eq!(reply["result"]["stopReason"], "completed", "reply: {reply}");
+}
+
+/// session.resume with a `handle` imports a native session: it mints a
+/// Damon row bound to the handle, resumes the backend, and a second
+/// resume of the same handle returns the same session — no duplicates.
+#[tokio::test]
+async fn session_resume_by_handle_imports_native_session() {
+    let (_state, _store, addr) = serve(test_config(None)).await;
+    let (mut ws, _) = ws_connect(&format!("ws://{addr}/ws")).await;
+
+    let handle = json!({"provider": "mock", "native_handle": "native-42"});
+    rpc_send(
+        &mut ws,
+        json!({"id":1,"method":"session.resume",
+               "params":{"handle":handle,"title":"imported","cwd":"/tmp"}}),
+    )
+    .await;
+    let reply = read_reply(&mut ws, 1).await;
+    assert!(
+        reply.get("error").is_none(),
+        "handle resume failed: {reply}"
+    );
+    let session_id = reply["result"]["sessionId"].as_str().unwrap().to_string();
+    assert_eq!(reply["result"]["backend"], "mock", "reply: {reply}");
+
+    // The imported session is listed with its title.
+    rpc_send(&mut ws, json!({"id":2,"method":"session.list","params":{}})).await;
+    let reply = read_reply(&mut ws, 2).await;
+    let sessions = reply["result"]["sessions"].as_array().unwrap();
+    let row = sessions
+        .iter()
+        .find(|s| s["sessionId"] == session_id)
+        .expect("imported session missing from list");
+    assert_eq!(row["title"], "imported", "row: {row}");
+
+    // Re-resuming the same handle dedups to the same Damon session.
+    rpc_send(
+        &mut ws,
+        json!({"id":3,"method":"session.resume","params":{"handle":handle}}),
+    )
+    .await;
+    let reply = read_reply(&mut ws, 3).await;
+    assert_eq!(reply["result"]["sessionId"], session_id, "reply: {reply}");
+
+    // The imported session drives turns like a native one.
+    rpc_send(
+        &mut ws,
+        json!({"id":4,"method":"turn.start",
+               "params":{"sessionId":session_id,"prompt":"hi"}}),
+    )
+    .await;
+    let reply = read_reply(&mut ws, 4).await;
     assert_eq!(reply["result"]["stopReason"], "completed", "reply: {reply}");
 }
 

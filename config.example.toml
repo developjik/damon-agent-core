@@ -17,6 +17,7 @@
 # default_backend = "claude"
 
 # Backend launch overrides — every field optional, catalog defaults otherwise.
+# Catalog ids: claude, codex, omp, cursor, amp, kimi, qwen.
 # [backends.claude]
 # command = "claude"                       # or a local adapter build's path
 # args = ["-p", "--output-format", "stream-json", "--input-format", "stream-json", "--verbose"]
