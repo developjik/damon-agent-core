@@ -31,9 +31,143 @@ const RATE_LIMIT_BURST: f64 = 20.0;
 type AuthTokenCache = (Option<String>, Option<(Instant, Result<String, String>)>);
 
 /// Process-wide counters, exported as Prometheus text on GET /metrics.
+/// Label cardinality is bounded by construction: turn stats key by
+/// backend id (the catalog is fixed at boot plus config reloads), rpc
+/// errors by wire code.
 #[derive(Default)]
 pub struct Metrics {
+    /// HTTP requests through the token gate (historical scope).
     pub requests_total: std::sync::atomic::AtomicU64,
+    /// JSON-RPC frames dispatched — WS and relay paths alike.
+    pub rpc_requests_total: std::sync::atomic::AtomicU64,
+    /// JSON-RPC error responses, keyed by wire error code.
+    rpc_errors: parking_lot::Mutex<HashMap<String, std::sync::atomic::AtomicU64>>,
+    /// Turn outcomes + wall-clock duration, keyed by backend id.
+    turns: parking_lot::Mutex<HashMap<String, TurnMetrics>>,
+}
+
+/// Upper bounds (seconds) of the turn-duration histogram buckets.
+const TURN_BUCKETS: [f64; 8] = [1.0, 5.0, 15.0, 30.0, 60.0, 120.0, 300.0, 600.0];
+/// `run_turn` stop reasons, in the order `TurnMetrics::status` counts
+/// them.
+const TURN_STATUSES: [&str; 5] = ["completed", "failed", "canceled", "timeout", "closed"];
+
+/// Per-backend turn accounting: outcome counters plus a fixed-bucket
+/// duration histogram (sum/count give the mean without a client lib).
+#[derive(Default)]
+struct TurnMetrics {
+    status: [std::sync::atomic::AtomicU64; TURN_STATUSES.len()],
+    duration_buckets: [std::sync::atomic::AtomicU64; TURN_BUCKETS.len()],
+    duration_sum_ms: std::sync::atomic::AtomicU64,
+    total: std::sync::atomic::AtomicU64,
+}
+
+impl Metrics {
+    pub(crate) fn record_rpc_request(&self) {
+        self.rpc_requests_total
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    }
+
+    pub(crate) fn record_rpc_error(&self, code: i64) {
+        let mut m = self.rpc_errors.lock();
+        m.entry(code.to_string())
+            .or_default()
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    }
+
+    /// Record one finished turn: backend, `run_turn` stop reason,
+    /// wall-clock duration.
+    pub fn record_turn(&self, backend: &str, status: &str, duration: std::time::Duration) {
+        let mut turns = self.turns.lock();
+        let t = turns.entry(backend.to_string()).or_default();
+        t.total.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        if let Some(i) = TURN_STATUSES.iter().position(|s| *s == status) {
+            t.status[i].fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        }
+        t.duration_sum_ms.fetch_add(
+            duration.as_millis() as u64,
+            std::sync::atomic::Ordering::Relaxed,
+        );
+        let secs = duration.as_secs_f64();
+        for (i, edge) in TURN_BUCKETS.iter().enumerate() {
+            if secs <= *edge {
+                t.duration_buckets[i].fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            }
+        }
+    }
+
+    /// The full Prometheus text body for /metrics.
+    pub fn render(&self, live_sessions: usize, busy_sessions: usize) -> String {
+        use std::fmt::Write as _;
+        use std::sync::atomic::Ordering::Relaxed;
+        let mut out = String::new();
+        let _ = writeln!(
+            out,
+            "# HELP damon_requests_total HTTP requests through the token gate."
+        );
+        let _ = writeln!(out, "# TYPE damon_requests_total counter");
+        let _ = writeln!(
+            out,
+            "damon_requests_total {}",
+            self.requests_total.load(Relaxed)
+        );
+        let _ = writeln!(out, "# TYPE damon_rpc_requests_total counter");
+        let _ = writeln!(
+            out,
+            "damon_rpc_requests_total {}",
+            self.rpc_requests_total.load(Relaxed)
+        );
+        let _ = writeln!(out, "# TYPE damon_live_sessions gauge");
+        let _ = writeln!(out, "damon_live_sessions {live_sessions}");
+        let _ = writeln!(out, "# TYPE damon_busy_sessions gauge");
+        let _ = writeln!(out, "damon_busy_sessions {busy_sessions}");
+
+        let mut errors: Vec<_> = self
+            .rpc_errors
+            .lock()
+            .iter()
+            .map(|(code, n)| (code.clone(), n.load(Relaxed)))
+            .collect();
+        errors.sort();
+        for (code, n) in errors {
+            let _ = writeln!(out, "damon_rpc_errors_total{{code=\"{code}\"}} {n}");
+        }
+
+        let turns_guard = self.turns.lock();
+        let mut turns: Vec<_> = turns_guard.iter().collect();
+        turns.sort_by(|a, b| a.0.cmp(b.0));
+        for (backend, t) in turns {
+            for (i, status) in TURN_STATUSES.iter().enumerate() {
+                let _ = writeln!(
+                    out,
+                    "damon_turns_total{{backend=\"{backend}\",status=\"{status}\"}} {}",
+                    t.status[i].load(Relaxed)
+                );
+            }
+            for (i, edge) in TURN_BUCKETS.iter().enumerate() {
+                let _ = writeln!(
+                    out,
+                    "damon_turn_seconds_bucket{{backend=\"{backend}\",le=\"{edge}\"}} {}",
+                    t.duration_buckets[i].load(Relaxed)
+                );
+            }
+            let total = t.total.load(Relaxed);
+            let _ = writeln!(
+                out,
+                "damon_turn_seconds_bucket{{backend=\"{backend}\",le=\"+Inf\"}} {total}"
+            );
+            let _ = writeln!(
+                out,
+                "damon_turn_seconds_sum{{backend=\"{backend}\"}} {}",
+                t.duration_sum_ms.load(Relaxed) as f64 / 1000.0
+            );
+            let _ = writeln!(
+                out,
+                "damon_turn_seconds_count{{backend=\"{backend}\"}} {total}"
+            );
+        }
+        out
+    }
 }
 
 /// Shared daemon state: config, store, and the session manager that
@@ -260,6 +394,7 @@ pub fn router(state: Arc<AppState>) -> Router {
         // Embedded chat UI — static markup, no secrets; the page
         // authenticates itself through the ws ticket flow.
         .route("/ui", get(crate::ui::ui))
+        .route("/relay-client.js", get(crate::ui::relay_client_js))
         // PWA assets — same trust level as /ui.
         .route("/manifest.webmanifest", get(crate::ui::manifest))
         .route("/icon.svg", get(crate::ui::icon))
@@ -303,13 +438,14 @@ async fn health(State(state): State<Arc<AppState>>) -> Json<serde_json::Value> {
 }
 
 /// GET /metrics — Prometheus text exposition of the process counters.
+/// `damon_live_sessions` is the live map size; `damon_busy_sessions`
+/// counts turns in flight (what the old `live_sessions` number
+/// actually measured).
 async fn metrics(State(state): State<Arc<AppState>>) -> Response {
-    use std::sync::atomic::Ordering::Relaxed;
-    let body = format!(
-        "damon_requests_total {}\ndamon_live_sessions {}\n",
-        state.metrics.requests_total.load(Relaxed),
-        state.sessions.busy_ids().await.len(),
-    );
+    let busy = state.sessions.busy_ids().await.len();
+    let body = state
+        .metrics
+        .render(state.sessions.live_count().await, busy);
     (
         [(
             axum::http::header::CONTENT_TYPE,
@@ -406,5 +542,91 @@ async fn require_token(State(state): State<Arc<AppState>>, req: Request, next: N
             next.run(req).await
         }
         _ => StatusCode::UNAUTHORIZED.into_response(),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The rendered body is valid Prometheus text: HELP/TYPE metadata,
+    /// cumulative histogram buckets ending at +Inf == count, and a sum
+    /// that tracks the recorded durations. Buckets are CUMULATIVE, so a
+    /// 2s turn lands in every bucket ≥ its duration and none below.
+    #[test]
+    fn metrics_render_turn_histogram_and_errors() {
+        let m = Metrics::default();
+        m.record_turn("mock", "completed", std::time::Duration::from_millis(2_100));
+        m.record_turn("mock", "failed", std::time::Duration::from_millis(700));
+        m.record_turn("claude", "completed", std::time::Duration::from_secs(90));
+        m.record_rpc_error(-32602);
+        m.record_rpc_error(-32602);
+        m.record_rpc_error(-32001);
+
+        let body = m.render(3, 1);
+        assert!(body.contains("damon_live_sessions 3"), "{body}");
+        assert!(body.contains("damon_busy_sessions 1"), "{body}");
+        assert!(
+            body.contains("damon_rpc_errors_total{code=\"-32602\"} 2"),
+            "{body}"
+        );
+        assert!(
+            body.contains("damon_rpc_errors_total{code=\"-32001\"} 1"),
+            "{body}"
+        );
+        // mock: one 2.1s turn (first bucket edge ≥ 2.1 is 5) and one
+        // 0.7s turn (edge 1) — cumulative counts per le.
+        assert!(
+            body.contains("damon_turns_total{backend=\"mock\",status=\"completed\"} 1"),
+            "{body}"
+        );
+        assert!(
+            body.contains("damon_turns_total{backend=\"mock\",status=\"failed\"} 1"),
+            "{body}"
+        );
+        assert!(
+            body.contains("damon_turn_seconds_bucket{backend=\"mock\",le=\"1\"} 1"),
+            "{body}"
+        );
+        assert!(
+            body.contains("damon_turn_seconds_bucket{backend=\"mock\",le=\"5\"} 2"),
+            "{body}"
+        );
+        assert!(
+            body.contains("damon_turn_seconds_bucket{backend=\"mock\",le=\"+Inf\"} 2"),
+            "{body}"
+        );
+        // sum is seconds: 2.1 + 0.7 = 2.8.
+        assert!(
+            body.contains("damon_turn_seconds_sum{backend=\"mock\"} 2.8"),
+            "{body}"
+        );
+        assert!(
+            body.contains("damon_turn_seconds_count{backend=\"mock\"} 2"),
+            "{body}"
+        );
+        // claude: the 90s turn lands past the 60 bucket.
+        assert!(
+            body.contains("damon_turn_seconds_bucket{backend=\"claude\",le=\"60\"} 0"),
+            "{body}"
+        );
+        assert!(
+            body.contains("damon_turn_seconds_bucket{backend=\"claude\",le=\"120\"} 1"),
+            "{body}"
+        );
+    }
+
+    /// An unknown stop reason still counts the turn (total/sum/count)
+    /// without inventing a status label.
+    #[test]
+    fn metrics_record_unknown_status_still_counts_total() {
+        let m = Metrics::default();
+        m.record_turn("mock", "weird", std::time::Duration::from_secs(1));
+        let body = m.render(0, 0);
+        assert!(
+            body.contains("damon_turn_seconds_count{backend=\"mock\"} 1"),
+            "{body}"
+        );
+        assert!(!body.contains("status=\"weird\""), "{body}");
     }
 }

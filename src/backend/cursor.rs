@@ -2,10 +2,14 @@
 //!
 //! One-shot: the CLI takes the prompt as a positional arg and exits per
 //! turn; `--resume <chatId>` continues the chat in a fresh process.
-//! Frame shape differs from Claude:
-//! - `system.init` carries `session_id`, `model`, `permissionMode`
-//! - `assistant` frames carry complete messages (no partial deltas
-//!   unless `--stream-partial-output`, which we don't enable)
+//! - `assistant` frames stream per-chunk deltas under
+//!   `--stream-partial-output` (always enabled): of the three assistant
+//!   event kinds it emits, only `timestamp_ms` present + `model_call_id`
+//!   absent carries new text — the buffered pre-tool flush (both set) and
+//!   the end-of-turn flush (neither set) are duplicates. Downstream every
+//!   consumer coalesces consecutive AssistantMessage items (rpc.rs
+//!   persistence, the channel bridge buffer, the UI), so per-chunk
+//!   emission streams live without duplicating the transcript.
 //! - `tool_call` frames: `{type:"tool_call", subtype:"started"|"completed",
 //!   call_id, tool_call:{readToolCall|writeToolCall|function:{...}}}`
 //! - `result` has no `usage`/`total_cost_usd`
@@ -40,7 +44,7 @@ impl StreamJsonDialect for CursorDialect {
     }
 
     fn launch_args(&self, config: &SessionConfig, resume: Option<&str>) -> Vec<String> {
-        let mut args = vec![];
+        let mut args = vec!["--stream-partial-output".to_string()];
         if let Some(id) = resume {
             args.push("--resume".to_string());
             args.push(id.to_string());
@@ -81,6 +85,14 @@ impl StreamJsonDialect for CursorDialect {
                 ctx.set_native_handle(id).await;
             }
             "assistant" => {
+                // --stream-partial-output triples the assistant events:
+                // emit ONLY the delta kind (timestamp_ms set,
+                // model_call_id absent). The pre-tool buffered flush
+                // (both set) and the end-of-turn flush (neither set)
+                // repeat text the deltas already delivered.
+                if f.get("timestamp_ms").is_none() || f.get("model_call_id").is_some() {
+                    return;
+                }
                 let Some(blocks) = f["message"]["content"].as_array() else {
                     return;
                 };
@@ -368,5 +380,55 @@ mod tests {
             .collect();
         assert!(modes.contains(&"bypassPermissions".to_string()));
         assert!(!modes.contains(&"acceptEdits".to_string()));
+    }
+
+    #[tokio::test]
+    async fn assistant_delta_kinds_filter_per_docs() {
+        let d = CursorDialect;
+        // Delta: timestamp_ms set, model_call_id absent — the only kind
+        // carrying new text under --stream-partial-output.
+        let t = TestCtx::new();
+        d.on_frame(
+            &t.as_ctx(),
+            &json!({
+                "type":"assistant","timestamp_ms":1234,
+                "message":{"role":"assistant","content":[{"type":"text","text":"Hel"}]}
+            }),
+        )
+        .await;
+        assert_eq!(t.events.lock().await.len(), 1);
+
+        // Buffered pre-tool flush: both fields set — duplicate, skipped.
+        let t = TestCtx::new();
+        d.on_frame(
+            &t.as_ctx(),
+            &json!({
+                "type":"assistant","timestamp_ms":1235,"model_call_id":"m1",
+                "message":{"role":"assistant","content":[{"type":"text","text":"Hello"}]}
+            }),
+        )
+        .await;
+        assert!(t.events.lock().await.is_empty());
+
+        // End-of-turn flush: neither field set — duplicate, skipped.
+        let t = TestCtx::new();
+        d.on_frame(
+            &t.as_ctx(),
+            &json!({
+                "type":"assistant",
+                "message":{"role":"assistant","content":[{"type":"text","text":"Hello"}]}
+            }),
+        )
+        .await;
+        assert!(t.events.lock().await.is_empty());
+    }
+
+    #[test]
+    fn launch_args_enable_partial_streaming() {
+        let d = CursorDialect;
+        assert!(
+            d.launch_args(&SessionConfig::default(), None)
+                .contains(&"--stream-partial-output".to_string())
+        );
     }
 }

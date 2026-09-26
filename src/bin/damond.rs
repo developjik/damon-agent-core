@@ -83,8 +83,15 @@ async fn main() -> anyhow::Result<()> {
     }
     #[cfg(debug_assertions)]
     let _ = dotenvy::from_path(Path::new(".env"));
+    // Console output is unchanged; the tee also fills the in-daemon
+    // ring that `logs.tail`/`logs.follow` (and `damon logs`) serve —
+    // no ANSI, so ring lines stay plain text.
     tracing_subscriber::fmt()
         .with_env_filter(EnvFilter::try_from_default_env().unwrap_or_else(|_| "damon=info".into()))
+        .with_ansi(false)
+        .with_writer(damon_core::logs::MakeTeeWriter::new(
+            damon_core::logs::ring(),
+        ))
         .init();
     // rustls needs an explicit process-level crypto provider.
     let _ = rustls::crypto::ring::default_provider().install_default();

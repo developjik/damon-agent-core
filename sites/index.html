@@ -4,10 +4,10 @@
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>Damon — 데몬 하나. 모든 코딩 에이전트.</title>
-<meta name="description" content="Damon은 Claude Code·Codex CLI·Oh My Pi·Cursor·Amp·Kimi·Qwen을 네이티브 CLI로 구동하는 Rust 로컬 에이전트 컨트롤 데몬입니다. 세션, 권한 릴레이, 검색 가능한 히스토리, 채팅 채널, 원격 접근을 한 곳에서.">
+<meta name="description" content="Damon은 Claude Code·Codex CLI·Oh My Pi·Cursor·Amp·Kimi·Qwen·Gemini를 네이티브 CLI로 구동하는 Rust 로컬 에이전트 컨트롤 데몬입니다. 세션, 권한 릴레이, 검색 가능한 히스토리, 채팅 채널, 어디서든 접근을 한 곳에서.">
 <meta name="theme-color" content="#0a0e16">
 <meta property="og:title" content="Damon — One daemon. Every coding agent.">
-<meta property="og:description" content="Rust local agent-control daemon driving seven coding-agent CLIs natively — Claude Code, Codex CLI, Oh My Pi, Cursor, Amp, Kimi, Qwen. Sessions, permission relay, searchable history, chat channels, remote access — one resident daemon.">
+<meta property="og:description" content="Rust local agent-control daemon driving eight coding-agent CLIs natively — Claude Code, Codex CLI, Oh My Pi, Cursor, Amp, Kimi, Qwen, Gemini. Sessions, permission relay, searchable history, chat channels, from-anywhere access — one resident daemon.">
 <meta property="og:type" content="website">
 <link rel="icon" href="./favicon.svg" type="image/svg+xml">
 <link rel="stylesheet" href="./assets/css/main.css">
@@ -34,6 +34,7 @@
       <a href="#quickstart" data-i18n="nav.quick">시작하기</a>
       <a href="#toolbox" data-i18n="nav.tools">도구</a>
       <a href="#channels" data-i18n="nav.chan">채널</a>
+      <a href="#anywhere" data-i18n="nav.any">어디서든</a>
       <a href="#ecosystem" data-i18n="nav.eco">생태계</a>
     </nav>
     <div class="header-actions">
@@ -56,7 +57,7 @@
       <circle cx="200" cy="200" r="60" fill="none" stroke="#5b8cff" stroke-width="1.2" opacity=".8"/>
       <circle cx="200" cy="200" r="110" fill="none" stroke="#7dd3fc" stroke-width=".8" opacity=".4"/>
       <circle cx="200" cy="200" r="160" fill="none" stroke="#7dd3fc" stroke-width=".6" opacity=".25"/>
-      <circle cx="200" cy="90" r="6.5" fill="#d97757"/><circle cx="286" cy="131" r="6.5" fill="#10a37f"/><circle cx="307" cy="224" r="6.5" fill="#a78bfa"/><circle cx="248" cy="299" r="6.5" fill="#e8ecf4"/><circle cx="152" cy="299" r="6.5" fill="#fbbf24"/><circle cx="93" cy="224" r="6.5" fill="#fb7185"/><circle cx="114" cy="131" r="6.5" fill="#67e8f9"/>
+      <circle cx="200" cy="90" r="6.5" fill="#d97757"/><circle cx="292" cy="108" r="6.5" fill="#10a37f"/><circle cx="330" cy="200" r="6.5" fill="#a78bfa"/><circle cx="292" cy="292" r="6.5" fill="#e8ecf4"/><circle cx="200" cy="330" r="6.5" fill="#fbbf24"/><circle cx="108" cy="292" r="6.5" fill="#fb7185"/><circle cx="70" cy="200" r="6.5" fill="#67e8f9"/><circle cx="108" cy="108" r="6.5" fill="#8ab4f8"/>
       <circle cx="200" cy="40" r="4.5" fill="#7dd3fc"/><circle cx="339" cy="120" r="4.5" fill="#7dd3fc"/><circle cx="339" cy="280" r="4.5" fill="#7dd3fc"/><circle cx="200" cy="360" r="4.5" fill="#7dd3fc"/><circle cx="61" cy="280" r="4.5" fill="#7dd3fc"/><circle cx="61" cy="120" r="4.5" fill="#7dd3fc"/>
     </svg>
   </div>
@@ -65,7 +66,7 @@
     <div class="hero-copy">
       <p class="kicker" data-i18n="hero.badge">Rust 기반 로컬 에이전트 컨트롤 데몬</p>
       <h1><span data-i18n="hero.title1">데몬 하나.</span><br><span class="grad" data-i18n="hero.title2">모든 코딩 에이전트.</span></h1>
-      <p class="lead" data-i18n="hero.lead">Damon은 Claude Code·Codex CLI·Oh My Pi·Cursor·Amp·Kimi·Qwen을 각자의 네이티브 CLI로 구동하는 Rust 상주 데몬입니다. 모델·툴·인증은 에이전트 몫 — Damon은 세션, 권한 릴레이, 검색 가능한 히스토리, 채팅 채널, 원격 접근을 소유합니다.</p>
+      <p class="lead" data-i18n="hero.lead">Damon은 Claude Code·Codex CLI·Oh My Pi·Cursor·Amp·Kimi·Qwen·Gemini를 각자의 네이티브 CLI로 구동하는 Rust 상주 데몬입니다. 모델·툴·인증은 에이전트 몫 — Damon은 세션, 권한 릴레이, 검색 가능한 히스토리, 채팅 채널, 어디서든 접근을 소유합니다.</p>
       <div class="badges">
         <img src="https://github.com/developjik/damon-agent-core/actions/workflows/ci.yml/badge.svg" alt="ci">
         <img src="https://img.shields.io/crates/v/damon-core.svg" alt="crates.io">
@@ -137,7 +138,7 @@
     </div>
 
     <div class="backend-strip">
-      <p class="backend-strip-title" data-i18n="strip.title">PATH에 있으면 자동 등록 — 일곱 개 네이티브 백엔드</p>
+      <p class="backend-strip-title" data-i18n="strip.title">PATH에 있으면 자동 등록 — 여덟 개 네이티브 백엔드</p>
       <div class="backend-chips">
         <span class="bchip" style="--c:#d97757"><i></i>Claude Code<em>stream-json</em></span>
         <span class="bchip" style="--c:#10a37f"><i></i>Codex CLI<em>app-server</em></span>
@@ -146,6 +147,7 @@
         <span class="bchip" style="--c:#fbbf24"><i></i>Amp<em>amp dialect</em></span>
         <span class="bchip" style="--c:#fb7185"><i></i>Kimi Code<em>stream-json</em></span>
         <span class="bchip" style="--c:#67e8f9"><i></i>Qwen Code<em>stream-json</em></span>
+        <span class="bchip" style="--c:#8ab4f8"><i></i>Gemini CLI<em>stream-json</em></span>
       </div>
       <p class="backend-strip-more" data-i18n="strip.more">그 외 어떤 에이전트 CLI도 <code>[backends.X]</code> 블록 하나로</p>
     </div>
@@ -190,6 +192,7 @@
         <span class="chip chip-agent" style="--c:#fbbf24">Amp</span>
         <span class="chip chip-agent" style="--c:#fb7185">Kimi Code</span>
         <span class="chip chip-agent" style="--c:#67e8f9">Qwen Code</span>
+        <span class="chip chip-agent" style="--c:#8ab4f8">Gemini CLI</span>
         <span class="chip chip-dim">+ [backends.X]</span>
       </div>
       <p class="arch-note" data-i18n="arch.agents.note">모델·툴·구독 인증·컨텍스트는 전부 에이전트 소유</p>
@@ -231,7 +234,7 @@
           <button class="copy-btn" type="button" data-copy="curl localhost:9470/health" aria-label="copy"><svg viewBox="0 0 24 24" width="14" height="14" aria-hidden="true"><rect x="9" y="9" width="12" height="12" rx="2" fill="none" stroke="currentColor" stroke-width="2"/><path d="M5 15V5a2 2 0 0 1 2-2h10" fill="none" stroke="currentColor" stroke-width="2"/></svg></button>
         </div>
         <pre><code><span class="ps1">$</span> curl localhost:9470/health
-<span class="out">{"backends":["amp","claude","codex","cursor","kimi","omp","qwen"],"status":"ok"}</span><span class="blink" aria-hidden="true">▍</span></code></pre>
+<span class="out">{"backends":["amp","claude","codex","cursor","gemini","kimi","omp","qwen"],"status":"ok"}</span><span class="blink" aria-hidden="true">▍</span></code></pre>
       </div>
 
       <div class="term">
@@ -321,24 +324,61 @@
   </div>
 </section>
 
-<!-- ================= REMOTE ================= -->
-<section class="section" id="remote">
+<!-- ================= ANYWHERE ================= -->
+<section class="section" id="anywhere">
   <div class="container">
-    <p class="kicker" data-i18n="remote.kicker">원격 접근</p>
-    <h2 data-i18n="remote.title">어디서든, 안전하게</h2>
+    <p class="kicker" data-i18n="any.kicker">어디서든 <span class="new-pill">NEW</span></p>
+    <h2 data-i18n="any.title">인터넷만 되면, 어디서든</h2>
+    <p class="section-lead" data-i18n="any.lead">책상에서 시작한 작업은 집을 나선 뒤에도 계속됩니다. 폰의 채팅과 브라우저가 같은 데몬의 리모컨이 됩니다 — 모든 통신은 종단간 암호화.</p>
+
+    <div class="flow-strip">
+      <div class="flow-step">
+        <span class="flow-ico" aria-hidden="true">🖥️</span>
+        <b data-i18n="any.f1t">아침 · 책상</b>
+        <p data-i18n="any.f1d">웹 UI에서 큰 작업을 시작</p>
+      </div>
+      <span class="flow-arrow" aria-hidden="true">→</span>
+      <div class="flow-step">
+        <span class="flow-ico" aria-hidden="true">📴</span>
+        <b data-i18n="any.f2t">외출 · 화면 꺼짐</b>
+        <p data-i18n="any.f2d">턴은 데몬에서 계속 — 끊기지 않습니다</p>
+      </div>
+      <span class="flow-arrow" aria-hidden="true">→</span>
+      <div class="flow-step">
+        <span class="flow-ico" aria-hidden="true">💬</span>
+        <b data-i18n="any.f3t">이동 중 · 폰</b>
+        <p data-i18n="any.f3d"><code>!sessions</code> → <code>!resume</code>로 이어잡기</p>
+      </div>
+      <span class="flow-arrow" aria-hidden="true">→</span>
+      <div class="flow-step">
+        <span class="flow-ico" aria-hidden="true">🔔</span>
+        <b data-i18n="any.f4t">완료 · 알림</b>
+        <p data-i18n="any.f4d">끝나면 채팅으로 소식 — 권한도 답장으로 승인</p>
+      </div>
+    </div>
+
     <div class="feature-grid three">
-      <article class="card">
-        <h3 data-i18n="remote.r1t">Tailscale (권장)</h3>
-        <p data-i18n="remote.r1d"><code>ws://&lt;tailscale-ip&gt;:9470/ws</code>로 attach — WireGuard E2E, 데몬 설정 변경 없음.</p>
+      <article class="card any-card">
+        <span class="new-badge" data-i18n="any.badge">NEW</span>
+        <h3 data-i18n="any.c1t">화면이 꺼져도 작업은 계속</h3>
+        <p data-i18n="any.c1d"><code>turn.start {detach: true}</code> — 연결이 끊겨도 턴이 끝까지 돌고 결과는 히스토리에 남습니다. 다시 접속하면 이어서 보입니다.</p>
       </article>
-      <article class="card">
-        <h3 data-i18n="remote.r2t">직접 TLS</h3>
-        <p data-i18n="remote.r2d"><code>tls_cert</code>/<code>tls_key</code>로 <code>wss</code> 서빙. 비루프백 바인드는 <code>auth_token</code> 없이 기동 거부.</p>
+      <article class="card any-card">
+        <span class="new-badge" data-i18n="any.badge">NEW</span>
+        <h3 data-i18n="any.c2t">채팅에서 이어잡기 + 알림</h3>
+        <p data-i18n="any.c2d"><code>!sessions</code>·<code>!resume</code>·<code>!watch</code> — 어느 화면에서 돌든 세션이 끝나거나 권한을 요청하면 채팅으로 알리고, 답장으로 승인합니다.</p>
       </article>
-      <article class="card">
-        <h3 data-i18n="remote.r3t">자체 릴레이</h3>
-        <p data-i18n="remote.r3d">공개 호스트의 <code>damon-relay</code>로 아웃바운드 연결 — 인바운드 포트 불필요. X25519 키 교환 → AES-256-GCM, 릴레이는 평문을 볼 수 없음.</p>
+      <article class="card any-card">
+        <span class="new-badge" data-i18n="any.badge">NEW</span>
+        <h3 data-i18n="any.c3t">릴레이가 웹 UI를 서빙</h3>
+        <p data-i18n="any.c3d">브라우저로 릴레이 호스트를 열고 데몬 이름+토큰 입력 — 페이지가 직접 E2E 핸드셰이크합니다. VPN·포트포워딩·호스팅 불필요.</p>
       </article>
+    </div>
+
+    <div class="transport-strip">
+      <span class="tchip" data-i18n="any.t1">Tailscale</span>
+      <span class="tchip" data-i18n="any.t2">직접 TLS · wss</span>
+      <span class="tchip" data-i18n="any.t3">자체 릴레이 — 다이얼아웃 · X25519 + AES-256-GCM · 브라우저 클라이언트 내장</span>
     </div>
   </div>
 </section>

@@ -11,11 +11,11 @@ use axum::extract::{Path, State};
 use axum::response::Response;
 use axum::routing::{get, post};
 use damon_core::api::{self, AppState};
-use damon_core::channel::{Bridge, ChannelApi, Incoming};
+use damon_core::channel::{Bridge, ChannelApi, Incoming, MediaOut};
 use damon_core::config::Config;
 use damon_core::discord::{DiscordApi, DiscordChannel, incoming_from_message};
 use damon_core::slack::{SlackApi, SlackChannel, incoming_from_event};
-use damon_core::store::Store;
+use damon_core::store::{SessionFilter, Store};
 use serde_json::{Value, json};
 use tokio::sync::Mutex;
 
@@ -66,10 +66,10 @@ async fn wait_for_sent(sent: &Mutex<Vec<(String, String)>>, needle: &str) {
         if sent.lock().await.iter().any(|(_, t)| t.contains(needle)) {
             return;
         }
-        assert!(
-            std::time::Instant::now() < deadline,
-            "timed out waiting for {needle:?}"
-        );
+        if std::time::Instant::now() >= deadline {
+            let dump = sent.lock().await.clone();
+            panic!("timed out waiting for {needle:?}; sent={dump:?}");
+        }
         tokio::time::sleep(std::time::Duration::from_millis(50)).await;
     }
 }
@@ -121,16 +121,16 @@ async fn bridge_delivers_response_and_maps_sessions() {
         if std::time::Instant::now() >= deadline {
             let sent = ch.sent.lock().await;
             let sessions = store
-                .list_sessions_paged(u32::MAX, 0)
+                .list_sessions_paged(u32::MAX, 0, Default::default())
                 .await
                 .unwrap_or_default();
             let mut dump = String::new();
-            for (sid, ..) in &sessions {
+            for s in &sessions {
                 let msgs = store
-                    .messages_paged(sid, u32::MAX, 0)
+                    .messages_paged(&s.id, u32::MAX, 0)
                     .await
                     .unwrap_or_default();
-                dump.push_str(&format!("session {sid}: {} msgs\n", msgs.len()));
+                dump.push_str(&format!("session {}: {} msgs\n", s.id, msgs.len()));
                 for m in msgs {
                     dump.push_str(&format!(
                         "  {} {}\n",
@@ -146,13 +146,125 @@ async fn bridge_delivers_response_and_maps_sessions() {
 
     let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
     loop {
-        let sessions = store.list_sessions_paged(u32::MAX, 0).await.unwrap();
+        let sessions = store
+            .list_sessions_paged(u32::MAX, 0, Default::default())
+            .await
+            .unwrap();
         if sessions.len() >= 2 {
             break;
         }
         assert!(std::time::Instant::now() < deadline, "expected 2 sessions");
         tokio::time::sleep(std::time::Duration::from_millis(50)).await;
     }
+}
+
+/// Bridge restart no longer resets a conversation: the chat→session
+/// mapping and the !cwd/!agent prefs live in daemon-side
+/// channel_state rows, so a fresh Bridge (fresh connection, even)
+/// reattaches the same session, and a !new after restart still
+/// creates with the persisted cwd.
+#[tokio::test]
+async fn bridge_state_survives_restart() {
+    let cfg = test_config();
+    let shared: damon_core::config::SharedConfig = Arc::new(parking_lot::RwLock::new(cfg));
+    let store = Store::in_memory().await.unwrap();
+    let state = AppState::new(shared, store.clone()).await;
+    state
+        .sessions
+        .insert_client("mock".into(), common::mock_client());
+    let url = serve_app(state).await;
+
+    let workdir = std::env::temp_dir().join(format!("damon-chan-{}", uuid::Uuid::new_v4()));
+    std::fs::create_dir_all(&workdir).unwrap();
+
+    // First incarnation: set the conversation's cwd, run a turn.
+    let sent1 = Arc::new(MockChannel {
+        sent: Mutex::new(vec![]),
+    });
+    let client1 = damon_core::client::DamonClient::connect(&url, None)
+        .await
+        .unwrap();
+    let bridge1 = Bridge::new(sent1.clone(), client1);
+    bridge1.client().hello().await.unwrap();
+    bridge1.spawn_event_router().await;
+    bridge1
+        .handle_message(
+            "chat-a".into(),
+            None,
+            None,
+            format!("!cwd {}", workdir.display()),
+            Vec::new(),
+        )
+        .await;
+    wait_for_sent(&sent1.sent, "cwd set").await;
+    bridge1
+        .handle_message("chat-a".into(), None, None, "hi".into(), Vec::new())
+        .await;
+    wait_for_sent(&sent1.sent, "echo: hi").await;
+
+    let first: Vec<_> = store
+        .list_sessions_paged(u32::MAX, 0, Default::default())
+        .await
+        .unwrap();
+    assert_eq!(first.len(), 1, "one session for the chat");
+    let first_id = first[0].id.clone();
+    assert_eq!(
+        std::path::Path::new(&first[0].cwd),
+        workdir.as_path(),
+        "!cwd must shape the created session: {:?}",
+        first[0].cwd
+    );
+
+    // Second incarnation: fresh connection, fresh Bridge — same chat.
+    let sent2 = Arc::new(MockChannel {
+        sent: Mutex::new(vec![]),
+    });
+    let client2 = damon_core::client::DamonClient::connect(&url, None)
+        .await
+        .unwrap();
+    let bridge2 = Bridge::new(sent2.clone(), client2);
+    bridge2.client().hello().await.unwrap();
+    bridge2.spawn_event_router().await;
+    bridge2
+        .handle_message("chat-a".into(), None, None, "again".into(), Vec::new())
+        .await;
+    wait_for_sent(&sent2.sent, "echo: again").await;
+
+    // The persisted mapping reattached the SAME session — no second
+    // row was created for the chat.
+    let rows: Vec<_> = store
+        .list_sessions_paged(u32::MAX, 0, Default::default())
+        .await
+        .unwrap();
+    assert_eq!(
+        rows.len(),
+        1,
+        "restart must reattach, not re-create: {rows:?}"
+    );
+    assert_eq!(rows[0].id, first_id);
+
+    // !new after restart: the persisted prefs still pick the cwd for
+    // the fresh session.
+    bridge2
+        .handle_message("chat-a".into(), None, None, "!new".into(), Vec::new())
+        .await;
+    wait_for_sent(&sent2.sent, "session reset").await;
+    bridge2
+        .handle_message("chat-a".into(), None, None, "fresh".into(), Vec::new())
+        .await;
+    wait_for_sent(&sent2.sent, "echo: fresh").await;
+    let rows: Vec<_> = store
+        .list_sessions_paged(u32::MAX, 0, Default::default())
+        .await
+        .unwrap();
+    assert_eq!(rows.len(), 2, "!new creates a fresh session");
+    let fresh = rows.iter().find(|r| r.id != first_id).unwrap();
+    assert_eq!(
+        std::path::Path::new(&fresh.cwd),
+        workdir.as_path(),
+        "persisted prefs must shape the post-restart session: {:?}",
+        fresh.cwd
+    );
 }
 
 #[tokio::test]
@@ -565,7 +677,7 @@ async fn bridge_allowlist_drops_unlisted_senders() {
     );
     assert!(
         store
-            .list_sessions_paged(u32::MAX, 0)
+            .list_sessions_paged(u32::MAX, 0, Default::default())
             .await
             .unwrap()
             .is_empty(),
@@ -583,4 +695,792 @@ async fn bridge_allowlist_drops_unlisted_senders() {
         )
         .await;
     wait_for_sent(&ch.sent, "echo:").await;
+}
+
+// --- Bounded prompt queueing ---------------------------------------------------
+
+#[tokio::test]
+async fn prompts_queue_behind_a_running_turn_and_drain_in_order() {
+    let cfg = test_config();
+    let shared: damon_core::config::SharedConfig = Arc::new(parking_lot::RwLock::new(cfg));
+    let store = Store::in_memory().await.unwrap();
+    let state = AppState::new(shared, store).await;
+    state
+        .sessions
+        .insert_client("mock".into(), common::mock_client());
+    let url = serve_app(state).await;
+    let client = damon_core::client::DamonClient::connect(&url, None)
+        .await
+        .unwrap();
+    let ch = Arc::new(MockChannel {
+        sent: Mutex::new(vec![]),
+    });
+    let bridge = Bridge::new(ch.clone(), client);
+    bridge.client().hello().await.unwrap();
+    bridge.spawn_event_router().await;
+
+    // A permission-asking turn parks the lane…
+    bridge
+        .handle_message(
+            "chat".into(),
+            None,
+            Some("u1".into()),
+            "use the perm tool".into(),
+            Vec::new(),
+        )
+        .await;
+    wait_for_sent(&ch.sent, "🔐").await;
+    // …so the next three prompts queue with positions, not rejections…
+    for text in ["two", "three", "four"] {
+        bridge
+            .handle_message("chat".into(), None, None, text.into(), Vec::new())
+            .await;
+    }
+    // …and the fifth is refused — the queue is capped.
+    bridge
+        .handle_message("chat".into(), None, None, "five".into(), Vec::new())
+        .await;
+    {
+        let sent = ch.sent.lock().await;
+        assert!(sent.iter().any(|(_, t)| t == "queued — position 1"));
+        assert!(sent.iter().any(|(_, t)| t == "queued — position 2"));
+        assert!(sent.iter().any(|(_, t)| t == "queued — position 3"));
+        assert!(
+            sent.iter()
+                .any(|(_, t)| t == "queue full — try again after the running turn")
+        );
+    }
+
+    // Resolving the permission ends turn 1 and drains the queue in
+    // FIFO order — every queued echo arrives, the refused one doesn't.
+    bridge
+        .handle_message(
+            "chat".into(),
+            None,
+            Some("u1".into()),
+            "allow".into(),
+            Vec::new(),
+        )
+        .await;
+    wait_for_sent(&ch.sent, "✅ allowed").await;
+    wait_for_sent(&ch.sent, "echo: two").await;
+    wait_for_sent(&ch.sent, "echo: three").await;
+    wait_for_sent(&ch.sent, "echo: four").await;
+    tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+    assert!(
+        !ch.sent
+            .lock()
+            .await
+            .iter()
+            .any(|(_, t)| t.contains("echo: five")),
+        "capped prompt ran anyway"
+    );
+}
+
+#[tokio::test]
+async fn cancel_drops_queued_prompts_and_frees_the_lane() {
+    let cfg = test_config();
+    let shared: damon_core::config::SharedConfig = Arc::new(parking_lot::RwLock::new(cfg));
+    let store = Store::in_memory().await.unwrap();
+    let state = AppState::new(shared, store.clone()).await;
+    state
+        .sessions
+        .insert_client("mock".into(), common::mock_client());
+    let url = serve_app(state).await;
+    let client = damon_core::client::DamonClient::connect(&url, None)
+        .await
+        .unwrap();
+    let ch = Arc::new(MockChannel {
+        sent: Mutex::new(vec![]),
+    });
+    let bridge = Bridge::new(ch.clone(), client);
+    bridge.client().hello().await.unwrap();
+    bridge.spawn_event_router().await;
+
+    // A hanging turn parks the lane; one prompt queues behind it.
+    bridge
+        .handle_message("chat".into(), None, None, "hang".into(), Vec::new())
+        .await;
+    bridge
+        .handle_message("chat".into(), None, None, "stale prompt".into(), Vec::new())
+        .await;
+    wait_for_sent(&ch.sent, "queued — position 1").await;
+    // The hang turn's session must exist before !cancel can cancel it:
+    // wait for the store row, then a beat for the bridge to cache the
+    // mapping (the store row is written before the map insert).
+    {
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        loop {
+            if !store
+                .list_sessions_paged(u32::MAX, 0, Default::default())
+                .await
+                .unwrap()
+                .is_empty()
+            {
+                break;
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "hang turn never created a session"
+            );
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        }
+    }
+    tokio::time::sleep(std::time::Duration::from_millis(150)).await;
+
+    // !cancel stops the turn AND clears its queue.
+    bridge
+        .handle_message("chat".into(), None, None, "!cancel".into(), Vec::new())
+        .await;
+    wait_for_sent(&ch.sent, "cancel requested — dropped 1 queued prompt(s)").await;
+    // The cancelled turn's end is observable as its stop marker.
+    wait_for_sent(&ch.sent, "[canceled]").await;
+
+    // The lane is free again: a fresh prompt runs (never queues), and
+    // the cancelled queue's prompt never runs.
+    bridge
+        .handle_message("chat".into(), None, None, "fresh".into(), Vec::new())
+        .await;
+    wait_for_sent(&ch.sent, "echo: fresh").await;
+    assert!(
+        !ch.sent
+            .lock()
+            .await
+            .iter()
+            .any(|(_, t)| t.contains("stale")),
+        "cancelled queue drained into a turn anyway"
+    );
+}
+
+// --- !cwd / !agent preferences -------------------------------------------------
+
+#[tokio::test]
+async fn cwd_pref_applies_to_the_next_new_session() {
+    let cfg = test_config();
+    let shared: damon_core::config::SharedConfig = Arc::new(parking_lot::RwLock::new(cfg));
+    let store = Store::in_memory().await.unwrap();
+    let state = AppState::new(shared, store.clone()).await;
+    state
+        .sessions
+        .insert_client("mock".into(), common::mock_client());
+    let url = serve_app(state).await;
+    let client = damon_core::client::DamonClient::connect(&url, None)
+        .await
+        .unwrap();
+    let ch = Arc::new(MockChannel {
+        sent: Mutex::new(vec![]),
+    });
+    let bridge = Bridge::new(ch.clone(), client);
+    bridge.client().hello().await.unwrap();
+    bridge.spawn_event_router().await;
+
+    // Relative and non-directory paths are rejected with the reason.
+    bridge
+        .handle_message(
+            "chat".into(),
+            None,
+            None,
+            "!cwd relative/path".into(),
+            Vec::new(),
+        )
+        .await;
+    wait_for_sent(&ch.sent, "cwd must be an absolute path").await;
+    bridge
+        .handle_message(
+            "chat".into(),
+            None,
+            None,
+            "!cwd /no/such/dir-xyz".into(),
+            Vec::new(),
+        )
+        .await;
+    wait_for_sent(&ch.sent, "not a directory").await;
+
+    // Setting it replies that it applies to the NEXT session…
+    let tmp = std::env::temp_dir();
+    bridge
+        .handle_message(
+            "chat".into(),
+            None,
+            None,
+            format!("!cwd {}", tmp.display()),
+            Vec::new(),
+        )
+        .await;
+    wait_for_sent(&ch.sent, "cwd set — it applies to the next new session").await;
+    // …and !cwd alone reports the effective value.
+    bridge
+        .handle_message("chat".into(), None, None, "!cwd".into(), Vec::new())
+        .await;
+    wait_for_sent(&ch.sent, &format!("cwd: {}", tmp.display())).await;
+
+    // A fresh session is created with that cwd — observable in the
+    // store's session rows (filter by cwd).
+    bridge
+        .handle_message("chat".into(), None, None, "hi".into(), Vec::new())
+        .await;
+    wait_for_sent(&ch.sent, "echo:").await;
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+    loop {
+        let n = store
+            .list_sessions_paged(
+                u32::MAX,
+                0,
+                SessionFilter {
+                    cwd: Some(tmp.to_string_lossy().into_owned()),
+                    ..Default::default()
+                },
+            )
+            .await
+            .unwrap()
+            .len();
+        if n == 1 {
+            break;
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "no session created with cwd {}",
+            tmp.display()
+        );
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+    }
+}
+
+#[tokio::test]
+async fn agent_pref_lists_validates_and_resets_the_session() {
+    let cfg = test_config();
+    let shared: damon_core::config::SharedConfig = Arc::new(parking_lot::RwLock::new(cfg));
+    let store = Store::in_memory().await.unwrap();
+    let state = AppState::new(shared, store.clone()).await;
+    state
+        .sessions
+        .insert_client("mock".into(), common::mock_client());
+    let url = serve_app(state).await;
+    let client = damon_core::client::DamonClient::connect(&url, None)
+        .await
+        .unwrap();
+    let ch = Arc::new(MockChannel {
+        sent: Mutex::new(vec![]),
+    });
+    let bridge = Bridge::new(ch.clone(), client);
+    bridge.client().hello().await.unwrap();
+    bridge.spawn_event_router().await;
+
+    // Listing shows the daemon's backends (built-in registry plus the
+    // injected mock) and the effective default.
+    bridge
+        .handle_message("chat".into(), None, None, "!agent".into(), Vec::new())
+        .await;
+    wait_for_sent(&ch.sent, "effective: daemon default").await;
+    {
+        let sent = ch.sent.lock().await;
+        let listing = sent
+            .iter()
+            .map(|(_, t)| t)
+            .find(|t| t.starts_with("backends: "))
+            .expect("no backends listing reply");
+        assert!(listing.contains("mock"), "mock missing from {listing:?}");
+    }
+    // Unknown backends are rejected, listing what exists.
+    bridge
+        .handle_message(
+            "chat".into(),
+            None,
+            None,
+            "!agent nosuch".into(),
+            Vec::new(),
+        )
+        .await;
+    {
+        let sent = ch.sent.lock().await;
+        assert!(
+            sent.iter()
+                .any(|(_, t)| t.starts_with("unknown backend 'nosuch'")),
+            "no unknown-backend reply: {sent:?}"
+        );
+    }
+
+    // Setting a backend resets the session mapping: the next prompt
+    // creates a NEW session instead of reusing the old one.
+    bridge
+        .handle_message("chat".into(), None, None, "first".into(), Vec::new())
+        .await;
+    wait_for_sent(&ch.sent, "echo: first").await;
+    let count_after_first = || async {
+        store
+            .list_sessions_paged(u32::MAX, 0, Default::default())
+            .await
+            .unwrap()
+            .len()
+    };
+    let before = count_after_first().await;
+    assert_eq!(before, 1);
+    bridge
+        .handle_message("chat".into(), None, None, "!agent mock".into(), Vec::new())
+        .await;
+    wait_for_sent(&ch.sent, "backend set to mock").await;
+    bridge
+        .handle_message("chat".into(), None, None, "second".into(), Vec::new())
+        .await;
+    wait_for_sent(&ch.sent, "echo: second").await;
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+    loop {
+        if count_after_first().await >= 2 {
+            break;
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "session mapping was not reset by !agent"
+        );
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+    }
+}
+
+// --- Permission buttons through the bridge -------------------------------------
+
+/// A button press resolves the pending lane exactly like a typed reply:
+/// the synthesized Incoming is the same shape (word as text, presser as
+/// sender), so the requester-identity binding applies to presses too —
+/// someone else's ✅ must not approve your tool run.
+#[tokio::test]
+async fn button_press_resolves_permission_with_requester_identity() {
+    let cfg = test_config();
+    let shared: damon_core::config::SharedConfig = Arc::new(parking_lot::RwLock::new(cfg));
+    let store = Store::in_memory().await.unwrap();
+    let state = AppState::new(shared, store).await;
+    state
+        .sessions
+        .insert_client("mock".into(), common::mock_client());
+    let url = serve_app(state).await;
+    let client = damon_core::client::DamonClient::connect(&url, None)
+        .await
+        .unwrap();
+    let ch = Arc::new(MockChannel {
+        sent: Mutex::new(vec![]),
+    });
+    let bridge = Bridge::new(ch.clone(), client);
+    bridge.client().hello().await.unwrap();
+    bridge.spawn_event_router().await;
+
+    bridge
+        .handle_message(
+            "chat".into(),
+            None,
+            Some("u1".into()),
+            "use the perm tool".into(),
+            Vec::new(),
+        )
+        .await;
+    wait_for_sent(&ch.sent, "🔐").await;
+
+    // Another user's press (or typed allow) is swallowed — no ✅.
+    let press_from = |id: &str| Incoming {
+        chat_id: "chat".into(),
+        thread_id: None,
+        sender_id: Some(id.into()),
+        text: "allow".into(),
+        attachments: Vec::new(),
+    };
+    bridge
+        .handle_message(
+            "chat".into(),
+            None,
+            Some("u2".into()),
+            "allow".into(),
+            Vec::new(),
+        )
+        .await;
+    tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+    assert!(
+        !ch.sent.lock().await.iter().any(|(_, t)| t.contains("✅")),
+        "non-requester approved the tool"
+    );
+    // The requester's press resolves it and the tool runs.
+    let press = press_from("u1");
+    bridge
+        .handle_message(
+            press.chat_id,
+            press.thread_id,
+            press.sender_id,
+            press.text,
+            press.attachments,
+        )
+        .await;
+    wait_for_sent(&ch.sent, "✅ allowed").await;
+    wait_for_sent(&ch.sent, "allowed").await;
+}
+
+// --- Cross-surface pickup: !sessions / !resume / !watch ----------------------
+
+/// Serve a daemon with the mock backend, wire a bridge to it, and hand
+/// back a second client standing in for ANOTHER surface (web UI, CLI)
+/// that owns the "desk" sessions the chat picks up or watches.
+async fn serve_with_bridge() -> (
+    String,
+    Arc<MockChannel>,
+    Arc<Bridge>,
+    damon_core::client::DamonClient,
+    Store,
+) {
+    let cfg = test_config();
+    let shared: damon_core::config::SharedConfig = Arc::new(parking_lot::RwLock::new(cfg));
+    let store = Store::in_memory().await.unwrap();
+    let state = AppState::new(shared, store.clone()).await;
+    state
+        .sessions
+        .insert_client("mock".into(), common::mock_client());
+    let url = serve_app(state).await;
+    let ch = Arc::new(MockChannel {
+        sent: Mutex::new(vec![]),
+    });
+    let client = damon_core::client::DamonClient::connect(&url, None)
+        .await
+        .unwrap();
+    let bridge = Bridge::new(ch.clone(), client.clone());
+    bridge.client().hello().await.unwrap();
+    bridge.spawn_event_router().await;
+    (url, ch, bridge, client, store)
+}
+
+/// !sessions lists sessions from every surface and !resume adopts one:
+/// the conversation's next prompt lands in the adopted session's
+/// history, not in a fresh session.
+#[tokio::test]
+async fn sessions_and_resume_continue_a_desk_session_in_the_chat() {
+    let (_url, ch, bridge, client, store) = serve_with_bridge().await;
+
+    // The chat's own session — one prompt so it exists and has a title.
+    bridge
+        .handle_message("chat-a".into(), None, None, "hi".into(), Vec::new())
+        .await;
+    wait_for_sent(&ch.sent, "echo: hi").await;
+
+    // A "desk" session from another surface, given a friendly title.
+    let desk = client
+        .create_session(Some("mock"), "/tmp", None)
+        .await
+        .unwrap();
+    client.rename_session(&desk, "desk work").await.unwrap();
+
+    bridge
+        .handle_message("chat-a".into(), None, None, "!sessions".into(), Vec::new())
+        .await;
+    wait_for_sent(&ch.sent, "desk work").await;
+    wait_for_sent(&ch.sent, "!resume").await;
+
+    // Adopt by title fragment, then prompt — the turn must reach the
+    // adopted session.
+    bridge
+        .handle_message(
+            "chat-a".into(),
+            None,
+            None,
+            "!resume desk".into(),
+            Vec::new(),
+        )
+        .await;
+    wait_for_sent(&ch.sent, "attached: \"desk work\"").await;
+    bridge
+        .handle_message(
+            "chat-a".into(),
+            None,
+            None,
+            "hello again".into(),
+            Vec::new(),
+        )
+        .await;
+    wait_for_sent(&ch.sent, "echo: hello again").await;
+
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+    loop {
+        let msgs = store.messages_paged(&desk, u32::MAX, 0).await.unwrap();
+        let has_user = msgs
+            .iter()
+            .any(|m| m.role == "user" && m.data["content"] == "hello again");
+        let has_echo = msgs
+            .iter()
+            .any(|m| m.role == "assistant" && m.data["content"] == "echo: hello again");
+        if has_user && has_echo {
+            break;
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "prompt never reached the adopted session"
+        );
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+    }
+}
+
+/// A watched session's completion pings the chat even when the turn
+/// was started by another surface — the cross-surface notification.
+#[tokio::test]
+async fn watch_pings_the_chat_when_another_surface_finishes() {
+    let (_url, ch, bridge, client, _store) = serve_with_bridge().await;
+    let desk = client
+        .create_session(Some("mock"), "/tmp", None)
+        .await
+        .unwrap();
+    client.rename_session(&desk, "long job").await.unwrap();
+
+    bridge
+        .handle_message(
+            "chat-a".into(),
+            None,
+            None,
+            format!("!watch {}", &desk[..8]),
+            Vec::new(),
+        )
+        .await;
+    wait_for_sent(&ch.sent, "watching \"long job\"").await;
+
+    // The desk surface runs the turn; the chat gets the ping.
+    client
+        .turn_start_blocks(&desk, vec![json!({"type": "text", "text": "go"})])
+        .await
+        .unwrap();
+    wait_for_sent(&ch.sent, "finished a turn").await;
+}
+
+/// A watched session's permission ask surfaces in the chat and is
+/// answerable there: the reply maps onto the offered actions and the
+/// desk turn proceeds to completion.
+#[tokio::test]
+async fn watch_relayed_permission_ask_is_answerable_from_the_chat() {
+    let (_url, ch, bridge, client, store) = serve_with_bridge().await;
+    let desk = client
+        .create_session(Some("mock"), "/tmp", None)
+        .await
+        .unwrap();
+
+    bridge
+        .handle_message(
+            "chat-a".into(),
+            None,
+            None,
+            format!("!watch {}", &desk[..8]),
+            Vec::new(),
+        )
+        .await;
+    wait_for_sent(&ch.sent, "watching").await;
+
+    // The desk surface prompts with the mock's permission knob — the
+    // ask must surface in the chat.
+    client
+        .turn_start_blocks(&desk, vec![json!({"type": "text", "text": "perm please"})])
+        .await
+        .unwrap();
+    wait_for_sent(&ch.sent, "reply 'allow' or 'deny'").await;
+
+    bridge
+        .handle_message("chat-a".into(), None, None, "allow".into(), Vec::new())
+        .await;
+    wait_for_sent(&ch.sent, "✅ allowed").await;
+    wait_for_sent(&ch.sent, "finished a turn").await;
+
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+    loop {
+        let msgs = store.messages_paged(&desk, u32::MAX, 0).await.unwrap();
+        if msgs
+            .iter()
+            .any(|m| m.role == "assistant" && m.data["content"] == "allowed")
+        {
+            break;
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "permission never took effect"
+        );
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+    }
+}
+
+/// !unwatch stops the pings — the session itself keeps running.
+#[tokio::test]
+async fn unwatch_stops_the_pings() {
+    let (_url, ch, bridge, client, _store) = serve_with_bridge().await;
+    let desk = client
+        .create_session(Some("mock"), "/tmp", None)
+        .await
+        .unwrap();
+
+    bridge
+        .handle_message(
+            "chat-a".into(),
+            None,
+            None,
+            format!("!watch {}", &desk[..8]),
+            Vec::new(),
+        )
+        .await;
+    wait_for_sent(&ch.sent, "watching").await;
+    bridge
+        .handle_message(
+            "chat-a".into(),
+            None,
+            None,
+            format!("!unwatch {}", &desk[..8]),
+            Vec::new(),
+        )
+        .await;
+    wait_for_sent(&ch.sent, "stopped following").await;
+
+    client
+        .turn_start_blocks(&desk, vec![json!({"type": "text", "text": "go"})])
+        .await
+        .unwrap();
+    tokio::time::sleep(std::time::Duration::from_secs(1)).await;
+    assert!(
+        !ch.sent
+            .lock()
+            .await
+            .iter()
+            .any(|(_, t)| t.contains("finished a turn")),
+        "unwatched session still pinged the chat"
+    );
+}
+
+/// The watch registry lives daemon-side: a fresh bridge restores it
+/// wholesale and keeps pinging after the original bridge is gone.
+#[tokio::test]
+async fn watches_survive_a_bridge_restart() {
+    let (url, ch1, bridge1, client, _store) = serve_with_bridge().await;
+    let desk = client
+        .create_session(Some("mock"), "/tmp", None)
+        .await
+        .unwrap();
+    client.rename_session(&desk, "long job").await.unwrap();
+
+    bridge1
+        .handle_message(
+            "chat-a".into(),
+            None,
+            None,
+            format!("!watch {}", &desk[..8]),
+            Vec::new(),
+        )
+        .await;
+    wait_for_sent(&ch1.sent, "watching \"long job\"").await;
+
+    // A second bridge incarnation (fresh connection) restores the
+    // registry and re-subscribes on its own connection.
+    let ch2 = Arc::new(MockChannel {
+        sent: Mutex::new(vec![]),
+    });
+    let client2 = damon_core::client::DamonClient::connect(&url, None)
+        .await
+        .unwrap();
+    let bridge2 = Bridge::new(ch2.clone(), client2);
+    bridge2.client().hello().await.unwrap();
+    bridge2.restore_watches().await;
+    bridge2.spawn_event_router().await;
+
+    client
+        .turn_start_blocks(&desk, vec![json!({"type": "text", "text": "go"})])
+        .await
+        .unwrap();
+    wait_for_sent(&ch2.sent, "finished a turn").await;
+}
+
+// --- Media + chunking ------------------------------------------------------------
+
+/// Channels without upload support still say something: the default
+/// send_media degrades to a text note (consumer-observable through the
+/// same send path every message takes).
+#[tokio::test]
+async fn send_media_default_falls_back_to_a_text_note() {
+    let ch = Arc::new(MockChannel {
+        sent: Mutex::new(vec![]),
+    });
+    let media = |name: &str| MediaOut {
+        data: vec![1, 2, 3],
+        mime: "image/png".into(),
+        filename: name.into(),
+    };
+    ch.send_media("chat", None, None, &[media("a.png"), media("b.png")])
+        .await
+        .unwrap();
+    ch.send_media("chat", None, Some("chart"), &[media("c.png")])
+        .await
+        .unwrap();
+    let sent = ch.sent.lock().await;
+    assert_eq!(sent[0], ("chat".into(), "[2 media attachment(s)]".into()));
+    assert_eq!(
+        sent[1],
+        ("chat".into(), "chart\n[1 media attachment(s)]".into())
+    );
+}
+
+/// A reply longer than the flush threshold arrives as multiple chunks,
+/// each within the cap, with code fences kept intact — the chunks
+/// reassemble (stripping re-opened fence markers) into the full reply.
+#[tokio::test]
+async fn long_reply_is_flushed_in_fence_safe_chunks() {
+    let cfg = test_config();
+    let shared: damon_core::config::SharedConfig = Arc::new(parking_lot::RwLock::new(cfg));
+    let store = Store::in_memory().await.unwrap();
+    let state = AppState::new(shared, store).await;
+    state
+        .sessions
+        .insert_client("mock".into(), common::mock_client());
+    let url = serve_app(state).await;
+    let client = damon_core::client::DamonClient::connect(&url, None)
+        .await
+        .unwrap();
+    let ch = Arc::new(MockChannel {
+        sent: Mutex::new(vec![]),
+    });
+    let bridge = Bridge::new(ch.clone(), client);
+    bridge.client().hello().await.unwrap();
+    bridge.spawn_event_router().await;
+
+    // The mock echoes the prompt, so the reply is a >threshold fenced
+    // block. Leading newline keeps the fence on its own line after the
+    // "echo: " prefix.
+    let fenced = format!("\n```rust\n{}\n```", "let x = 1;\n".repeat(600));
+    bridge
+        .handle_message("chat".into(), None, None, fenced.clone(), Vec::new())
+        .await;
+    let full = format!("echo: {fenced}");
+    let fences_of = |c: &str| {
+        c.lines()
+            .filter(|l| l.trim_start_matches(' ').starts_with("```"))
+            .count()
+    };
+    // A chunk that ends mid-fence is followed by one whose first line
+    // is the re-opened "```info" marker — strip those heads to rebuild.
+    let reassemble = |chunks: &[String]| {
+        let mut joined = String::new();
+        for (i, c) in chunks.iter().enumerate() {
+            if i > 0 && fences_of(&chunks[i - 1]) % 2 == 1 {
+                joined.push_str(c.split_once('\n').unwrap().1);
+            } else {
+                joined.push_str(c);
+            }
+        }
+        joined
+    };
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(15);
+    let chunks = loop {
+        let chunks: Vec<String> = ch
+            .sent
+            .lock()
+            .await
+            .iter()
+            .filter(|(c, _)| c == "chat")
+            .map(|(_, t)| t.clone())
+            .collect();
+        if chunks.len() >= 3 && reassemble(&chunks) == full {
+            break chunks;
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "chunks never reassembled: {chunks:?}"
+        );
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+    };
+    assert!(chunks.len() >= 3, "expected multiple chunks: {chunks:?}");
+    for c in &chunks {
+        assert!(c.len() <= 3500, "oversized chunk: {}", c.len());
+    }
+    assert_eq!(reassemble(&chunks), full);
 }

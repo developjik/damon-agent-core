@@ -17,7 +17,7 @@
 # default_backend = "claude"
 
 # Backend launch overrides — every field optional, catalog defaults otherwise.
-# Catalog ids: claude, codex, omp, cursor, amp, kimi, qwen.
+# Catalog ids: claude, codex, omp, cursor, amp, kimi, qwen, gemini.
 # [backends.claude]
 # command = "claude"                       # or a local adapter build's path
 # args = ["-p", "--output-format", "stream-json", "--input-format", "stream-json", "--verbose"]
@@ -31,19 +31,30 @@
 # [backends.my-agent.env]
 # KEY = "value"
 
-# MCP servers forwarded to every agent session at session.create time —
-# the AGENT spawns and permissions them (Damon never launches them itself).
-# [mcp_servers.filesystem]
-# command = "npx"
-# args = ["-y", "@modelcontextprotocol/server-filesystem", "/tmp"]
+# MCP servers are per-session: pass them in session.create's
+# `mcpServers` param — the agent spawns and permissions them (Damon
+# never launches them itself). Only claude forwards them today; other
+# backends ignore the param.
 
 # permission_timeout_secs = 300   # deny agent permission asks after this
 # session_retention_days = 30     # delete sessions older than this; unset = keep forever
 # agent_idle_secs = 1800          # idle backend sessions are closed after this;
                                   # sessions reattach via the resume chain; 0 = disabled
+# max_sessions = 16                # cap on live backend sessions (unset =
+                                   # unlimited); reaps/close free slots again
+# allowed_dirs = [                 # cwd allowlist for session.create/resume/
+#   "/home/me/code",               # import. Unset = unrestricted. Component-
+# ]                                # wise prefix after canonicalization; meant
+                                   # for remote/TLS deployments where the
+                                   # shared token shouldn't grant an agent
+                                   # process anywhere on the machine. Hot-
+                                   # reloaded.
 
 # Remote relay — dial out so clients can reach this daemon without an
-# inbound port. Run damon-relay on a public host first.
+# inbound port. Run damon-relay on a public host first; the relay also
+# serves the web UI at its root, so any browser can open the relay host,
+# enter this daemon's relay `name` + the auth_token, and connect
+# end-to-end encrypted (the relay sees only ciphertext).
 # [relay]
 # url = "ws://your-relay:8080"
 # name = "my-daemon"

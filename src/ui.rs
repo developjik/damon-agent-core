@@ -18,6 +18,18 @@ pub async fn ui() -> impl axum::response::IntoResponse {
     (UI_HEADERS, Html(include_str!("ui.html")))
 }
 
+/// The browser relay client (`DamonRelay` global) — the same file
+/// `damon-relay` serves at its own `/relay-client.js`. Kept out of the
+/// inline page so it can be loaded standalone (Node tests) and the CSP
+/// stays `'self'`-clean.
+pub async fn relay_client_js() -> impl axum::response::IntoResponse {
+    (
+        UI_HEADERS,
+        [(header::CONTENT_TYPE, "text/javascript; charset=utf-8")],
+        include_str!("relay-client.js"),
+    )
+}
+
 /// Installability manifest for the UI. The icon is referenced by path
 /// (`/icon.svg`): Chromium's install pipeline fetches manifest icons
 /// over HTTP and does not reliably accept `data:` URLs in `src`, so an

@@ -11,6 +11,11 @@
 //!   protocol (can_use_tool permission asks, interrupt, set_model,
 //!   set_permission_mode).
 //!
+//! Task tool_use/tool_result pairs additionally raise Subagent
+//! lifecycle events (omp-shaped: name/description/status/state) so
+//! consumers see subagents uniformly across backends; the tool_call
+//! timeline items are still emitted alongside.
+//!
 //! One process = one conversation. Resume spawns a fresh process with
 //! `--resume <session_id>`; Claude's own transcript file is the durable
 //! record.
@@ -22,14 +27,25 @@ use anyhow::Result;
 use async_trait::async_trait;
 use serde_json::{Value, json};
 
-use super::streamjson::{ControlOp, SessionCtx, StreamJsonDialect};
+use super::streamjson::{
+    ClaudeFrameParser, ClaudeQuirks, ControlOp, SessionCtx, StreamJsonDialect,
+};
 use super::types::*;
 
-pub struct ClaudeDialect;
+pub struct ClaudeDialect {
+    /// Shared Claude-frame translator; the claude preset adds the
+    /// Task→Subagent lifecycle events and vendor tool mapping.
+    parser: ClaudeFrameParser,
+}
 
 impl ClaudeDialect {
     pub fn dialect() -> Arc<dyn StreamJsonDialect> {
-        Arc::new(Self)
+        Arc::new(Self {
+            parser: ClaudeFrameParser::new(ClaudeQuirks {
+                tool_detail: map_tool_input,
+                ..ClaudeQuirks::claude()
+            }),
+        })
     }
 }
 
@@ -71,10 +87,6 @@ impl StreamJsonDialect for ClaudeDialect {
     async fn on_frame(&self, session: &Arc<dyn SessionCtx>, f: &Value) {
         let ty = f["type"].as_str().unwrap_or_default();
         match ty {
-            "system" => self.on_system(session, f).await,
-            "assistant" => self.on_assistant(session, f).await,
-            "user" => self.on_user(session, f).await,
-            "result" => self.on_result(session, f).await,
             "control_request" => self.on_control_request(session, f).await,
             "control_response" => {
                 // Answer to a control request WE sent (interrupt, set_model).
@@ -92,7 +104,10 @@ impl StreamJsonDialect for ClaudeDialect {
                 };
                 session.resolve_wire(&id, result).await;
             }
-            _ => {}
+            // system/assistant/user/result share the family parser —
+            // the claude preset adds Task→Subagent lifecycle events on
+            // top of the common block translation.
+            _ => self.parser.on_frame(session, f).await,
         }
     }
 
@@ -157,9 +172,19 @@ impl StreamJsonDialect for ClaudeDialect {
 
     fn catalog(&self) -> ProviderCatalog {
         // Claude has no model-listing wire call; the init frame reports
-        // the active model. Modes are the CLI's permission modes.
+        // the active model. The CLI's documented alias names are stable
+        // across versions, so the picker offers those — full model ids
+        // (claude-sonnet-4-5…) also work via set_model passthrough, they
+        // just can't be enumerated without a listing wire.
         ProviderCatalog {
-            models: vec![],
+            models: ["sonnet", "opus", "opusplan"]
+                .iter()
+                .map(|m| ModelDef {
+                    id: m.to_string(),
+                    name: format!("{} (alias)", (*m).to_uppercase()),
+                    selectable: true,
+                })
+                .collect(),
             modes: ["default", "acceptEdits", "plan", "bypassPermissions"]
                 .iter()
                 .map(|m| ModeDef {
@@ -205,7 +230,7 @@ impl StreamJsonDialect for ClaudeDialect {
                     native_handle: stem.to_string(),
                     metadata: json!({"transcript": path.to_string_lossy()}),
                 },
-                title: None,
+                title: transcript_title(&path).await,
                 cwd: Some(cwd.to_path_buf()),
                 modified_at: modified,
             });
@@ -222,112 +247,52 @@ impl StreamJsonDialect for ClaudeDialect {
             mcp_servers: true,
             reasoning_stream: true,
             steer: true,
-            rewind: true,
+            rewind: false,
             subagent_events: true,
         }
     }
 }
 
+/// The first user message of a transcript jsonl, whitespace-collapsed
+/// and truncated — the closest thing to a title a Claude session file
+/// carries. Reads a bounded prefix, so importing a directory of huge
+/// transcripts stays cheap; returns None when no user line surfaces.
+async fn transcript_title(path: &Path) -> Option<String> {
+    use tokio::io::{AsyncBufReadExt, BufReader};
+    let f = tokio::fs::File::open(path).await.ok()?;
+    let mut lines = BufReader::new(f).lines();
+    for _ in 0..80 {
+        let line = lines.next_line().await.ok()?;
+        let Some(line) = line else { break };
+        let Ok(v) = serde_json::from_str::<serde_json::Value>(&line) else {
+            continue;
+        };
+        if v["type"] != "user" {
+            continue;
+        }
+        let content = &v["message"]["content"];
+        let text = match content {
+            serde_json::Value::String(s) => Some(s.clone()),
+            serde_json::Value::Array(parts) => Some(
+                parts
+                    .iter()
+                    .filter_map(|p| p["text"].as_str())
+                    .collect::<Vec<_>>()
+                    .join(" "),
+            ),
+            _ => None,
+        }?;
+        let collapsed: String = text.split_whitespace().collect::<Vec<_>>().join(" ");
+        if collapsed.is_empty() {
+            continue;
+        }
+        let cut = collapsed.floor_char_boundary(80);
+        return Some(collapsed[..cut].to_string());
+    }
+    None
+}
+
 impl ClaudeDialect {
-    async fn on_system(&self, session: &Arc<dyn SessionCtx>, f: &Value) {
-        if f["subtype"].as_str() == Some("init") {
-            let id = f["session_id"].as_str().unwrap_or_default().to_string();
-            session.set_native_handle(id).await;
-        }
-        // Other system subtypes (hooks, thinking_tokens) are housekeeping.
-    }
-
-    async fn on_assistant(&self, session: &Arc<dyn SessionCtx>, f: &Value) {
-        let Some(blocks) = f["message"]["content"].as_array() else {
-            return;
-        };
-        for block in blocks {
-            let item = match block["type"].as_str().unwrap_or_default() {
-                "text" => TimelineItem::AssistantMessage {
-                    text: block["text"].as_str().unwrap_or_default().to_string(),
-                },
-                "thinking" => TimelineItem::Reasoning {
-                    text: block["thinking"].as_str().unwrap_or_default().to_string(),
-                },
-                "tool_use" => TimelineItem::ToolCall(ToolCall {
-                    call_id: block["id"].as_str().unwrap_or_default().to_string(),
-                    name: block["name"].as_str().unwrap_or_default().to_string(),
-                    status: ToolCallStatus::Running,
-                    detail: map_tool_input(
-                        block["name"].as_str().unwrap_or_default(),
-                        &block["input"],
-                    ),
-                }),
-                _ => TimelineItem::Unknown { raw: block.clone() },
-            };
-            session.emit_timeline(item).await;
-        }
-    }
-
-    async fn on_user(&self, session: &Arc<dyn SessionCtx>, f: &Value) {
-        // tool_result blocks arrive as user messages.
-        let Some(blocks) = f["message"]["content"].as_array() else {
-            return;
-        };
-        for block in blocks {
-            if block["type"].as_str() != Some("tool_result") {
-                continue;
-            }
-            let call_id = block["tool_use_id"]
-                .as_str()
-                .unwrap_or_default()
-                .to_string();
-            let is_error = block["is_error"].as_bool().unwrap_or(false);
-            let output = match &block["content"] {
-                Value::String(s) => s.clone(),
-                other => other.to_string(),
-            };
-            let item = TimelineItem::ToolCall(ToolCall {
-                call_id,
-                name: String::new(),
-                status: if is_error {
-                    ToolCallStatus::Failed
-                } else {
-                    ToolCallStatus::Completed
-                },
-                detail: ToolCallDetail::Unknown {
-                    input: Value::Null,
-                    output: Value::String(output),
-                },
-            });
-            session.emit_timeline(item).await;
-        }
-    }
-
-    async fn on_result(&self, session: &Arc<dyn SessionCtx>, f: &Value) {
-        let usage = Usage {
-            input_tokens: f["usage"]["input_tokens"].as_u64(),
-            cached_input_tokens: f["usage"]["cache_read_input_tokens"].as_u64(),
-            output_tokens: f["usage"]["output_tokens"].as_u64(),
-            cost_usd: f["total_cost_usd"].as_f64(),
-            context_window: None,
-            context_used: None,
-        };
-        let kind = if f["subtype"].as_str() == Some("interrupted")
-            || f["terminal_reason"].as_str() == Some("aborted_streaming")
-        {
-            // Interrupt reports is_error:true with subtype
-            // "error_during_execution" — the aborted_streaming terminal
-            // reason is what marks a user cancel.
-            StreamEventKind::TurnCanceled {
-                reason: "interrupted".to_string(),
-            }
-        } else if f["is_error"].as_bool().unwrap_or(false) {
-            StreamEventKind::TurnFailed {
-                error: f["result"].as_str().unwrap_or("unknown error").to_string(),
-                code: f["subtype"].as_str().map(|s| s.to_string()),
-            }
-        } else {
-            StreamEventKind::TurnCompleted { usage: Some(usage) }
-        };
-        session.finish_turn(kind).await;
-    }
-
     /// Agent → daemon control requests. `can_use_tool` becomes a
     /// PermissionRequest; anything else gets a minimal success response
     /// so the agent isn't blocked on a handshake we don't implement.
@@ -427,5 +392,81 @@ fn map_tool_input(name: &str, input: &Value) -> ToolCallDetail {
             input: input.clone(),
             output: Value::Null,
         },
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn capabilities_match_what_claude_actually_does() {
+        // Task tool_use/tool_result pairs raise Subagent events; rewind
+        // is unimplemented in every backend.
+        let c = ClaudeDialect::dialect().capabilities();
+        assert!(c.subagent_events);
+        assert!(!c.rewind);
+        assert!(c.mcp_servers);
+        assert!(c.steer);
+    }
+
+    #[tokio::test]
+    async fn transcript_title_reads_first_user_message() {
+        let dir = std::env::temp_dir().join(format!("damon-claude-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("s1.jsonl");
+        std::fs::write(
+            &path,
+            concat!(
+                "{\"type\":\"summary\",\"summary\":\"line 1\"}\n",
+                "{\"type\":\"user\",\"message\":{\"role\":\"user\",\"content\":\"fix  the\\n timeout bug\"}}\n",
+                "{\"type\":\"assistant\",\"message\":{\"role\":\"assistant\",\"content\":\"ok\"}}\n",
+            ),
+        )
+        .unwrap();
+        // Whitespace collapses, not truncated at 80.
+        assert_eq!(
+            transcript_title(&path).await.as_deref(),
+            Some("fix the timeout bug")
+        );
+
+        // Array-form content: text parts join.
+        let path2 = dir.join("s2.jsonl");
+        std::fs::write(
+            &path2,
+            "{\"type\":\"user\",\"message\":{\"role\":\"user\",\"content\":[{\"type\":\"text\",\"text\":\"hello\"},{\"type\":\"text\",\"text\":\"world\"}]}}\n",
+        )
+        .unwrap();
+        assert_eq!(
+            transcript_title(&path2).await.as_deref(),
+            Some("hello world")
+        );
+
+        // Long first message truncates at a char boundary (80 bytes).
+        let path3 = dir.join("s3.jsonl");
+        let long = "가".repeat(100);
+        std::fs::write(
+            &path3,
+            format!(
+                "{{\"type\":\"user\",\"message\":{{\"role\":\"user\",\"content\":\"{long}\"}}}}\n"
+            ),
+        )
+        .unwrap();
+        let t = transcript_title(&path3).await.unwrap();
+        assert!(
+            t.chars().count() == 26,
+            "80-byte cap floors to a char boundary (78/3): {}",
+            t.chars().count()
+        );
+
+        // No user line at all.
+        let path4 = dir.join("s4.jsonl");
+        std::fs::write(
+            &path4,
+            "{\"type\":\"assistant\",\"message\":{\"content\":\"hi\"}}\n",
+        )
+        .unwrap();
+        assert_eq!(transcript_title(&path4).await, None);
+        std::fs::remove_dir_all(&dir).ok();
     }
 }

@@ -20,7 +20,7 @@ use serde_json::{Value, json};
 use std::process::Stdio;
 use tokio::io::{AsyncWriteExt, BufReader};
 use tokio::process::{Child, Command};
-use tokio::sync::{Mutex, broadcast, oneshot};
+use tokio::sync::{Mutex, broadcast, oneshot, watch};
 
 /// Hard cap on one stdout line. Protocol frames are small; a runaway
 /// agent emitting a megabyte-long line must not grow the read buffer
@@ -44,6 +44,10 @@ pub struct NdjsonTransport {
     closed: AtomicBool,
     child: Mutex<Child>,
     last_used: AtomicU64,
+    /// Fires once the process exits (stdout EOF, read error, or
+    /// shutdown) — session pumps select on it so a dead backend fails
+    /// the in-flight turn instead of leaving waiters on a silent pipe.
+    exited: watch::Sender<bool>,
 }
 
 impl NdjsonTransport {
@@ -91,18 +95,26 @@ impl NdjsonTransport {
             closed: AtomicBool::new(false),
             child: Mutex::new(child),
             last_used: AtomicU64::new(epoch_secs()),
+            exited: watch::Sender::new(false),
         });
-
         // stderr must never block protocol I/O: a dedicated task drains
-        // it line by line. Nothing consumes the lines today — bounded
-        // reads keep a chatty backend from ballooning memory.
+        // it line by line into the daemon log. Auth/login failures and
+        // CLI errors land here — dropping them made those look like
+        // silent hangs. Bounded reads keep a chatty backend from
+        // ballooning memory.
         {
+            let backend = command.clone();
             tokio::spawn(async move {
                 let mut reader = BufReader::new(stderr);
                 let mut buf: Vec<u8> = Vec::new();
                 loop {
                     match read_capped_line(&mut reader, &mut buf, STDERR_LINE_CAP).await {
-                        Ok((true, _)) => {}
+                        Ok((true, _)) => {
+                            let line = String::from_utf8_lossy(&buf).trim().to_string();
+                            if !line.is_empty() {
+                                tracing::warn!(backend = %backend, "backend stderr: {line}");
+                            }
+                        }
                         Ok((false, _)) => return, // EOF
                         Err(_) => return,
                     }
@@ -136,6 +148,13 @@ impl NdjsonTransport {
         self.frames.subscribe()
     }
 
+    /// A receiver that fires after the process exits — stdout EOF, read
+    /// error, or `shutdown()`. Pumps use it to stop promptly instead of
+    /// blocking on the still-open broadcast channel forever.
+    pub fn exited(&self) -> watch::Receiver<bool> {
+        self.exited.subscribe()
+    }
+
     /// Whether the subprocess is still alive.
     pub fn is_alive(&self) -> bool {
         !self.closed.load(Ordering::SeqCst)
@@ -156,6 +175,7 @@ impl NdjsonTransport {
     /// child — kill on the owned handle reaps or no-ops.
     pub async fn shutdown(&self) {
         self.closed.store(true, Ordering::SeqCst);
+        let _ = self.exited.send(true);
         let mut child = self.child.lock().await;
         let _ = child.kill().await;
     }
@@ -219,6 +239,8 @@ async fn read_loop(stdout: tokio::process::ChildStdout, me: Arc<NdjsonTransport>
     for (_, tx) in pending.drain() {
         let _ = tx.send(Err(json!({"message": "backend process exited"})));
     }
+    // Wake exit watchers.
+    let _ = me.exited.send(true);
 }
 
 /// Read one `\n`-terminated line into `buf` (newline stripped), never

@@ -1,7 +1,7 @@
 {
   "name": "damon-agent",
-  "version": "0.4.0",
-  "description": "Damon agent core — local multi-provider agent daemon",
+  "version": "0.5.0",
+  "description": "Damon agent core \u2014 local multi-provider agent daemon",
   "license": "MIT OR Apache-2.0",
   "repository": "https://github.com/developjik/damon-agent-core",
   "homepage": "https://github.com/developjik/damon-agent-core#readme",
@@ -16,13 +16,26 @@
   },
   "scripts": {
     "postinstall": "node install.js",
-    "test": "node --test client.test.mjs"
+    "test": "node --test client.test.mjs",
+    "typecheck": "tsc --noEmit --strict --module nodenext --moduleResolution nodenext --allowImportingTsExtensions types-smoke.ts"
   },
   "engines": {
     "node": ">=22"
   },
-  "files": ["install.js", "client.mjs", "README.md", "bin/"],
+  "files": [
+    "install.js",
+    "client.mjs",
+    "client.d.mts",
+    "README.md",
+    "bin/"
+  ],
   "exports": {
-    ".": "./client.mjs"
+    ".": {
+      "types": "./client.d.mts",
+      "default": "./client.mjs"
+    }
+  },
+  "devDependencies": {
+    "typescript": "^5.5.0"
   }
 }

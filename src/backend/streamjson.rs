@@ -10,7 +10,11 @@
 //!   qwen). Permissions still relay while a turn's process is alive.
 //!
 //! Per-vendor differences live in [`StreamJsonDialect`]: launch args,
-//! frame translation, permission wire format, and control frames.
+//! frame dispatch for vendor-private frames, permission wire format,
+//! and control frames. Claude-family content/result translation is
+//! shared through [`ClaudeFrameParser`], parameterized by
+//! [`ClaudeQuirks`] so each dialect's exact behavior is data, not a
+//! forked parser.
 
 use std::collections::HashMap;
 use std::path::Path;
@@ -20,7 +24,7 @@ use std::time::Duration;
 
 use anyhow::{Result, bail};
 use async_trait::async_trait;
-use serde_json::Value;
+use serde_json::{Value, json};
 use tokio::sync::{Mutex, broadcast};
 
 use super::registry::ResolvedBackend;
@@ -96,6 +100,13 @@ pub trait StreamJsonDialect: Send + Sync {
         bail!("dialect does not take stdin prompts")
     }
 
+    /// The stdin frame carrying a mid-turn steering message. Default:
+    /// identical to a prompt frame — dialects that mark steering on
+    /// the wire (amp's `steer: true`) override this.
+    fn steer_frame(&self, prompt: &PromptInput) -> Result<Value> {
+        self.prompt_frame(prompt)
+    }
+
     /// The stdin frame answering a permission ask. `wire_id` is the id
     /// the agent used in its request (stored in the pending ask).
     fn permission_response_frame(
@@ -133,6 +144,401 @@ pub trait StreamJsonDialect: Send + Sync {
     /// Session shape this dialect drives.
     fn session_kind(&self) -> SessionKind {
         SessionKind::Persistent
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Claude-frame parser (shared by the claude/amp/kimi/qwen dialects)
+// ---------------------------------------------------------------------------
+
+/// Dialect quirks of the Claude stream-json frame family, expressed as
+/// data so a single translator covers every vendor CLI. The presets
+/// below document exactly where each dialect diverges; anything not
+/// listed is identical across the family.
+///
+/// Cursor is deliberately NOT on this parser: its wire carries
+/// complete `tool_call` envelopes instead of assistant tool_use blocks
+/// and tool_result messages, so it keeps a private translator.
+pub struct ClaudeQuirks {
+    /// Normalizes a tool_use name+input into timeline detail. Dialects
+    /// with vendor tool names (claude, amp) plug their mapper in; the
+    /// default keeps the raw input so nothing is silently dropped.
+    pub tool_detail: fn(name: &str, input: &Value) -> ToolCallDetail,
+    /// Assistant frames may additionally carry OpenAI-style
+    /// `tool_calls`, with results arriving as top-level `tool` frames
+    /// (kimi's hybrid wire).
+    pub openai_tool_calls: bool,
+    /// Tool results arrive as `user` frames carrying `tool_result`
+    /// blocks. Kimi reports them as `tool` frames instead.
+    pub user_tool_results: bool,
+    /// `usage: null` reports no usage at all (kimi, qwen) rather than
+    /// an all-None Usage (claude and amp always report one).
+    pub usage_optional: bool,
+    /// Cost comes from the frame's `total_cost_usd` (claude, qwen);
+    /// amp and kimi report none.
+    pub cost_from_frame: bool,
+    /// amp reports the context window as `usage.max_tokens`.
+    pub context_from_max_tokens: bool,
+    /// Failure text prefers the frame's `error` field (amp, kimi,
+    /// qwen); claude only ever reports `result`.
+    pub error_field_first: bool,
+    /// claude marks user interrupts (subtype "interrupted", or
+    /// terminal_reason "aborted_streaming") as a cancel, not a failure.
+    pub detect_interrupt: bool,
+    /// Task tool_use/tool_result pairs also raise Subagent lifecycle
+    /// events (claude's Task tool is its subagent spawner), shaped like
+    /// omp's raw subagent frames so consumers see one consistent
+    /// name/description/status/state vocabulary across backends.
+    pub subagent_from_task: bool,
+}
+
+impl Default for ClaudeQuirks {
+    fn default() -> Self {
+        Self {
+            tool_detail: raw_tool_detail,
+            openai_tool_calls: false,
+            user_tool_results: true,
+            usage_optional: false,
+            cost_from_frame: false,
+            context_from_max_tokens: false,
+            error_field_first: false,
+            detect_interrupt: false,
+            subagent_from_task: false,
+        }
+    }
+}
+
+impl ClaudeQuirks {
+    /// Claude Code proper: vendor tool names, frame-reported cost,
+    /// interrupt detection, and Task subagents.
+    pub fn claude() -> Self {
+        Self {
+            cost_from_frame: true,
+            detect_interrupt: true,
+            subagent_from_task: true,
+            ..Self::default()
+        }
+    }
+
+    /// Amp: Claude-compatible frames, no cost, the context window
+    /// reported as `usage.max_tokens`, failure text preferring `error`.
+    pub fn amp() -> Self {
+        Self {
+            context_from_max_tokens: true,
+            error_field_first: true,
+            ..Self::default()
+        }
+    }
+
+    /// Kimi: hybrid wire — OpenAI `tool_calls` plus `tool` result
+    /// frames, optional usage, no user-frame tool results.
+    pub fn kimi() -> Self {
+        Self {
+            openai_tool_calls: true,
+            user_tool_results: false,
+            usage_optional: true,
+            error_field_first: true,
+            ..Self::default()
+        }
+    }
+
+    /// Qwen: Claude-shaped blocks and user-frame tool results, with
+    /// optional usage that carries the frame cost.
+    pub fn qwen() -> Self {
+        Self {
+            usage_optional: true,
+            cost_from_frame: true,
+            error_field_first: true,
+            ..Self::default()
+        }
+    }
+}
+
+/// Default tool_use detail: keep the raw input verbatim. Vendor
+/// dialects override with their own mapper.
+fn raw_tool_detail(_name: &str, input: &Value) -> ToolCallDetail {
+    ToolCallDetail::Unknown {
+        input: input.clone(),
+        output: Value::Null,
+    }
+}
+
+/// One translator for the Claude stream-json frame family. The
+/// claude/amp/kimi/qwen dialects delegate here from `on_frame` after
+/// handling their private arms (control frames, amp's error system
+/// subtypes), so content-block and result-frame logic exists exactly
+/// once instead of as four copy-pasted parsers that drift apart.
+pub struct ClaudeFrameParser {
+    quirks: ClaudeQuirks,
+    /// In-flight Task calls (tool_use id → identity), consulted only
+    /// when `subagent_from_task` is set so a tool_result can be told
+    /// apart as a subagent ending. Claude tool_use ids are globally
+    /// unique, so one parser shared across sessions stays consistent;
+    /// the matching tool_result prunes its entry. A Task whose turn
+    /// dies (interrupt, crash) leaves a dead id behind — a handful of
+    /// strings costs nothing.
+    tasks: Mutex<HashMap<String, TaskIdentity>>,
+}
+
+/// What a Task call remembered about its subagent, so the terminal
+/// event can repeat the identity.
+struct TaskIdentity {
+    name: String,
+    description: String,
+}
+
+impl ClaudeFrameParser {
+    pub fn new(quirks: ClaudeQuirks) -> Self {
+        Self {
+            quirks,
+            tasks: Mutex::new(HashMap::new()),
+        }
+    }
+
+    /// Translate one inbound frame. Frame types the dialect owns
+    /// (control_request/control_response, amp's error subtypes) are
+    /// matched by the dialect before falling through to this.
+    pub async fn on_frame(&self, ctx: &Arc<dyn SessionCtx>, f: &Value) {
+        match f["type"].as_str().unwrap_or_default() {
+            "system" => self.on_system(ctx, f).await,
+            "assistant" => self.on_assistant(ctx, f).await,
+            "user" if self.quirks.user_tool_results => self.on_user(ctx, f).await,
+            "tool" if self.quirks.openai_tool_calls => self.on_tool(ctx, f).await,
+            "result" => self.on_result(ctx, f).await,
+            _ => {}
+        }
+    }
+
+    async fn on_system(&self, ctx: &Arc<dyn SessionCtx>, f: &Value) {
+        if f["subtype"].as_str() == Some("init") {
+            let id = f["session_id"].as_str().unwrap_or_default().to_string();
+            ctx.set_native_handle(id).await;
+        }
+        // Other system subtypes (hooks, thinking_tokens) are housekeeping.
+    }
+
+    async fn on_assistant(&self, ctx: &Arc<dyn SessionCtx>, f: &Value) {
+        // `content` may be absent on kimi frames that only carry
+        // tool_calls — no early return, or those frames would be
+        // dropped before the OpenAI arm below.
+        if let Some(blocks) = f["message"]["content"].as_array() {
+            for block in blocks {
+                // Set when this block starts a subagent Task — the
+                // event rides behind the tool_call item so the timeline
+                // shows the call first, then the subagent it spawned.
+                let mut subagent = None;
+                let item = match block["type"].as_str().unwrap_or_default() {
+                    "text" => TimelineItem::AssistantMessage {
+                        text: block["text"].as_str().unwrap_or_default().to_string(),
+                    },
+                    "thinking" => TimelineItem::Reasoning {
+                        text: block["thinking"].as_str().unwrap_or_default().to_string(),
+                    },
+                    "tool_use" => {
+                        let name = block["name"].as_str().unwrap_or_default();
+                        let call = ToolCall {
+                            call_id: block["id"].as_str().unwrap_or_default().to_string(),
+                            name: name.to_string(),
+                            status: ToolCallStatus::Running,
+                            detail: (self.quirks.tool_detail)(name, &block["input"]),
+                        };
+                        if self.quirks.subagent_from_task && name == "Task" {
+                            subagent =
+                                Some(self.task_started(&call.call_id, &block["input"]).await);
+                        }
+                        TimelineItem::ToolCall(call)
+                    }
+                    _ => TimelineItem::Unknown { raw: block.clone() },
+                };
+                ctx.emit_timeline(item).await;
+                if let Some(event) = subagent {
+                    self.emit_subagent(ctx, event).await;
+                }
+            }
+        }
+        // OpenAI-style tool_calls array (kimi's hybrid wire).
+        if self.quirks.openai_tool_calls
+            && let Some(calls) = f["message"]["tool_calls"].as_array()
+        {
+            for call in calls {
+                let name = call["function"]["name"].as_str().unwrap_or_default();
+                ctx.emit_timeline(TimelineItem::ToolCall(ToolCall {
+                    call_id: call["id"].as_str().unwrap_or_default().to_string(),
+                    name: name.to_string(),
+                    status: ToolCallStatus::Running,
+                    detail: (self.quirks.tool_detail)(name, &call["function"]["arguments"]),
+                }))
+                .await;
+            }
+        }
+    }
+
+    /// tool_result blocks arrive as user messages (claude, amp, qwen).
+    async fn on_user(&self, ctx: &Arc<dyn SessionCtx>, f: &Value) {
+        let Some(blocks) = f["message"]["content"].as_array() else {
+            return;
+        };
+        for block in blocks {
+            if block["type"].as_str() != Some("tool_result") {
+                continue;
+            }
+            let call_id = block["tool_use_id"]
+                .as_str()
+                .unwrap_or_default()
+                .to_string();
+            let is_error = block["is_error"].as_bool().unwrap_or(false);
+            let output = match &block["content"] {
+                Value::String(s) => s.clone(),
+                other => other.to_string(),
+            };
+            ctx.emit_timeline(TimelineItem::ToolCall(ToolCall {
+                call_id: call_id.clone(),
+                name: String::new(),
+                status: if is_error {
+                    ToolCallStatus::Failed
+                } else {
+                    ToolCallStatus::Completed
+                },
+                detail: ToolCallDetail::Unknown {
+                    input: Value::Null,
+                    output: Value::String(output),
+                },
+            }))
+            .await;
+            if let Some(event) = self.task_finished(&call_id, is_error).await {
+                self.emit_subagent(ctx, event).await;
+            }
+        }
+    }
+
+    /// OpenAI-style tool result frames: the result is the whole message
+    /// (`tool_call_id` + top-level `content`). Kimi only.
+    async fn on_tool(&self, ctx: &Arc<dyn SessionCtx>, f: &Value) {
+        let call_id = f["tool_call_id"]
+            .as_str()
+            .or_else(|| f["tool_use_id"].as_str())
+            .unwrap_or_default()
+            .to_string();
+        let output = match &f["content"] {
+            Value::String(s) => s.clone(),
+            other => other.to_string(),
+        };
+        ctx.emit_timeline(TimelineItem::ToolCall(ToolCall {
+            call_id,
+            name: String::new(),
+            status: ToolCallStatus::Completed,
+            detail: ToolCallDetail::Unknown {
+                input: Value::Null,
+                output: Value::String(output),
+            },
+        }))
+        .await;
+    }
+
+    /// The per-turn `result` frame: usage shape and failure text follow
+    /// the dialect's quirks; claude additionally recognizes interrupts.
+    async fn on_result(&self, ctx: &Arc<dyn SessionCtx>, f: &Value) {
+        let usage = if self.quirks.usage_optional && f["usage"].is_null() {
+            None
+        } else {
+            Some(Usage {
+                input_tokens: f["usage"]["input_tokens"].as_u64(),
+                cached_input_tokens: f["usage"]["cache_read_input_tokens"].as_u64(),
+                output_tokens: f["usage"]["output_tokens"].as_u64(),
+                cost_usd: if self.quirks.cost_from_frame {
+                    f["total_cost_usd"].as_f64()
+                } else {
+                    None
+                },
+                context_window: if self.quirks.context_from_max_tokens {
+                    f["usage"]["max_tokens"].as_u64()
+                } else {
+                    None
+                },
+                context_used: None,
+            })
+        };
+        let kind = if self.quirks.detect_interrupt
+            && (f["subtype"].as_str() == Some("interrupted")
+                || f["terminal_reason"].as_str() == Some("aborted_streaming"))
+        {
+            // Interrupt reports is_error:true with subtype
+            // "error_during_execution" — the aborted_streaming terminal
+            // reason is what marks a user cancel.
+            StreamEventKind::TurnCanceled {
+                reason: "interrupted".to_string(),
+            }
+        } else if f["is_error"].as_bool().unwrap_or(false) {
+            let error = if self.quirks.error_field_first {
+                f["error"].as_str().or_else(|| f["result"].as_str())
+            } else {
+                f["result"].as_str()
+            }
+            .unwrap_or("unknown error");
+            StreamEventKind::TurnFailed {
+                error: error.to_string(),
+                code: f["subtype"].as_str().map(|s| s.to_string()),
+            }
+        } else {
+            StreamEventKind::TurnCompleted { usage }
+        };
+        ctx.finish_turn(kind).await;
+    }
+
+    /// A Task tool_use opened a subagent — remember its identity and
+    /// return the omp-shaped start event (name/description/status plus
+    /// a mirror `state`, keyed by the tool_use id so the terminal
+    /// event and the UI cards can correlate).
+    async fn task_started(&self, call_id: &str, input: &Value) -> Value {
+        let TaskIdentity { name, description } = TaskIdentity {
+            name: input["subagent_type"]
+                .as_str()
+                .unwrap_or("Task")
+                .to_string(),
+            description: input["description"]
+                .as_str()
+                .unwrap_or_default()
+                .to_string(),
+        };
+        self.tasks.lock().await.insert(
+            call_id.to_string(),
+            TaskIdentity {
+                name: name.clone(),
+                description: description.clone(),
+            },
+        );
+        json!({
+            "type": "subagent_lifecycle",
+            "id": call_id,
+            "name": name,
+            "description": description,
+            "status": "running",
+            "state": "running",
+        })
+    }
+
+    /// A tool_result closed a Task call — returns the terminal
+    /// subagent event, or None when the result belongs to an ordinary
+    /// tool.
+    async fn task_finished(&self, call_id: &str, is_error: bool) -> Option<Value> {
+        let identity = self.tasks.lock().await.remove(call_id)?;
+        let status = if is_error { "failed" } else { "completed" };
+        Some(json!({
+            "type": "subagent_event",
+            "id": call_id,
+            "name": identity.name,
+            "description": identity.description,
+            "status": status,
+            "state": status,
+        }))
+    }
+
+    async fn emit_subagent(&self, ctx: &Arc<dyn SessionCtx>, event: Value) {
+        let turn = ctx.current_turn().await;
+        ctx.emit(StreamEvent {
+            turn_id: turn,
+            kind: StreamEventKind::Subagent { event },
+        });
     }
 }
 
@@ -279,22 +685,40 @@ impl StreamJsonSession {
             shared: Shared::new(resolved.id.clone(), dialect.capabilities()),
         });
 
-        // Frame dispatch task: translate wire frames → StreamEvent.
+        // Frame dispatch task: translate wire frames → StreamEvent, and
+        // fail the in-flight turn if the process dies without sending
+        // its result frame (a dead CLI otherwise wedges the UI forever).
         {
-            let me: Arc<dyn SessionCtx> = session.clone();
+            let ctx: Arc<dyn SessionCtx> = session.clone();
+            let me: Weak<dyn SessionCtx> = Arc::downgrade(&ctx);
             let d = dialect.clone();
             let mut rx = transport.subscribe();
-            let t = transport.clone();
+            let mut exited = transport.exited();
             tokio::spawn(async move {
                 loop {
-                    match rx.recv().await {
-                        Ok(frame) => d.on_frame(&me, &frame).await,
-                        Err(broadcast::error::RecvError::Lagged(_)) => continue,
-                        Err(broadcast::error::RecvError::Closed) => break,
+                    tokio::select! {
+                        r = rx.recv() => match r {
+                            Ok(frame) => {
+                                if let Some(me) = me.upgrade() {
+                                    d.on_frame(&me, &frame).await;
+                                }
+                            }
+                            Err(broadcast::error::RecvError::Lagged(_)) => continue,
+                            Err(broadcast::error::RecvError::Closed) => break,
+                        },
+                        _ = exited.changed() => {
+                            if *exited.borrow() { break; }
+                        }
                     }
-                    if !t.is_alive() {
-                        break;
-                    }
+                }
+                // The backend died. finish_turn is a no-op when the
+                // dialect already closed the turn with a result frame.
+                if let Some(me) = me.upgrade() {
+                    me.finish_turn(StreamEventKind::TurnFailed {
+                        error: "backend process exited without a result frame".to_string(),
+                        code: None,
+                    })
+                    .await;
                 }
             });
         }
@@ -383,8 +807,8 @@ impl AgentSession for StreamJsonSession {
 
     async fn steer(&self, prompt: PromptInput, _expected_turn: &str) -> Result<SteerResult> {
         // stream-json dialects accept a new user message mid-turn; the
-        // CLI queues it as steering input.
-        let frame = self.dialect.prompt_frame(&prompt)?;
+        // CLI queues it as steering input (amp marks the frame).
+        let frame = self.dialect.steer_frame(&prompt)?;
         self.transport.send(frame).await?;
         Ok(SteerResult::Accepted)
     }
@@ -587,18 +1011,21 @@ impl AgentSession for OneShotSession {
                 let ctx: Arc<dyn SessionCtx> = me.clone();
                 let d = self.dialect.clone();
                 let mut rx = transport.subscribe();
+                let mut exited = transport.exited();
                 tokio::spawn(async move {
                     loop {
-                        match rx.recv().await {
-                            Ok(frame) => {
-                                me.touch();
-                                d.on_frame(&ctx, &frame).await;
+                        tokio::select! {
+                            r = rx.recv() => match r {
+                                Ok(frame) => {
+                                    me.touch();
+                                    d.on_frame(&ctx, &frame).await;
+                                }
+                                Err(broadcast::error::RecvError::Lagged(_)) => continue,
+                                Err(broadcast::error::RecvError::Closed) => break,
+                            },
+                            _ = exited.changed() => {
+                                if *exited.borrow() { break; }
                             }
-                            Err(broadcast::error::RecvError::Lagged(_)) => continue,
-                            Err(broadcast::error::RecvError::Closed) => break,
-                        }
-                        if !transport.is_alive() {
-                            break;
                         }
                     }
                     // Process ended. If the dialect already finished the
@@ -772,11 +1199,12 @@ where
         }));
     Ok(())
 }
-
 #[cfg(test)]
 pub(crate) mod tests {
     //! A recording SessionCtx for dialect fixture tests — no process.
     use super::*;
+    use serde_json::json;
+
     use tokio::sync::Mutex as TokioMutex;
 
     pub struct TestCtx {
@@ -835,5 +1263,378 @@ pub(crate) mod tests {
             self.sent.lock().await.push(frame);
             Ok(())
         }
+    }
+
+    /// A dialect whose CLI dies without ever sending a result frame —
+    /// exercises the exit pump against a real subprocess.
+    struct DyingDialect;
+
+    #[async_trait]
+    impl StreamJsonDialect for DyingDialect {
+        fn launch_args(&self, _config: &SessionConfig, _resume: Option<&str>) -> Vec<String> {
+            vec![]
+        }
+        async fn on_frame(&self, _ctx: &Arc<dyn SessionCtx>, _frame: &Value) {}
+        fn prompt_frame(&self, _prompt: &PromptInput) -> Result<Value> {
+            Ok(json!({"type": "user"}))
+        }
+        fn permission_response_frame(
+            &self,
+            _ask: &PermissionRequest,
+            _wire_id: &str,
+            _response: &PermissionResponse,
+        ) -> Value {
+            json!({})
+        }
+        fn capabilities(&self) -> Capabilities {
+            Capabilities::default()
+        }
+    }
+
+    #[tokio::test]
+    async fn persistent_session_fails_turn_when_process_dies() {
+        use crate::backend::registry::ResolvedBackend;
+
+        let resolved = ResolvedBackend {
+            id: "dying".into(),
+            title: "Dying".into(),
+            command: "sh".into(),
+            args: vec!["-c".into(), "sleep 1".into()],
+            env: vec![],
+            auth_hint: String::new(),
+            detected: true,
+        };
+        let session = StreamJsonSession::spawn(
+            &resolved,
+            Arc::new(DyingDialect),
+            SessionConfig {
+                cwd: std::env::temp_dir(),
+                ..Default::default()
+            },
+            None,
+        )
+        .await
+        .unwrap();
+        let mut events = session.subscribe();
+        session
+            .start_turn(PromptInput::Text("hello".into()))
+            .await
+            .unwrap();
+
+        // TurnStarted arrives immediately; ~1s later the process exits
+        // with no result frame — the pump must fail the turn, not
+        // block forever on the still-open channel.
+        loop {
+            let ev = tokio::time::timeout(Duration::from_secs(15), events.recv())
+                .await
+                .expect("timed out waiting for TurnFailed");
+            let ev = ev.expect("event channel closed");
+            if matches!(ev.kind, StreamEventKind::TurnFailed { .. }) {
+                return; // regression passes
+            }
+        }
+    }
+
+    // ------------------------------------------------------------------
+    // Dialect fixture tests, keyed by dialect. These moved out of the
+    // amp/kimi/qwen files when their copy-pasted frame parsers were
+    // replaced by ClaudeFrameParser — they pin each dialect's exact
+    // translation through the shared code.
+    // ------------------------------------------------------------------
+
+    use crate::backend::amp::AmpDialect;
+    use crate::backend::claude::ClaudeDialect;
+    use crate::backend::kimi::KimiDialect;
+    use crate::backend::qwen::QwenDialect;
+
+    #[tokio::test]
+    async fn amp_init_captures_thread_id() {
+        let t = TestCtx::new();
+        let ctx = t.as_ctx();
+        AmpDialect::dialect()
+            .on_frame(
+                &ctx,
+                &json!({"type":"system","subtype":"init","session_id":"T-abc-123"}),
+            )
+            .await;
+        assert_eq!(t.native.lock().await.as_deref(), Some("T-abc-123"));
+    }
+
+    #[tokio::test]
+    async fn amp_assistant_text_and_tool_use() {
+        let t = TestCtx::new();
+        let ctx = t.as_ctx();
+        AmpDialect::dialect()
+            .on_frame(
+                &ctx,
+                &json!({
+                    "type":"assistant",
+                    "message":{"role":"assistant","content":[
+                        {"type":"text","text":"reading file"},
+                        {"type":"tool_use","id":"tu1","name":"Read","input":{"file_path":"/x.rs"}}
+                    ]}
+                }),
+            )
+            .await;
+        let events = t.events.lock().await;
+        assert_eq!(events.len(), 2);
+        assert!(matches!(
+            events[0].kind,
+            StreamEventKind::Timeline(TimelineItem::AssistantMessage { .. })
+        ));
+        assert!(matches!(
+            events[1].kind,
+            StreamEventKind::Timeline(TimelineItem::ToolCall(_))
+        ));
+    }
+
+    #[tokio::test]
+    async fn amp_result_finishes_with_usage() {
+        let t = TestCtx::new();
+        let ctx = t.as_ctx();
+        AmpDialect::dialect()
+            .on_frame(
+                &ctx,
+                &json!({
+                    "type":"result","subtype":"success","is_error":false,
+                    "usage":{"input_tokens":10,"output_tokens":5,"max_tokens":200000}
+                }),
+            )
+            .await;
+        let events = t.events.lock().await;
+        let Some(StreamEventKind::TurnCompleted { usage }) = events.last().map(|e| &e.kind) else {
+            panic!("expected TurnCompleted");
+        };
+        let usage = usage.as_ref().unwrap();
+        assert_eq!(usage.input_tokens, Some(10));
+        // amp's quirk: the context window rides in usage.max_tokens and
+        // no cost is reported.
+        assert_eq!(usage.context_window, Some(200000));
+        assert_eq!(usage.cost_usd, None);
+    }
+
+    #[tokio::test]
+    async fn kimi_openai_style_tool_calls() {
+        let t = TestCtx::new();
+        let ctx = t.as_ctx();
+        KimiDialect::dialect()
+            .on_frame(
+                &ctx,
+                &json!({
+                    "type":"assistant","session_id":"k-1",
+                    "message":{"role":"assistant","tool_calls":[
+                        {"id":"c1","function":{"name":"read_file","arguments":"{\"path\":\"a.rs\"}"}}
+                    ]}
+                }),
+            )
+            .await;
+        let events = t.events.lock().await;
+        let Some(StreamEventKind::Timeline(TimelineItem::ToolCall(tc))) =
+            events.first().map(|e| &e.kind)
+        else {
+            panic!("expected tool call");
+        };
+        assert_eq!(tc.name, "read_file");
+        assert_eq!(tc.call_id, "c1");
+    }
+
+    #[tokio::test]
+    async fn kimi_tool_result_frame_completes_call() {
+        let t = TestCtx::new();
+        let ctx = t.as_ctx();
+        KimiDialect::dialect()
+            .on_frame(
+                &ctx,
+                &json!({"type":"tool","tool_call_id":"c1","content":"file contents"}),
+            )
+            .await;
+        let events = t.events.lock().await;
+        let Some(StreamEventKind::Timeline(TimelineItem::ToolCall(tc))) =
+            events.first().map(|e| &e.kind)
+        else {
+            panic!("expected tool call");
+        };
+        assert_eq!(tc.status, ToolCallStatus::Completed);
+    }
+
+    #[tokio::test]
+    async fn qwen_tool_result_via_user_frame() {
+        let t = TestCtx::new();
+        let ctx = t.as_ctx();
+        QwenDialect::dialect()
+            .on_frame(
+                &ctx,
+                &json!({
+                    "type":"user",
+                    "message":{"role":"user","content":[
+                        {"type":"tool_result","tool_use_id":"tu1","content":"ok","is_error":false}
+                    ]}
+                }),
+            )
+            .await;
+        let events = t.events.lock().await;
+        let Some(StreamEventKind::Timeline(TimelineItem::ToolCall(tc))) =
+            events.first().map(|e| &e.kind)
+        else {
+            panic!("expected tool call");
+        };
+        assert_eq!(tc.status, ToolCallStatus::Completed);
+    }
+
+    /// The Task tool_use keeps its tool_call timeline item AND raises
+    /// an omp-shaped Subagent start event keyed by the tool_use id.
+    #[tokio::test]
+    async fn claude_task_tool_use_raises_subagent_start() {
+        let t = TestCtx::new();
+        let ctx = t.as_ctx();
+        ClaudeDialect::dialect()
+            .on_frame(
+                &ctx,
+                &json!({
+                    "type":"assistant",
+                    "message":{"role":"assistant","content":[
+                        {"type":"tool_use","id":"task-1","name":"Task","input":{
+                            "subagent_type":"code-reviewer",
+                            "description":"review the parser",
+                            "prompt":"look at streamjson.rs"
+                        }}
+                    ]}
+                }),
+            )
+            .await;
+        let events = t.events.lock().await;
+        assert_eq!(events.len(), 2);
+        assert!(matches!(
+            events[0].kind,
+            StreamEventKind::Timeline(TimelineItem::ToolCall(_))
+        ));
+        let StreamEventKind::Subagent { event } = &events[1].kind else {
+            panic!("expected subagent event, got {:?}", events[1].kind);
+        };
+        assert_eq!(event["type"], "subagent_lifecycle");
+        assert_eq!(event["id"], "task-1");
+        assert_eq!(event["name"], "code-reviewer");
+        assert_eq!(event["description"], "review the parser");
+        assert_eq!(event["status"], "running");
+        assert_eq!(event["state"], "running");
+        // The subagent event stays inside its turn like omp's do.
+        assert_eq!(events[1].turn_id.as_deref(), Some("t1"));
+    }
+
+    /// A Task tool_result closes the loop: the terminal event repeats
+    /// the remembered identity and reflects the outcome.
+    #[tokio::test]
+    async fn claude_task_result_raises_terminal_subagent_event() {
+        let t = TestCtx::new();
+        let ctx = t.as_ctx();
+        let d = ClaudeDialect::dialect();
+        d.on_frame(
+            &ctx,
+            &json!({
+                "type":"assistant",
+                "message":{"content":[
+                    {"type":"tool_use","id":"task-9","name":"Task","input":{
+                        "subagent_type":"general-purpose","description":"find the bug"
+                    }}
+                ]}
+            }),
+        )
+        .await;
+        d.on_frame(
+            &ctx,
+            &json!({
+                "type":"user",
+                "message":{"content":[
+                    {"type":"tool_result","tool_use_id":"task-9","content":"found it","is_error":false}
+                ]}
+            }),
+        )
+        .await;
+        let events = t.events.lock().await;
+        // start pair (tool_call + subagent), then result pair
+        assert_eq!(events.len(), 4);
+        let StreamEventKind::Subagent { event } = &events[3].kind else {
+            panic!("expected subagent event, got {:?}", events[3].kind);
+        };
+        assert_eq!(event["id"], "task-9");
+        assert_eq!(event["name"], "general-purpose");
+        assert_eq!(event["description"], "find the bug");
+        assert_eq!(event["status"], "completed");
+        assert_eq!(event["state"], "completed");
+        // The tool_result's own timeline item is still there.
+        assert!(matches!(
+            events[2].kind,
+            StreamEventKind::Timeline(TimelineItem::ToolCall(_))
+        ));
+    }
+
+    #[tokio::test]
+    async fn claude_failed_task_result_marks_subagent_failed() {
+        let t = TestCtx::new();
+        let ctx = t.as_ctx();
+        let d = ClaudeDialect::dialect();
+        d.on_frame(
+            &ctx,
+            &json!({
+                "type":"assistant",
+                "message":{"content":[
+                    {"type":"tool_use","id":"task-x","name":"Task","input":{
+                        "subagent_type":"general-purpose","description":"boom"
+                    }}
+                ]}
+            }),
+        )
+        .await;
+        d.on_frame(
+            &ctx,
+            &json!({
+                "type":"user",
+                "message":{"content":[
+                    {"type":"tool_result","tool_use_id":"task-x","content":"exploded","is_error":true}
+                ]}
+            }),
+        )
+        .await;
+        let events = t.events.lock().await;
+        let StreamEventKind::Subagent { event } = &events[3].kind else {
+            panic!("expected subagent event");
+        };
+        assert_eq!(event["status"], "failed");
+    }
+
+    /// Only Task calls raise subagent events — ordinary tool traffic
+    /// must not grow any.
+    #[tokio::test]
+    async fn claude_plain_tool_traffic_raises_no_subagent_events() {
+        let t = TestCtx::new();
+        let ctx = t.as_ctx();
+        let d = ClaudeDialect::dialect();
+        d.on_frame(
+            &ctx,
+            &json!({
+                "type":"assistant",
+                "message":{"content":[
+                    {"type":"tool_use","id":"bash-1","name":"Bash","input":{"command":"ls"}}
+                ]}
+            }),
+        )
+        .await;
+        d.on_frame(
+            &ctx,
+            &json!({
+                "type":"user",
+                "message":{"content":[
+                    {"type":"tool_result","tool_use_id":"bash-1","content":"files","is_error":false}
+                ]}
+            }),
+        )
+        .await;
+        let events = t.events.lock().await;
+        assert_eq!(events.len(), 2);
+        assert!(
+            events.iter().all(|e| {
+                matches!(e.kind, StreamEventKind::Timeline(TimelineItem::ToolCall(_)))
+            })
+        );
     }
 }

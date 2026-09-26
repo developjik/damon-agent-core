@@ -74,6 +74,11 @@ const DAEMON_NOTIFY_TIMEOUT: std::time::Duration = std::time::Duration::from_sec
 /// — the daemon pings every 30s, so a healthy link never reaches it.
 const TUNNEL_IDLE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(120);
 
+/// A client socket silent this long is half-open — dropped so the
+/// daemon frees the session slot via the disconnect notice. Current
+/// clients (Rust, npm) ping every 30s, so only dead links reach it.
+const CLIENT_IDLE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(120);
+
 /// Daemon names are map keys and log fields — restrict to a printable
 /// charset so an unauthenticated caller can't forge log lines with
 /// newlines/control chars.
@@ -112,7 +117,11 @@ async fn main() -> anyhow::Result<()> {
                  Environment:\n\
                  \x20 DAMON_RELAY_BIND    listen address (default 0.0.0.0:8080)\n\
                  \x20 DAMON_RELAY_SECRET  require this secret on /register\n\
-                 \x20 RUST_LOG            tracing filter (default info)",
+                 \x20 RUST_LOG            tracing filter (default info)\n\
+                 \n\
+                 The bundled web UI is served at / (and /ui): open the relay\n\
+                 host in a browser, enter the daemon name and auth token, and\n\
+                 the page connects back through this relay end-to-end encrypted.",
                 env!("CARGO_PKG_VERSION")
             );
             return Ok(());
@@ -146,6 +155,19 @@ async fn main() -> anyhow::Result<()> {
         .route("/register", get(register))
         .route("/connect", get(connect))
         .route("/health", get(|| async { "ok" }))
+        // The chat UI, served here too: a phone opens the relay host in
+        // a browser, enters daemon name + token, and connects back
+        // through this same relay — no inbound port on the daemon and
+        // nothing to host. Same embedded handlers as the daemon's /ui
+        // (static, no secrets; the page authenticates itself via the
+        // E2E handshake, not a ticket).
+        .route("/", get(damon_core::ui::ui))
+        .route("/ui", get(damon_core::ui::ui))
+        .route("/relay-client.js", get(damon_core::ui::relay_client_js))
+        // PWA assets — installability when the phone opens the relay
+        // page (same static handlers the daemon serves).
+        .route("/manifest.webmanifest", get(damon_core::ui::manifest))
+        .route("/icon.svg", get(damon_core::ui::icon))
         .with_state(state);
 
     info!(%bind, "damon-relay listening");
@@ -495,11 +517,28 @@ async fn relay_client_session(
         // momentary.
         let mut clients = state.clients.lock().await;
         let daemon_tx2 = daemon_tx.clone();
+        let name_log = name.clone();
         let recv_task = tokio::spawn(async move {
             // Ping/Pong/Binary keep the link alive — axum yields them to
             // us, so a keepalive ping must not end the pump and drop the
-            // client.
-            while let Some(msg) = reader.next().await {
+            // client. Any frame resets the idle clock; a client silent
+            // for the whole window is half-open (NAT drop, dead peer)
+            // and is dropped so the daemon's session slot is freed via
+            // the disconnect notice instead of waiting out TCP.
+            loop {
+                let msg = match tokio::time::timeout(CLIENT_IDLE_TIMEOUT, reader.next()).await {
+                    Err(_) => {
+                        warn!(
+                            daemon = %name_log,
+                            client = client_id,
+                            "client silent for {}s; dropping",
+                            CLIENT_IDLE_TIMEOUT.as_secs()
+                        );
+                        break;
+                    }
+                    Ok(m) => m,
+                };
+                let Some(msg) = msg else { break };
                 let text = match msg {
                     Ok(Message::Text(t)) => t,
                     Ok(Message::Close(_)) | Err(_) => break,

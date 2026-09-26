@@ -62,8 +62,9 @@ damond --print-config-path   # config.toml 위치
 ```
 
 `config.example.toml` 참조. 에이전트 CLI의 로그인은 각 CLI의 자체 인증을
-그대로 사용한다(탐지된 CLI — `claude`, `codex`, `omp` — 가 각자 인증한다) —
-Damon이 에이전트 토큰을 보관하지 않는다.
+그대로 사용한다(탐지된 CLI — `claude`, `codex`, `omp`, `cursor`, `amp`,
+`kimi`, `qwen`, `gemini` — 가 각자 인증한다) — Damon이 에이전트 토큰을
+보관하지 않는다.
 
 
 ## 원격 릴레이
@@ -83,3 +84,8 @@ damon --relay ws://your-relay:8080 --relay-name my-daemon --token <auth_token> c
 ```
 
 E2E: X25519 키 교환 + `sha256(auth_token || pubkey)` 증명 → AES-256-GCM. 릴레이는 암호문만 본다.
+
+**릴레이가 웹 UI도 서빙한다.** 아무 브라우저(셀룰러 데이터를 쓰는 폰 포함)로
+`http://your-relay:8080/`를 열고 데몬 이름과 `auth_token`을 입력하면, 페이지가
+같은 릴레이를 통해 종단간 암호화로 다시 접속한다 — VPN도, 포트포워딩도, 별도
+호스팅도 필요 없다.

@@ -20,8 +20,14 @@ type Ws = WebSocketStream<MaybeTlsStream<TcpStream>>;
 #[derive(Debug)]
 pub enum ClientEvent {
     /// A `session.event` push: `event` is the StreamEvent payload
-    /// (`{"type": "…", …}` — see docs/protocol-v2.md).
-    Event { session_id: String, event: Value },
+    /// (`{"type": "…", …}` — see docs/protocol-v2.md). `replay` marks
+    /// catch-up frames the daemon sends for history a late subscriber
+    /// missed — consumers that already rendered that history skip them.
+    Event {
+        session_id: String,
+        event: Value,
+        replay: bool,
+    },
     /// Response to a `turn_start` call, routed through the event stream
     /// so it stays ordered after that session's `session.event` pushes.
     /// `result` is the turn result (`{turnId, stopReason, usage?}`) or
@@ -60,6 +66,8 @@ pub struct DamonClient {
     /// The daemon's permission timeout, learned from the `hello` push
     /// (`permissionTimeoutSecs`); defaults until then.
     permission_timeout_secs: Arc<AtomicU64>,
+    /// Sessions this client touched — the auto-resume set.
+    touched: Arc<Mutex<TouchedSessions>>,
 }
 
 /// Tunables for `connect_with_options` / `connect_relay_with_options`.
@@ -69,11 +77,21 @@ pub struct ConnectOptions {
     /// (warn-once logged) when a slow consumer lets this fill — raise it
     /// for consumers that batch-render.
     pub event_capacity: usize,
+    /// Re-issue `session.resume` for every session this client touched
+    /// after a reconnect lands — the daemon re-attaches the backend and
+    /// replays missed events (tagged `replay: true`), so subscriptions
+    /// survive daemon restarts transparently. Default on; the resumes
+    /// are fire-and-forget (failures are logged, never surfaced as
+    /// errors on the caller's next request).
+    pub auto_resume: bool,
 }
 
 impl Default for ConnectOptions {
     fn default() -> Self {
-        Self { event_capacity: 64 }
+        Self {
+            event_capacity: 64,
+            auto_resume: true,
+        }
     }
 }
 /// Whether the transport is currently usable. Public so embedders can
@@ -161,7 +179,7 @@ impl DamonClient {
                 Ok(ws_transport(ws))
             })
         });
-        Ok(Self::start(writer, rx, Some(redial), opts.event_capacity))
+        Ok(Self::start(writer, rx, Some(redial), opts))
     }
     /// Reconnects like `connect` — a dropped tunnel is redialed, which
     /// re-runs the E2E handshake.
@@ -189,7 +207,7 @@ impl DamonClient {
             Box::new(ChannelWriter(tx)),
             rx,
             Some(redial),
-            opts.event_capacity,
+            opts,
         ))
     }
 
@@ -200,15 +218,20 @@ impl DamonClient {
         writer: Box<dyn TextWriter>,
         rx: mpsc::Receiver<String>,
         redial: Option<Redial>,
-        event_capacity: usize,
+        opts: ConnectOptions,
     ) -> Self {
         let pending: Arc<Mutex<HashMap<u64, Pending>>> = Arc::new(Mutex::new(HashMap::new()));
-        let (event_tx, event_rx) = mpsc::channel(event_capacity.max(1));
+        let (event_tx, event_rx) = mpsc::channel(opts.event_capacity.max(1));
         let (conn_tx, conn_rx) = watch::channel(ConnState::Connected);
         let writer: Arc<Mutex<Box<dyn TextWriter>>> = Arc::new(Mutex::new(writer));
         let dropped = Arc::new(AtomicU64::new(0));
         let permission_timeout_secs = Arc::new(AtomicU64::new(DEFAULT_PERMISSION_TIMEOUT_SECS));
 
+        let touched = Arc::new(Mutex::new(TouchedSessions::default()));
+        // One id space: the supervisor's auto-resumes and the client's
+        // requests share this counter — separate counters would collide
+        // in the pending map.
+        let next_id = Arc::new(AtomicU64::new(1));
         tokio::spawn(
             Reconnect {
                 redial,
@@ -218,6 +241,9 @@ impl DamonClient {
                 conn_tx,
                 dropped,
                 permission_timeout_secs: permission_timeout_secs.clone(),
+                next_id: next_id.clone(),
+                touched: touched.clone(),
+                auto_resume: opts.auto_resume,
             }
             .run(rx),
         );
@@ -225,10 +251,11 @@ impl DamonClient {
         Self {
             writer,
             pending,
-            next_id: Arc::new(AtomicU64::new(1)),
+            next_id,
             events: Arc::new(Mutex::new(event_rx)),
             conn: conn_rx,
             permission_timeout_secs,
+            touched,
         }
     }
 
@@ -260,7 +287,17 @@ impl DamonClient {
             match rx.await {
                 Ok(Ok(v)) => return Ok(v),
                 // The server answered — even with an error, don't retry.
-                Ok(Err(e)) => bail!("{}", e["message"].as_str().unwrap_or("rpc error")),
+                // The wire code rides along on a typed RpcError so
+                // callers can branch (downcast) instead of parsing the
+                // message — e.g. auto-resume on SESSION_NOT_LIVE.
+                Ok(Err(e)) => {
+                    return Err(crate::rpc::RpcError::error(
+                        e["code"]
+                            .as_i64()
+                            .unwrap_or(crate::rpc::error_code::INTERNAL_ERROR),
+                        e["message"].as_str().unwrap_or("rpc error"),
+                    ));
+                }
                 // Link died before the response (dropped waiter): the
                 // supervisor is redialing — wait and resend.
                 Err(_) => continue,
@@ -331,10 +368,12 @@ impl DamonClient {
                 json!({"backend": backend, "cwd": cwd, "model": model}),
             )
             .await?;
-        v["sessionId"]
+        let sid = v["sessionId"]
             .as_str()
             .map(String::from)
-            .context("no sessionId in response")
+            .context("no sessionId in response")?;
+        self.touched.lock().await.insert(&sid);
+        Ok(sid)
     }
 
     /// Sessions as `(sessionId, createdAt, backend, title)` tuples —
@@ -409,10 +448,12 @@ impl DamonClient {
                 json!({"handle": handle, "title": title, "cwd": cwd}),
             )
             .await?;
-        v["sessionId"]
+        let sid = v["sessionId"]
             .as_str()
             .map(String::from)
-            .context("no sessionId in response")
+            .context("no sessionId in response")?;
+        self.touched.lock().await.insert(&sid);
+        Ok(sid)
     }
 
     /// Rename a session (sets its title).
@@ -445,7 +486,29 @@ impl DamonClient {
         v["sessionId"]
             .as_str()
             .map(String::from)
-            .context("no sessionId in response")
+            .context("no sessionId in response")?;
+        self.touched.lock().await.insert(id);
+        Ok(id.to_string())
+    }
+
+    /// Subscribe this connection to a live session's events without
+    /// touching it (no create/resume/turn) — the cross-surface
+    /// notification path: a bridge watches a session another client
+    /// started and reacts to its events. Unlike `touched` sessions,
+    /// watches are NOT re-issued automatically after a reconnect — the
+    /// consumer re-watches on `ClientEvent::Connected`.
+    pub async fn watch_session(&self, id: &str) -> anyhow::Result<()> {
+        self.request("session.watch", json!({"sessionId": id}))
+            .await?;
+        Ok(())
+    }
+
+    /// Drop a `watch_session` subscription. The session itself is
+    /// untouched; other connections keep theirs.
+    pub async fn unwatch_session(&self, id: &str) -> anyhow::Result<()> {
+        self.request("session.unwatch", json!({"sessionId": id}))
+            .await?;
+        Ok(())
     }
 
     /// Fork a session: copy the session row and its messages into a new
@@ -508,6 +571,7 @@ impl DamonClient {
     /// Shared turn.start send: register the pending waiter before the
     /// frame goes out so the response can never arrive to no waiter.
     async fn turn_start_params(&self, session_id: &str, prompt: Value) -> anyhow::Result<()> {
+        self.touched.lock().await.insert(session_id);
         let id = self.next_id.fetch_add(1, Ordering::Relaxed);
         self.pending.lock().await.insert(
             id,
@@ -527,6 +591,24 @@ impl DamonClient {
             return Err(e).context("send failed");
         }
         Ok(())
+    }
+
+    /// Steer a running turn with an additional prompt. `expected_turn`
+    /// (a turn id) restricts the steer to that turn — None steers
+    /// whatever turn is live. Returns the backend's SteerResult —
+    /// `{"result": "accepted"}` or `{"result": "unavailable"}`, the
+    /// caller's cue to queue the text as a follow-up turn instead.
+    pub async fn turn_steer(
+        &self,
+        session_id: &str,
+        prompt: &str,
+        expected_turn: Option<&str>,
+    ) -> anyhow::Result<Value> {
+        self.request(
+            "turn.steer",
+            json!({"sessionId": session_id, "prompt": prompt, "expectedTurn": expected_turn}),
+        )
+        .await
     }
 
     /// Cancel the session's running turn.
@@ -549,6 +631,28 @@ impl DamonClient {
         self.request(
             "permission.respond",
             json!({"sessionId": session_id, "requestId": request_id, "response": response}),
+        )
+        .await?;
+        Ok(())
+    }
+
+    /// Switch the session's model mid-conversation. Backends without
+    /// model switching reject with an RPC error.
+    pub async fn set_model(&self, session_id: &str, model: &str) -> anyhow::Result<()> {
+        self.request(
+            "session.set_model",
+            json!({"sessionId": session_id, "model": model}),
+        )
+        .await?;
+        Ok(())
+    }
+
+    /// Switch the session's permission/behavior mode (e.g. "plan",
+    /// "auto"). Backends without mode switching reject with an RPC error.
+    pub async fn set_mode(&self, session_id: &str, mode: &str) -> anyhow::Result<()> {
+        self.request(
+            "session.set_mode",
+            json!({"sessionId": session_id, "mode": mode}),
         )
         .await?;
         Ok(())
@@ -638,6 +742,34 @@ fn ws_transport(ws: Ws) -> (Box<dyn TextWriter>, mpsc::Receiver<String>) {
     (Box::new(WsWriter(writer)), rx)
 }
 
+/// Sessions this client touched (created/resumed/prompted), in first-
+/// touch order — the auto-resume set after a reconnect. Bounded: past
+/// the cap the oldest id stops being resumed (a client juggling 1024+
+/// live sessions re-subscribes explicitly).
+#[derive(Default)]
+struct TouchedSessions {
+    order: std::collections::VecDeque<String>,
+    set: std::collections::HashSet<String>,
+}
+const TOUCHED_CAP: usize = 1024;
+
+impl TouchedSessions {
+    fn insert(&mut self, id: &str) {
+        if self.set.insert(id.to_string()) {
+            if self.order.len() >= TOUCHED_CAP
+                && let Some(oldest) = self.order.pop_front()
+            {
+                self.set.remove(&oldest);
+            }
+            self.order.push_back(id.to_string());
+        }
+    }
+
+    fn snapshot(&self) -> Vec<String> {
+        self.order.iter().cloned().collect()
+    }
+}
+
 /// Owns the inbound-text channel and redials when it dies.
 /// On reconnect the writer is swapped and `conn` flips back to Connected,
 /// releasing any `request()` calls parked in `wait_connected`.
@@ -649,6 +781,9 @@ struct Reconnect {
     conn_tx: watch::Sender<ConnState>,
     dropped: Arc<AtomicU64>,
     permission_timeout_secs: Arc<AtomicU64>,
+    next_id: Arc<AtomicU64>,
+    touched: Arc<Mutex<TouchedSessions>>,
+    auto_resume: bool,
 }
 
 impl Reconnect {
@@ -696,6 +831,29 @@ impl Reconnect {
                         }
                         // Same best-effort mirror as the Disconnected flip.
                         let _ = self.event_tx.try_send(ClientEvent::Connected);
+                        // Auto-resubscribe: resume every touched session
+                        // so its events (and missed history, replay-tagged)
+                        // keep flowing. Fire-and-forget — a dropped session
+                        // answers with an error the pending map discards,
+                        // never the caller's next request.
+                        if self.auto_resume {
+                            let ids = self.touched.lock().await.snapshot();
+                            for sid in ids {
+                                let id = self.next_id.fetch_add(1, Ordering::Relaxed);
+                                let (tx, _rx) = oneshot::channel();
+                                self.pending.lock().await.insert(id, Pending::Direct(tx));
+                                let msg = json!({
+                                    "id": id,
+                                    "method": "session.resume",
+                                    "params": {"sessionId": sid},
+                                });
+                                let sent =
+                                    self.writer.lock().await.send_text(msg.to_string()).await;
+                                if sent.is_err() {
+                                    self.pending.lock().await.remove(&id);
+                                }
+                            }
+                        }
                         break;
                     }
                     Err(_) => {
@@ -728,15 +886,17 @@ async fn handle_frame(
         permission_timeout_secs.store(secs, Ordering::Relaxed);
         return;
     }
-    if v.get("event").is_some() {
-        // Events are lossy by design — a slow consumer must never
-        // backpressure the pump into stalling RPC responses. Every drop
-        // is counted; warn once per power of two so a wedged consumer
-        // doesn't spam the log.
+    // A session.event push. `replay` marks catch-up frames for history
+    // a late subscriber missed — routed like any event, consumers
+    // decide.
+    if v.get("event").is_some() && v.get("id").is_none() {
         let ev = ClientEvent::Event {
             session_id: v["sessionId"].as_str().unwrap_or("").to_string(),
             event: v["data"].clone(),
+            replay: v["replay"].as_bool().unwrap_or(false),
         };
+        // A wedged consumer is counted; warn once per power of two so
+        // it doesn't spam the log.
         if event_tx.try_send(ev).is_err() {
             let n = dropped.fetch_add(1, Ordering::Relaxed) + 1;
             if n.is_power_of_two() {

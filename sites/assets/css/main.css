@@ -473,6 +473,101 @@ section { scroll-margin-top: 72px; }
 .docs-links a { font-size: 14px; font-weight: 600; text-decoration: none; color: var(--muted); }
 .docs-links a:hover { color: var(--accent-2); }
 
+/* ---------- anywhere (from-anywhere access) ---------- */
+
+.new-pill {
+  display: inline-block;
+  vertical-align: 3px;
+  margin-left: 10px;
+  font-size: 10.5px;
+  font-weight: 800;
+  letter-spacing: 0.14em;
+  color: #071018;
+  background: linear-gradient(135deg, #7dd3fc, #5b8cff);
+  border-radius: 999px;
+  padding: 3px 10px;
+}
+
+.flow-strip {
+  display: flex;
+  align-items: stretch;
+  gap: 10px;
+  margin: 30px 0 26px;
+}
+.flow-step {
+  flex: 1 1 0;
+  background: var(--panel);
+  border: 1px solid var(--border);
+  border-radius: 14px;
+  padding: 16px 16px 14px;
+  position: relative;
+  overflow: hidden;
+}
+.flow-step::before {
+  content: "";
+  position: absolute;
+  inset: 0 auto 0 0;
+  width: 3px;
+  background: linear-gradient(180deg, var(--accent-2), var(--accent));
+  opacity: 0.75;
+}
+.flow-ico { font-size: 21px; display: block; margin-bottom: 8px; }
+.flow-step b { display: block; font-size: 14px; margin-bottom: 4px; }
+.flow-step p { margin: 0; font-size: 13.5px; color: var(--muted); }
+.flow-arrow {
+  align-self: center;
+  color: var(--accent);
+  font-size: 20px;
+  flex: none;
+  opacity: 0.8;
+}
+
+.any-card { position: relative; overflow: hidden; }
+.any-card::after {
+  content: "";
+  position: absolute;
+  inset: -40% -40% auto auto;
+  width: 180px;
+  height: 180px;
+  background: radial-gradient(closest-side, rgba(91, 140, 255, 0.16), transparent);
+  pointer-events: none;
+}
+.new-badge {
+  position: absolute;
+  top: 14px;
+  right: 14px;
+  font-size: 10px;
+  font-weight: 800;
+  letter-spacing: 0.14em;
+  color: #071018;
+  background: linear-gradient(135deg, #7dd3fc, #5b8cff);
+  border-radius: 999px;
+  padding: 3px 9px;
+}
+
+.transport-strip {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 10px;
+  margin-top: 26px;
+}
+.tchip {
+  font-size: 13px;
+  font-weight: 600;
+  color: var(--muted);
+  border: 1px solid var(--border);
+  border-radius: 999px;
+  padding: 7px 15px;
+  background: var(--panel);
+}
+.tchip:hover { color: var(--accent-2); border-color: var(--border-strong); }
+
+@media (max-width: 860px) {
+  .flow-strip { flex-direction: column; }
+  .flow-arrow { transform: rotate(90deg); text-align: center; }
+  .flow-step { flex: none; }
+}
+
 /* ---------- footer ---------- */
 
 .site-footer { border-top: 1px solid var(--border); padding: 40px 0 48px; }

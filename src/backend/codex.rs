@@ -23,6 +23,7 @@
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
+use std::sync::Weak;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
 
@@ -54,10 +55,10 @@ impl CodexClient {
                 session_persistence: true,
                 session_listing: true,
                 dynamic_modes: true,
-                mcp_servers: true,
+                mcp_servers: false,
                 reasoning_stream: true,
                 steer: true,
-                rewind: true,
+                rewind: false,
                 subagent_events: false,
             },
         }
@@ -195,10 +196,10 @@ impl CodexSession {
                 session_persistence: true,
                 session_listing: true,
                 dynamic_modes: true,
-                mcp_servers: true,
+                mcp_servers: false,
                 reasoning_stream: true,
                 steer: true,
-                rewind: true,
+                rewind: false,
                 subagent_events: false,
             },
             events,
@@ -209,20 +210,44 @@ impl CodexSession {
             open_items: Mutex::new(HashMap::new()),
         });
 
-        // Frame dispatch task.
+        // Frame dispatch task: routes responses/notifications, and fails
+        // the in-flight turn when the process dies without completing
+        // it (turn/start's own waiter unblocks via the pending drain).
         {
-            let me = session.clone();
+            let me: Weak<CodexSession> = Arc::downgrade(&session);
             let mut rx = transport.subscribe();
+            let mut exited = transport.exited();
             tokio::spawn(async move {
                 loop {
-                    match rx.recv().await {
-                        Ok(frame) => me.on_frame(frame).await,
-                        Err(broadcast::error::RecvError::Lagged(_)) => continue,
-                        Err(broadcast::error::RecvError::Closed) => break,
+                    tokio::select! {
+                        r = rx.recv() => match r {
+                            Ok(frame) => {
+                                let Some(s) = me.upgrade() else { break };
+                                s.on_frame(frame).await;
+                            }
+                            Err(broadcast::error::RecvError::Lagged(_)) => continue,
+                            Err(broadcast::error::RecvError::Closed) => break,
+                        },
+                        _ = exited.changed() => {
+                            if *exited.borrow() { break; }
+                        }
                     }
-                    if !me.transport.is_alive() {
-                        break;
-                    }
+                }
+                // The backend died mid-turn — its turn/completed never
+                // comes; tell subscribers instead of spinning forever.
+                if let Some(s) = me.upgrade()
+                    && let Some(turn) = s.current_turn.lock().await.take()
+                {
+                    s.emit(StreamEvent {
+                        turn_id: Some(turn),
+                        kind: StreamEventKind::TurnFailed {
+                            error: "backend process exited without completing the turn".to_string(),
+                            code: None,
+                        },
+                    });
+                    s.emit(StreamEvent::new(StreamEventKind::AttentionRequired {
+                        reason: AttentionReason::Finished,
+                    }));
                 }
             });
         }
@@ -368,7 +393,9 @@ impl CodexSession {
                             .to_string(),
                         code: None,
                     },
-                    _ => StreamEventKind::TurnCompleted { usage: None },
+                    _ => StreamEventKind::TurnCompleted {
+                        usage: codex_usage(params),
+                    },
                 };
                 self.emit(StreamEvent { turn_id, kind });
                 self.emit(StreamEvent::new(StreamEventKind::AttentionRequired {
@@ -426,7 +453,11 @@ impl CodexSession {
                     let mut asks = self.pending_asks.lock().await;
                     let found = asks
                         .iter()
-                        .find(|(_, a)| a.request.id == rid || a.rpc_id.as_str() == Some(rid))
+                        .find(|(_, a)| {
+                            a.request.id == rid
+                                || a.rpc_id.as_str() == Some(rid)
+                                || a.rpc_id.as_u64().is_some_and(|n| n.to_string() == rid)
+                        })
                         .map(|(k, _)| k.clone());
                     if let Some(k) = found {
                         asks.remove(&k);
@@ -661,6 +692,65 @@ impl CodexSession {
         });
     }
 }
+/// Map a `turn/completed` usage block into the normalized [`Usage`].
+///
+/// Codex reports cumulative token accounting under
+/// `params.usage.totalTokenUsage` (per-turn under `lastTokenUsage`), with
+/// snake_case token fields. We prefer the cumulative block since it's what
+/// a context-window consumer cares about; a flat `usage` object is accepted
+/// as a fallback for protocol revisions that inline it. Codex reports no
+/// cost or context-window figures here — those stay `None`.
+fn codex_usage(params: &Value) -> Option<Usage> {
+    let usage = params.get("usage")?;
+    let tokens = usage
+        .get("totalTokenUsage")
+        .filter(|t| {
+            t.get("input_tokens")
+                .or_else(|| t.get("output_tokens"))
+                .is_some()
+        })
+        .or_else(|| usage.get("lastTokenUsage"))
+        .unwrap_or(usage);
+    if tokens.get("input_tokens").is_none() && tokens.get("output_tokens").is_none() {
+        return None;
+    }
+    Some(Usage {
+        input_tokens: tokens["input_tokens"].as_u64(),
+        cached_input_tokens: tokens["cached_input_tokens"].as_u64(),
+        output_tokens: tokens["output_tokens"].as_u64(),
+        cost_usd: None,
+        context_window: None,
+        context_used: None,
+    })
+}
+
+/// Build the app-server result payload answering an approval/input request.
+///
+/// Approvals take `{decision}`; free-text questions additionally carry the
+/// user's answer alongside the decision (`answer` field). Wire shape is
+/// UNVERIFIED against a live codex app-server — mirrors the documented
+/// decision payload with the freeform answer appended.
+fn codex_approval_result(kind: PermissionKind, response: &PermissionResponse) -> Value {
+    let (decision, answer) = match response {
+        PermissionResponse::Allow {
+            action_id, answer, ..
+        } => (
+            action_id.clone().unwrap_or_else(|| "accept".to_string()),
+            answer.clone(),
+        ),
+        PermissionResponse::Deny { action_id, .. } => (
+            action_id.clone().unwrap_or_else(|| "decline".to_string()),
+            None,
+        ),
+    };
+    let mut result = json!({"decision": decision});
+    if kind == PermissionKind::Question
+        && let Some(text) = answer
+    {
+        result["answer"] = json!(text);
+    }
+    result
+}
 
 /// Codex approval decisions → normalized actions.
 fn codex_decisions(decisions: &[&str]) -> Vec<PermissionAction> {
@@ -783,16 +873,9 @@ impl AgentSession for CodexSession {
         let Some(ask) = self.pending_asks.lock().await.remove(request_id) else {
             bail!("no pending permission {request_id}");
         };
-        let decision = match &response {
-            PermissionResponse::Allow { action_id, .. } => {
-                action_id.clone().unwrap_or_else(|| "accept".to_string())
-            }
-            PermissionResponse::Deny { action_id, .. } => {
-                action_id.clone().unwrap_or_else(|| "decline".to_string())
-            }
-        };
+        let result = codex_approval_result(ask.request.kind, &response);
         self.transport
-            .send(json!({"id": ask.rpc_id, "result": {"decision": decision}}))
+            .send(json!({"id": ask.rpc_id, "result": result}))
             .await?;
         self.emit(StreamEvent::new(StreamEventKind::PermissionResolved {
             request_id: request_id.to_string(),
@@ -807,5 +890,104 @@ impl AgentSession for CodexSession {
             native_handle: id,
             metadata: Value::Null,
         })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use serde_json::json;
+
+    #[test]
+    fn turn_completed_usage_maps_total_token_usage() {
+        // UNVERIFIED fixture: shape mirrors the documented app-server
+        // turn/completed notification.
+        let params = json!({
+            "threadId": "th1",
+            "turn": {"id": "t1", "status": "completed"},
+            "usage": {
+                "totalTokenUsage": {
+                    "input_tokens": 120,
+                    "cached_input_tokens": 80,
+                    "output_tokens": 45,
+                    "total_tokens": 165
+                },
+                "lastTokenUsage": {
+                    "input_tokens": 10,
+                    "output_tokens": 5
+                }
+            }
+        });
+        let usage = codex_usage(&params).expect("usage expected");
+        assert_eq!(usage.input_tokens, Some(120));
+        assert_eq!(usage.cached_input_tokens, Some(80));
+        assert_eq!(usage.output_tokens, Some(45));
+        assert_eq!(usage.cost_usd, None);
+        assert_eq!(usage.context_window, None);
+        assert_eq!(usage.context_used, None);
+    }
+
+    #[test]
+    fn turn_completed_usage_falls_back_to_flat_block() {
+        let params = json!({
+            "turn": {"id": "t1", "status": "completed"},
+            "usage": {"input_tokens": 7, "output_tokens": 3}
+        });
+        let usage = codex_usage(&params).expect("usage expected");
+        assert_eq!(usage.input_tokens, Some(7));
+        assert_eq!(usage.cached_input_tokens, None);
+        assert_eq!(usage.output_tokens, Some(3));
+    }
+
+    #[test]
+    fn turn_completed_without_usage_yields_none() {
+        let params = json!({"turn": {"id": "t1", "status": "completed"}});
+        assert!(codex_usage(&params).is_none());
+    }
+
+    #[test]
+    fn question_allow_with_answer_carries_answer_on_wire() {
+        let response = PermissionResponse::Allow {
+            action_id: None,
+            updated_input: None,
+            answer: Some("use the staging cluster".to_string()),
+        };
+        let result = codex_approval_result(PermissionKind::Question, &response);
+        assert_eq!(result["decision"], json!("accept"));
+        assert_eq!(result["answer"], json!("use the staging cluster"));
+    }
+
+    #[test]
+    fn tool_approval_result_stays_decision_only() {
+        // Even when an answer tag-along is present, tool approvals must not
+        // leak free text into the decision payload.
+        let response = PermissionResponse::Allow {
+            action_id: Some("acceptForSession".to_string()),
+            updated_input: None,
+            answer: Some("stray text".to_string()),
+        };
+        let result = codex_approval_result(PermissionKind::Tool, &response);
+        assert_eq!(result, json!({"decision": "acceptForSession"}));
+    }
+
+    #[test]
+    fn deny_result_defaults_to_decline_without_answer() {
+        let response = PermissionResponse::Deny {
+            action_id: None,
+            message: Some("not that one".to_string()),
+            interrupt: false,
+        };
+        let result = codex_approval_result(PermissionKind::Question, &response);
+        assert_eq!(result, json!({"decision": "decline"}));
+    }
+
+    #[test]
+    fn allow_response_without_answer_field_deserializes() {
+        // Back-compat: existing daemon clients send allow without `answer`.
+        let v: PermissionResponse = serde_json::from_value(json!({"behavior": "allow"})).unwrap();
+        match v {
+            PermissionResponse::Allow { answer, .. } => assert_eq!(answer, None),
+            other => panic!("expected allow, got {other:?}"),
+        }
     }
 }

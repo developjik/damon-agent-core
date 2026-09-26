@@ -5,6 +5,8 @@ pub mod client;
 pub mod config;
 pub mod discord;
 pub mod discovery;
+pub mod logs;
+pub mod ratelimit;
 pub mod relay;
 pub mod rpc;
 pub mod service;

@@ -24,6 +24,17 @@ jobs:
       - name: Install Linux deps
         if: runner.os == 'Linux'
         run: sudo apt-get update && sudo apt-get install -y libdbus-1-dev pkg-config
+      # The declared MSRV (Cargo.toml rust-version) and the pinned
+      # toolchain must stay in lockstep — a silent drift would let PRs
+      # pass on a newer rustc than the floor users build with.
+      - name: Declared MSRV matches the pinned toolchain
+        run: |
+          msrv=$(grep -m1 '^rust-version' Cargo.toml | cut -d'"' -f2)
+          pin=$(grep -m1 '^channel' rust-toolchain.toml | cut -d'"' -f2)
+          [ "${pin%.*}" = "$msrv" ] || {
+            echo "Cargo.toml rust-version=$msrv but rust-toolchain.toml pins $pin" >&2
+            exit 1
+          }
       - run: cargo fmt --check
       - run: cargo clippy --all-targets -- -D warnings
       - run: cargo test
@@ -76,7 +87,7 @@ jobs:
 
   release:
     if: startsWith(github.ref, 'refs/tags/v')
-    needs: test
+    needs: [test, audit, deny, coverage]
     permissions:
       contents: write
     strategy:
@@ -144,6 +155,8 @@ jobs:
         shell: bash
         env:
           DEFAULT_BRANCH: ${{ github.event.repository.default_branch }}
+          MINISIGN_SECRET_KEY: ${{ secrets.MINISIGN_SECRET_KEY }}
+          GH_TOKEN: ${{ github.token }}
         run: |
           tag="${GITHUB_REF_NAME}"
           version="${tag#v}"
@@ -196,6 +209,43 @@ jobs:
             git push origin "HEAD:${DEFAULT_BRANCH:-main}"
           fi
 
+      # Runs on the same leg as the Formula pass, which already
+      # verified every tarball against its build-computed .sha256 —
+      # the manifest is assembled from those verified hashes. With
+      # MINISIGN_SECRET_KEY registered (minisign/rsign secret key,
+      # passwordless — see docs/release.md) the manifest is signed
+      # minisign-style; until then it ships unsigned with a warning,
+      # and scripts/verify-release.sh treats a missing signature as
+      # advisory unless --require-signature is passed.
+      - name: Publish SHA256SUMS manifest (+ minisign signature)
+        if: matrix.target == 'x86_64-unknown-linux-gnu'
+        shell: bash
+        env:
+          MINISIGN_SECRET_KEY: ${{ secrets.MINISIGN_SECRET_KEY }}
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          base="https://github.com/${{ github.repository }}/releases/download/${GITHUB_REF_NAME}"
+          targets="aarch64-apple-darwin x86_64-apple-darwin x86_64-unknown-linux-gnu aarch64-unknown-linux-gnu"
+          tmp="$(mktemp -d)"
+          : > SHA256SUMS
+          for target in $targets; do
+            curl --proto '=https' --tlsv1.2 --retry 5 --retry-all-errors -fsSL \
+              "$base/damon-$target.tar.gz.sha256" -o "$tmp/$target.published"
+            printf '%s  damon-%s.tar.gz\n' "$(cut -d' ' -f1 < "$tmp/$target.published")" "$target" >> SHA256SUMS
+          done
+          cat SHA256SUMS
+          assets=(SHA256SUMS)
+          if [ -n "$MINISIGN_SECRET_KEY" ]; then
+            cargo install rsign2 --locked
+            key="$(mktemp)"; printf '%s' "$MINISIGN_SECRET_KEY" > "$key"
+            rsign sign -s "$key" -x SHA256SUMS.minisig -W SHA256SUMS
+            rm -f "$key"
+            assets+=(SHA256SUMS.minisig)
+          else
+            echo "::warning::MINISIGN_SECRET_KEY is not registered — publishing SHA256SUMS without a signature (see docs/release.md)"
+          fi
+          gh release upload "${GITHUB_REF_NAME}" "${assets[@]}" --clobber
+
   deny:
     # cargo-deny gates licenses/bans/sources. Advisories are
     # deliberately not checked here: the audit job above already runs
@@ -211,22 +261,25 @@ jobs:
 
   coverage:
     # Separate job instead of a test-matrix step: instrumented builds
-    # would roughly double the test legs' time for a report nobody
-    # gates on. lcov.info is uploaded as an artifact for local
-    # inspection — no coverage threshold is enforced yet.
+    # would roughly double the test legs' time. The line-coverage floor
+    # (measured 63.5% at introduction) gates the release: erosion shows
+    # up here instead of shipping.
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
       - uses: dtolnay/rust-toolchain@46817827a5bfabe028bf34e1cce71fd40e2ff697 # 1.95.0
+        with:
+          components: llvm-tools-preview
       - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
       - name: Install Linux deps
         run: sudo apt-get update && sudo apt-get install -y libdbus-1-dev pkg-config
       - run: cargo install cargo-llvm-cov --locked
-      - run: cargo llvm-cov --lcov --output-path lcov.info
+      - run: cargo llvm-cov --lcov --output-path lcov.info --fail-under-lines 60
       - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
         with:
           name: lcov
           path: lcov.info
+
 
   publish-npm:
     if: startsWith(github.ref, 'refs/tags/v')

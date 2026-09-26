@@ -31,6 +31,8 @@ pub fn mock_config(auth_token: Option<&str>) -> Config {
         // Idle reaping off by default — only the dedicated idle test
         // turns it on, so no other test's shared mock gets killed.
         agent_idle_secs: 0,
+        max_sessions: None,
+        allowed_dirs: Vec::new(),
     }
 }
 
@@ -192,28 +194,66 @@ impl AgentSession for MockSession {
                         }),
                     ));
                 }
-                PermissionResponse::Deny { .. } => {
+                PermissionResponse::Deny { interrupt, .. } => {
                     self.emit(StreamEvent::in_turn(
                         turn.clone(),
                         StreamEventKind::Timeline(TimelineItem::AssistantMessage {
                             text: "denied".into(),
                         }),
                     ));
+                    if interrupt {
+                        // Deny + interrupt kills the whole turn — the
+                        // daemon drives the interrupt right after the
+                        // deny; model that the turn never completes.
+                        self.emit(StreamEvent::in_turn(
+                            turn.clone(),
+                            StreamEventKind::TurnCanceled {
+                                reason: "denied with interrupt".into(),
+                            },
+                        ));
+                        return Ok(turn);
+                    }
                 }
             }
         } else if text.contains("hang") {
-            // Hang until interrupted.
+            // Hang mid-turn until interrupted. Like a real backend,
+            // start_turn returns immediately and the turn ends via an
+            // event when the interrupt lands — a blocking start_turn
+            // would wrongly stall `turn.start` responses, including a
+            // detached start's immediate reply.
             let (tx, rx) = oneshot::channel();
             *self.interrupt.lock().await = Some(tx);
-            let _ = rx.await;
+            let parked_turn = turn.clone();
+            let parked_events = self.events.clone();
+            tokio::spawn(async move {
+                let _ = rx.await;
+                let _ = parked_events.send(StreamEvent::in_turn(
+                    parked_turn,
+                    StreamEventKind::TurnCanceled {
+                        reason: "interrupted".into(),
+                    },
+                ));
+            });
+            return Ok(turn);
+        } else if text.contains("fail") {
+            // Fail the turn — exercises the durable error-marker path.
             self.emit(StreamEvent::in_turn(
                 turn.clone(),
-                StreamEventKind::TurnCanceled {
-                    reason: "interrupted".into(),
+                StreamEventKind::TurnFailed {
+                    error: "mock failure".into(),
+                    code: Some("MOCK".into()),
                 },
             ));
             return Ok(turn);
         } else {
+            if text.contains("compact") {
+                self.emit(StreamEvent::in_turn(
+                    turn.clone(),
+                    StreamEventKind::Timeline(TimelineItem::Compaction {
+                        summary: "compacted 3 messages".into(),
+                    }),
+                ));
+            }
             self.emit(StreamEvent::in_turn(
                 turn.clone(),
                 StreamEventKind::Timeline(TimelineItem::AssistantMessage {

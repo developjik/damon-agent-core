@@ -10,7 +10,10 @@
 //! material to an unauthenticated peer. NOTE: the relay itself (and any
 //! observer on a plain ws:// link) sees the client's proof and both
 //! public keys — a low-entropy auth_token is offline-brute-forcible from
-//! one captured handshake. Use a high-entropy token and wss:// relays.
+//! one captured handshake. Mitigations: high-entropy tokens, wss://
+//! relays, and the opt-in stretched proof (`"kdf": "s256"` — 2^16 extra
+//! sha256 rounds per guess; this client and current daemons negotiate
+//! it automatically, older peers fall back to the single-hash proof).
 //! Post-handshake frames are AES-256-GCM with direction-separated
 //! keys and a sequence number as nonce — the relay sees only ciphertext.
 //!
@@ -52,17 +55,19 @@ pub struct E2e {
 }
 
 impl E2e {
-    /// Daemon side: read the client's {e2e_pub}, answer {e2e_pub}, then
-    /// verify the client's proof BEFORE emitting our own. The daemon
-    /// never reveals token-derived material to an unauthenticated peer —
-    /// an attacker connecting as a fake client cannot harvest
+    /// Daemon side: read the client's {e2e_pub} (plus an optional
+    /// `"kdf": "s256"` marker), answer {e2e_pub}, then verify the
+    /// client's proof BEFORE emitting our own. The daemon never
+    /// reveals token-derived material to an unauthenticated peer — an
+    /// attacker connecting as a fake client cannot harvest
     /// (pubkey, proof) samples to brute the auth_token offline.
     pub async fn daemon_handshake(
         tx: &mpsc::Sender<String>,
         rx: &mut mpsc::Receiver<String>,
         token: &str,
     ) -> anyhow::Result<Self> {
-        // 1. Client's ephemeral public key.
+        // 1. Client's ephemeral public key; `kdf: "s256"` opts into
+        //    the stretched proof (older clients send no such field).
         let msg = rx.recv().await.context("client handshake missing")?;
         let v: Value = serde_json::from_str(&msg)?;
         let client_pub = B64
@@ -71,19 +76,24 @@ impl E2e {
         let client_pub: [u8; 32] = client_pub
             .try_into()
             .map_err(|_| anyhow::anyhow!("bad pubkey len"))?;
+        let stretch = v["kdf"] == PROOF_KDF;
 
-        // 2. Our keypair — public key only, no proof yet.
+        // 2. Our keypair — public key only, no proof yet. Echo the KDF
+        //    marker so the client knows which proof we expect.
         let secret = x25519_dalek::StaticSecret::random_from_rng(getrandom_rng());
         let public = x25519_dalek::PublicKey::from(&secret);
-        tx.send(json!({"e2e_pub": B64.encode(public.as_bytes())}).to_string())
-            .await
-            .context("send handshake")?;
+        let mut reply = json!({"e2e_pub": B64.encode(public.as_bytes())});
+        if stretch {
+            reply["kdf"] = json!(PROOF_KDF);
+        }
+        tx.send(reply.to_string()).await.context("send handshake")?;
 
         // 3. Client proves token knowledge first; only a verified client
         //    ever sees our proof.
         let msg = rx.recv().await.context("client proof missing")?;
         let v: Value = serde_json::from_str(&msg)?;
         let their_proof = v["e2e_proof"].as_str().context("missing e2e_proof")?;
+        let proof = proof_fn(stretch);
         if !crate::config::constant_time_eq(
             their_proof.as_bytes(),
             proof(token, &client_pub, public.as_bytes()).as_bytes(),
@@ -114,10 +124,13 @@ impl E2e {
         rx: &mut mpsc::Receiver<String>,
         token: &str,
     ) -> anyhow::Result<Self> {
-        // 1. Our ephemeral public key.
+        // 1. Our ephemeral public key, advertising the stretched-proof
+        //    KDF — a daemon that echoes it computes the stretched
+        //    proof too; anything older ignores the unknown field and
+        //    we fall back to the legacy single-hash proof.
         let secret = x25519_dalek::StaticSecret::random_from_rng(getrandom_rng());
         let public = x25519_dalek::PublicKey::from(&secret);
-        tx.send(json!({"e2e_pub": B64.encode(public.as_bytes())}).to_string())
+        tx.send(json!({"e2e_pub": B64.encode(public.as_bytes()), "kdf": PROOF_KDF}).to_string())
             .await
             .context("send handshake")?;
 
@@ -136,6 +149,8 @@ impl E2e {
         let their_pub: [u8; 32] = their_pub
             .try_into()
             .map_err(|_| anyhow::anyhow!("bad pubkey len"))?;
+        let stretch = v["kdf"] == PROOF_KDF;
+        let proof = proof_fn(stretch);
 
         // 3. Our proof over (client_pub, daemon_pub).
         tx.send(json!({"e2e_proof": proof(token, public.as_bytes(), &their_pub)}).to_string())
@@ -240,6 +255,42 @@ fn proof(token: &str, mine: &[u8], theirs: &[u8]) -> String {
     h.update(mine);
     h.update(theirs);
     B64.encode(h.finalize())
+}
+
+/// Stretched KDF marker (`"kdf": "s256"` in the client's first
+/// handshake frame). Opt-in and symmetric: a daemon that sees the
+/// marker echoes it and both sides run the stretched proof; anything
+/// older ignores the unknown field and keeps the single-hash proof.
+const PROOF_KDF: &str = "s256";
+
+/// Extra sha256 rounds for the stretched proof. Each offline guess at
+/// a low-entropy token then costs 2^16 compressions instead of one —
+/// cheap for a legitimate handshake (single-digit ms), expensive for
+/// brute force.
+const PROOF_ITERATIONS: u32 = 1 << 16;
+
+/// proof() through PROOF_ITERATIONS extra sha256 rounds — same pubkey
+/// binding, brute-force resistant. See `PROOF_KDF`.
+fn proof_stretched(token: &str, mine: &[u8], theirs: &[u8]) -> String {
+    use sha2::Digest;
+    let mut h: [u8; 32] = {
+        let mut x = sha2::Sha256::new();
+        x.update(b"damon-relay-proof-s256");
+        x.update(token.as_bytes());
+        x.update(mine);
+        x.update(theirs);
+        x.finalize().into()
+    };
+    for _ in 0..PROOF_ITERATIONS {
+        h = sha2::Sha256::digest(h).into();
+    }
+    B64.encode(h)
+}
+
+/// The proof function a side uses for this handshake: stretched when
+/// both sides negotiated `s256`, legacy single-hash otherwise.
+fn proof_fn(stretch: bool) -> fn(&str, &[u8], &[u8]) -> String {
+    if stretch { proof_stretched } else { proof }
 }
 
 /// sha256(shared || label) — directional session key derivation.
@@ -628,8 +679,19 @@ async fn tunnel_once(
 // Client side: connect through the relay
 // ---------------------------------------------------------------------------
 
+/// Client-side keepalive cadence — pings the relay so NATs keep the
+/// flow open and the client's own idle check gets a Pong to observe.
+const CLIENT_PING_EVERY: std::time::Duration = std::time::Duration::from_secs(30);
+
+/// A client link silent this long (no frame of any kind) is half-open —
+/// the pumps shut down so callers see the channels close instead of
+/// waiting out TCP on a dead socket.
+const CLIENT_IDLE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(120);
+
 /// Connect to `relay_url`, attach to daemon `name`, do the E2E handshake,
 /// and return (tx, rx) channel pair carrying plaintext JSON frames.
+/// The link pings the relay every 30s and self-closes after 120s of
+/// inbound silence — callers see channel closure instead of a hang.
 pub async fn client_connect(
     relay_url: &str,
     name: &str,
@@ -652,10 +714,25 @@ pub async fn client_connect(
 
     let (raw_in_tx, mut raw_in_rx) = mpsc::channel::<String>(64);
     let (raw_out_tx, mut raw_out_rx) = mpsc::channel::<String>(64);
+    // Inbound liveness clock, in milliseconds since `started`: any
+    // frame — text, Ping, Pong — resets it. Shared with the write
+    // pump, which enforces the idle deadline.
+    let started = tokio::time::Instant::now();
+    let last_rx = Arc::new(std::sync::atomic::AtomicU64::new(0));
+    let last_rx_read = last_rx.clone();
+    let mark_rx = move |last_rx: &Arc<std::sync::atomic::AtomicU64>| {
+        last_rx.store(
+            (tokio::time::Instant::now() - started).as_millis() as u64,
+            Ordering::Relaxed,
+        )
+    };
     let read_pump = tokio::spawn(async move {
         // Ping/Pong/Binary keep the link alive — a keepalive proxy's ping
-        // must not end the pump (tungstenite answers pings itself).
+        // must not end the pump (tungstenite answers pings itself). Any
+        // frame is inbound liveness.
+        let last_rx = last_rx_read;
         while let Some(msg) = reader.next().await {
+            mark_rx(&last_rx);
             let t = match msg {
                 Ok(tokio_tungstenite::tungstenite::Message::Text(t)) => t,
                 Ok(tokio_tungstenite::tungstenite::Message::Close(_)) | Err(_) => break,
@@ -675,18 +752,54 @@ pub async fn client_connect(
             }
         }
     });
+    let read_pump_abort = read_pump.abort_handle();
 
+    // Write pump + keepalive: pings the relay every CLIENT_PING_EVERY
+    // (keeping NAT state and the relay's own idle check happy) and
+    // tears the link down after CLIENT_IDLE_TIMEOUT without ANY
+    // inbound frame — a half-open socket must not sit on the OS (and
+    // the daemon's session slot) until TCP gives up. Breaking here
+    // drops the writer; aborting the read pump closes the read half,
+    // and the channel cascade delivers the closure to the caller.
+    let write_side_abort = read_pump_abort.clone();
     tokio::spawn(async move {
-        while let Some(data) = raw_out_rx.recv().await {
-            let msg = json!({"data": data}).to_string();
-            if writer
-                .send(tokio_tungstenite::tungstenite::Message::Text(msg.into()))
-                .await
-                .is_err()
-            {
-                break;
+        let mut ping = tokio::time::interval(CLIENT_PING_EVERY);
+        ping.tick().await; // first ping after one cadence
+        loop {
+            let idle_ms = last_rx.load(Ordering::Relaxed);
+            let deadline =
+                started + std::time::Duration::from_millis(idle_ms) + CLIENT_IDLE_TIMEOUT;
+            tokio::select! {
+                _ = ping.tick() => {
+                    if writer
+                        .send(tokio_tungstenite::tungstenite::Message::Ping(Vec::new().into()))
+                        .await
+                        .is_err()
+                    {
+                        break;
+                    }
+                }
+                out = raw_out_rx.recv() => {
+                    let Some(data) = out else { break };
+                    let msg = json!({"data": data}).to_string();
+                    if writer
+                        .send(tokio_tungstenite::tungstenite::Message::Text(msg.into()))
+                        .await
+                        .is_err()
+                    {
+                        break;
+                    }
+                }
+                _ = tokio::time::sleep_until(deadline) => {
+                    warn!(
+                        "relay link silent for {}s; closing",
+                        CLIENT_IDLE_TIMEOUT.as_secs()
+                    );
+                    break;
+                }
             }
         }
+        write_side_abort.abort();
     });
 
     // Bound the handshake — a relay that accepts the socket but never
@@ -703,7 +816,7 @@ pub async fn client_connect(
             // leaving it alive keeps the TCP connection (and the relay's
             // per-IP session slot) open after every failed attempt —
             // repeated bad-token redials would wedge the relay cap.
-            read_pump.abort();
+            read_pump_abort.abort();
             match r {
                 Ok(Err(e)) => return Err(e),
                 Err(_) => return Err(anyhow::anyhow!("E2E handshake timed out")),
@@ -740,6 +853,7 @@ pub async fn client_connect(
             }
         }
     });
+
     Ok((plain_out_tx, plain_in_rx))
 }
 
@@ -768,4 +882,104 @@ pub type RelayState = Arc<Mutex<HashMap<String, mpsc::Sender<String>>>>;
 
 pub fn new_relay_state() -> RelayState {
     Arc::new(Mutex::new(HashMap::new()))
+}
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use tokio::sync::mpsc;
+
+    #[test]
+    fn stretched_proof_differs_from_legacy_and_is_deterministic() {
+        // Vectors cross-checked against npm/client.mjs proof() — the
+        // two implementations must agree byte-for-byte or Rust↔npm
+        // relay handshakes fail auth.
+        let mine = [1u8; 32];
+        let theirs = [3u8; 32];
+        assert_eq!(
+            proof("tok", &mine, &theirs),
+            "S8mawcxH7YVZq1N0D+PC7Q48QoULbq/LSh/T0S+p2mI="
+        );
+        assert_eq!(
+            proof_stretched("tok", &mine, &theirs),
+            "pEQzR8r3Ev4sJ+cFta1ZJEpgGRynd3Ix9EFoElBMBqQ="
+        );
+        let legacy = proof("tok", b"mine", b"theirs");
+        let stretched = proof_stretched("tok", b"mine", b"theirs");
+        assert_ne!(legacy, stretched);
+        assert_eq!(stretched, proof_stretched("tok", b"mine", b"theirs"));
+        // Binding still covers both pubkeys and the token.
+        assert_ne!(stretched, proof_stretched("tok2", b"mine", b"theirs"));
+        assert_ne!(stretched, proof_stretched("tok", b"min2", b"theirs"));
+        assert_ne!(stretched, proof_stretched("tok", b"mine", b"their2"));
+    }
+
+    /// The daemon's hello reply echoes `"kdf": "s256"` only when the
+    /// client offered it — older clients must see the bare reply they
+    /// always did.
+    #[tokio::test]
+    async fn daemon_echoes_s256_only_when_client_offers_it() {
+        for (hello, expect_echo) in [
+            (
+                json!({"e2e_pub": B64.encode([0u8; 32]), "kdf": PROOF_KDF}),
+                true,
+            ),
+            (json!({"e2e_pub": B64.encode([0u8; 32])}), false),
+        ] {
+            let (c2d_tx, mut c2d_rx) = mpsc::channel::<String>(8);
+            let (d2c_tx, mut d2c_rx) = mpsc::channel::<String>(8);
+            let daemon =
+                tokio::spawn(
+                    async move { E2e::daemon_handshake(&d2c_tx, &mut c2d_rx, "tok").await },
+                );
+            c2d_tx.send(hello.to_string()).await.unwrap();
+            let reply: Value = serde_json::from_str(&d2c_rx.recv().await.unwrap()).unwrap();
+            assert_eq!(reply.get("kdf").is_some(), expect_echo);
+            // No proof follows — the daemon sees the pipe drop.
+            drop(c2d_tx);
+            drop(d2c_rx);
+            assert!(daemon.await.unwrap().is_err());
+        }
+    }
+
+    /// A legacy client (no `"kdf"` field, single-hash proof) still
+    /// authenticates against a current daemon, and the derived session
+    /// keys match — s256 is strictly opt-in.
+    #[tokio::test]
+    async fn legacy_client_without_marker_interoperates() {
+        let (c2d_tx, mut c2d_rx) = mpsc::channel::<String>(8);
+        let (d2c_tx, mut d2c_rx) = mpsc::channel::<String>(8);
+        let daemon =
+            tokio::spawn(async move { E2e::daemon_handshake(&d2c_tx, &mut c2d_rx, "tok").await });
+        // Legacy client: fresh keypair, bare hello.
+        let secret = x25519_dalek::StaticSecret::random_from_rng(getrandom_rng());
+        let public = x25519_dalek::PublicKey::from(&secret);
+        c2d_tx
+            .send(json!({"e2e_pub": B64.encode(public.as_bytes())}).to_string())
+            .await
+            .unwrap();
+        let v: Value = serde_json::from_str(&d2c_rx.recv().await.unwrap()).unwrap();
+        assert!(
+            v.get("kdf").is_none(),
+            "legacy hello must not get s256 back"
+        );
+        let daemon_pub: [u8; 32] = B64
+            .decode(v["e2e_pub"].as_str().unwrap())
+            .unwrap()
+            .try_into()
+            .unwrap();
+        c2d_tx
+            .send(json!({"e2e_proof": proof("tok", public.as_bytes(), &daemon_pub)}).to_string())
+            .await
+            .unwrap();
+        let v: Value = serde_json::from_str(&d2c_rx.recv().await.unwrap()).unwrap();
+        assert_eq!(v["e2e_proof"], proof("tok", &daemon_pub, public.as_bytes()));
+
+        let daemon = daemon.await.unwrap().unwrap();
+        let shared = secret.diffie_hellman(&x25519_dalek::PublicKey::from(daemon_pub));
+        assert!(shared.was_contributory());
+        let client = E2e::from_shared(shared.as_bytes(), false);
+        // Same keys both sides — frames round-trip.
+        let ct = client.encrypt(r#"{"id":1}"#).unwrap();
+        assert_eq!(daemon.decrypt(&ct).unwrap(), r#"{"id":1}"#);
+    }
 }

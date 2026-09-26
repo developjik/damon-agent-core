@@ -90,6 +90,27 @@ enum Cmd {
         #[arg(long)]
         upto: Option<i64>,
     },
+    /// Steer a running turn with extra text
+    Steer {
+        /// Session id
+        id: String,
+        /// Text to steer with (words joined by spaces)
+        text: Vec<String>,
+    },
+    /// Switch a session's model
+    Model {
+        /// Session id
+        id: String,
+        /// Model id (e.g. anthropic/claude-sonnet-4, openai/gpt-5)
+        model: String,
+    },
+    /// Switch a session's permission mode
+    Mode {
+        /// Session id
+        id: String,
+        /// Mode id (e.g. plan, auto, default)
+        mode: String,
+    },
     /// List native sessions a backend made outside damon; --attach N
     /// imports one into the chat REPL
     Import {
@@ -114,6 +135,15 @@ enum Cmd {
         /// Output path (default: <data_dir>/damon-backup-YYYYMMDD-HHMMSS.db)
         #[arg(long)]
         out: Option<std::path::PathBuf>,
+    },
+    /// Recent daemon log lines; -f streams live ones
+    Logs {
+        /// Stream new lines as they arrive (Ctrl-C to stop)
+        #[arg(short)]
+        follow: bool,
+        /// Number of recent lines to print (max 2000)
+        #[arg(long, default_value = "200")]
+        lines: u64,
     },
     /// Check connectivity, auth, and agent availability
     Doctor,
@@ -210,6 +240,34 @@ async fn main() -> anyhow::Result<()> {
                 ));
             }
         }
+
+        Cmd::Logs { follow, lines } => {
+            // Tail first (the response is the backlog), then opt this
+            // connection into live log.line pushes. Works over the
+            // relay — the frames are ordinary event pushes.
+            let tail = client.request("logs.tail", json!({"lines": lines})).await?;
+            for l in tail["lines"].as_array().into_iter().flatten() {
+                if let Some(s) = l.as_str() {
+                    outln(s);
+                }
+            }
+            if !follow {
+                return Ok(());
+            }
+            client.request("logs.follow", json!({})).await?;
+            let mut events = client.events().await;
+            loop {
+                match events.recv().await {
+                    Some(damon_core::client::ClientEvent::Event { event, .. })
+                        if event.get("line").is_some() =>
+                    {
+                        outln(event["line"].as_str().unwrap_or(""));
+                    }
+                    Some(_) => continue, // session.event pushes — not ours
+                    None => break,       // daemon link died
+                }
+            }
+        }
         Cmd::Sessions => {
             let sessions = client.list_sessions(None, None).await?;
             if args.json {
@@ -283,6 +341,37 @@ async fn main() -> anyhow::Result<()> {
                 outln(json!({"renamed": id}).to_string());
             } else {
                 outln(format!("renamed {id}"));
+            }
+        }
+        Cmd::Steer { id, text } => {
+            let v = client.turn_steer(&id, &text.join(" "), None).await?;
+            let result = v["result"].as_str().unwrap_or_default();
+            if args.json {
+                outln(json!({"steered": id, "result": result}).to_string());
+            } else if result == "accepted" {
+                outln(format!("steered {id}"));
+            } else {
+                // `unavailable`: the backend has no mid-turn input path —
+                // say so instead of implying the text landed.
+                outln(format!(
+                    "steer unavailable for {id} — send the text as a new prompt instead"
+                ));
+            }
+        }
+        Cmd::Model { id, model } => {
+            client.set_model(&id, &model).await?;
+            if args.json {
+                outln(json!({"sessionId": id, "model": model}).to_string());
+            } else {
+                outln(format!("model {model} set on {id}"));
+            }
+        }
+        Cmd::Mode { id, mode } => {
+            client.set_mode(&id, &mode).await?;
+            if args.json {
+                outln(json!({"sessionId": id, "mode": mode}).to_string());
+            } else {
+                outln(format!("mode {mode} set on {id}"));
             }
         }
         Cmd::Chat { session, backend } => {
@@ -762,6 +851,7 @@ async fn run_turn(
             Some(ClientEvent::Event {
                 session_id: sid,
                 event,
+                replay: false,
             }) if sid == session_id => match event["type"].as_str() {
                 Some("timeline") => match event["kind"].as_str() {
                     Some("assistant_message") => {

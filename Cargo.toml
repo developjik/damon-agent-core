@@ -1,7 +1,8 @@
 [package]
 name = "damon-core"
-version = "0.4.0"
+version = "0.5.0"
 edition = "2024"
+rust-version = "1.95"
 license = "MIT OR Apache-2.0"
 description = "Damon agent core — local control daemon for coding agents"
 repository = "https://github.com/developjik/damon-agent-core"

@@ -1,5 +1,446 @@
 # Changelog
 
+## 0.5.0 — 2026-09-27
+
+### Added — the web UI through the relay (anywhere, no VPN)
+
+- **`damon-relay` serves the chat UI** — the bundled single-page UI is
+  now available at the relay's own root (`/`, `/ui`) plus its
+  `/relay-client.js` and PWA assets. Open the relay host in any phone
+  or laptop browser, enter the daemon name + auth token, and the page
+  connects back through the same relay: no inbound port on the daemon,
+  no VPN, nothing to host.
+- **Browser E2E relay client (`DamonRelay`)** — a dependency-free
+  WebSocket shim (`src/relay-client.js`, loaded by the UI wherever it
+  is served) that runs the exact Rust relay handshake: X25519 ephemeral
+  key exchange, the client-first `sha256(token ‖ …)` proof with the
+  `s256` stretched negotiation, and direction-separated AES-256-GCM
+  frames with strict sequence numbers. Crypto is pure JS on purpose —
+  `crypto.subtle` only exists in secure contexts, and self-hosted
+  relays are typically plain `ws://` — and self-tests against
+  published vectors (RFC 7748, the Rust proof vectors) on first
+  connect. A 30s encrypted `hello` keepalive replaces WebSocket pings
+  (browsers can't send them) to keep the relay's 120s idle reaper fed.
+- **UI remote mode** — the auth card gains a direct/relay switch
+  (auto-defaulted by where the page is served from), persisted per
+  tab; reconnect and auth-failure handling work through the relay like
+  the local path. The daemon also serves `/relay-client.js` so a
+  locally-opened page can switch to relay mode without redeploying.
+- **Verified byte-for-byte against the Rust implementation**: npm
+  `relay.test.mjs` cross-checks sha256/X25519/AES-256-GCM against
+  Node's native crypto and the Rust proof vectors, and — with the
+  debug binaries built — runs a full E2E: JS handshake ↔ real
+  `damon-relay` + `damond`, RPC round trips, and wrong-token rejection.
+
+### Added — cross-surface session pickup and notifications
+
+- **`!sessions` / `!resume <id|title>`** — continue desk work from the
+  phone. `!sessions` lists recent sessions from every surface (the
+  current one marked), `!resume` adopts one into the chat: it is
+  brought live through the persisted resume handle, the chat→session
+  mapping is rebound (persisted as before), and the session is
+  auto-watched. Resolution accepts an exact id, a unique id prefix, or
+  a unique case-insensitive title fragment — whatever a phone keyboard
+  can produce.
+- **`!watch` / `!unwatch <id|prefix|all>`** — follow a live session
+  without adopting it. When a watched session finishes a turn, fails,
+  is canceled, or asks for permission — on ANY surface (web UI, CLI,
+  another chat) — the chat is pinged; a permission ask delivered this
+  way is answerable from the chat with the same `allow`/`deny`/`always`
+  replies (routed straight to `permission.respond`). Watched sessions
+  that this bridge is currently streaming to a chat never double-notify.
+- **`session.watch` / `session.unwatch`** — the wire counterpart:
+  subscribe/unsubscribe one connection to a live session's events
+  without creating/resuming/turning on it. Watches are per-connection —
+  the bridge re-issues them after every reconnect and restores the
+  registry (one daemon-side `channel_state` row) on restart.
+
+### Added — detached turns (mobile-friendly)
+
+- **`turn.start {detach: true}`** — a turn that outlives its client.
+  The response returns immediately (`{turnId, detached: true}`) and a
+  background collector finishes the turn on a task no connection owns:
+  disconnecting never cancels it. This is the mobile case — a locked
+  phone or a wifi→cellular handoff drops the socket mid-turn, which
+  used to cancel the running work. `turn.cancel`, a deny-with-
+  `interrupt`, and `timeoutSecs` still end a detached turn early.
+  Persistence, broadcast events, replay, the `busy` claim, idle-reap
+  protection, and the 64-prompt concurrency cap are identical to
+  blocking turns, so a reconnecting client (or a second client) picks
+  the turn up through the normal replay path — in-flight journal while
+  it runs, store rows once it ends. Blocking `turn.start` is unchanged:
+  disconnect still cancels unowned turns.
+- **Web UI** sends detached turns and drives its busy state from turn
+  events instead of the `turn.start` await; on reconnect it restores
+  the running indicator from `session.status` when a detached turn
+  survived the drop.
+- **Node/Python SDKs** expose `prompt(..., { detach: true })` /
+  `prompt(..., detach=True)`.
+
+### Added — phase-5 SDK resilience and projects
+
+- **npm TypeScript types** — `client.d.mts` ships with the package
+  (`exports["."].types`), covering the full public surface: typed
+  `ClientEvent` union, `StreamEvent`, permission/response shapes,
+  session/project rows, and the `autoResume` option. `npm run
+  typecheck` (tsc --strict, new typescript devDependency) compiles a
+  `types-smoke.ts` exercising every declaration — the documented
+  Electron/Tauri embedders finally get IDE support.
+- **Auto-resubscribe on reconnect (all three SDKs)** — the Rust
+  (`ConnectOptions { auto_resume }`, default on), npm
+  (`{ autoResume }` on connect/connectRelay), and Python
+  (`auto_resume=True`) clients now remember every session they
+  created/resumed/prompted and re-issue `session.resume` for each
+  after a redial lands. The daemon re-attaches the backend and replays
+  missed events (tagged `replay: true`), so subscriptions survive
+  daemon restarts transparently — the core headless-runner flow that
+  used to be every caller's manual chore. Fire-and-forget: a dropped
+  session surfaces on the next real call, never as a reconnect
+  failure. The Rust supervisor shares the request id space with the
+  caller (a second counter would collide in the pending map).
+- **Projects / workspace abstraction** — `project.create/list/get/
+  set_defaults/delete` over a new `projects` table; sessions gain a
+  `project_id` (column-existence migration). `session.create
+  {projectId}` scopes the session: the project root becomes the cwd
+  default and its defaults (`backend`/`model`/`mode`/`mcpServers`)
+  fill whatever the request left unset — explicit params always win,
+  and the daemon-resolved model is now persisted on the session row
+  (`set_session_model`, revived with a producer). `session.list`,
+  `session.search`, and the global `session.usage` accept a
+  `projectId` filter; `project.delete` refuses while sessions are
+  still bound. Unknown defaults keys fail at `project.create` time,
+  not at the first session that consumes them.
+- **`turn.start {detach}`** (concurrent work landed mid-phase) — a
+  detached turn resolves immediately `{turnId, detached: true}` and
+  outlives its connection; disconnect no longer cancels it. Completing
+  the wiring here: `start_turn` now races the disconnect token (a
+  backend that parks inside its start path — the mock's hang knob, a
+  slow agent boot — could otherwise hold the busy claim with no
+  connection left to answer for it), and the mock grew a
+  detached-friendly hang so the detached reply arrives before the
+  park.
+
+### Added — phase-4 file API and channel persistence
+
+- **`file.read` / `file.write` / `file.list`** — client-facing file
+  access jailed to the session's stored cwd. Paths resolve relative
+  (or absolute-inside); the jail is enforced after best-effort
+  canonicalization (existing symlink hops resolve, a write target
+  resolves through its deepest existing ancestor so a symlinked cwd
+  still admits new files, lexical `..` folding covers the rest) and
+  every escape fails closed with `-32602`. Caps: 512 KiB reads
+  (base64 body fits the 1 MiB frame budget, `-32005` over), 1 MiB
+  decoded writes, 1000 listing entries. Unlocks channel attachments
+  and UI file browsing on the same surface.
+- **`channel.get/set/delete_state` + bridge persistence** — a
+  daemon-side `channel_state` table (conv_id, key) that the chat
+  bridges now back their in-memory maps with: the chat→session
+  mapping and the `!cwd`/`!agent` prefs survive a bridge restart (a
+  fresh Bridge reattaches the same session instead of silently
+  resetting the conversation to defaults), the 24h cache eviction
+  re-loads from state instead of dropping context, and `!new`/
+  `!delete`/backend switches clear the persisted mapping so a restart
+  never resurrects a replaced session. Persistence failures warn and
+  degrade to the old in-memory behavior.
+
+### Added — phase-3 lifecycle and ops
+
+- **`session.status`** — live-session introspection over RPC:
+  `{sessionId, backend, busy, idleSecs}` for every resident backend
+  process. Complements the `/metrics` gauges with per-session detail.
+- **`session.restart`** — kill the live backend (crashed, wedged, or
+  healthy) and reattach through the persisted handle in one call;
+  returns the resume shape. Mid-turn restarts refuse with `-32006`
+  instead of killing the turn's process underneath the collector.
+- **`session.set_pinned` / `session.set_archived`** — pinned rows
+  float to the front of `session.list` (which now reports `pinned`/
+  `archived` per row and accepts `includeArchived`); both flags are
+  exempt from the `session_retention_days` sweep. Schema columns are
+  added by the existing column-existence migration.
+- **`logs.tail` / `logs.follow` + `damon logs [-f] [--lines N]`** —
+  the daemon tees its formatted log output (ANSI off) into a bounded
+  in-process ring (2000 lines). `logs.tail` serves the recent window;
+  `logs.follow` opts a connection into a live `log.line` push per new
+  line (same envelope family as `session.event`, so it works through
+  the relay). `damon logs -f` prints the backlog then streams; Ctrl-C
+  stops. Console output is unchanged.
+
+
+- **Slack native permission buttons** — the old "interactive blocks
+  need a public request URL" rationale only holds for HTTP apps:
+  with Socket Mode, `block_actions` presses arrive on the WebSocket
+  the bridge already holds. `send_permission` now posts a Block Kit
+  card (allow / scoped-always / deny with primary/danger styles, the
+  title mrkdwn-escaped), a press acks the envelope, strips the
+  buttons via `chat.update` (so a resolved card can't be re-pressed
+  into a literal "allow" prompt), and synthesizes the typed-reply
+  Incoming — same word, same presser, so the bridge's pending-lane
+  and identity checks apply unchanged. One-time app config: enable
+  Interactivity with Socket Mode. Blocks shapes pinned by a mock-
+  server test; UNVERIFIED against a live workspace, like the upload
+  flow.
+- **Discord inbound attachments** — `MESSAGE_CREATE` attachments map
+  to lazy `Url` attachments (CDN URLs are public and signed; fetched
+  at prompt time like Slack's `url_private`), replacing the
+  "attachments aren't supported on this channel yet" notice. A
+  mention + file with no text is now a real prompt.
+- **OMP compaction events** — `auto_compaction_start`/`_end` frames
+  map to the same normalized `Compaction` timeline item codex emits
+  (previously `{}`-dropped), so context-compaction boundaries render
+  and persist uniformly across backends.
+- **FTS prefix search** — a trailing `term*` becomes an FTS5 prefix
+  query (`error*` matches `errors`); quote-wrapping used to swallow
+  the star so prefix searches silently degraded to exact matches. A
+  bare `*` searches nothing.
+- **Claude catalog + import titles** — the model picker offers the
+  CLI's stable alias names (`sonnet`/`opus`/`opusplan`; full model
+  ids still pass through `set_model`), and imported sessions carry a
+  title extracted from the transcript's first user message
+  (whitespace-collapsed, 80-byte cap) instead of `None`.
+- **Gemini mode honesty** — mode descriptions now say what the ids
+  actually do in headless mode: `default` and `bypassPermissions`
+  both auto-approve (no permission wire), `acceptEdits` maps to
+  `auto_edit`, `plan` to `plan`. A picker no longer implies
+  "default" will ask first.
+
+### Fixed — phase-1 defect sweep
+
+- **Concurrent `turn.start` on one session is rejected** with a new
+  typed error (`-32006`, "a turn is already running on this session")
+  instead of running two collectors on the same broadcast — which
+  double-persisted every event and let disconnect cancel the wrong
+  turn. The busy claim is now taken atomically in the dispatcher and
+  released by a guard on every exit path (a rejected turn can no
+  longer wedge the session).
+- **Failed turns leave a durable marker**: a backend `turn_failed` now
+  persists an `error` row (role `error`, reason in `data.content`).
+  `session.messages`/`session.export` show why a prompt has no answer,
+  and a late subscriber's replay re-raises it as a timeline
+  `error {message}` item — reconnecting clients no longer lose the
+  failure reason entirely. New `TimelineItem::Error` carries it on the
+  wire; the web UI renders the stored row as an error bubble.
+- **Backend compaction events are persisted** as `compaction` rows
+  (codex already emitted the timeline item; the store dropped it).
+  Compaction boundaries are now part of the searchable transcript and
+  replay; the web UI renders the stored row with the same collapsed
+  card as the live event.
+- **`session.fork` copies the backend resume handle** — the fork is
+  resumable. Both rows share the native handle only until each runs
+  its next turn (run_turn rebinds a session to its own fresh native
+  handle afterwards); `upto` still bounds the copied store history
+  only, the native transcript replays in full on resume.
+- **`session.close` RPC added** — kills the live backend process,
+  keeps the row and history, frees a `max_sessions` slot, idempotent.
+  The `SESSION_LIMIT` error message always told clients to "close,
+  delete, or let idle sessions reap first"; close now actually exists
+  on the wire. Documented in `docs/protocol-v2.md` and the
+  self-describing `rpc_methods()` schema.
+- **`allowed_dirs` config** — optional cwd allowlist gating
+  `session.create`, both `session.resume` paths, and
+  `session.import`. Component-wise prefix after best-effort
+  canonicalization (`/a/b` admits `/a/b/c`, not `/a/bc`); unset keeps
+  the zero-config default of unrestricted. Fail-closed for
+  remote/TLS deployments where the shared token would otherwise let
+  an agent process run anywhere. Hot-reloaded.
+- **Store v3 migration re-indexes legacy FTS rows**: the v1 backfill
+  only indexed plain-string `content`, so older array-form messages
+  (text parts, tool payloads — exactly what the current extractor
+  handles) were silently unsearchable. Reopening the store re-runs
+  `fts_text` over every message missing from the index (idempotent)
+  and stamps `user_version = 3`.
+- **npm client surfaces the `replay` flag** on `events()` — JS
+  consumers can finally tell catch-up history from live frames after
+  a reconnect, matching the Rust and Python clients (one-field fix,
+  pinned by a new test).
+- **Schema test completeness**: the expected-method list in
+  `tests/rpc.rs` now includes `session.fork` (it was missing — a
+  schema regression on fork would have passed) and `session.close`.
+
+### Added — P3 infrastructure sweep
+
+
+- **Typed JSON-RPC error codes** — parse/invalid-request/method/param
+  failures answer with their reserved codes
+  (`-32700`/`-32600`/`-32601`/`-32602`) instead of every error being
+  `-32000`; an unparseable frame or an id-carrying method-less frame
+  now gets an error reply instead of silence. Damon server codes let
+  clients degrade gracefully instead of parsing messages: `-32001`
+  session-not-live (auto-resume), `-32002` capability-unsupported
+  (hide model/mode pickers, queue steer text as the next prompt),
+  `-32003` backend-unavailable, `-32004` session-limit, `-32005`
+  response-over-budget — a response over the 1 MiB relay frame budget
+  fails loudly with a paging hint instead of vanishing into the
+  encrypter. Messages are unchanged (string-matching clients keep
+  working); codes are documented in `docs/protocol-v2.md`, and the
+  Rust client carries them on the error
+  (`downcast_ref::<rpc::RpcError>()`); the npm client's existing
+  `RpcError.code` now sees real values.
+- **`/metrics` overhaul** — `damon_live_sessions` reports the real
+  live-session count (it used to count busy turns), with
+  `damon_busy_sessions` alongside; new `damon_rpc_requests_total`,
+  `damon_rpc_errors_total{code}`, per-backend
+  `damon_turns_total{backend,status}`, and a `damon_turn_seconds_*`
+  duration histogram (fixed buckets plus sum/count).
+- **CI release gating** — the release job now needs `audit`, `deny`,
+  and `coverage` in addition to `test`, so a vulnerable or
+  license-banned build cannot ship; coverage enforces a 60% line floor
+  (`--fail-under-lines`, measured 63.5% at introduction); MSRV is
+  declared (`rust-version = "1.95"`) with a CI drift check against the
+  pinned toolchain.
+- **Release signing (SHA256SUMS + minisign)** — every tag publishes a
+  `SHA256SUMS` manifest covering all five tarballs (assembled only
+  after each was verified against its build-computed `.sha256`
+  sidecar) and, once the `MINISIGN_SECRET_KEY` repo secret is
+  registered, a minisign-format signature. `scripts/verify-release.sh`
+  checks checksums and signature (signed/tampered/unsigned-advisory/
+  unsigned-strict paths all exercised), and `npm install` prefers the
+  manifest over per-target sidecars. `docs/release.md` documents the
+  one-time key setup.
+- **Changelog accuracy** — the missing `0.3.0` section heading is
+  restored (its content sat unattributed inside 0.4.0), the post-0.3.0
+  additions (chat surface parity, interrupt classification) moved into
+  0.4.0 where they belong, and a `0.1.0` section was reconstructed for
+  the initial release (no changelog existed at that tag).
+
+
+### Added — P1 reliability sweep
+
+- **`max_sessions` config** caps live in-memory backend sessions
+  (create and resume); going past it fails with a named error until
+  sessions are closed, deleted, or reaped. Hot-reloaded.
+- **Fresh-session reap grace**: a session that has never run a turn is
+  not idle-reaped for its first 60s — the client's
+  create→turn.start gap survives even a tiny `agent_idle_secs`.
+- **Event replay for late subscribers**: a connection first touching a
+  session now receives everything it missed before live streaming —
+  persisted history from the store, then the in-flight turn's journal,
+  each frame tagged `"replay": true`. Reconnecting mid-turn no longer
+  loses the earlier stream; create/resume results report the
+  `replayed` count.
+- **Discord gateway RESUME (op 6)**: reconnects resume the gateway
+  session when it survives (messages missed while disconnected are
+  replayed by Discord) and re-identify only on an invalidated session
+  (op 9 `d:false`), under the existing exponential backoff. READY's
+  `session_id` is tracked; the heartbeat seq resets on fresh identify.
+- **Rate-limit handling for channel sends** (shared
+  `ratelimit::send_with_rate_limit`): Telegram/Discord/Slack now retry
+  429s up to 3 extra attempts honoring `Retry-After` (header or JSON
+  body — Discord/Telegram shapes) with exponential fallback, and pace
+  the next chunk when an `X-RateLimit-Remaining: 0` bucket is
+  exhausted. A second consecutive 429 used to fail the whole turn.
+- **Channel bridge delivery failures are logged** (`Bridge::deliver`)
+  — a lost final reply, permission prompt, or error notice leaves a
+  warn trace instead of vanishing (`let _` everywhere before).
+- **Relay link liveness, both ends**: the Rust client pings every 30s
+  and self-closes after 120s of inbound silence (channels close,
+  callers see it instead of hanging on a half-open socket);
+  damon-relay drops client sockets silent for 120s and notifies the
+  daemon so its session slot is freed.
+- **Opt-in stretched relay proof (`kdf: "s256"`)**: handshakes between
+  current clients and daemons iterate sha256 2^16 extra times per
+  proof, making offline brute-force of a captured handshake cost 2^16
+  compressions per token guess instead of one. Older peers keep the
+  single-hash proof (additive negotiation, byte-compatible — pinned by
+  cross-implementation test vectors). npm client mirrors it.
+- **`permission.respond` deny with `interrupt: true` now actually
+  interrupts the turn** — the daemon drives the backend interrupt
+  after delivering the denial (previously every backend ignored the
+  flag).
+
+### Fixed — P0 defect sweep
+
+- **Persistent sessions no longer hang when the backend process dies.**
+  The transport now exposes an exit signal (stdout EOF, read error, or
+  shutdown); claude/amp/codex/omp dispatch pumps select on it and fail
+  the in-flight turn with `TurnFailed` instead of blocking forever on
+  the still-open broadcast channel. One-shot dialects (cursor/kimi/
+  qwen) get the guarantee their exit pump was written for — it had the
+  same latent hang — and the omp handshake fails fast when the process
+  dies before `ready`.
+- **Backend stderr is logged, not discarded.** Every capped stderr line
+  lands in the daemon log at WARN with the backend command — CLI
+  auth/login failures used to look like silent hangs.
+- **Codex permission bookkeeping**: `serverRequest/resolved` now also
+  matches numeric JSON-RPC ids, so answered asks are actually removed
+  from the pending map.
+- **RPC self-description matches the dispatch**: `session.messages`
+  documents `offset` (it said `before`, which no code reads);
+  `permission.respond` now lists its required `requestId`.
+- **Capabilities tell the truth**: `rewind` is false everywhere (no
+  backend implements it), `subagent_events` false for claude/amp (only
+  omp emits `Subagent` events), `mcp_servers` false for codex/omp
+  (only claude forwards `session.create`'s `mcpServers` today).
+- **amp steering marks the frame** with `steer: true` as its input
+  protocol documents; other stream-json dialects steer with a plain
+  user frame as before.
+- **config.example.toml** no longer ships a commented `[mcp_servers.*]`
+  block — uncommenting it would fail startup since 0.4.0 stopped
+  parsing the section. It now points at `session.create`'s
+  `mcpServers`.
+
+### Added — P2 feature sweep
+
+- **Native permission buttons**: Telegram permission prompts render as an
+  inline keyboard and Discord's as component buttons (allow / scoped-always /
+  deny derived from the agent's offered actions). A press resolves the ask as
+  if the presser typed the reply — the requester-identity check and the
+  single-pending-per-conversation lane are unchanged. Slack stays text-only:
+  interactive blocks require a public request URL the Socket-Mode-only
+  daemon does not host.
+- **Per-conversation `!cwd` / `!agent`**: a chat can pin its project
+  directory (validated, absolute) and backend (`!agent <id>` validated
+  against `backend.list`, resetting the session since backends are fixed at
+  create time). Preferences are in-memory like the chat→session map — a
+  daemon restart falls back to the configured defaults.
+- **Bounded prompt queueing**: a second prompt arriving mid-turn is queued
+  (cap 3) and runs when the live turn ends, instead of being rejected;
+  `!cancel` drains the queue too.
+- **Channel media**: Slack `file_share` attachments now reach the agent
+  (`url_private` fetched with the bot token — previously "attachments
+  aren't supported"); `ChannelApi::send_media` delivers outbound images on
+  Telegram (sendPhoto/sendDocument), Discord (multipart), and Slack
+  (files upload v2), ready for backends that emit `images` on assistant
+  timeline items.
+- **Markdown over channels**: replies render as Telegram HTML (parse-error
+  fallback to plain text), and stream flushing is fence-safe — chunks never
+  split inside a ``` block (oversized fences split and reopen).
+- **Store/RPC**: `session.list` and `session.search` filter by
+  `backend`/`cwd`/`tag` (search also `since`/`until`, RFC3339 or date);
+  messages carry real `ts` (unix ms — legacy rows clamp to the session's
+  creation time for time-filtered search); `session.set_tags`; `session.export`
+  (full transcript superset of the CLI export); `session.usage {daily:true,
+  days:N}` day-bucketed cost/turn rollup; `session.fork` now copies usage
+  history, tags, and title.
+- **Dashboard**: steer bar while a turn runs (unavailable backends queue the
+  text as the next prompt, per the SteerResult contract); search hits
+  deep-link to the exact message (paged walk, compaction-aware); session
+  list pages 50-at-a-time with Load more instead of a hardcoded 500.
+- **Rust client + CLI parity**: `DamonClient::turn_steer/set_model/set_mode`
+  and `damon steer|model|mode` subcommands.
+- **Python client relay transport**: the npm client's relay link (X25519 +
+  AES-256-GCM, stretched-proof `kdf:"s256"` negotiation) is ported to
+  stdlib-only Python, pinned by cross-implementation vectors against the npm
+  reference and relay.rs goldens.
+- **gemini backend**: `gemini` CLI via headless `--output-format stream-json`
+  (init/message/tool_use/tool_result/error/result frames grounded in the
+  upstream formatter sources; UNVERIFIED dialect until run against a real
+  install — same convention as cursor/amp/kimi/qwen).
+- **Claude subagent events**: Task tool_use/results now raise omp-shaped
+  `Subagent` stream events (capability flipped true), so consumers render
+  one consistent shape across backends.
+- **Codex**: `turn/completed` token usage is mapped (totalTokenUsage /
+  lastTokenUsage fallback) instead of dropped; Question approvals can carry
+  the user's free-text answer (`PermissionResponse::Allow.answer`, optional
+  and backward-compatible).
+- **cursor delta streaming**: `--stream-partial-output` enabled — only the
+  delta kind (`timestamp_ms` set, `model_call_id` absent) is emitted per the
+  documented three-kind rule; every consumer already coalesces consecutive
+  assistant messages, so transcripts don't duplicate.
+- **Shared Claude-frame parser**: amp/kimi/qwen's copy-pasted frame
+  translation collapsed into one `streamjson::ClaudeFrameParser` with
+  per-dialect quirks (tool-detail mappers, OpenAI tool_calls, usage shape,
+  interrupt detection) — one place to fix dialect bugs now.
+
 ## 0.4.0 — 2026-09-26
 
 ### Removed — dead-code sweep (breaking)
@@ -51,6 +492,43 @@
   approval-mode command, so the mode is fixed at spawn
   (`dynamic_modes` stays false) and unknown modes defer to omp's own
   `tools.approvalMode` setting.
+
+### Added — chat surface parity
+
+- **Subagent events render everywhere** — `subagent` stream events
+  (OMP today) were silently dropped by every chat surface. The web UI
+  shows a collapsible 🤖 card per subagent (name/status plus the raw
+  frame), chat channels post `🤖 name status`, and the CLI prints
+  `[subagent name status]`.
+- **Model/mode pickers in the web UI** — the composer gains model and
+  mode selects fed by `catalog.models`; a change applies to the live
+  session via `session.set_model`/`session.set_mode`, or rides along on
+  the next `session.create`.
+- **Native session import** — `session.resume` now accepts
+  `{handle:{provider,native_handle}, cwd?, title?}`: the daemon mints a
+  session row bound to the handle (deduped — re-importing the same
+  native session returns the same session) and resumes it. The web UI
+  sidebar has an Import button listing `session.import` results, the
+  CLI has `damon import <backend> [--attach N]`, and the Rust/Node/
+  Python clients expose `resume_by_handle`/`resumeByHandle`.
+- **Cancel from every surface** — chat channels gain `!cancel`, and
+  the CLI REPL accepts `/cancel` (or `cancel`/`/stop`) mid-turn. Other
+  input typed mid-turn is carried over as the next prompt instead of
+  being swallowed.
+
+### Fixed — interrupt classification
+
+- **Claude cancels reported as failures** — an interrupted turn's
+  result frame arrives `is_error:true` with subtype
+  `error_during_execution`, so `turn.cancel` surfaced as
+  `[turn error] unknown error`. The dialect now maps
+  `terminal_reason:"aborted_streaming"` (and `subtype:"interrupted"`)
+  to `TurnCanceled`.
+- **`mode_changed` fell through to `model_changed`** in the web UI
+  event switch, printing a bogus `model: undefined` line on every mode
+  change.
+
+## 0.3.0 — 2026-09-24
 
 ### Changed — native-CLI backend architecture (breaking)
 
@@ -457,41 +935,6 @@ history, channels, and remote access instead:
 - **`damon-relay --help`/`--version`** — the relay used to ignore argv
   entirely and start the server on `--help`; unknown args now exit 2.
 
-### Added — chat surface parity
-
-- **Subagent events render everywhere** — `subagent` stream events
-  (OMP today) were silently dropped by every chat surface. The web UI
-  shows a collapsible 🤖 card per subagent (name/status plus the raw
-  frame), chat channels post `🤖 name status`, and the CLI prints
-  `[subagent name status]`.
-- **Model/mode pickers in the web UI** — the composer gains model and
-  mode selects fed by `catalog.models`; a change applies to the live
-  session via `session.set_model`/`session.set_mode`, or rides along on
-  the next `session.create`.
-- **Native session import** — `session.resume` now accepts
-  `{handle:{provider,native_handle}, cwd?, title?}`: the daemon mints a
-  session row bound to the handle (deduped — re-importing the same
-  native session returns the same session) and resumes it. The web UI
-  sidebar has an Import button listing `session.import` results, the
-  CLI has `damon import <backend> [--attach N]`, and the Rust/Node/
-  Python clients expose `resume_by_handle`/`resumeByHandle`.
-- **Cancel from every surface** — chat channels gain `!cancel`, and
-  the CLI REPL accepts `/cancel` (or `cancel`/`/stop`) mid-turn. Other
-  input typed mid-turn is carried over as the next prompt instead of
-  being swallowed.
-
-### Fixed — interrupt classification
-
-- **Claude cancels reported as failures** — an interrupted turn's
-  result frame arrives `is_error:true` with subtype
-  `error_during_execution`, so `turn.cancel` surfaced as
-  `[turn error] unknown error`. The dialect now maps
-  `terminal_reason:"aborted_streaming"` (and `subtype:"interrupted"`)
-  to `TurnCanceled`.
-- **`mode_changed` fell through to `model_changed`** in the web UI
-  event switch, printing a bogus `model: undefined` line on every mode
-  change.
-
 ## 0.2.0 — 2026-09-19
 
 ### Breaking
@@ -777,3 +1220,29 @@ history, channels, and remote access instead:
     readable (it may hold literal secrets).
   - Release tarballs ship `.sha256` sidecars and `npm install` verifies
     the checksum before extraction.
+
+## 0.1.0 — 2026-09-16
+
+Initial release — Damon as a local, always-on agent core (no changelog
+existed at this tag; section reconstructed from the v0.1.0 tree):
+
+- **Core daemon (`damond`)** with a built-in agent runtime: sessions,
+  streaming, tool loop, interactive permission prompts, cancellation,
+  context compaction (85% threshold), exposed as ACP-style JSON-RPC
+  over WebSocket.
+- **Provider layer**: OpenAI, Anthropic, Gemini plus compat presets
+  (OpenRouter, Groq, DeepSeek, vLLM, Ollama… auto-discovered), model
+  glob routing, `model:low/:medium/:high` thinking suffixes, and
+  OpenAI-compatible `/v1/chat/completions` + `/v1/responses`
+  endpoints for drop-in clients.
+- **MCP stdio servers** declared in config; tools namespaced
+  `server.tool` with per-server `auto_approve` or interactive
+  permission prompts.
+- **Surfaces**: `damon` CLI, embedded web UI at `/ui`, Rust + npm
+  clients, and Telegram/Slack/Discord channel binaries with per-chat
+  session mapping and `allow`/`deny` permission replies.
+- **`damon-relay`** public-host tunnel — the daemon dials out, the
+  link is end-to-end encrypted (X25519 + AES-256-GCM), the relay sees
+  only ciphertext.
+- **Secrets**: `env:`/`keychain:`/`!cmd` references only (literal keys
+  rejected), OAuth tokens in the OS keychain with auto-refresh.

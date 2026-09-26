@@ -15,6 +15,7 @@ pub mod amp;
 pub mod claude;
 pub mod codex;
 pub mod cursor;
+pub mod gemini;
 pub mod kimi;
 pub mod omp;
 pub mod qwen;
@@ -108,13 +109,21 @@ pub trait AgentSession: Send + Sync {
     /// The resume token for this session, once the backend has one.
     fn persistence_handle(&self) -> Option<PersistenceHandle>;
 
-    /// Switch permission/behavior mode. Default: unsupported.
+    /// Switch permission/behavior mode. Default: unsupported — the
+    /// typed code lets clients hide the affordance instead of surfacing
+    /// the error.
     async fn set_mode(&self, _mode: &str) -> Result<()> {
-        anyhow::bail!("mode switching not supported")
+        Err(crate::rpc::RpcError::error(
+            crate::rpc::error_code::NOT_SUPPORTED,
+            "mode switching not supported",
+        ))
     }
 
-    /// Switch model. Default: unsupported.
+    /// Switch model. Default: unsupported (see `set_mode`).
     async fn set_model(&self, _model: &str) -> Result<()> {
-        anyhow::bail!("model switching not supported")
+        Err(crate::rpc::RpcError::error(
+            crate::rpc::error_code::NOT_SUPPORTED,
+            "model switching not supported",
+        ))
     }
 }

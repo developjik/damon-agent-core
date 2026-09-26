@@ -50,6 +50,22 @@ async fn damon(url: &str, args: &[&str]) -> (String, bool) {
     )
 }
 
+/// Run `damon` with args; returns (stderr, success) — for asserting
+/// that daemon-side RPC errors surface on the failing exit path.
+async fn damon_err(url: &str, args: &[&str]) -> (String, bool) {
+    let out = tokio::process::Command::new(env!("CARGO_BIN_EXE_damon"))
+        .arg("--url")
+        .arg(url)
+        .args(args)
+        .output()
+        .await
+        .expect("run damon");
+    (
+        String::from_utf8_lossy(&out.stderr).to_string(),
+        out.status.success(),
+    )
+}
+
 #[tokio::test]
 async fn cli_sessions_and_prompt() {
     let url = serve_daemon().await;
@@ -147,5 +163,51 @@ async fn cli_doctor() {
     assert!(
         parsed["backends"].as_u64().unwrap_or(0) >= 1,
         "expected at least the mock backend: {out}"
+    );
+}
+
+/// steer/model/mode against a live session through the real router.
+/// The mock backend has no mid-turn input path and no model/mode
+/// switching, so it pins the two shapes the CLI must handle: a
+/// successful steer whose SteerResult is `unavailable`, and a daemon
+/// RPC error surfacing through the exit status and stderr.
+#[tokio::test]
+async fn cli_steer_model_mode() {
+    let url = serve_daemon().await;
+
+    // Make a session live (idle reaping is off in the mock config).
+    let (out, ok) = damon(&url, &["prompt", "hello"]).await;
+    assert!(ok, "prompt failed: {out}");
+    let (out, ok) = damon(&url, &["sessions"]).await;
+    assert!(ok, "sessions failed: {out}");
+    let sid = out.split('\t').next().unwrap().trim().to_string();
+    assert!(!sid.is_empty(), "no session id");
+
+    // Steer: the mock's default SteerResult is `unavailable` — printed
+    // as guidance, not an error (the RPC itself succeeded).
+    let (out, ok) = damon(&url, &["steer", &sid, "keep", "going"]).await;
+    assert!(ok, "steer failed: {out}");
+    assert!(out.contains("unavailable"), "steer result missing: {out}");
+
+    // --json steer returns the session and the backend's result.
+    let (out, ok) = damon(&url, &["--json", "steer", &sid, "more"]).await;
+    assert!(ok, "steer failed: {out}");
+    let parsed: serde_json::Value = serde_json::from_str(&out).unwrap();
+    assert_eq!(parsed["steered"], sid, "unexpected json: {out}");
+    assert_eq!(parsed["result"], "unavailable", "unexpected json: {out}");
+
+    // Model/mode: the mock backend rejects switching — the daemon's
+    // error must reach the CLI's exit status and stderr.
+    let (err, ok) = damon_err(&url, &["model", &sid, "anthropic/claude-opus"]).await;
+    assert!(!ok, "model switch should have failed");
+    assert!(
+        err.contains("model switching not supported"),
+        "model stderr: {err}"
+    );
+    let (err, ok) = damon_err(&url, &["mode", &sid, "plan"]).await;
+    assert!(!ok, "mode switch should have failed");
+    assert!(
+        err.contains("mode switching not supported"),
+        "mode stderr: {err}"
     );
 }

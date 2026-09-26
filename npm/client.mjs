@@ -36,14 +36,29 @@ export class DamonClient {
   serverHello = null;   // latest {"hello": …} greeting (sent on every connect)
   #connected;           // Promise resolved when the link is up
   #markConnected;
+  #touched = new Set(); // session ids this client created/resumed/prompted
+  #autoResume;          // re-issue session.resume for #touched after a redial
 
-  constructor(io, dial) {
+  constructor(io, dial, { autoResume = true } = {}) {
     this.#dial = dial;
+    this.#autoResume = autoResume;
     this.#connected = new Promise((r) => (this.#markConnected = r));
     this.#attach(io);
     // connect()/connectRelay() only resolve after the link (including
     // any relay handshake) is fully up.
     this.#markConnected();
+  }
+
+  /** Fire-and-forget session.resume for every touched session after a
+   *  redial — the daemon re-attaches the backend and replays missed
+   *  events (replay:true), so subscriptions survive daemon restarts.
+   *  Failures (e.g. the session was deleted meanwhile) are swallowed:
+   *  the next caller-facing call surfaces its own errors. */
+  #autoResubscribe() {
+    if (!this.#autoResume) return;
+    for (const sessionId of this.#touched) {
+      this.#call("session.resume", { sessionId }).catch(() => {});
+    }
   }
 
   #attach(io) {
@@ -58,7 +73,7 @@ export class DamonClient {
    *  ?ticket= — the token never appears in a URL. If the link drops the
    *  client redials with backoff (100ms → 5s, fresh ticket each attempt);
    *  calls made while down wait up to 10s for the link. */
-  static async connect(url, { token, webSocket, fetchImpl } = {}) {
+  static async connect(url, { token, webSocket, fetchImpl, autoResume } = {}) {
     const WS = webSocket ?? globalThis.WebSocket;
     if (!WS) {
       throw new Error(
@@ -68,7 +83,7 @@ export class DamonClient {
     const fetchFn = fetchImpl ?? globalThis.fetch;
     // Redial: fresh ticket + WS → new transport.
     const dial = () => dialWs(url, WS, token, fetchFn);
-    return new DamonClient(await dial(), dial);
+    return new DamonClient(await dial(), dial, { autoResume });
   }
 
   /** Connect through a damon-relay — E2E-encrypted, identical surface.
@@ -94,9 +109,17 @@ export class DamonClient {
       else p.resolve(m.result);
       return;
     }
-    // Server push: {"event":"session.event","sessionId","data":<StreamEvent>}.
+    // Server push: {"event":"session.event","sessionId","data":<StreamEvent>,
+    // "replay":true?}. The replay mark lets consumers separate
+    // catch-up history from live frames instead of double-rendering
+    // after a reconnect — same field the Rust/Python clients surface.
     if (typeof m.event === "string") {
-      this.#push({ type: "event", sessionId: m.sessionId, event: m.data });
+      this.#push({
+        type: "event",
+        sessionId: m.sessionId,
+        event: m.data,
+        replay: m.replay === true,
+      });
       return;
     }
     // {"hello": {protocol, daemon, version, …}} — sent on every connect.
@@ -143,6 +166,7 @@ export class DamonClient {
         if (this.#closed) { io.close(); return; }
         this.#markConnected();
         this.#push({ type: "reconnected" });
+        this.#autoResubscribe();
         return;
       } catch {
         delay = Math.min(delay * 2, 5000);
@@ -246,6 +270,7 @@ export class DamonClient {
    *  default backend. */
   async newSession(cwd, backend) {
     const r = await this.#call("session.create", { cwd, backend });
+    this.#touched.add(r.sessionId);
     return r.sessionId;
   }
 
@@ -265,6 +290,7 @@ export class DamonClient {
   /** Resume an existing session; returns sessionId. Throws if unknown. */
   async resumeSession(sessionId) {
     const r = await this.#call("session.resume", { sessionId });
+    this.#touched.add(sessionId);
     return r.sessionId;
   }
 
@@ -273,6 +299,7 @@ export class DamonClient {
    *  the Damon sessionId (deduped: same handle → same session). */
   async resumeByHandle(handle, { title, cwd } = {}) {
     const r = await this.#call("session.resume", { handle, title, cwd });
+    this.#touched.add(r.sessionId);
     return r.sessionId;
   }
 
@@ -317,9 +344,15 @@ export class DamonClient {
    *  turn ends — events stream first, then this response. `prompt` is a
    *  string or an array of content blocks. The same outcome is also
    *  delivered as a {type:"promptDone"} event on the events() stream
-   *  for consumers that only iterate events. */
-  async prompt(sessionId, text, timeoutSecs) {
+   *  for consumers that only iterate events.
+   *
+   *  With `{ detach: true }` the call resolves immediately with
+   *  {turnId, detached: true} and the turn keeps running on the daemon
+   *  even if this client disconnects — the outcome arrives as stream
+   *  events (or replay on the next connect) instead of this response. */
+  async prompt(sessionId, text, timeoutSecs, { detach } = {}) {
     await this.#ready();
+    this.#touched.add(sessionId);
     const id = ++this.#nextId;
     const done = new Promise((resolve, reject) => {
       this.#pending.set(id, {
@@ -341,7 +374,7 @@ export class DamonClient {
     try {
       await this.#send(JSON.stringify({
         id, method: "turn.start",
-        params: { sessionId, prompt: text, timeoutSecs },
+        params: { sessionId, prompt: text, timeoutSecs, detach },
       }));
     } catch (e) {
       this.#pending.delete(id);
@@ -452,11 +485,15 @@ async function dialWs(url, WS, token, fetchFn) {
  *  client_handshake) every JSON-RPC frame is AES-256-GCM encrypted with
  *  direction-separated keys and strict sequence numbers.
  *
- *    1. client → {"e2e_pub": b64(X25519 public key)}      (no proof yet)
- *    2. daemon → {"e2e_pub": b64(X25519 public key)}      (bare)
+ *    1. client → {"e2e_pub": b64(X25519 public key), "kdf": "s256"}  (no proof yet)
+ *    2. daemon → {"e2e_pub": b64(X25519 public key), "kdf": "s256"}  (bare; echoes kdf when understood)
  *    3. client → {"e2e_proof": b64(sha256(token ‖ client_pub ‖ daemon_pub))}
  *    4. daemon → {"e2e_proof": b64(sha256(token ‖ daemon_pub ‖ client_pub))}
  *               …or {"e2e_error": "auth"} so a wrong token fails fast.
+ *
+ *  When the daemon echoes `"kdf": "s256"` both sides stretch the proofs
+ *  with 2^16 extra sha256 rounds (brute-force hardening for low-entropy
+ *  tokens); older daemons ignore the marker and keep step 3/4 as-is.
  *
  *  All messages travel wrapped in the envelope the relay pipes:
  *  `{"data": "..."}`. Post-handshake frames are base64 of
@@ -466,7 +503,7 @@ async function dialWs(url, WS, token, fetchFn) {
  *  reordered, or tampered fails closed — the link dies and redials with a
  *  full fresh handshake, exactly like Rust connect_relay.
  *  Requires WebCrypto X25519 (Node >= 22, Chrome 133+, Safari 17+). */
-export async function connectRelay({ url, name, token, webSocket, handshakeTimeoutMs } = {}) {
+export async function connectRelay({ url, name, token, webSocket, handshakeTimeoutMs, autoResume } = {}) {
   if (!url || typeof url !== "string") {
     throw new Error("connectRelay: url (the relay's ws://host:port) is required");
   }
@@ -478,7 +515,7 @@ export async function connectRelay({ url, name, token, webSocket, handshakeTimeo
   }
   // Rust bounds the handshake at 15s (relay.rs HANDSHAKE_TIMEOUT).
   const dial = () => dialRelay(url, name, token, webSocket, handshakeTimeoutMs ?? 15000);
-  return new DamonClient(await dial(), dial);
+  return new DamonClient(await dial(), dial, { autoResume });
 }
 
 async function dialRelay(url, name, token, webSocket, timeoutMs) {
@@ -511,9 +548,11 @@ function relayEncode(s) {
 async function relayIo(ws, token, timeoutMs) {
   const io = { send: null, close: null };
   let down = false;
+  let pingTimer = null;
   const markDown = () => {
     if (down) return;
     down = true;
+    clearInterval(pingTimer);
     try { ws.close(); } catch {}
     io.onDown?.();
   };
@@ -542,6 +581,18 @@ async function relayIo(ws, token, timeoutMs) {
   });
   ws.addEventListener("close", markDown);
   ws.addEventListener("error", markDown);
+
+  // Keepalive (mirrors relay.rs CLIENT_PING_EVERY): ping the relay
+  // every 30s so NATs keep the flow open and the relay's own idle
+  // check sees liveness. Node's ws exposes ping(); browsers don't —
+  // there the relay's 120s idle drop triggers markDown and the
+  pingTimer = setInterval(() => {
+    if (down) return;
+    try { ws.ping?.(); } catch {}
+  }, 30_000);
+  // The keepalive must never keep a process alive on its own (a failed
+  // test that never closes the client would otherwise hang the runner).
+  pingTimer.unref?.();
 
   // Every outbound message is wrapped in the envelope the relay pipes.
   const sendRaw = (text) => ws.send(JSON.stringify({ data: text }));
@@ -606,17 +657,21 @@ async function relayIo(ws, token, timeoutMs) {
   return io;
 }
 
-/** Client side of the 4-message E2E handshake (relay.rs:112-159). A fresh
- *  X25519 keypair per call — reconnect attempts never reuse keys. Returns
- *  the direction-separated session keys (client sends with c2d, receives
- *  with d2c; the daemon mirrors). */
+/** Client side of the 4-message E2E handshake (relay.rs E2e). A fresh
+ *  X25519 keypair per call — reconnect attempts never reuse keys. The
+ *  first frame advertises the stretched-proof KDF (`kdf: "s256"`); a
+ *  daemon that echoes it uses the stretched proof, anything older
+ *  ignores the unknown field and both sides fall back to the legacy
+ *  single-hash proof. Returns the direction-separated session keys
+ *  (client sends with c2d, receives with d2c; the daemon mirrors). */
 async function e2eHandshake(sendRaw, nextFrame, token) {
-  // 1. Our ephemeral public key.
+  // 1. Our ephemeral public key + KDF offer.
   const kp = await x25519Keypair();
   const mine = new Uint8Array(await subtle.exportKey("raw", kp.publicKey));
-  sendRaw(JSON.stringify({ e2e_pub: b64(mine) }));
+  sendRaw(JSON.stringify({ e2e_pub: b64(mine), kdf: PROOF_KDF }));
 
-  // 2. Daemon's bare {e2e_pub} — no proof until we authenticate.
+  // 2. Daemon's bare {e2e_pub} — no proof until we authenticate. An
+  //    echoed kdf marker means stretched proofs both ways.
   const hs = JSON.parse(await nextFrame());
   const theirPubB64 = hs.e2e_pub;
   if (typeof theirPubB64 !== "string") {
@@ -624,11 +679,12 @@ async function e2eHandshake(sendRaw, nextFrame, token) {
   }
   const theirs = unb64(theirPubB64);
   if (theirs.length !== 32) throw new Error("bad pubkey len");
+  const stretch = hs.kdf === PROOF_KDF;
 
   // 3. Our proof over (client_pub, daemon_pub) — the client proves FIRST,
   //    so the daemon never reveals token-derived material to a peer that
   //    hasn't authenticated (and a relay can't farm proofs per pubkey).
-  sendRaw(JSON.stringify({ e2e_proof: await proof(token, mine, theirs) }));
+  sendRaw(JSON.stringify({ e2e_proof: await proof(token, mine, theirs, stretch) }));
 
   // 4. Daemon's proof — or an explicit auth rejection so a wrong token
   //    fails fast instead of timing out.
@@ -638,7 +694,7 @@ async function e2eHandshake(sendRaw, nextFrame, token) {
   }
   if (
     typeof reply.e2e_proof !== "string" ||
-    !constantTimeEq(reply.e2e_proof, await proof(token, theirs, mine))
+    !constantTimeEq(reply.e2e_proof, await proof(token, theirs, mine, stretch))
   ) {
     throw new Error("daemon failed E2E proof — wrong auth_token?");
   }
@@ -715,10 +771,29 @@ async function x25519Shared(privateKey, publicKey) {
 
 // --- Frame codec (pure; mirrors relay.rs proof/derive_key/seq_nonce/E2e) ---
 
+/** Stretched-proof KDF marker — mirrors relay.rs PROOF_KDF. Opt-in via
+ *  the first handshake frame; a daemon that echoes it runs the same
+ *  stretched proof, older peers keep the single-hash proof below. */
+const PROOF_KDF = "s256";
+
+/** Extra sha256 rounds when `stretch` is set — mirrors relay.rs
+ *  PROOF_ITERATIONS (2^16). Cheap per handshake, expensive per offline
+ *  guess at a low-entropy token. */
+const PROOF_ITERATIONS = 1 << 16;
+
 /** sha256(token ‖ mine ‖ theirs), base64 — binds the proof to BOTH public
- *  keys, so a relay cannot replay a captured proof for other keys. */
-async function proof(token, mine, theirs) {
-  return b64(await sha256(te(token), mine, theirs));
+ *  keys, so a relay cannot replay a captured proof for other keys. With
+ *  `stretch`, iterate sha256 PROOF_ITERATIONS more times over a
+ *  domain-separated seed (exactly relay.rs proof_stretched). */
+async function proof(token, mine, theirs, stretch = false) {
+  let h = await sha256(te(token), mine, theirs);
+  if (stretch) {
+    h = await sha256(te("damon-relay-proof-s256"), te(token), mine, theirs);
+    for (let i = 0; i < PROOF_ITERATIONS; i++) {
+      h = await sha256(h);
+    }
+  }
+  return b64(h);
 }
 
 /** sha256(shared ‖ label) — directional session key material

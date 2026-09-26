@@ -1,6 +1,6 @@
 #!/usr/bin/env node
 // Downloads the matching release binary from GitHub Releases.
-const { execSync } = require("child_process");
+const { spawnSync } = require("child_process");
 const fs = require("fs");
 const path = require("path");
 
@@ -23,8 +23,9 @@ if (!target) {
 
 const ext = process.platform === "win32" ? ".exe" : "";
 const expected = [`damond${ext}`, `damon${ext}`, `damon-telegram${ext}`, `damon-discord${ext}`, `damon-slack${ext}`, `damon-relay${ext}`];
-
-const url = `https://github.com/${REPO}/releases/download/v${VERSION}/damon-${target}.tar.gz`;
+const asset = `damon-${target}.tar.gz`;
+const url = `https://github.com/${REPO}/releases/download/v${VERSION}/${asset}`;
+const sumsUrl = `https://github.com/${REPO}/releases/download/v${VERSION}/SHA256SUMS`;
 const sumUrl = `${url}.sha256`;
 const bin = path.join(__dirname, "bin");
 fs.mkdirSync(bin, { recursive: true });
@@ -36,21 +37,27 @@ function fail(msg) {
 }
 
 function hasCurl() {
-  const probe = process.platform === "win32" ? "where curl" : "which curl";
-  try {
-    execSync(probe, { stdio: "ignore" });
-    return true;
-  } catch {
-    return false;
-  }
+  // Literal argv — spawnSync with an array never touches a shell.
+  const r = process.platform === "win32"
+    ? spawnSync("where", ["curl"], { stdio: "ignore" })
+    : spawnSync("which", ["curl"], { stdio: "ignore" });
+  return !r.error && r.status === 0;
 }
 
 async function download() {
   try {
     if (hasCurl()) {
       // --connect-timeout: dead host fails fast; --max-time: a stalled
-      // transfer must not hang the postinstall forever.
-      execSync(`curl -fsSL --connect-timeout 15 --max-time 300 "${url}" -o "${tarball}"`, { stdio: "inherit" });
+      // transfer must not hang the postinstall forever. Literal argv —
+      // spawnSync with an array never touches a shell.
+      const r = spawnSync(
+        "curl",
+        ["-fsSL", "--connect-timeout", "15", "--max-time", "300", url, "-o", tarball],
+        { stdio: "inherit" },
+      );
+      if (r.error || r.status !== 0) {
+        throw new Error(r.error ? r.error.message : `curl exited ${r.status}`);
+      }
       return;
     }
     // No curl: fall back to Node's built-in fetch (Node >= 18).
@@ -93,14 +100,26 @@ async function main() {
   if (!fs.existsSync(tarball) || fs.statSync(tarball).size === 0) {
     fail(`downloaded tarball is empty: ${url}`);
   }
-
   // Verify the release checksum before extraction — a tampered or
-  // truncated artifact must never reach the install.
+  // truncated artifact must never reach the install. Prefer the
+  // release-wide SHA256SUMS manifest (one file, covered by the
+  // minisign signature published alongside it — see
+  // scripts/verify-release.sh); older releases only have the
+  // per-target sidecar.
   let expectedSha;
   try {
-    expectedSha = (await fetchText(sumUrl)).trim().split(/\s+/)[0];
-  } catch (err) {
-    fail(`could not fetch checksum ${sumUrl}: ${err.message}`);
+    const manifest = await fetchText(sumsUrl);
+    const line = manifest
+      .split("\n")
+      .find((l) => l.trim().endsWith(asset));
+    if (!line) fail(`SHA256SUMS has no entry for ${asset}`);
+    expectedSha = line.trim().split(/\s+/)[0];
+  } catch {
+    try {
+      expectedSha = (await fetchText(sumUrl)).trim().split(/\s+/)[0];
+    } catch (err) {
+      fail(`could not fetch checksum ${sumUrl}: ${err.message}`);
+    }
   }
   const actualSha = require("crypto")
     .createHash("sha256")
@@ -111,9 +130,10 @@ async function main() {
     fail(`checksum mismatch for ${path.basename(tarball)}: expected ${expectedSha}, got ${actualSha}`);
   }
 
-  try {
-    execSync(`tar xzf "${tarball}" -C "${bin}"`, { stdio: "inherit" });
-  } catch {
+  // Literal argv — tar never sees a shell, so a tampered tarball name
+  // cannot smuggle flags or commands.
+  const x = spawnSync("tar", ["xzf", tarball, "-C", bin], { stdio: "inherit" });
+  if (x.error || x.status !== 0) {
     fail(`could not extract ${tarball} — corrupt download? (url: ${url})`);
   }
   fs.unlinkSync(tarball);
@@ -126,16 +146,27 @@ async function main() {
   // tarball — on Windows the extensionless targets (bin/damond) never
   // exist, so npm skips shim creation and no command lands on PATH.
   // Write extensionless launchers next to the .exe so the shims resolve.
+  // The names come from the static `expected` list; every write target
+  // is resolved against the bin/ root and boundary-checked before the
+  // write, so nothing can escape the directory even if that list were
+  // ever edited wrong.
   if (process.platform === "win32") {
+    const root = path.resolve(bin);
     for (const f of expected) {
       const base = f.replace(/\.exe$/, "");
-      const launcher = path.join(bin, base);
+      const launcher = path.resolve(root, base);
+      if (!launcher.startsWith(root + path.sep)) {
+        fail(`unexpected binary name in the manifest: ${f}`);
+      }
       if (!fs.existsSync(launcher)) {
         fs.writeFileSync(launcher, `#!/bin/sh\nexec "$(dirname "$0")/${f}" "$@"\n`);
       }
       // cmd.exe can't run the sh launcher — write a .cmd one-liner that
       // calls the real exe relative to the script's own directory.
-      const cmd = path.join(bin, `${base}.cmd`);
+      const cmd = path.resolve(root, `${base}.cmd`);
+      if (!cmd.startsWith(root + path.sep)) {
+        fail(`unexpected binary name in the manifest: ${f}`);
+      }
       if (!fs.existsSync(cmd)) {
         fs.writeFileSync(cmd, `@"%~dp0${f}" %*\r\n`);
       }

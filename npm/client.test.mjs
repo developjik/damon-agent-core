@@ -171,12 +171,17 @@ function makeDaemon(token, log) {
         log.frames.push("pub");
         st.clientPub = __test.unb64(m.e2e_pub);
         log.clientPubs.push(Buffer.from(st.clientPub).toString("base64"));
-        reply({ e2e_pub: __test.b64(dPub) }); // bare pub — no proof yet
+        // Mirror relay.rs daemon_handshake: echo the stretched-proof KDF
+        // only when the client offered it.
+        st.stretch = m.kdf === "s256";
+        const hello = { e2e_pub: __test.b64(dPub) }; // bare pub — no proof yet
+        if (st.stretch) hello.kdf = "s256";
+        reply(hello);
         return;
       }
       if (m && typeof m.e2e_proof === "string") {
         log.frames.push("proof");
-        const expected = await __test.proof(token, st.clientPub, dPub);
+        const expected = await __test.proof(token, st.clientPub, dPub, st.stretch);
         if (!__test.constantTimeEq(m.e2e_proof, expected)) {
           log.proofRejected = true;
           reply({ e2e_error: "auth" });
@@ -188,7 +193,7 @@ function makeDaemon(token, log) {
         st.sendKey = await __test.importAesKey(await __test.deriveKeys(shared, "d2c"), ["encrypt"]);
         st.recvKey = await __test.importAesKey(await __test.deriveKeys(shared, "c2d"), ["decrypt"]);
         log.handshakes += 1;
-        reply({ e2e_proof: await __test.proof(token, dPub, st.clientPub) });
+        reply({ e2e_proof: await __test.proof(token, dPub, st.clientPub, st.stretch) });
         // Daemon pushes its hello + one session.event right after the
         // handshake, before any request — exercises the decrypt
         // pipeline's queued handover.
@@ -290,8 +295,10 @@ test("connectRelay: E2E handshake + encrypted RPC over a mock relay", async () =
   for (const f of sockets[0].sent) {
     assert.deepEqual(Object.keys(JSON.parse(f)), ["data"]); // the relay envelope only
   }
-  // Handshake frames: bare JSON with the exact field names relay.rs uses.
-  assert.deepEqual(Object.keys(JSON.parse(inner[0])), ["e2e_pub"]);
+  // Handshake frames: bare JSON with the exact field names relay.rs uses —
+  // the pub frame now carries the opt-in kdf marker, echoed by the daemon.
+  assert.deepEqual(Object.keys(JSON.parse(inner[0])), ["e2e_pub", "kdf"]);
+  assert.equal(JSON.parse(inner[0]).kdf, "s256");
   assert.deepEqual(Object.keys(JSON.parse(inner[1])), ["e2e_proof"]);
   // Everything after: sealed frames, never plaintext.
   for (const d of inner.slice(2)) {
@@ -396,6 +403,115 @@ test("DamonClient.connect: direct-WS path still round-trips plaintext and reconn
   await c.waitFor((e) => e?.type === "reconnected");
   assert.deepEqual(await client.hello(), { pong: true });
 
+  client.close();
+  await c.done;
+});
+
+test("events(): replay-flagged session.event surfaces replay:true, live stays false", async () => {
+  // A reconnecting consumer must be able to tell catch-up history
+  // from live frames — the Rust and Python clients already surface
+  // the daemon's `replay` mark; this pins the npm side to the same
+  // contract.
+  const sockets = [];
+  const Ws = mockRelayClass(sockets);
+  const attach = (ws) => {
+    ws.onsend = (s) => {
+      const m = JSON.parse(s);
+      ws.serverSend(JSON.stringify({ id: m.id, result: { pong: true } }));
+    };
+    for (const f of ws.sent.splice(0)) ws.onsend(f);
+  };
+
+  const p = DamonClient.connect("ws://127.0.0.1:9/ws", { webSocket: Ws });
+  attach(sockets[0]);
+  const client = await p;
+  const c = collect(client);
+
+  sockets[0].serverSend(JSON.stringify({
+    event: "session.event", sessionId: "s1", replay: true,
+    data: { type: "timeline", kind: "assistant_message", text: "old" },
+  }));
+  sockets[0].serverSend(JSON.stringify({
+    event: "session.event", sessionId: "s1",
+    data: { type: "timeline", kind: "assistant_message", text: "new" },
+  }));
+
+  const replayed = await c.waitFor((e) => e?.type === "event" && e.event.text === "old");
+  const live = await c.waitFor((e) => e?.type === "event" && e.event.text === "new");
+  assert.equal(replayed.replay, true, "catch-up frame must carry replay:true");
+  assert.equal(live.replay, false, "live frame must not be marked");
+
+  client.close();
+  await c.done;
+});
+
+test("reconnect auto-resumes touched sessions (autoResume)", async () => {
+  // After a redial the client re-issues session.resume for every
+  // session it touched — subscriptions (and replay) survive daemon
+  // restarts without the caller doing anything.
+  const sockets = [];
+  const Ws = mockRelayClass(sockets);
+  const replies = []; // per-socket record of received frames
+  const attach = (ws) => {
+    ws.onsend = (s) => {
+      const m = JSON.parse(s);
+      if (!replies[sockets.indexOf(ws)]) replies[sockets.indexOf(ws)] = [];
+      replies[sockets.indexOf(ws)].push(m);
+      ws.serverSend(JSON.stringify({ id: m.id, result: { sessionId: m.params?.sessionId ?? "x", pong: true } }));
+    };
+    for (const f of ws.sent.splice(0)) ws.onsend(f);
+  };
+
+  const client = await DamonClient.connect("ws://127.0.0.1:9/ws", { webSocket: Ws });
+  attach(sockets[0]);
+  // Touch a session (the mock's pong reply is fine — tracking is the point).
+  await client.prompt("sid-js", "hi");
+  await client.resumeSession("sid-js");
+
+  const c = collect(client);
+  sockets[0].close();
+  await c.waitFor((e) => e?.type === "disconnected");
+  await until(() => sockets.length === 2, "redial");
+  attach(sockets[1]);
+  await c.waitFor((e) => e?.type === "reconnected");
+
+  // The resume for the touched session hit the NEW socket.
+  await until(
+    () => (replies[1] ?? []).some((m) => m.method === "session.resume" && m.params?.sessionId === "sid-js"),
+    "auto-resume on the new link",
+  );
+  client.close();
+  await c.done;
+});
+
+test("autoResume: false opts out of resubscription", async () => {
+  const sockets = [];
+  const Ws = mockRelayClass(sockets);
+  const seen = [];
+  const attach = (ws) => {
+    ws.onsend = (s) => {
+      const m = JSON.parse(s);
+      seen.push(m);
+      ws.serverSend(JSON.stringify({ id: m.id, result: { pong: true } }));
+    };
+    for (const f of ws.sent.splice(0)) ws.onsend(f);
+  };
+
+  const client = await DamonClient.connect("ws://127.0.0.1:9/ws", { webSocket: Ws, autoResume: false });
+  attach(sockets[0]);
+  await client.prompt("sid-off", "hi");
+
+  const c = collect(client);
+  sockets[0].close();
+  await c.waitFor((e) => e?.type === "disconnected");
+  await until(() => sockets.length === 2, "redial");
+  attach(sockets[1]);
+  await c.waitFor((e) => e?.type === "reconnected");
+  await new Promise((r) => setTimeout(r, 200));
+  assert(
+    !seen.some((m) => m.method === "session.resume"),
+    `autoResume=false must not resume; saw: ${seen.map((m) => m.method).join(",")}`,
+  );
   client.close();
   await c.done;
 });

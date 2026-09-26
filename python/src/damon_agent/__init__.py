@@ -3,4 +3,4 @@
 from .client import DamonClient, RpcError
 
 __all__ = ["DamonClient", "RpcError"]
-__version__ = "0.4.0"
+__version__ = "0.5.0"

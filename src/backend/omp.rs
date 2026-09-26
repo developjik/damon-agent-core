@@ -21,6 +21,7 @@
 use std::collections::HashMap;
 use std::path::Path;
 use std::sync::Arc;
+use std::sync::Weak;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
 
@@ -52,7 +53,7 @@ impl OmpClient {
                 session_persistence: true,
                 session_listing: false,
                 dynamic_modes: false,
-                mcp_servers: true,
+                mcp_servers: false,
                 reasoning_stream: true,
                 steer: true,
                 rewind: false,
@@ -188,7 +189,7 @@ impl OmpSession {
                 session_persistence: true,
                 session_listing: false,
                 dynamic_modes: false,
-                mcp_servers: true,
+                mcp_servers: false,
                 reasoning_stream: true,
                 steer: true,
                 rewind: false,
@@ -203,20 +204,43 @@ impl OmpSession {
             chunks: Mutex::new(HashMap::new()),
         });
 
-        // Frame dispatch task.
+        // Frame dispatch task: routes command responses/events, and
+        // fails the in-flight turn when the process dies (prompt is
+        // acked immediately, so agent_end would never arrive).
         {
-            let me = session.clone();
+            let me: Weak<OmpSession> = Arc::downgrade(&session);
             let mut rx = transport.subscribe();
+            let mut exited = transport.exited();
             tokio::spawn(async move {
                 loop {
-                    match rx.recv().await {
-                        Ok(frame) => me.on_frame(frame).await,
-                        Err(broadcast::error::RecvError::Lagged(_)) => continue,
-                        Err(broadcast::error::RecvError::Closed) => break,
+                    tokio::select! {
+                        r = rx.recv() => match r {
+                            Ok(frame) => {
+                                let Some(s) = me.upgrade() else { break };
+                                s.on_frame(frame).await;
+                            }
+                            Err(broadcast::error::RecvError::Lagged(_)) => continue,
+                            Err(broadcast::error::RecvError::Closed) => break,
+                        },
+                        _ = exited.changed() => {
+                            if *exited.borrow() { break; }
+                        }
                     }
-                    if !me.transport.is_alive() {
-                        break;
-                    }
+                }
+                // The backend died mid-turn — agent_end never comes.
+                if let Some(s) = me.upgrade()
+                    && let Some(turn) = s.current_turn.lock().await.take()
+                {
+                    s.emit(StreamEvent {
+                        turn_id: Some(turn),
+                        kind: StreamEventKind::TurnFailed {
+                            error: "backend process exited without completing the turn".to_string(),
+                            code: None,
+                        },
+                    });
+                    s.emit(StreamEvent::new(StreamEventKind::AttentionRequired {
+                        reason: AttentionReason::Finished,
+                    }));
                 }
             });
         }
@@ -224,12 +248,20 @@ impl OmpSession {
         // Handshake: wait for ready, then negotiate v2.
         let ready = async {
             let mut rx = transport.subscribe();
+            let mut exited = transport.exited();
             loop {
-                match rx.recv().await {
-                    Ok(f) if f["type"] == "ready" => return Ok(f),
-                    Ok(_) => continue,
-                    Err(broadcast::error::RecvError::Lagged(_)) => continue,
-                    Err(broadcast::error::RecvError::Closed) => bail!("omp exited before ready"),
+                tokio::select! {
+                    r = rx.recv() => match r {
+                        Ok(f) if f["type"] == "ready" => return Ok(f),
+                        Ok(_) => continue,
+                        Err(broadcast::error::RecvError::Lagged(_)) => continue,
+                        Err(broadcast::error::RecvError::Closed) => bail!("omp exited before ready"),
+                    },
+                    _ = exited.changed() => {
+                        if *exited.borrow() {
+                            bail!("omp exited before ready");
+                        }
+                    }
                 }
             }
         };
@@ -396,7 +428,16 @@ impl OmpSession {
                     kind: StreamEventKind::Subagent { event: f.clone() },
                 });
             }
-            "auto_compaction_start" | "auto_compaction_end" => {}
+            // Context auto-compaction boundaries — the same normalized
+            // item codex emits, so every surface renders one shape.
+            // The frames carry no summary payload worth trusting (the
+            // shape is UNVERIFIED against a real omp), so the boundary
+            // itself is the message.
+            "auto_compaction_start" | "auto_compaction_end" => {
+                if let Some(item) = compaction_item(ty) {
+                    self.emit_timeline(item).await;
+                }
+            }
             _ => {}
         }
     }
@@ -541,6 +582,21 @@ impl OmpSession {
             turn_id: turn,
             kind: StreamEventKind::Timeline(item),
         });
+    }
+}
+
+/// auto_compaction frame → the Compaction timeline item it maps to
+/// (None for anything else). Pure so the mapping itself stays pinned
+/// by a unit test — `on_frame` just routes it.
+fn compaction_item(ty: &str) -> Option<TimelineItem> {
+    match ty {
+        "auto_compaction_start" => Some(TimelineItem::Compaction {
+            summary: "auto compaction started".to_string(),
+        }),
+        "auto_compaction_end" => Some(TimelineItem::Compaction {
+            summary: "auto compaction completed".to_string(),
+        }),
+        _ => None,
     }
 }
 
@@ -724,5 +780,23 @@ mod tests {
         // Unknown/default modes defer to omp's own tools.approvalMode.
         assert!(mode_args(None).is_empty());
         assert!(mode_args(Some("plan")).is_empty());
+    }
+
+    #[test]
+    fn compaction_frames_map_to_timeline_items() {
+        match compaction_item("auto_compaction_start") {
+            Some(TimelineItem::Compaction { summary }) => {
+                assert_eq!(summary, "auto compaction started")
+            }
+            _ => panic!("start must map to a Compaction item"),
+        }
+        match compaction_item("auto_compaction_end") {
+            Some(TimelineItem::Compaction { summary }) => {
+                assert_eq!(summary, "auto compaction completed")
+            }
+            _ => panic!("end must map to a Compaction item"),
+        }
+        assert!(compaction_item("message_update").is_none());
+        assert!(compaction_item("").is_none());
     }
 }

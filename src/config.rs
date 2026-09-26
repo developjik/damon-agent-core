@@ -41,6 +41,20 @@ pub struct Config {
     /// prompt. 0 disables the idle sweep. Default 1800.
     #[serde(default = "default_agent_idle_secs")]
     pub agent_idle_secs: u64,
+    /// Cap on live in-memory backend sessions; unset = unlimited.
+    /// `session.create`/`resume` past the cap fail until sessions are
+    /// closed, deleted, or reaped by the idle sweep. Hot-reloaded.
+    pub max_sessions: Option<usize>,
+    /// Directory allowlist for session working directories. Empty
+    /// (default) = unrestricted — the zero-config promise. When set,
+    /// `session.create`, both `session.resume` paths, and
+    /// `session.import` reject cwds outside these roots
+    /// (component-wise prefix after best-effort canonicalization, so
+    /// `/a/bc` cannot sneak under `/a/b`). Meant for remote/TLS
+    /// deployments, where the shared token would otherwise let an
+    /// agent process run anywhere on the machine. Hot-reloaded.
+    #[serde(default)]
+    pub allowed_dirs: Vec<PathBuf>,
 }
 
 /// `[agents.<id>]` — explicit launch line for one agent. Every field
@@ -321,8 +335,10 @@ const STARTER_CONFIG: &str = r#"# Damon agent core configuration.
 
 # Top-level keys must precede every [table] — TOML would otherwise
 # attach them to the last table above.
-# bind = "127.0.0.1:9470"          # default; changing requires restart
-# auth_token = "env:DAMON_TOKEN"   # required for non-loopback binds
+# bind = "127.0.0.1:9470"            # default; changing requires restart
+# auth_token — a literal token or an env ref like "env:DAMON_TOKEN";
+#   required for non-loopback binds
+# max_sessions = 16               # cap on live backend sessions; unset = unlimited
 # default_backend = "claude"       # when session.create omits `backend`
 # permission_timeout_secs = 300    # deny agent permission asks after this
 # session_retention_days = 30      # delete sessions older than this

@@ -62,8 +62,8 @@ damond --print-config-path   # where config.toml lives
 ```
 
 See `config.example.toml`. Agent CLIs keep their own logins (each detected
-CLI — `claude`, `codex`, `omp` — authenticates itself) — Damon stores no
-agent tokens.
+CLI — `claude`, `codex`, `omp`, `cursor`, `amp`, `kimi`, `qwen`, `gemini` —
+authenticates itself) — Damon stores no agent tokens.
 
 
 ## Remote relay
@@ -85,3 +85,8 @@ damon --relay ws://your-relay:8080 --relay-name my-daemon --token <auth_token> c
 
 E2E: X25519 key exchange + `sha256(auth_token || pubkey)` proof →
 AES-256-GCM. The relay sees only ciphertext.
+
+**The relay also serves the web UI.** Open `http://your-relay:8080/` in any
+browser (a phone on cellular works too), enter the daemon name and
+`auth_token`, and the page connects back through the relay end-to-end
+encrypted — no VPN, no port forwarding, no hosting.

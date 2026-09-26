@@ -1,5 +1,7 @@
 # Damon integration guide
 
+**English** | [한국어](integration.ko.md)
+
 `damond` is a local agent-control daemon. Any program attaches through two surfaces:
 
 | Surface | Purpose |
@@ -22,15 +24,16 @@ Damon drives coding agents through their native CLIs as stdio subprocesses. Mode
 | `amp` | Amp (Sourcegraph) | `amp --execute --stream-json --stream-json-input` | `amp` CLI login |
 | `kimi` | Kimi Code (Moonshot) | `kimi -p --output-format stream-json` | `kimi login` |
 | `qwen` | Qwen Code (Alibaba) | `qwen -p --output-format stream-json` | `qwen` CLI login |
+| `gemini` | Gemini CLI (Google) | `gemini --output-format stream-json --skip-trust` | `gemini` CLI login or `GEMINI_API_KEY` |
 
 Detection: the binary on PATH registers the backend automatically.
 
 Session shapes differ per backend: `claude` and `amp` keep one process per
 session (bidirectional stream-json — permission relay, steering, interrupts
-work). `cursor`, `kimi`, and `qwen` are one-shot per turn — each prompt
-respawns the CLI with a resume flag (`--resume`/`--session`), so mid-turn
-steering and permission relay are unavailable; headless runs use the CLI's
-own auto-approval policy.
+work). `cursor`, `kimi`, `qwen`, and `gemini` are one-shot per turn — each
+prompt respawns the CLI with a resume flag (`--resume`/`--session`), so
+mid-turn steering and permission relay are unavailable; headless runs use
+the CLI's own auto-approval policy.
 
 Overrides — replace a launch line or point at a local build:
 
@@ -72,12 +75,13 @@ Client → daemon requests:
 - `session.fork {sessionId, upto?}` → `{sessionId}`
 - `session.usage {sessionId?}` → `{contextUsed, contextSize, costUsd, turns}` or a per-session rollup
 - `session.search {query, limit?}` → `{results: [...]}` — FTS5 over message text and tool I/O
-- `turn.start {sessionId, prompt, timeoutSecs?}` → `{turnId, stopReason, usage?}` — resolves when the turn ends; events stream first
+- `turn.start {sessionId, prompt, timeoutSecs?, detach?}` → `{turnId, stopReason, usage?}` — resolves when the turn ends; events stream first. With `detach: true` the response returns immediately (`{turnId, detached: true}`) and the turn outlives the connection — disconnecting never cancels it (`turn.cancel` and `timeoutSecs` still apply); a reconnecting client picks the outcome up through replay
 - `turn.steer {sessionId, prompt, expectedTurn?}` → `{result}` — mid-turn steering where supported
 - `turn.cancel {sessionId}` → `{cancelled: true}`
 - `permission.respond {sessionId, requestId, response}` → `{}` — answer a permission ask
 - `session.set_model {sessionId, model}` / `session.set_mode {sessionId, mode}` → `{}`
 - `catalog.models {backend}` → `{models, modes, commands}`
+- `session.watch {sessionId}` / `session.unwatch {sessionId}` → subscribe this connection to a live session's events without touching it — the cross-surface notification path (a chat bridge pings its channel when a web-UI session finishes or asks for permission)
 
 Daemon → client pushes:
 
@@ -194,10 +198,13 @@ still its own.
 
 - Recommended: Tailscale — WireGuard E2E, attach at `ws://<tailscale-ip>:9470/ws` with no daemon changes
 - Direct: `tls_cert` + `tls_key` serve `wss`. Non-loopback binds refuse to start without `auth_token`.
+- Relay: run `damon-relay` on a public host and add `[relay]` — the daemon dials out, so no inbound port; X25519 + AES-256-GCM end-to-end encrypted, the relay sees only ciphertext. **The relay also serves the bundled web UI at its root** — open the relay host in any browser, enter daemon name + token, and the page connects back through the relay end-to-end encrypted (no VPN, no port forwarding; the browser runs its own crypto, so plain `ws://` hosting works).
 
 ## Channel adapters
 
 Three channels attach the same way — per-chat session mapping, streamed replies, permissions approved by replying "allow"/"deny".
+
+Cross-surface pickup: `!sessions` lists recent sessions from every surface, `!resume <id|title>` continues one in the chat (auto-watched), and `!watch`/`!unwatch <id|title>` follow a session so completions and permission asks ping the chat — answerable with the same `allow`/`deny` replies — even when the turn runs on the web UI or CLI.
 
 | Adapter | Run | Receive | Notes |
 |---|---|---|---|

@@ -112,6 +112,13 @@
   #search:focus { outline: none; border-color: var(--accent); box-shadow: 0 0 0 3px var(--accent-dim); }
   #search::-webkit-search-cancel-button { -webkit-appearance: none; }
   #sessions { flex: 1; min-height: 0; overflow-y: auto; padding: 0 8px 12px; }
+  #moreBtn {
+    display: block; width: calc(100% - 16px); margin: 8px 8px 0; padding: 7px;
+    border: 1px dashed var(--border2); border-radius: 9px; background: none;
+    color: var(--muted); font-size: 11.5px; cursor: pointer;
+  }
+  #moreBtn:hover { color: var(--fg); border-color: var(--accent); }
+  #moreBtn:disabled { opacity: .5; cursor: default; }
   .sessGroup {
     font-size: 10px; text-transform: uppercase; letter-spacing: .09em;
     color: var(--faint); font-weight: 700; padding: 12px 8px 5px;
@@ -278,6 +285,9 @@
   .msg .msgcopy.did { color: var(--ok); border-color: var(--ok); opacity: 1; }
   .msg.user .msgcopy { color: #dbe7ff; background: rgba(0,0,0,.28); border-color: rgba(255,255,255,.28); }
   .sess .meta mark { background: var(--accent-dim); color: var(--accent); border-radius: 3px; padding: 0 1px; }
+  /* Search deeplink: flash the row we jumped to */
+  .msg.flash, .thought.flash, .toolcard.flash { animation: flashHi 1.9s ease-out; }
+  @keyframes flashHi { 0%, 55% { box-shadow: 0 0 0 2px var(--accent), 0 8px 32px rgba(0,0,0,.45); } }
 
   /* ---- tool call cards ---- */
   .toolcard {
@@ -490,6 +500,31 @@
   .qchip .qt { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
   .qchip .qx { border: 0; background: none; color: inherit; cursor: pointer; font-size: 13px; padding: 0 3px; }
   .qchip .qx:hover { color: var(--err); }
+  /* ---- steer bar ---- */
+  #steerBar {
+    display: none; align-items: center; gap: 7px; padding: 0 26px 8px;
+  }
+  #steerBar.show { display: flex; }
+  #steerInput {
+    flex: 1; min-width: 0; background: var(--panel); color: var(--fg);
+    border: 1px solid color-mix(in srgb, var(--accent) 30%, transparent);
+    border-radius: 9px; padding: 6px 10px; font: inherit; font-size: 12px;
+  }
+  #steerInput:focus { outline: none; border-color: var(--accent); box-shadow: 0 0 0 3px var(--accent-dim); }
+  #steerBtn {
+    flex: none; border: 0; border-radius: 9px; padding: 7px 13px; cursor: pointer;
+    font-size: 12px; font-weight: 700; color: var(--on-user);
+    background: linear-gradient(180deg, var(--user2), var(--user));
+    box-shadow: 0 2px 10px color-mix(in srgb, var(--user) 40%, transparent);
+  }
+  #steerBtn:hover { filter: brightness(1.14); }
+  #steerBtn:disabled { opacity: .45; cursor: default; box-shadow: none; }
+  #steerNote {
+    flex: none; font-size: 11px; color: var(--faint); max-width: 45%;
+    overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
+  }
+  #steerNote.ok { color: var(--ok); }
+  #steerNote.err { color: var(--warn); }
   #attachBar { display: flex; gap: 8px; padding: 0 26px 7px; flex-wrap: wrap; }
   #attachBar:empty { display: none; }
   #attachBar .thumb { position: relative; }
@@ -562,12 +597,16 @@
   }
   #authCard h2 { font-size: 15.5px; margin-bottom: 6px; }
   #authCard p { color: var(--muted); font-size: 12px; margin-bottom: 15px; line-height: 1.5; }
-  #token {
+  #token, #relayUrl, #relayName, #connMode {
     width: 100%; background: var(--bg); color: var(--fg);
     border: 1px solid var(--border); border-radius: 9px; padding: 10px 11px;
     font: 13px var(--mono); margin-bottom: 10px;
   }
-  #token:focus { outline: none; border-color: var(--accent); box-shadow: 0 0 0 3px var(--accent-dim); }
+  #token:focus, #relayUrl:focus, #relayName:focus { outline: none; border-color: var(--accent); box-shadow: 0 0 0 3px var(--accent-dim); }
+  #authModes { display: flex; gap: 14px; margin-bottom: 12px; }
+  #authModes label { display: flex; gap: 6px; align-items: center; font-size: 12.5px; color: var(--muted); cursor: pointer; }
+  #authModes input { accent-color: var(--accent); }
+  #relayHint { color: var(--muted); font-size: 11.5px; line-height: 1.5; margin: -4px 0 10px; }
   #authErr { color: var(--err); font-size: 12px; min-height: 16px; margin-bottom: 8px; }
   #authBtn {
     width: 100%; padding: 10px; border: 0; border-radius: 10px; cursor: pointer; font-weight: 650;
@@ -594,6 +633,7 @@
     .msg, .toolmsg, .toolcard { max-width: 94%; }
     #log { padding: 15px 13px 9px; }
     #composer { padding: 10px 13px; }
+    #steerBar { padding: 0 15px 6px; }
     #attachBar { padding: 0 15px 6px; }
     #perm { margin: 0 13px 9px; }
     #jumpBtn { bottom: 104px; right: 14px; }
@@ -723,6 +763,11 @@
     </div>
     <div id="queueBar"></div>
     <div id="attachBar"></div>
+    <div id="steerBar">
+      <input id="steerInput" type="text" placeholder="steer the running turn…" title="Mid-turn course correction — delivered to the agent without ending the turn" aria-label="Steer the running turn">
+      <span id="steerNote" role="status"></span>
+      <button id="steerBtn" title="Steer (Enter)">⇨</button>
+    </div>
     <div id="composer">
       <select id="agent" title="Agent for the next session (each conversation is pinned to one agent)"></select>
       <select id="modelSel" title="Model — applies to the active session, or the next one"></select>
@@ -739,8 +784,17 @@
   <div id="auth">
     <div id="authCard" role="dialog" aria-modal="true" aria-label="Authentication">
       <div class="logo">d</div>
-      <h2>Authentication required</h2>
-      <p>This daemon has an auth token configured. Paste it to continue — it is exchanged for a one-shot WebSocket ticket and kept only in this tab's session storage.</p>
+      <h2>Connect to Damon</h2>
+      <p id="authDesc"></p>
+      <div id="authModes">
+        <label><input type="radio" name="connMode" value="local"> this daemon</label>
+        <label><input type="radio" name="connMode" value="relay"> via relay</label>
+      </div>
+      <div id="relayFields" style="display:none">
+        <input id="relayUrl" placeholder="relay url — ws(s)://host:port" autocomplete="off">
+        <input id="relayName" placeholder="daemon name" autocomplete="off">
+        <div id="relayHint">Relayed sessions are end-to-end encrypted (the relay only relays ciphertext); the token proves your identity inside the handshake and never crosses the wire in the clear.</div>
+      </div>
       <input id="token" type="password" placeholder="auth token" autocomplete="off">
       <div id="authErr"></div>
       <button id="authBtn">Connect</button>
@@ -776,6 +830,7 @@
     </div>
   </aside>
 
+<script src="relay-client.js"></script>
 <script>
 "use strict";
 // ---------- state ----------
@@ -792,6 +847,16 @@ let todoEl = null;             // live todo card for the running turn
 const toolEls = new Map();     // call_id -> toolcard element
 const subagentEls = new Map(); // subagent id -> card element
 let token = sessionStorage.getItem("damon_token") || "";
+// Connection mode: "local" dials the same origin's /ws (the daemon is
+// serving this page); "relay" dials a damon-relay host by daemon name
+// and runs the E2E handshake — how a phone reaches a daemon it is not
+// colocated with. A page served FROM the relay (or a saved file)
+// defaults to relay; the daemon's own /ui defaults to local.
+let connMode = sessionStorage.getItem("damon_conn_mode")
+  || (location.pathname === "/ui" ? "local" : "relay");
+let relayUrl = sessionStorage.getItem("damon_relay_url")
+  || (connMode === "relay" ? (location.protocol === "https:" ? "wss://" : "ws://") + location.host : "");
+let relayName = sessionStorage.getItem("damon_relay_name") || "";
 let retries = 0;               // consecutive failed direct dials
 let backoff = 1000;
 let reconnectTimer = null;
@@ -803,9 +868,12 @@ let busyTick = null, busySince = 0;
 const PLACEHOLDER = "Message — Enter to send, Shift+Enter for newline";
 const liveTurns = new Set();   // sessionIds with a turn in flight (this conn)
 const missedTurns = new Set(); // turns whose updates were dropped while viewing another session
+let steerBusy = false;         // a turn.steer request is in flight
+let steerNoteTimer = null;     // auto-clear for the steer result note
 
 const $ = id => document.getElementById(id);
 const log = $("log"), banner = $("banner"), input = $("input");
+const steerInput = $("steerInput"), steerNote = $("steerNote");
 
 // ---------- theme ----------
 // Default dark; stored choice wins; toggle flips and persists.
@@ -1017,6 +1085,10 @@ function clearAsk() { pendingAsk = null; hidePerm(); }
 function setBusy(on) {
   busy = on;
   $("cancelBtn").style.display = on ? "grid" : "none";
+  // The steer affordance exists only while a turn runs on the open
+  // session — hiding it mid-render must not eat a half-typed steer.
+  $("steerBar").classList.toggle("show", on);
+  if (!on) { steerInput.value = ""; setSteerNote("", ""); }
   // Typing stays enabled so a next message can be drafted mid-turn.
   input.placeholder = on ? "Agent is working — you can type ahead" : PLACEHOLDER;
   document.querySelectorAll(".msg.streaming").forEach(el => el.classList.remove("streaming"));
@@ -1114,19 +1186,32 @@ async function probablyAuthGated() {
 async function connect() {
   clearTimeout(reconnectTimer); reconnectTimer = null;
   setConn("pending", "connecting");
-  let ticket = "";
-  if (token) {
-    try { ticket = await fetchTicket(); }
-    catch (e) {
-      // Bad/expired token — stop retrying and ask again.
-      token = ""; sessionStorage.removeItem("damon_token");
-      showAuth(e.message);
-      scheduleReconnect();
+  // Relay mode: the token proves identity inside the E2E handshake —
+  // there is no ticket endpoint to ask and nothing to pre-validate, so
+  // a missing token goes straight back to the auth card.
+  if (connMode === "relay") {
+    if (!token || !relayUrl || !relayName) { showAuth(""); return; }
+    if (typeof DamonRelay === "undefined") {
+      setConn("off", "relay client missing");
+      setBanner("relay client failed to load");
       return;
     }
+    ws = DamonRelay.connect({ url: relayUrl, name: relayName, token });
+  } else {
+    let ticket = "";
+    if (token) {
+      try { ticket = await fetchTicket(); }
+      catch (e) {
+        // Bad/expired token — stop retrying and ask again.
+        token = ""; sessionStorage.removeItem("damon_token");
+        showAuth(e.message);
+        scheduleReconnect();
+        return;
+      }
+    }
+    try { ws = new WebSocket(wsUrl(ticket)); }
+    catch (e) { scheduleReconnect(); return; }
   }
-  try { ws = new WebSocket(wsUrl(ticket)); }
-  catch (e) { scheduleReconnect(); return; }
 
   ws.onopen = async () => {
     retries = 0; backoff = 1000;
@@ -1137,14 +1222,20 @@ async function connect() {
       setConn("on", "connected");
       await refreshAgents();
       await refreshSessions();
-      // Every turn this connection owned was cancelled server-side on
-      // disconnect — clear the tracking before any reattach.
+      // Turn tracking restarts after a drop. Detached turns were NOT
+      // cancelled server-side — the one on the active session is
+      // re-detected from live status below.
       liveTurns.clear();
       if (activeSession) {
-        // Reattach: reload history; a turn interrupted by the drop was
-        // cancelled server-side on disconnect.
+        // Reattach: reload history, then restore the running indicator
+        // if a detached turn survived the disconnect.
         setBusy(false);
         await loadMessages(activeSession);
+        try {
+          const st = await request("session.status", {});
+          if ((st.sessions || []).some(s => s.sessionId === activeSession && s.busy))
+            setBusy(true);
+        } catch { /* advisory only */ }
         sysline("reconnected");
       }
     } catch (e) {
@@ -1159,7 +1250,8 @@ async function connect() {
     else if (v.event === "session.event") onSessionEvent(v);
     else if (v.hello) daemonInfo = Object.assign(daemonInfo || {}, v.hello);
   };
-  ws.onclose = () => {
+  ws.onclose = (ev) => {
+    const closeReason = (ev && ev.reason) || "";
     ws = null;
     pendingAsk = null;
     // Fail every in-flight request — clearing the map alone would leave
@@ -1169,12 +1261,19 @@ async function connect() {
       p.reject(new Error("connection closed"));
     }
     pending.clear();
-    liveTurns.clear(); // server cancelled this connection's turns on close
+    liveTurns.clear(); // tracking resets; detached turns keep running server-side
     missedTurns.clear();
     setConn("off", "reconnecting");
     if (manualClose) { manualClose = false; return; }
+    // A relay handshake that failed authentication must not retry-loop
+    // — the token is wrong; ask for it instead.
+    if (connMode === "relay" && /auth|token/i.test(closeReason)) {
+      token = ""; sessionStorage.removeItem("damon_token");
+      showAuth(closeReason);
+      return;
+    }
     setBanner("disconnected — retrying");
-    if (!token && ++retries >= 2)
+    if (!token && ++retries >= 2 && connMode !== "relay")
       probablyAuthGated().then(gated => { if (gated) showAuth(""); });
     scheduleReconnect();
   };
@@ -1498,6 +1597,7 @@ function toolCard(u) {
     }
   }
   stickScroll();
+  return el; // stored rows anchor search deeplinks on the first card
 }
 
 // Subagent lifecycle/progress card. OMP emits raw frames
@@ -1613,7 +1713,10 @@ function onTimeline(sid, ev) {
 function onSessionEvent(v) {
   const sid = v.sessionId;
   const ev = v.data;
-  if (!ev || typeof ev !== "object") return;
+  // Replayed catch-up history (reconnect/late subscribe): the history
+  // pane is built from session.messages rows — rendering replay here
+  // would duplicate everything already shown.
+  if (v.replay === true) return;
   // Permission asks resolve out-of-band — they must reach the card even
   // while another session is on screen, and clear when resolved.
   if (ev.type === "permission_requested") {
@@ -1630,19 +1733,39 @@ function onSessionEvent(v) {
     return;
   }
   // Turns another client started still move the UI when we're watching
-  // that session; our own turns are driven by the turn.start await.
+  // that session; our own turns set busy in sendPrompt before the
+  // first event lands.
   if (ev.type === "turn_started" && !liveTurns.has(sid)) {
     if (sid === activeSession) setBusy(true);
     return;
   }
-  if ((ev.type === "turn_completed" || ev.type === "turn_failed" ||
-       ev.type === "turn_canceled") && !liveTurns.has(sid)) {
+  // Turns we sent detached finish here too — sendPrompt no longer
+  // awaits a completion response, so this branch serves both our own
+  // and foreign turns.
+  if (ev.type === "turn_completed" || ev.type === "turn_failed" ||
+       ev.type === "turn_canceled") {
+    const ours = liveTurns.delete(sid);
+    if (ours) missedTurns.delete(sid);
     if (sid === activeSession) {
+      // Final synchronous render before the streaming handles are
+      // dropped — the last rAF batch may still be pending.
+      if (streamBody) streamBody.innerHTML = mdLite(streamText);
+      if (thoughtEl) {
+        thoughtEl.querySelector(".thoughtBody").textContent = thoughtText;
+        thoughtEl.open = false; // collapse the finished reasoning
+      }
       setBusy(false);
+      streamEl = streamBody = thoughtEl = todoEl = null;
       if (ev.type === "turn_failed") sysline("turn failed: " + (ev.error || "unknown"));
       else if (ev.type === "turn_canceled") sysline("cancelled");
       loadMessages(sid); // re-render the finished turn from the store
     }
+    // Hidden-tab attention: notification or title flash ("✳ damon — done").
+    // Event names ("turn_canceled") map onto the response vocabulary
+    // ("canceled") that notifyTurnDone expects.
+    if (ours) notifyTurnDone(
+      ev.type === "turn_failed" ? undefined : ev.type.replace("turn_", ""),
+      ev.type === "turn_failed" ? (ev.error || "unknown") : undefined);
     if (ev.type !== "turn_canceled") refreshSessions();
     refreshUsage();
     flushQueue();
@@ -1803,43 +1926,131 @@ async function forkSession(s) {
     if (r.sessionId) selectSession(r.sessionId);
   } catch (e) { errBubble("fork failed: " + e.message); }
 }
-async function refreshSessions() {
+// ---------- session sidebar paging ----------
+// session.list pages oldest-first (created_at, id ASC) with no count and
+// no DESC mode, but the sidebar reads newest-first: probe the exact row
+// count, read the newest slice first, and let "Load more" walk older
+// slices. A count gone stale between refreshes can only miss rows, never
+// duplicate them, and the next refresh re-probes and repairs.
+const SESS_PAGE = 50;
+let sessTotal = 0;          // exact store count (probed)
+let sessShown = 0;          // rows currently rendered, newest-first
+let sessLastGroup = null;   // group header of the last rendered row
+let sessSeq = 0;            // refresh token: stale async renders drop
+function sessFromRow(row) {
+  // Rows are [id, created_at, agent, title] tuples or objects (which
+  // may also carry cwd/tags); downstream code wants objects.
+  return Array.isArray(row)
+    ? { sessionId: row[0], createdAt: row[1], agent: row[2], title: row[3] }
+    : row;
+}
+async function sessHasRow(offset) {
+  const r = await request("session.list", { limit: 1, offset });
+  return (r.sessions || []).length > 0;
+}
+async function sessCount(hint) {
+  // has(i) ⇔ count > i is monotone, so probes can bisect. Steady state
+  // (count unchanged) is two probes: the hint still brackets. Growth
+  // gallops up from the hint; shrink bisects from zero.
+  if (hint > 0 && (await sessHasRow(hint - 1)) && !(await sessHasRow(hint)))
+    return hint;
+  if (!(await sessHasRow(0))) return 0;
+  let lo = hint > 0 && (await sessHasRow(hint)) ? hint : 0;
+  let hi = lo + 64;
+  while (await sessHasRow(hi)) { lo = hi; hi *= 2; }
+  while (hi - lo > 1) {
+    const mid = (lo + hi) >> 1;
+    if (await sessHasRow(mid)) lo = mid; else hi = mid;
+  }
+  return hi;
+}
+function sessRowEl(s) {
+  const bits = [];
+  if (s.agent || s.model) bits.push(s.agent || s.model);
+  const rt = relTime(s.createdAt);
+  if (rt) bits.push(rt);
+  return makeSessRow({
+    label: s.title || s.sessionId.slice(0, 8),
+    labelTitle: s.sessionId + (s.createdAt ? " — " + s.createdAt : "") +
+      (s.cwd ? " — " + s.cwd : ""),
+    meta: bits.join(" · "),
+    active: s.sessionId === activeSession,
+    onClick: () => selectSession(s.sessionId),
+    onRename: () => renameSession(s),
+    onFork: () => forkSession(s),
+    onDelete: () => deleteSession(s),
+  });
+}
+// Append a newest-first slice, keeping group headers continuous —
+// "Load more" slices are strictly older than what is rendered.
+function appendSessionRows(slice) {
+  const list = $("sessions");
+  for (const s of slice) {
+    const g = sessGroup(s.createdAt);
+    if (g !== sessLastGroup) {
+      sessLastGroup = g;
+      const h = document.createElement("div");
+      h.className = "sessGroup";
+      h.textContent = g;
+      list.appendChild(h);
+    }
+    list.appendChild(sessRowEl(s));
+  }
+}
+// "Load more" lives at the end of the list; rebuilds (which wipe the
+// list) and search result views recreate or drop it as needed.
+function renderMoreBtn() {
+  let btn = document.getElementById("moreBtn");
+  if (sessShown >= sessTotal) { if (btn) btn.remove(); return; }
+  if (!btn) {
+    btn = document.createElement("button");
+    btn.id = "moreBtn";
+    btn.textContent = "Load more";
+    btn.onclick = loadMoreSessions;
+  }
+  btn.disabled = false;
+  const left = sessTotal - sessShown;
+  btn.title = left + " older session" + (left === 1 ? "" : "s");
+  $("sessions").appendChild(btn);
+}
+async function loadMoreSessions() {
+  const btn = document.getElementById("moreBtn");
+  if (!btn || btn.disabled) return;
+  btn.disabled = true;
+  const seq = sessSeq;
   try {
-    const r = await request("session.list", { limit: 500 });
-    // Rows are [id, created_at, agent, title] tuples, oldest-first; the
-    // sidebar reads newest-first and downstream code wants objects.
-    sessionsCache = (r.sessions || []).map(row =>
-      Array.isArray(row)
-        ? { sessionId: row[0], createdAt: row[1], agent: row[2], title: row[3] }
-        : row
-    ).reverse();
+    // Next-older slice; the clamped limit keeps a stale-high count from
+    // re-reading rows the newest page already shows.
+    const remaining = Math.max(0, sessTotal - sessShown);
+    const limit = Math.min(SESS_PAGE, remaining);
+    const offset = remaining - limit;
+    const r = await request("session.list", { limit, offset });
+    if (seq !== sessSeq) return; // a rebuild raced us — drop the slice
+    const slice = (r.sessions || []).map(sessFromRow).reverse();
+    sessionsCache = sessionsCache.concat(slice);
+    sessShown += slice.length;
+    appendSessionRows(slice);
+    renderMoreBtn();
+  } catch (e) {
+    errBubble("session.list failed: " + e.message);
+    btn.disabled = false; // keep the retry affordance alive
+  }
+}
+async function refreshSessions() {
+  const seq = ++sessSeq;
+  try {
+    const total = await sessCount(sessTotal);
+    const offset = Math.max(0, total - SESS_PAGE);
+    const r = await request("session.list", { limit: SESS_PAGE, offset });
+    if (seq !== sessSeq) return;
+    sessTotal = total;
+    sessionsCache = (r.sessions || []).map(sessFromRow).reverse();
+    sessShown = sessionsCache.length;
     const list = $("sessions");
     list.textContent = "";
-    let lastGroup = null;
-    for (const s of sessionsCache) {
-      const g = sessGroup(s.createdAt);
-      if (g !== lastGroup) {
-        lastGroup = g;
-        const h = document.createElement("div");
-        h.className = "sessGroup";
-        h.textContent = g;
-        list.appendChild(h);
-      }
-      const bits = [];
-      if (s.agent || s.model) bits.push(s.agent || s.model);
-      const rt = relTime(s.createdAt);
-      if (rt) bits.push(rt);
-      list.appendChild(makeSessRow({
-        label: s.title || s.sessionId.slice(0, 8),
-        labelTitle: s.sessionId + (s.createdAt ? " — " + s.createdAt : ""),
-        meta: bits.join(" · "),
-        active: s.sessionId === activeSession,
-        onClick: () => selectSession(s.sessionId),
-        onRename: () => renameSession(s),
-        onFork: () => forkSession(s),
-        onDelete: () => deleteSession(s),
-      }));
-    }
+    sessLastGroup = null;
+    appendSessionRows(sessionsCache);
+    renderMoreBtn();
     updateCrumb();
   } catch (e) {
     errBubble("session.list failed: " + e.message);
@@ -1867,8 +2078,14 @@ async function refreshUsage() {
     $("usage").textContent = bits.join(" · ");
   } catch { $("usage").textContent = ""; }
 }
-async function selectSession(sid) {
-  if (sid === activeSession) return;
+async function selectSession(sid, focusMessageId) {
+  if (sid === activeSession) {
+    // Already open — a deeplink still owes its scroll/flash; reload
+    // only when the row isn't rendered (e.g. first page was trimmed).
+    if (focusMessageId !== undefined && !focusStoredMessage(focusMessageId))
+      await loadMessages(sid, focusMessageId);
+    return;
+  }
   try {
     await request("session.resume", { sessionId: sid });
     activeSession = sid;
@@ -1876,7 +2093,7 @@ async function selectSession(sid) {
     setBusy(liveTurns.has(sid));
     if (pendingAsk && pendingAsk.sid === sid)
       showPermission(pendingAsk.sid, pendingAsk.ev);
-    await loadMessages(sid);
+    await loadMessages(sid, focusMessageId);
     updateCrumb();
     refreshSessions();
     refreshUsage();
@@ -2027,13 +2244,13 @@ async function newSession() {
 // History arrives as StoredMessage rows: {id, session_id, role, data}
 // where data holds the OpenAI-shaped payload (content, tool_calls, …) —
 // or, for v2 turns, a serialized ToolCall under role "tool".
-async function loadMessages(sid) {
+async function loadMessages(sid, focusMessageId) {
   log.textContent = "";
   toolEls.clear();
   streamEl = streamBody = thoughtEl = todoEl = null;
   try {
     // session.messages is paged (default 200) — walk pages so long
-    // transcripts load in full.
+    // transcripts load in full (a deeplink target may sit pages in).
     const msgs = [];
     for (let offset = 0; ; offset += 200) {
       const r = await request("session.messages", { sessionId: sid, limit: 200, offset });
@@ -2044,9 +2261,24 @@ async function loadMessages(sid) {
     for (const m of msgs) renderStored(m);
     stickScroll(true);
     syncEmpty();
+    if (focusMessageId !== undefined && !focusStoredMessage(focusMessageId))
+      // Rows at or before the compaction cutoff never come back from
+      // session.messages — say so instead of silently landing at the top.
+      errBubble("message not found — it may predate a context compaction");
   } catch (e) {
     errBubble("session.messages failed: " + e.message);
   }
+}
+// Scroll to and flash a stored row by message id (search deeplink).
+// Returns false when no row carries that id.
+function focusStoredMessage(mid) {
+  const el = log.querySelector('[data-message-id="' + CSS.escape(String(mid)) + '"]');
+  if (!el) return false;
+  stick = false; // the jump leaves the bottom; don't autoscroll back down
+  el.scrollIntoView({ block: "center" });
+  el.classList.add("flash");
+  setTimeout(() => el.classList.remove("flash"), 1900);
+  return true;
 }
 function msgText(m) {
   const d = m.data || m;
@@ -2058,9 +2290,11 @@ function msgText(m) {
 function renderStored(m) {
   const d = m.data || m;
   const text = msgText(m);
+  let anchor = null; // element that visually owns this row (deeplink target)
   switch (m.role) {
     case "user": {
       const ub = text.trim() ? bubble("user", esc(text), text) : bubble("user", "");
+      anchor = ub;
       // Image parts persist as OpenAI image_url data URLs — render them.
       if (Array.isArray(d.content))
         for (const p of d.content) {
@@ -2078,7 +2312,7 @@ function renderStored(m) {
       if (Array.isArray(d.tool_calls)) {
         for (const tc of d.tool_calls) {
           // Legacy OpenAI-shaped tool_calls — adapt to the v2 card.
-          toolCard({
+          const card = toolCard({
             call_id: tc.id || tc.name || "tool",
             name: tc.function && tc.function.name || tc.name || "tool",
             detail: { type: "unknown", input: (() => {
@@ -2087,9 +2321,10 @@ function renderStored(m) {
             })(), output: null },
             status: "completed",
           });
+          if (!anchor) anchor = card;
         }
       }
-      if (text.trim()) bubble("assistant", mdLite(text), text);
+      if (text.trim()) anchor = bubble("assistant", mdLite(text), text);
       break;
     }
     case "reasoning": {
@@ -2100,12 +2335,13 @@ function renderStored(m) {
       el.innerHTML = "<summary>thinking</summary><div class=\"thoughtBody\"></div>";
       el.querySelector(".thoughtBody").textContent = text;
       log.appendChild(el);
+      anchor = el;
       break;
     }
     case "tool": {
       if (d.call_id) {
         // v2 stores the ToolCall itself — render through the same card.
-        toolCard(d);
+        anchor = toolCard(d);
         break;
       }
       // Legacy stored tool results fold into their card when the id
@@ -2129,12 +2365,34 @@ function renderStored(m) {
         const t = text.length > 2000 ? text.slice(0, 2000) + "…" : text;
         d2.textContent = t;
         log.appendChild(d2);
+        anchor = d2;
       }
       break;
     }
+    case "compaction": {
+      // Persisted context-compaction boundary — same card as the live
+      // event, so history and stream render identically.
+      const el = document.createElement("details");
+      el.className = "thought";
+      el.innerHTML = "<summary>context compacted</summary><div class=\"thoughtBody\"></div>";
+      el.querySelector(".thoughtBody").textContent = text;
+      log.appendChild(el);
+      anchor = el;
+      break;
+    }
+    case "error": {
+      // Durable turn-failure marker — the reason a prompt has no answer.
+      if (!text.trim()) break;
+      anchor = errBubble("turn failed: " + text);
+      break;
+    }
     default:
-      if (text.trim()) bubble("assistant", mdLite(text), text);
+      if (text.trim()) anchor = bubble("assistant", mdLite(text), text);
   }
+  // Search deeplinks scroll to [data-message-id]; a tool-only assistant
+  // row anchors on its first card so every row has a jump target.
+  if (anchor && m.id !== undefined && m.id !== null)
+    anchor.dataset.messageId = String(m.id);
   stickScroll();
 }
 
@@ -2210,36 +2468,23 @@ async function sendPrompt(text, imgs) {
   const blocks = [{ type: "text", text }];
   for (const a of imgs)
     blocks.push({ type: "image", data: a.data, mime: a.mimeType });
-  const params = { sessionId: sid, prompt: blocks };
+  // Detached: the daemon owns the turn from here — a dropped socket
+  // (phone lock, wifi→cellular handoff) never cancels it. The response
+  // only confirms the start; completion arrives as a turn_* event and
+  // is handled in onSessionEvent, exactly like a foreign client's turn.
   try {
-    const r = await request("turn.start", params);
-    if (r && r.stopReason === "canceled") sysline("cancelled");
-    else if (r && r.stopReason && r.stopReason !== "completed")
-      sysline("stopped: " + r.stopReason);
-    // Hidden-tab attention: notification or title flash ("✳ damon — done").
-    notifyTurnDone(r && r.stopReason);
+    await request("turn.start", { sessionId: sid, prompt: blocks, detach: true });
   } catch (e) {
     errBubble(e.message);
     notifyTurnDone(null, e.message);
-  } finally {
     liveTurns.delete(sid);
     if (permSession === sid || (pendingAsk && pendingAsk.sid === sid)) clearAsk();
-    const missed = missedTurns.delete(sid);
+    missedTurns.delete(sid);
     if (sid === activeSession) {
-      // Final synchronous render before the streaming handles are dropped —
-      // the last rAF batch may still be pending.
-      if (streamBody) streamBody.innerHTML = mdLite(streamText);
-      if (thoughtEl) {
-        thoughtEl.querySelector(".thoughtBody").textContent = thoughtText;
-        thoughtEl.open = false; // collapse the finished reasoning
-      }
       setBusy(false);
       streamEl = streamBody = thoughtEl = todoEl = null;
-      // Chunks dropped while another session was on screen — re-render
-      // the completed turn from the store.
-      if (missed) loadMessages(sid);
     }
-    refreshSessions(); // pick up the auto title assigned to this turn
+    refreshSessions();
     refreshUsage();
     flushQueue();
   }
@@ -2250,20 +2495,92 @@ function cancelPrompt() {
       .catch(e => errBubble("turn.cancel failed: " + e.message));
 }
 
+// ---------- steer ----------
+// Mid-turn course correction (turn.steer). The daemon answers
+// {result: "accepted" | "unavailable"}; backends that cannot steer
+// expect the text queued as a follow-up turn, so "unavailable" pushes
+// it onto promptQueue (rendered as a chip, removable) instead of
+// dropping it. RPC errors surface through the error bubble and leave
+// the text in the input for editing.
+function setSteerNote(text, cls) {
+  steerNote.textContent = text || "";
+  steerNote.className = cls || "";
+  clearTimeout(steerNoteTimer);
+  if (text) steerNoteTimer = setTimeout(() => setSteerNote("", ""), 4500);
+}
+async function sendSteer() {
+  const text = steerInput.value.trim();
+  if (!text || !activeSession || !busy || steerBusy) return;
+  steerBusy = true;
+  $("steerBtn").disabled = true;
+  try {
+    const r = await request("turn.steer", { sessionId: activeSession, prompt: text });
+    if (r && r.result === "accepted") {
+      steerInput.value = "";
+      setSteerNote("steered ✓", "ok");
+    } else {
+      promptQueue.push({ sessionId: activeSession, text, imgs: [] });
+      renderQueueBar();
+      steerInput.value = "";
+      setSteerNote("backend can’t steer — queued for next turn", "err");
+    }
+  } catch (e) {
+    errBubble("turn.steer failed: " + e.message);
+    steerInput.focus();
+    steerInput.select();
+  } finally {
+    steerBusy = false;
+    $("steerBtn").disabled = false;
+  }
+}
+
 // ---------- auth overlay ----------
+function syncAuthCard() {
+  const relay = connMode === "relay";
+  for (const r of document.querySelectorAll('input[name="connMode"]'))
+    r.checked = r.value === connMode;
+  $("relayFields").style.display = relay ? "" : "none";
+  $("authDesc").textContent = relay
+    ? "Reach your daemon from anywhere through a damon-relay host — no port forwarding, no VPN. Enter the relay address, the daemon name registered there, and the daemon's auth token."
+    : "This page is served by the daemon itself. Paste its auth token to continue — it is exchanged for a one-shot WebSocket ticket and kept only in this tab's session storage.";
+  $("relayUrl").value = relayUrl;
+  $("relayName").value = relayName;
+}
 function showAuth(err) {
   $("authErr").textContent = err || "";
+  syncAuthCard();
   $("auth").classList.add("show");
   setConn("off", "auth required");
-  $("token").focus();
+  (connMode === "relay" && !$("relayUrl").value ? $("relayUrl") : $("token")).focus();
 }
 async function submitToken() {
   const t = $("token").value.trim();
   if (!t) { $("authErr").textContent = "token required"; return; }
+  if (connMode === "relay") {
+    const url = $("relayUrl").value.trim().replace(/\/+$/, "");
+    const name = $("relayName").value.trim();
+    if (!url || !name) { $("authErr").textContent = "relay url and daemon name required"; return; }
+    connMode = "relay";
+    relayUrl = url;
+    relayName = name;
+    sessionStorage.setItem("damon_conn_mode", connMode);
+    sessionStorage.setItem("damon_relay_url", relayUrl);
+    sessionStorage.setItem("damon_relay_name", relayName);
+    token = t;
+    sessionStorage.setItem("damon_token", token);
+    // No ticket flow here — the handshake itself validates the token;
+    // an auth failure re-opens this card from ws.onclose.
+    $("auth").classList.remove("show");
+    $("token").value = "";
+    backoff = 1000;
+    connect();
+    return;
+  }
   try {
     token = t;
     await fetchTicket(); // validate before hiding the prompt
     sessionStorage.setItem("damon_token", token);
+    sessionStorage.setItem("damon_conn_mode", "local");
     $("auth").classList.remove("show");
     $("token").value = "";
     backoff = 1000;
@@ -2283,7 +2600,9 @@ function renderDaemonInfo() {
   $("dmAgent").textContent = info.daemon || "—";
   $("dmVersion").textContent = info.version || "—";
   const served = location.protocol === "http:" || location.protocol === "https:";
-  $("dmUrl").textContent = served ? location.origin : "local file";
+  $("dmUrl").textContent = connMode === "relay"
+    ? relayName + " @ " + relayUrl + (served ? " (page: " + location.host + ")" : "")
+    : served ? location.origin : "local file";
   const dot = $("connDot");
   const conn = $("dmConn");
   if (dot.classList.contains("on")) {
@@ -2471,7 +2790,21 @@ $("newBtn").onclick = newSession;
 $("emptyNewBtn").onclick = newSession;
 $("sendBtn").onclick = () => sendPrompt();
 $("cancelBtn").onclick = cancelPrompt;
+$("steerBtn").onclick = sendSteer;
+steerInput.addEventListener("keydown", e => {
+  // Same IME guard as the composer — Enter commits a candidate first.
+  if (e.key === "Enter" && !e.shiftKey && !e.isComposing && e.keyCode !== 229) {
+    e.preventDefault();
+    sendSteer();
+  }
+});
 $("authBtn").onclick = submitToken;
+for (const r of document.querySelectorAll('input[name="connMode"]'))
+  r.onchange = () => {
+    connMode = r.value;
+    sessionStorage.setItem("damon_conn_mode", connMode);
+    syncAuthCard();
+  };
 $("agent").onchange = refreshCatalog;
 $("modelSel").onchange = () => applyPick("model");
 $("modeSel").onchange = () => applyPick("mode");
@@ -2570,8 +2903,10 @@ async function runSearch() {
     const list = $("sessions");
     list.textContent = "";
     for (const hit of (r.results || [])) {
-      // Results are [sessionId, messageId, snippet] tuples.
+      // Results are {sessionId, messageId, snippet} objects (older
+      // daemons sent [sessionId, messageId, snippet] tuples).
       const sid = Array.isArray(hit) ? hit[0] : hit.sessionId;
+      const mid = Array.isArray(hit) ? hit[1] : hit.messageId;
       const snippet = Array.isArray(hit) ? hit[2] : hit.snippet;
       const s = sessionsCache.find(x => x.sessionId === sid);
       list.appendChild(makeSessRow({
@@ -2580,7 +2915,8 @@ async function runSearch() {
         // FTS5 snippet marks matches with \x01/\x02 — escape, then highlight.
         metaHtml: esc(snippet || "").replace(/\x01/g, "<mark>").replace(/\x02/g, "</mark>"),
         active: sid === activeSession,
-        onClick: () => selectSession(sid),
+        // Deeplink: open the session and jump to the matching row.
+        onClick: () => selectSession(sid, mid),
         onDelete: () => deleteSession({ sessionId: sid }),
       }));
     }

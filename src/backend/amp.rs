@@ -19,14 +19,25 @@ use anyhow::Result;
 use async_trait::async_trait;
 use serde_json::{Value, json};
 
-use super::streamjson::{ControlOp, SessionCtx, StreamJsonDialect};
+use super::streamjson::{
+    ClaudeFrameParser, ClaudeQuirks, ControlOp, SessionCtx, StreamJsonDialect,
+};
 use super::types::*;
 
-pub struct AmpDialect;
+pub struct AmpDialect {
+    /// Shared Claude-frame translator; amp's preset keeps the vendor
+    /// tool mapping and its usage/error-text quirks.
+    parser: ClaudeFrameParser,
+}
 
 impl AmpDialect {
     pub fn dialect() -> Arc<dyn StreamJsonDialect> {
-        Arc::new(Self)
+        Arc::new(Self {
+            parser: ClaudeFrameParser::new(ClaudeQuirks {
+                tool_detail: map_tool_input,
+                ..ClaudeQuirks::amp()
+            }),
+        })
     }
 }
 
@@ -62,27 +73,22 @@ impl StreamJsonDialect for AmpDialect {
 
     async fn on_frame(&self, ctx: &Arc<dyn SessionCtx>, f: &Value) {
         let ty = f["type"].as_str().unwrap_or_default();
+        // Amp-only: system error subtypes end the turn as failed.
+        // Everything else Claude-shaped goes through the shared parser.
+        if ty == "system"
+            && matches!(
+                f["subtype"].as_str(),
+                Some("error_max_turns") | Some("error_during_execution")
+            )
+        {
+            ctx.finish_turn(StreamEventKind::TurnFailed {
+                error: f["error"].as_str().unwrap_or("amp error").to_string(),
+                code: f["subtype"].as_str().map(|s| s.to_string()),
+            })
+            .await;
+            return;
+        }
         match ty {
-            "system" => {
-                match f["subtype"].as_str().unwrap_or_default() {
-                    "init" => {
-                        let id = f["session_id"].as_str().unwrap_or_default().to_string();
-                        ctx.set_native_handle(id).await;
-                    }
-                    // system error subtypes end the turn as failed.
-                    "error_max_turns" | "error_during_execution" => {
-                        ctx.finish_turn(StreamEventKind::TurnFailed {
-                            error: f["error"].as_str().unwrap_or("amp error").to_string(),
-                            code: f["subtype"].as_str().map(|s| s.to_string()),
-                        })
-                        .await;
-                    }
-                    _ => {}
-                }
-            }
-            "assistant" => self.on_assistant(ctx, f).await,
-            "user" => self.on_user(ctx, f).await,
-            "result" => self.on_result(ctx, f).await,
             // UNVERIFIED: amp may emit Claude-shaped control_request
             // frames for permission asks; handle them the same way.
             "control_request" => self.on_control_request(ctx, f).await,
@@ -101,7 +107,7 @@ impl StreamJsonDialect for AmpDialect {
                 };
                 ctx.resolve_wire(&id, result).await;
             }
-            _ => {}
+            _ => self.parser.on_frame(ctx, f).await,
         }
     }
 
@@ -125,6 +131,14 @@ impl StreamJsonDialect for AmpDialect {
             "type": "user",
             "message": {"role": "user", "content": content}
         }))
+    }
+
+    fn steer_frame(&self, prompt: &PromptInput) -> Result<Value> {
+        // amp's stream-json input marks mid-turn messages with
+        // `steer: true` so they queue as steering, not a new prompt.
+        let mut frame = self.prompt_frame(prompt)?;
+        frame["steer"] = json!(true);
+        Ok(frame)
     }
 
     fn permission_response_frame(
@@ -181,97 +195,12 @@ impl StreamJsonDialect for AmpDialect {
             reasoning_stream: true,
             steer: true,
             rewind: false,
-            subagent_events: true,
+            subagent_events: false,
         }
     }
 }
 
 impl AmpDialect {
-    async fn on_assistant(&self, ctx: &Arc<dyn SessionCtx>, f: &Value) {
-        let Some(blocks) = f["message"]["content"].as_array() else {
-            return;
-        };
-        for block in blocks {
-            let item = match block["type"].as_str().unwrap_or_default() {
-                "text" => TimelineItem::AssistantMessage {
-                    text: block["text"].as_str().unwrap_or_default().to_string(),
-                },
-                "thinking" => TimelineItem::Reasoning {
-                    text: block["thinking"].as_str().unwrap_or_default().to_string(),
-                },
-                "tool_use" => TimelineItem::ToolCall(ToolCall {
-                    call_id: block["id"].as_str().unwrap_or_default().to_string(),
-                    name: block["name"].as_str().unwrap_or_default().to_string(),
-                    status: ToolCallStatus::Running,
-                    detail: map_tool_input(
-                        block["name"].as_str().unwrap_or_default(),
-                        &block["input"],
-                    ),
-                }),
-                _ => TimelineItem::Unknown { raw: block.clone() },
-            };
-            ctx.emit_timeline(item).await;
-        }
-    }
-
-    async fn on_user(&self, ctx: &Arc<dyn SessionCtx>, f: &Value) {
-        let Some(blocks) = f["message"]["content"].as_array() else {
-            return;
-        };
-        for block in blocks {
-            if block["type"].as_str() != Some("tool_result") {
-                continue;
-            }
-            let call_id = block["tool_use_id"]
-                .as_str()
-                .unwrap_or_default()
-                .to_string();
-            let is_error = block["is_error"].as_bool().unwrap_or(false);
-            let output = match &block["content"] {
-                Value::String(s) => s.clone(),
-                other => other.to_string(),
-            };
-            ctx.emit_timeline(TimelineItem::ToolCall(ToolCall {
-                call_id,
-                name: String::new(),
-                status: if is_error {
-                    ToolCallStatus::Failed
-                } else {
-                    ToolCallStatus::Completed
-                },
-                detail: ToolCallDetail::Unknown {
-                    input: Value::Null,
-                    output: Value::String(output),
-                },
-            }))
-            .await;
-        }
-    }
-
-    async fn on_result(&self, ctx: &Arc<dyn SessionCtx>, f: &Value) {
-        let usage = Usage {
-            input_tokens: f["usage"]["input_tokens"].as_u64(),
-            cached_input_tokens: f["usage"]["cache_read_input_tokens"].as_u64(),
-            output_tokens: f["usage"]["output_tokens"].as_u64(),
-            cost_usd: None,
-            context_window: f["usage"]["max_tokens"].as_u64(),
-            context_used: None,
-        };
-        let kind = if f["is_error"].as_bool().unwrap_or(false) {
-            StreamEventKind::TurnFailed {
-                error: f["error"]
-                    .as_str()
-                    .or_else(|| f["result"].as_str())
-                    .unwrap_or("unknown error")
-                    .to_string(),
-                code: f["subtype"].as_str().map(|s| s.to_string()),
-            }
-        } else {
-            StreamEventKind::TurnCompleted { usage: Some(usage) }
-        };
-        ctx.finish_turn(kind).await;
-    }
-
     /// UNVERIFIED: assumes Claude's can_use_tool control_request shape.
     async fn on_control_request(&self, ctx: &Arc<dyn SessionCtx>, f: &Value) {
         let request_id = f["request_id"].as_str().unwrap_or_default().to_string();
@@ -393,71 +322,10 @@ mod tests {
     use serde_json::json;
 
     #[tokio::test]
-    async fn init_captures_thread_id() {
-        let t = TestCtx::new();
-        let ctx = t.as_ctx();
-        let d = AmpDialect;
-        d.on_frame(
-            &ctx,
-            &json!({"type":"system","subtype":"init","session_id":"T-abc-123"}),
-        )
-        .await;
-        assert_eq!(t.native.lock().await.as_deref(), Some("T-abc-123"));
-    }
-
-    #[tokio::test]
-    async fn assistant_text_and_tool_use() {
-        let t = TestCtx::new();
-        let ctx = t.as_ctx();
-        let d = AmpDialect;
-        d.on_frame(
-            &ctx,
-            &json!({
-                "type":"assistant",
-                "message":{"role":"assistant","content":[
-                    {"type":"text","text":"reading file"},
-                    {"type":"tool_use","id":"tu1","name":"Read","input":{"file_path":"/x.rs"}}
-                ]}
-            }),
-        )
-        .await;
-        let events = t.events.lock().await;
-        assert_eq!(events.len(), 2);
-        assert!(matches!(
-            events[0].kind,
-            StreamEventKind::Timeline(TimelineItem::AssistantMessage { .. })
-        ));
-        assert!(matches!(
-            events[1].kind,
-            StreamEventKind::Timeline(TimelineItem::ToolCall(_))
-        ));
-    }
-
-    #[tokio::test]
-    async fn result_finishes_with_usage() {
-        let t = TestCtx::new();
-        let ctx = t.as_ctx();
-        let d = AmpDialect;
-        d.on_frame(
-            &ctx,
-            &json!({
-                "type":"result","subtype":"success","is_error":false,
-                "usage":{"input_tokens":10,"output_tokens":5}
-            }),
-        )
-        .await;
-        let events = t.events.lock().await;
-        let Some(StreamEventKind::TurnCompleted { usage }) = events.last().map(|e| &e.kind) else {
-            panic!("expected TurnCompleted");
-        };
-        assert_eq!(usage.as_ref().unwrap().input_tokens, Some(10));
-    }
-
-    #[tokio::test]
     async fn permission_ask_registers_and_replies() {
         let t = TestCtx::new();
         let ctx = t.as_ctx();
-        let d = AmpDialect;
+        let d = AmpDialect::dialect();
         d.on_frame(
             &ctx,
             &json!({
@@ -474,14 +342,39 @@ mod tests {
             &PermissionResponse::Allow {
                 action_id: None,
                 updated_input: None,
+                answer: None,
             },
         );
         assert_eq!(frame["type"], "control_response");
     }
 
     #[test]
+    fn steer_frame_is_marked() {
+        let d = AmpDialect::dialect();
+        let f = d.steer_frame(&PromptInput::Text("go left".into())).unwrap();
+        assert_eq!(f["steer"], json!(true));
+        assert_eq!(f["message"]["content"], json!("go left"));
+        // Prompt frames stay unmarked — only steering is.
+        let p = d
+            .prompt_frame(&PromptInput::Text("go left".into()))
+            .unwrap();
+        assert!(p.get("steer").is_none());
+    }
+
+    #[test]
+    fn capabilities_match_what_amp_actually_does() {
+        // No Subagent events are emitted by this dialect; rewind is
+        // unimplemented in every backend.
+        let c = AmpDialect::dialect().capabilities();
+        assert!(!c.subagent_events);
+        assert!(!c.rewind);
+        assert!(!c.mcp_servers);
+        assert!(c.steer);
+    }
+
+    #[test]
     fn launch_args_resume_uses_threads_continue() {
-        let d = AmpDialect;
+        let d = AmpDialect::dialect();
         let args = d.launch_args(&SessionConfig::default(), Some("T-9"));
         assert_eq!(&args[..3], &["threads", "continue", "T-9"]);
         assert!(args.contains(&"--stream-json-input".to_string()));

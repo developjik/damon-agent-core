@@ -10,7 +10,7 @@ use std::collections::BTreeMap;
 use std::path::PathBuf;
 use std::sync::Arc;
 
-use crate::backend::{AgentClient, amp, claude, codex, cursor, kimi, omp, qwen};
+use crate::backend::{AgentClient, amp, claude, codex, cursor, gemini, kimi, omp, qwen};
 use crate::config::AgentConfig;
 
 /// One backend entry: how to detect it and how to launch a session.
@@ -102,6 +102,18 @@ pub const BACKENDS: &[BackendSpec] = &[
         env: &[],
         auth_hint: "log in with `qwen` once; the OAuth flow follows",
     },
+    BackendSpec {
+        id: "gemini",
+        title: "Gemini CLI (Google)",
+        detect: "gemini",
+        command: "gemini",
+        // One-shot headless runs; the dialect appends --prompt <text>,
+        // --approval-mode, and resume/model flags per turn. --skip-trust
+        // keeps the folder-trust prompt from blocking a non-TTY spawn.
+        args: &["--output-format", "stream-json", "--skip-trust"],
+        env: &[],
+        auth_hint: "log in with `gemini` once or set GEMINI_API_KEY; the quota follows",
+    },
 ];
 
 /// A backend entry resolved against config overrides.
@@ -183,6 +195,10 @@ pub fn client_for(resolved: &ResolvedBackend) -> Option<Arc<dyn AgentClient>> {
             resolved.clone(),
             qwen::QwenDialect::dialect(),
         ))),
+        "gemini" => Some(Arc::new(crate::backend::streamjson::StreamJsonClient::new(
+            resolved.clone(),
+            gemini::GeminiDialect::dialect(),
+        ))),
         "codex" => Some(Arc::new(codex::CodexClient::new(resolved.clone()))),
         "omp" => Some(Arc::new(omp::OmpClient::new(resolved.clone()))),
         _ => None,
@@ -212,12 +228,14 @@ mod tests {
     use super::*;
 
     #[test]
-    fn catalog_has_seven_backends() {
-        assert_eq!(BACKENDS.len(), 7);
+    fn catalog_has_eight_backends() {
+        assert_eq!(BACKENDS.len(), 8);
         let ids: Vec<_> = BACKENDS.iter().map(|b| b.id).collect();
         assert_eq!(
             ids,
-            ["claude", "codex", "omp", "cursor", "amp", "kimi", "qwen"]
+            [
+                "claude", "codex", "omp", "cursor", "amp", "kimi", "qwen", "gemini"
+            ]
         );
     }
 

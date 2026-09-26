@@ -254,6 +254,13 @@ pub enum TimelineItem {
     Compaction {
         summary: String,
     },
+    /// A turn failed. The daemon persists one such row when a backend
+    /// reports `TurnFailed`; live consumers see the TurnFailed event
+    /// itself, and this item replays the durable marker for late
+    /// subscribers (store role `"error"`).
+    Error {
+        message: String,
+    },
     /// Mapping miss — the raw provider payload is preserved so nothing
     /// is silently dropped from the transcript.
     Unknown {
@@ -393,6 +400,11 @@ pub enum PermissionResponse {
     Allow {
         action_id: Option<String>,
         updated_input: Option<Value>,
+        /// Free-text answer accompanying the allow decision. Consumed by
+        /// backends whose wire accepts user input alongside the decision
+        /// (e.g. codex questions). `Option` so existing allow payloads that
+        /// omit it stay deserializable.
+        answer: Option<String>,
     },
     Deny {
         action_id: Option<String>,

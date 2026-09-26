@@ -1,5 +1,7 @@
 # Damon 연동 가이드
 
+**한국어** | [English](integration.md)
+
 `damond`는 로컬 에이전트 컨트롤 데몬이다. 어떤 프로그램이든 두 표면으로 붙는다:
 
 | 표면 | 용도 |
@@ -18,8 +20,15 @@ Damon은 코딩 에이전트를 각자의 네이티브 CLI로, stdio subprocess�
 | `claude` | Claude Code (Claude Pro/Max) | `claude -p --output-format stream-json --input-format stream-json --verbose` | `claude` CLI 로그인 |
 | `codex` | Codex CLI (ChatGPT Plus/Pro) | `codex app-server` | `codex` CLI 로그인 |
 | `omp` | Oh My Pi (자체 관리 프로바이더 키) | `omp --mode rpc` | OMP 자체 auth 저장소 |
+| `cursor` | Cursor Agent (Cursor 구독) | `cursor-agent -p --output-format stream-json --trust` | `cursor-agent login` 또는 `CURSOR_API_KEY` |
+| `amp` | Amp (Sourcegraph) | `amp --execute --stream-json --stream-json-input` | `amp` CLI 로그인 |
+| `kimi` | Kimi Code (Moonshot) | `kimi -p --output-format stream-json` | `kimi` CLI 로그인 |
+| `qwen` | Qwen Code (Alibaba) | `qwen -p --output-format stream-json` | `qwen` CLI 로그인 |
+| `gemini` | Gemini CLI (Google) | `gemini --output-format stream-json --skip-trust` | `gemini` CLI 로그인 또는 `GEMINI_API_KEY` |
 
 탐지: PATH에 해당 바이너리가 있으면 백엔드가 자동 등록된다.
+
+세션 형태는 백엔드마다 다르다: `claude`와 `amp`는 세션당 프로세스 하나를 유지한다(양방향 stream-json — 권한 릴레이, 스티어링, 인터럽트 동작). `cursor`, `kimi`, `qwen`, `gemini`는 턴별 원샷 — 각 프롬프트마다 resume 플래그(`--resume`/`--session`)로 CLI를 다시 띄우므로 턴 도중 스티어링과 권한 릴레이는 불가능하고, 헤드리스 실행은 CLI 자체의 자동 승인 정책을 따른다.
 
 오버라이드 — 구동 명령을 교체하거나 로컬 빌드를 가리키기:
 
@@ -61,12 +70,13 @@ MCP 서버는 `session.create`의 `mcpServers`가 **에이전트에게 전달**�
 - `session.fork {sessionId, upto?}` → `{sessionId}`
 - `session.usage {sessionId?}` → `{contextUsed, contextSize, costUsd, turns}` 또는 세션별 롤업
 - `session.search {query, limit?}` → `{results: [...]}` — 메시지 텍스트와 툴 I/O에 대한 FTS5
-- `turn.start {sessionId, prompt, timeoutSecs?}` → `{turnId, stopReason, usage?}` — 턴이 끝날 때 resolve; 이벤트는 먼저 스트리밍된다
+- `turn.start {sessionId, prompt, timeoutSecs?, detach?}` → `{turnId, stopReason, usage?}` — 턴이 끝날 때 resolve; 이벤트는 먼저 스트리밍된다. `detach: true`면 즉시 `{turnId, detached: true}`를 반환하고 턴은 연결보다 오래 산다 — 연결이 끊겨도 취소되지 않으며(`turn.cancel`과 `timeoutSecs`는 여전히 적용) 재접속한 클라이언트는 리플레이로 결과를 받는다
 - `turn.steer {sessionId, prompt, expectedTurn?}` → `{result}` — 지원되는 경우 턴 도중 스티어링
 - `turn.cancel {sessionId}` → `{cancelled: true}`
 - `permission.respond {sessionId, requestId, response}` → `{}` — 권한 요청에 응답
 - `session.set_model {sessionId, model}` / `session.set_mode {sessionId, mode}` → `{}`
 - `catalog.models {backend}` → `{models, modes, commands}`
+- `session.watch {sessionId}` / `session.unwatch {sessionId}` → 세션을 건드리지 않고(생성·재개·턴 없이) 이 연결을 라이브 세션의 이벤트에 구독 — 표면을 넘나드는 알림 경로(웹 UI 세션이 끝나거나 권한을 요청하면 채팅 브리지가 채널로 알림)
 
 데몬 → 클라이언트 push:
 
@@ -151,8 +161,8 @@ Rust 예시는 `examples/backend_probe.rs` (`cargo run --example backend_probe`)
 
 ```rust
 let client = DamonClient::connect("ws://127.0.0.1:9470/ws", None).await?;
-let session = client.create_session("claude", "/tmp").await?;
-// turn_start()를 await하면서 ClientEvent::Event push를 소비한다.
+let session = client.create_session(Some("claude"), "/tmp", None).await?;
+// ClientEvent::Event push를 소비; 턴 결과는 TurnDone으로 도착한다.
 ```
 
 ## 데스크톱 앱 (Electron/Tauri)
@@ -182,10 +192,13 @@ SIGKILL된 데몬은 파일을 남기므로, 읽는 쪽은 이를 증거가 아�
 
 - 권장: Tailscale — WireGuard 기반 E2E, 데몬 설정 변경 없이 `ws://<tailscale-ip>:9470/ws`로 attach
 - 직접: `tls_cert` + `tls_key` 설정 시 `wss`로 서빙. 비루프백 바인드는 `auth_token`이 없으면 기동을 거부한다.
+- 릴레이: 공개 호스트에 `damon-relay`를 띄우고 config에 `[relay]` 추가 — 데몬이 아웃바운드로 연결하므로 인바운드 포트 불필요. X25519 + AES-256-GCM 종단간 암호화, 릴레이는 평문을 볼 수 없다. **릴레이가 번들 웹 UI를 루트에서 서빙한다** — 브라우저로 릴레이 호스트를 열고 데몬 이름+토큰을 입력하면 같은 릴레이를 통해 E2E 접속(VPN·포트포워딩 불필요, 브라우저가 자체 암호화를 수행하므로 일반 `ws://` 호스팅도 동작).
 
 ## 채널 어댑터
 
 세 채널이 같은 패턴으로 붙는다 — 채널별 chat → 에이전트 세션 자동 매핑, 응답 스트리밍, 권한 요청은 "allow"/"deny" 답장으로 승인.
+
+표면을 넘나드는 세션 픽업: `!sessions`로 모든 화면의 최근 세션을 보고, `!resume <id|제목>`으로 채팅에서 이어한다(자동 감시). `!watch`/`!unwatch <id|제목>`는 세션을 따라가 턴 완료·권한 요청을 채팅으로 알려준다 — 턴이 웹 UI나 CLI에서 돌아도 같은 `allow`/`deny` 답장으로 승인할 수 있다.
 
 | 어댑터 | 실행 | 수신 | 비고 |
 |---|---|---|---|
