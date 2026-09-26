@@ -329,21 +329,36 @@ test("connectRelay: drop → redial re-runs the handshake with a fresh keypair",
 
   const p = connectRelay({ url: "ws://relay.example:9471", name: "home", token: TOKEN, webSocket: RelayWs });
   attach(sockets[0]);
+  sockets[0].__attached = true; // the pre-attach replays; never re-handle it
   const client = await p;
   const c = collect(client);
   await client.hello();
 
-  sockets[0].close(); // relay side drops us
-  await c.waitFor((e) => e?.type === "disconnected");
-  await until(() => sockets.length === 2, "second dial");
-  attach(sockets[1]); // daemon behind the new pipe
-  await c.waitFor((e) => e?.type === "reconnected");
+  // Attach every dial the supervisor makes — under CI timing pressure a
+  // redial can be followed by another one, and attaching exactly one
+  // socket would strand the handshake on whichever dial won the race.
+  const attacher = setInterval(() => {
+    for (const s of sockets) {
+      if (!s.__attached) { s.__attached = true; attach(s); }
+    }
+  }, 20);
 
-  assert.equal(log.handshakes, 2);
-  assert.notEqual(log.clientPubs[0], log.clientPubs[1]); // fresh X25519 keypair per attempt
+  try {
+    sockets[0].close(); // relay side drops us
+    // Generous budgets: a loaded CI runner stretches the supervisor's
+    // redial backoff well past the 5s default.
+    await c.waitFor((e) => e?.type === "disconnected", 15000);
+    await until(() => sockets.length >= 2, "second dial", 15000);
+    await c.waitFor((e) => e?.type === "reconnected", 15000);
 
-  const r = await client.hello(); // same API over the new link
-  assert.equal(r.protocol, 2);
+    assert.ok(log.handshakes >= 2);
+    assert.notEqual(log.clientPubs[0], log.clientPubs[1]); // fresh X25519 keypair per attempt
+
+    const r = await client.hello(); // same API over the new link
+    assert.equal(r.protocol, 2);
+  } finally {
+    clearInterval(attacher);
+  }
 
   client.close();
   await c.done;

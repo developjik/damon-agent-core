@@ -607,7 +607,11 @@ mod tests {
     /// executable emits verbatim frames; the turn must observe the
     /// composed launch line (registry base + dialect args + prompt) and
     /// produce the full normalized event sequence. Stands in for a live
-    /// CLI on machines without one (see UNVERIFIED above).
+    /// CLI on machines without one (see UNVERIFIED above). Unix-only:
+    /// the fake CLI is a shebang script, which Windows cannot spawn
+    /// (os error 193); the dialect/parsing tests above carry the
+    /// platform-independent coverage.
+    #[cfg(unix)]
     #[tokio::test]
     async fn one_shot_session_runs_a_fake_cli_end_to_end() {
         use crate::backend::AgentSession;
