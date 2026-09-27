@@ -11,6 +11,7 @@ pub mod relay;
 pub mod rpc;
 pub mod service;
 pub mod session;
+pub mod slash_catalog;
 pub mod slack;
 pub mod store;
 pub mod telegram;

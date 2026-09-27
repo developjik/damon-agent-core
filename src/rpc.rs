@@ -1107,6 +1107,20 @@ async fn dispatch(
             let catalog = client.fetch_catalog(None).await?;
             Ok(serde_json::to_value(catalog)?)
         }
+
+        // The composer's `/` picker catalog — command/skill files the
+        // agent CLIs expand themselves. The walk touches user-level
+        // CLI homes (daemon-chosen, never client paths), so it runs on
+        // the blocking pool like every other fs-heavy handler.
+        "catalog.commands" => {
+            let root = resolve_picker_root(state, &params).await?;
+            let commands = tokio::task::spawn_blocking(move || {
+                crate::slash_catalog::catalog(&root)
+            })
+            .await
+            .map_err(|e| anyhow::anyhow!("catalog scan join failed: {e}"))?;
+            Ok(json!({"commands": commands}))
+        }
         "logs.tail" => {
             let n = params["lines"].as_u64().unwrap_or(200).min(2000) as usize;
             Ok(json!({"lines": crate::logs::ring().recent(n)}))
@@ -1882,6 +1896,7 @@ pub fn rpc_methods() -> Vec<Value> {
         json!({"name": "session.set_model", "params": {"sessionId": "string", "model": "string"}, "result": {}}),
         json!({"name": "session.set_mode", "params": {"sessionId": "string", "mode": "string"}, "result": {}}),
         json!({"name": "catalog.models", "params": {"backend": "string"}, "result": {"models": "array", "modes": "array"}}),
+        json!({"name": "catalog.commands", "params": {"sessionId": "string? — root selector", "cwd": "string? — gated by allowed_dirs like session.create"}, "result": {"commands": "array of {name, description?, argumentHint?, source, kind} — slash commands and skills the CLIs expand; workspace entries shadow same-named global ones"}}),
         json!({"name": "logs.tail", "params": {"lines": "number? — most recent lines, default 200, max 2000"}, "result": {"lines": "string[] — the daemon's recent log lines, oldest first"}}),
         json!({"name": "logs.follow", "params": {"follow": "boolean? — default true; false stops a previous follow"}, "result": {"following": "boolean — when true, every new log line arrives as a log.line push"}}),
         json!({"name": "file.read", "params": {"sessionId": "string", "path": "string — relative to the session cwd or absolute inside it"}, "result": {"content": "string — base64", "bytes": "number", "path": "string"}}),

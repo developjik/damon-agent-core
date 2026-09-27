@@ -1697,6 +1697,87 @@ async fn prompt_history_round_trips() {
     assert_eq!(prompts.len(), 200, "trim must keep exactly 200: {r}");
 }
 
+/// catalog.commands: workspace `.claude/commands` and `.claude/skills`
+/// under the picker root — `:`-joined directory names, frontmatter
+/// descriptions, kinds. Global roots also scan, but the assertions
+/// stick to workspace entries so they hold on any dev machine.
+#[tokio::test]
+async fn catalog_commands_lists_workspace_commands_and_skills() {
+    let (_state, _store, addr) = serve(test_config(None)).await;
+    let (mut ws, _) = ws_connect(&format!("ws://{addr}/ws")).await;
+    let dir = std::env::temp_dir().join(format!("damon-slash-{}", uuid::Uuid::new_v4()));
+    let cmds = dir.join(".claude").join("commands");
+    std::fs::create_dir_all(cmds.join("aimax")).unwrap();
+    std::fs::write(
+        cmds.join("aimax").join("plan.md"),
+        "---\ndescription: Plan the work\nargument-hint: [goal]\n---\nBody",
+    )
+    .unwrap();
+    let skills = dir.join(".claude").join("skills");
+    std::fs::create_dir_all(skills.join("review")).unwrap();
+    std::fs::write(skills.join("review").join("SKILL.md"), "Body").unwrap();
+
+    rpc_send(
+        &mut ws,
+        json!({"id":1,"method":"catalog.commands",
+               "params":{"cwd":dir.to_string_lossy()}}),
+    )
+    .await;
+    let r = read_reply(&mut ws, 1).await;
+    let commands = r["result"]["commands"].as_array().unwrap().to_vec();
+    let plan = commands
+        .iter()
+        .find(|e| e["name"] == "aimax:plan")
+        .expect("aimax:plan must catalog");
+    assert_eq!(plan["source"], "workspace", "{r}");
+    assert_eq!(plan["kind"], "command", "{r}");
+    assert_eq!(plan["description"], "Plan the work", "{r}");
+    assert_eq!(plan["argumentHint"], "[goal]", "{r}");
+    let review = commands
+        .iter()
+        .find(|e| e["name"] == "review" && e["source"] == "workspace")
+        .expect("review skill must catalog");
+    assert_eq!(review["kind"], "skill", "{r}");
+}
+
+/// The composer-support root selector: a client-supplied cwd passes
+/// through the same `allowed_dirs` gate as session.create, and an
+/// unknown session id has no root to resolve.
+#[tokio::test]
+async fn picker_root_gates_client_cwds_and_unknown_sessions() {
+    let dir = std::env::temp_dir().join(format!("damon-pick-{}", uuid::Uuid::new_v4()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let mut cfg = common::mock_config(None);
+    cfg.allowed_dirs = vec![dir.clone()];
+    let (_state, _store, addr) = serve(Arc::new(parking_lot::RwLock::new(cfg))).await;
+    let (mut ws, _) = ws_connect(&format!("ws://{addr}/ws")).await;
+
+    rpc_send(
+        &mut ws,
+        json!({"id":1,"method":"catalog.commands",
+               "params":{"cwd":dir.to_string_lossy()}}),
+    )
+    .await;
+    let r = read_reply(&mut ws, 1).await;
+    assert!(r["result"]["commands"].is_array(), "{r}");
+
+    rpc_send(
+        &mut ws,
+        json!({"id":2,"method":"catalog.commands","params":{"cwd":"/damon-nowhere"}}),
+    )
+    .await;
+    let r = read_reply(&mut ws, 2).await;
+    assert_eq!(r["error"]["code"], -32602, "outside allowed_dirs: {r}");
+
+    rpc_send(
+        &mut ws,
+        json!({"id":3,"method":"prompt.recent","params":{"sessionId":"nope"}}),
+    )
+    .await;
+    let r = read_reply(&mut ws, 3).await;
+    assert_eq!(r["error"]["code"], -32602, "unknown session: {r}");
+}
+
 /// Projects: create/list/get/set_defaults lifecycle, session.create
 /// integration (root-as-cwd-default, defaults fill unset params,
 /// explicit params win), list/search/usage filters, and delete
