@@ -1171,8 +1171,8 @@ mod tests {
         assert_eq!(sanitize_dirname("한글브랜치"), "worktree");
         assert_eq!(sanitize_dirname("--"), "worktree");
         assert_eq!(
-            default_worktree_path(Path::new("/a/b/repo"), "pr 9").to_string_lossy(),
-            "/a/b/repo-worktrees/pr-9"
+            default_worktree_path(Path::new("/a/b/repo"), "pr 9"),
+            Path::new("/a/b").join("repo-worktrees").join("pr-9")
         );
     }
 

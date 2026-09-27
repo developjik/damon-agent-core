@@ -54,7 +54,7 @@ pub fn sanitize_relative_path(s: &str) -> Option<String> {
     if s.len() >= 2 && s.as_bytes()[1] == b':' && s.as_bytes()[0].is_ascii_alphabetic() {
         return None;
     }
-    let mut out = PathBuf::new();
+    let mut out = String::new();
     for seg in s.split('/') {
         if seg.is_empty() {
             continue;
@@ -65,9 +65,12 @@ pub fn sanitize_relative_path(s: &str) -> Option<String> {
             return None;
         }
         let seg = sanitize_path_segment(seg)?;
-        out.push(seg);
+        if !out.is_empty() {
+            out.push('/');
+        }
+        out.push_str(&seg);
     }
-    out.to_str().map(String::from)
+    Some(out)
 }
 
 /// A local skill directory (for `local:` imports): a relative path
@@ -259,6 +262,27 @@ pub fn write_json_private<T: serde::Serialize>(path: &Path, value: &T) -> io::Re
 mod tests {
     use super::*;
 
+    /// Create a directory symlink, cross-platform. Windows needs the
+    /// directory flavor (and SeCreateSymbolicLinkPrivilege — absent
+    /// for unprivileged local runs), so callers skip only their
+    /// link-dependent assertions when this returns false; CI runners
+    /// on both platforms create links for real.
+    fn dir_symlink(target: &Path, link: &Path) -> bool {
+        #[cfg(unix)]
+        {
+            std::os::unix::fs::symlink(target, link).is_ok()
+        }
+        #[cfg(windows)]
+        {
+            std::os::windows::fs::symlink_dir(target, link).is_ok()
+        }
+        #[cfg(not(any(unix, windows)))]
+        {
+            let _ = (target, link);
+            false
+        }
+    }
+
     #[test]
     fn segment_sanitizer_rejects_the_escape_shapes() {
         assert_eq!(sanitize_path_segment("pdf"), Some("pdf".into()));
@@ -326,8 +350,10 @@ mod tests {
         let dst_target = dir.join("elsewhere");
         std::fs::create_dir_all(&src).unwrap();
         std::fs::create_dir_all(&dst_target).unwrap();
-        #[cfg(unix)]
-        std::os::unix::fs::symlink(&dst_target, dir.join("dst")).unwrap();
+        if !dir_symlink(&dst_target, &dir.join("dst")) {
+            let _ = std::fs::remove_dir_all(&dir);
+            return; // no link privilege — the refusal path is untestable
+        }
 
         let err = copy_dir(&src, &dir.join("dst")).unwrap_err();
         assert!(err.to_string().contains("symlink"));
@@ -344,11 +370,12 @@ mod tests {
         let real = dir.join("real");
         std::fs::create_dir_all(&real).unwrap();
         std::fs::create_dir_all(&base).unwrap();
-        #[cfg(unix)]
-        std::os::unix::fs::symlink(&real, base.join("hop")).unwrap();
+        let linked = dir_symlink(&real, &base.join("hop"));
 
         assert!(target_skill_path(&base, "pdf").is_some());
-        assert!(target_skill_path(&base, "hop/pdf").is_none());
+        if linked {
+            assert!(target_skill_path(&base, "hop/pdf").is_none());
+        }
         assert!(target_skill_path(&base, "../escape").is_none());
         // Not-yet-existing leaf is fine (sync pre-creates nothing).
         assert!(target_skill_path(&base, "fresh/skill").is_some());
