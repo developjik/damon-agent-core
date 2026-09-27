@@ -107,19 +107,37 @@ pub fn install_name_from_directory(dir: &str) -> Option<String> {
 }
 
 /// Remove a path whatever it is — file, directory, or symlink. A
-/// symlink is removed as a link (`remove_file` on both platforms;
-/// some windows directory links only answer to the directory call,
-/// hence the second try) and its target is never touched:
+/// symlink is removed as a link and its target is never touched:
 /// `remove_dir_all` on a symlink would follow it, and what symlinks
-/// point at here is the managed store.
+/// point at here is the managed store. Windows directory links answer
+/// only to the directory call, so links try `remove_dir` first. A
+/// fresh tree can briefly lose a delete race to a scanner's open
+/// handle (windows defender), so refusals retry a few times before
+/// giving up.
 pub fn remove_path(p: &Path) {
-    if std::fs::remove_file(p).is_ok() {
-        return;
-    }
-    // Only a real directory reaches here — a symlink already answered
-    // above or does not exist.
-    if p.symlink_metadata().is_ok_and(|m| m.is_dir()) {
-        let _ = std::fs::remove_dir_all(p);
+    let attempt = || -> io::Result<()> {
+        if let Ok(m) = p.symlink_metadata() {
+            if m.file_type().is_symlink() {
+                // Removes the link itself — never what it points at.
+                return std::fs::remove_dir(p).or_else(|_| std::fs::remove_file(p));
+            }
+            if m.is_dir() {
+                return std::fs::remove_dir_all(p);
+            }
+        }
+        std::fs::remove_file(p)
+    };
+    for try_index in 0..5u32 {
+        match attempt() {
+            Ok(()) => return,
+            Err(e) if e.kind() == io::ErrorKind::NotFound => return,
+            Err(_) if try_index + 1 < 5 => {
+                std::thread::sleep(std::time::Duration::from_millis(
+                    10 * u64::from(try_index + 1),
+                ));
+            }
+            Err(_) => return,
+        }
     }
 }
 
@@ -331,8 +349,10 @@ mod tests {
         let link = dir.join("link");
         std::fs::create_dir_all(&target).unwrap();
         std::fs::write(target.join("keep.txt"), "x").unwrap();
-        #[cfg(unix)]
-        std::os::unix::fs::symlink(&target, &link).unwrap();
+        if !dir_symlink(&target, &link) {
+            let _ = std::fs::remove_dir_all(&dir);
+            return; // no link privilege — the guard paths are untestable
+        }
 
         super::super::fsutil::remove_path(&link);
         assert!(!link.exists());

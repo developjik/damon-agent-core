@@ -171,6 +171,14 @@ fn remove_skill_from_target(
         };
     }
     fsutil::remove_path(&dest);
+    if dest.symlink_metadata().is_ok() {
+        return TargetOpResult {
+            target: root.id.clone(),
+            ok: false,
+            error: Some(format!("removal refused — {} still exists", dest.display())),
+            kept: false,
+        };
+    }
     TargetOpResult {
         target: root.id.clone(),
         ok: true,
