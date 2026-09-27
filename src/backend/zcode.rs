@@ -102,8 +102,10 @@ impl AgentClient for ZcodeClient {
         handle: &PersistenceHandle,
         config: SessionConfig,
     ) -> Result<Arc<dyn AgentSession>> {
-        Ok(ZcodeSession::spawn(&self.resolved, config, Some(&handle.native_handle)).await?
-            as Arc<dyn AgentSession>)
+        Ok(
+            ZcodeSession::spawn(&self.resolved, config, Some(&handle.native_handle)).await?
+                as Arc<dyn AgentSession>,
+        )
     }
 }
 
@@ -294,7 +296,9 @@ impl ZcodeSession {
             "session/requestRuntimePreferences" => {
                 let _ = self
                     .transport
-                    .send(json!({"id": rpc_id, "result": {"nativeSearchEnhancementsEnabled": false}}))
+                    .send(
+                        json!({"id": rpc_id, "result": {"nativeSearchEnhancementsEnabled": false}}),
+                    )
                     .await;
             }
             "interaction/requestPermission" => {
@@ -344,7 +348,8 @@ impl ZcodeSession {
                     actions,
                     suggestions: vec![],
                 };
-                self.register_ask(ask, rpc_id, option_responses, false).await;
+                self.register_ask(ask, rpc_id, option_responses, false)
+                    .await;
             }
             "interaction/requestUserInput" => {
                 let p = &f["params"];
@@ -610,19 +615,17 @@ impl AgentSession for ZcodeSession {
                 .collect::<Vec<_>>()
                 .join("\n"),
         };
-        let sid = self
-            .session_id
-            .lock()
-            .await
-            .clone()
-            .unwrap_or_default();
+        let sid = self.session_id.lock().await.clone().unwrap_or_default();
         self.request(
             "session/send",
             json!({"sessionId": sid, "content": content}),
             CONTROL_TIMEOUT,
         )
         .await?;
-        self.emit(StreamEvent::in_turn(turn_id.clone(), StreamEventKind::TurnStarted));
+        self.emit(StreamEvent::in_turn(
+            turn_id.clone(),
+            StreamEventKind::TurnStarted,
+        ));
         Ok(turn_id)
     }
 
@@ -653,7 +656,9 @@ impl AgentSession for ZcodeSession {
             bail!("no pending permission {request_id}");
         };
         let result = match &response {
-            PermissionResponse::Allow { action_id, answer, .. } => {
+            PermissionResponse::Allow {
+                action_id, answer, ..
+            } => {
                 let chosen = action_id.clone().or_else(|| answer.clone());
                 match chosen
                     .as_deref()

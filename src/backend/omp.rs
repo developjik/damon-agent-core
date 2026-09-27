@@ -887,11 +887,9 @@ mod tests {
     /// agent_end frames precede model retries).
     #[test]
     fn profiles_encode_terminal_semantics() {
-        let decide = |strict: bool, is_terminal: Option<bool>| {
-            match (strict, is_terminal) {
-                (true, None | Some(false)) => false,
-                (_, t) => t.unwrap_or(true),
-            }
+        let decide = |strict: bool, is_terminal: Option<bool>| match (strict, is_terminal) {
+            (true, None | Some(false)) => false,
+            (_, t) => t.unwrap_or(true),
         };
         // omp: lenient — missing flag means done.
         assert!(decide(OMP.strict_terminal, None));

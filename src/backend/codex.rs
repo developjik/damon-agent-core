@@ -397,14 +397,12 @@ impl CodexSession {
                             .to_string(),
                         code: None,
                     },
-                _ => StreamEventKind::TurnCompleted {
-                    // Newer app-servers carry no usage on turn/completed
-                    // — it arrives via thread/tokenUsage/updated and is
-                    // stashed in last_usage. Prefer whichever is present.
-                    usage: codex_usage(params).or_else(|| {
-                        self.last_usage.lock().clone()
-                    }),
-                },
+                    _ => StreamEventKind::TurnCompleted {
+                        // Newer app-servers carry no usage on turn/completed
+                        // — it arrives via thread/tokenUsage/updated and is
+                        // stashed in last_usage. Prefer whichever is present.
+                        usage: codex_usage(params).or_else(|| self.last_usage.lock().clone()),
+                    },
                 };
                 self.emit(StreamEvent { turn_id, kind });
                 self.emit(StreamEvent::new(StreamEventKind::AttentionRequired {
@@ -763,7 +761,11 @@ fn token_usage_event(v: &Value) -> Option<Usage> {
         cached_input_tokens: get(&["cached_input_tokens", "cachedTokens", "cached"]),
         output_tokens: output,
         cost_usd: None,
-        context_window: get(&["modelContextWindow", "model_context_window", "contextWindow"]),
+        context_window: get(&[
+            "modelContextWindow",
+            "model_context_window",
+            "contextWindow",
+        ]),
         context_used: None,
     })
 }

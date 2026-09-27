@@ -18,6 +18,9 @@
     --glow: 0 0 0 1px rgba(110,168,254,.25), 0 8px 32px rgba(0,0,0,.45);
     --radius: 14px;
     --mono: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+    /* highlight.js token palette (GitHub-dark-ish) */
+    --hl-kw: #ff7b72; --hl-str: #a5d6ff; --hl-num: #79c0ff; --hl-com: #8b949e;
+    --hl-title: #d2a8ff; --hl-bi: #ffa657; --hl-tag: #7ee787;
   }
   [data-theme="light"] {
     color-scheme: light;
@@ -30,6 +33,8 @@
     --hover: #e9edf2; --code-bg: #f0f3f7;
     --danger-bg: #ffebe9; --danger-fg: #a40e26;
     --glow: 0 0 0 1px rgba(31,111,235,.2), 0 8px 28px rgba(30,40,60,.12);
+    --hl-kw: #cf222e; --hl-str: #0a3069; --hl-num: #0550ae; --hl-com: #6e7781;
+    --hl-title: #8250df; --hl-bi: #953800; --hl-tag: #116329;
   }
   * { box-sizing: border-box; margin: 0; }
   html, body { height: 100%; }
@@ -340,6 +345,20 @@
     color: var(--faint); text-transform: uppercase; letter-spacing: .07em;
     font-family: var(--mono); pointer-events: none;
   }
+  /* highlight.js tokens (vendored build) — palette rides the theme vars. */
+  .hljs-keyword, .hljs-selector-tag, .hljs-meta-keyword, .hljs-doctag,
+  .hljs-template-tag, .hljs-literal { color: var(--hl-kw); }
+  .hljs-string, .hljs-regexp, .hljs-addition { color: var(--hl-str); }
+  .hljs-number, .hljs-symbol, .hljs-bullet, .hljs-link { color: var(--hl-num); }
+  .hljs-comment, .hljs-quote, .hljs-meta { color: var(--hl-com); font-style: italic; }
+  .hljs-title, .hljs-title.function_, .hljs-section, .hljs-name { color: var(--hl-title); }
+  .hljs-title.class_, .hljs-type, .hljs-built_in { color: var(--hl-bi); }
+  .hljs-attr, .hljs-attribute, .hljs-variable, .hljs-template-variable,
+  .hljs-params { color: var(--hl-num); }
+  .hljs-tag { color: var(--hl-tag); }
+  .hljs-deletion { color: var(--err); }
+  .hljs-emphasis { font-style: italic; }
+  .hljs-strong { font-weight: 600; }
   .msg pre, .toolmsg pre, .tcBody pre {
     background: var(--code-bg); border: 1px solid var(--border); border-radius: 9px;
     padding: 9px 12px; margin: 7px 0; overflow-x: auto;
@@ -743,6 +762,86 @@
 
   .setHint.warn { color: var(--warn); }
 
+  /* ---- skills hub panel (centered dialog) ---- */
+  #skBackdrop {
+    display: none; position: fixed; inset: 0; z-index: 26;
+    background: rgba(0,0,0,.5); border: 0; padding: 0; cursor: pointer;
+    backdrop-filter: blur(2px);
+  }
+  body.skills-open #skBackdrop { display: block; }
+  #skillsPanel {
+    display: none; position: fixed; z-index: 27;
+    left: 50%; top: 50%; transform: translate(-50%, -50%);
+    width: min(720px, 94vw); height: min(600px, 88vh);
+    background: var(--bg2); border: 1px solid var(--border); border-radius: 12px;
+    flex-direction: column; overflow: hidden;
+    box-shadow: 0 18px 60px rgba(0,0,0,.5);
+  }
+  body.skills-open #skillsPanel { display: flex; }
+  .skHead {
+    display: flex; align-items: center; gap: 10px; flex: none;
+    padding: 12px 16px; border-bottom: 1px solid var(--border);
+  }
+  .skHead h2 { font-size: 14.5px; font-weight: 700; margin-right: 6px; }
+  .skTabs { display: flex; gap: 4px; }
+  .skTab {
+    border: 1px solid transparent; background: none; color: var(--muted);
+    font: 550 12px/1 inherit; padding: 6px 10px; border-radius: 7px; cursor: pointer;
+  }
+  .skTab:hover { color: var(--fg); }
+  .skTab.active { color: var(--fg); border-color: var(--border); background: var(--panel); }
+  #skClose {
+    margin-left: auto; border: 1px solid var(--border); background: var(--panel);
+    color: var(--muted); width: 26px; height: 26px; border-radius: 7px;
+    cursor: pointer; font-size: 12px; display: grid; place-items: center;
+  }
+  #skClose:hover { color: var(--fg); border-color: var(--border2); }
+  #skBody { flex: 1; min-height: 0; overflow-y: auto; padding: 12px 16px 16px; }
+  .skToolbar { display: flex; gap: 8px; margin-bottom: 10px; flex-wrap: wrap; }
+  .skToolbar input[type="search"], .skForm input[type="text"] {
+    flex: 1; min-width: 140px; background: var(--panel); color: var(--fg);
+    border: 1px solid var(--border); border-radius: 7px; padding: 7px 10px;
+    font: 12.5px var(--mono);
+  }
+  .skBtn {
+    border: 1px solid var(--border); background: var(--panel); color: var(--fg);
+    border-radius: 7px; padding: 7px 11px; font: 550 12px/1 inherit; cursor: pointer;
+    white-space: nowrap;
+  }
+  .skBtn:hover { border-color: var(--border2); }
+  .skBtn.primary { border-color: var(--accent); color: var(--accent); }
+  .skBtn.danger { color: var(--err); }
+  .skBtn:disabled { opacity: .5; cursor: default; }
+  .skRow {
+    display: flex; align-items: baseline; gap: 10px;
+    padding: 9px 2px; border-bottom: 1px solid var(--border);
+  }
+  .skRow:last-child { border-bottom: 0; }
+  .skRow .skName { font-weight: 600; font-size: 13px; flex: none; max-width: 40%; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+  .skRow .skDesc { color: var(--muted); font-size: 11.5px; flex: 1; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+  .skChips { display: flex; gap: 5px; flex-wrap: wrap; flex: none; }
+  .skChip {
+    border: 1px solid var(--border); background: none; color: var(--faint);
+    font: 550 10.5px/1 inherit; padding: 4px 7px; border-radius: 999px; cursor: pointer;
+  }
+  .skChip.on { color: var(--ok); border-color: color-mix(in srgb, var(--ok) 45%, var(--border)); }
+  .skChip.orphan { color: var(--warn); border-color: color-mix(in srgb, var(--warn) 45%, var(--border)); }
+  .skChip:disabled { cursor: default; opacity: .7; }
+  .skBadge {
+    flex: none; color: var(--faint); font: 550 10px var(--mono);
+    border: 1px solid var(--border); border-radius: 5px; padding: 2px 5px;
+  }
+  .skMeta { color: var(--faint); font-size: 10.5px; margin: 12px 0 8px; }
+  .skEmpty { color: var(--faint); font-size: 12.5px; padding: 18px 2px; }
+  .skErr { color: var(--err); font-size: 12px; padding: 10px 2px; white-space: pre-wrap; }
+  .skForm { display: flex; flex-direction: column; gap: 8px; max-width: 560px; }
+  .skForm textarea {
+    background: var(--panel); color: var(--fg); border: 1px solid var(--border);
+    border-radius: 7px; padding: 8px 10px; font: 12.5px var(--mono);
+    min-height: 110px; resize: vertical;
+  }
+  .skTargetPicker { display: flex; gap: 6px; flex-wrap: wrap; margin: 2px 0 8px; }
+
   @media (prefers-reduced-motion: reduce) {
     * { animation: none !important; transition: none !important; }
     #log { scroll-behavior: auto; }
@@ -763,6 +862,7 @@
     </div>
     <button id="newBtn">+ New session</button>
     <button id="importBtn" title="Import a session the agent made outside damon">⇩ Import</button>
+    <button id="skillsBtn" title="Skills hub — install agent skills and manage prompts">✦ Skills</button>
     <input id="search" type="search" placeholder="search history…" title="Full-text search over all sessions (Ctrl/Cmd+K)">
     <div id="sessions"></div>
   </aside>
@@ -845,6 +945,19 @@
   </div>
 
   <button id="sBackdrop" aria-label="Close settings" tabindex="-1"></button>
+  <button id="skBackdrop" aria-label="Close skills panel" tabindex="-1"></button>
+  <div id="skillsPanel" role="dialog" aria-modal="true" aria-label="Skills and prompts" inert>
+    <div class="skHead">
+      <h2>✦ Skills</h2>
+      <div class="skTabs" role="tablist">
+        <button class="skTab active" data-tab="installed" role="tab">Installed</button>
+        <button class="skTab" data-tab="browse" role="tab">Browse</button>
+        <button class="skTab" data-tab="prompts" role="tab">Prompts</button>
+      </div>
+      <button id="skClose" aria-label="Close">✕</button>
+    </div>
+    <div id="skBody" role="tabpanel"></div>
+  </div>
   <aside id="setPanel" role="dialog" aria-modal="true" aria-label="Settings and status" inert>
     <div class="setHead">
       <h2>settings</h2>
@@ -874,6 +987,8 @@
   </aside>
 
 <script src="relay-client.js"></script>
+<script src="hljs.js"></script>
+<script src="stream-reveal.js"></script>
 <script>
 "use strict";
 // ---------- state ----------
@@ -886,6 +1001,12 @@ let streamEl = null;           // assistant bubble receiving chunks
 let streamBody = null;         // content div inside streamEl (copy/stamp survive)
 let streamText = "";
 let thoughtEl = null, thoughtText = "";
+let revealCtrl = null;        // StreamReveal pacing the live assistant text
+let thoughtCtrl = null;       // StreamReveal pacing the live thinking text
+let parseThrottle = null;     // ThrottledText gating mdLite commits
+let revealUnsubs = [];        // span subscriptions bound to the live snapshot
+let thoughtReader = null, thoughtReaderText = ""; // grapheme handle per snapshot
+let lastCommitMs = 0;         // measured cost of the last mdLite+DOM commit
 let todoEl = null;             // live todo card for the running turn
 const toolEls = new Map();     // call_id -> toolcard element
 const subagentEls = new Map(); // subagent id -> card element
@@ -943,23 +1064,55 @@ function esc(s) {
 // Markdown-lite: a conservative subset — fenced code, headings, lists,
 // blockquotes, hr, pipe tables, links, bold, italic, strikethrough,
 // inline code. Every fragment is escaped exactly once; no nesting.
-function mdLite(src) {
+// `opts.streaming` renders for a live turn: only provably closed fences
+// get highlighted (a still-growing fence would flicker on re-highlight),
+// and the syntax-highlighted HTML is served from a bounded LRU cache so
+// re-parsing the document stays cheap.
+const SR = globalThis.DamonStreamReveal;
+let codeCache = null;
+function hljsHighlight(code, lang) {
+  const hl = globalThis.hljs;
+  if (!hl || typeof hl.highlight !== "function") return null;
+  const name = String(lang || "").toLowerCase();
+  if (!name || !hl.getLanguage(name)) return null;
+  try { return hl.highlight(code, { language: name, ignoreIllegals: true }).value; }
+  catch { return null; } // malformed input: fall back to plain escaped code
+}
+function codeCacheGet() {
+  if (!codeCache) codeCache = SR.createCachedHighlighter(hljsHighlight);
+  return codeCache;
+}
+function mdLite(src, opts) {
+  const streaming = !!(opts && opts.streaming);
   const chunks = String(src).split(/```/);
   let out = "";
   for (let i = 0; i < chunks.length; i++) {
-    if (i % 2 === 1) out += codeBlockHtml(chunks[i]);
+    if (i % 2 === 1) {
+      // The split cannot see past the last chunk: during a live stream a
+      // trailing code chunk may still be growing, so only chunks with a
+      // later sibling are provably closed. Settled text is complete.
+      out += codeBlockHtml(chunks[i], streaming ? i < chunks.length - 1 : true);
+    }
     else out += mdBlocks(chunks[i]);
   }
   return out;
 }
-function codeBlockHtml(raw) {
+function codeBlockHtml(raw, highlightable) {
   const nl = raw.indexOf("\n");
   const lang = nl === -1 ? "" : raw.slice(0, nl).trim();
   const code = nl === -1 ? "" : raw.slice(nl + 1);
-  const tag = /^[a-zA-Z0-9_-]{1,20}$/.test(lang)
-    ? '<span class="codeLang">' + esc(lang) + "</span>" : "";
+  const known = /^[a-zA-Z0-9_-]{1,20}$/.test(lang);
+  const tag = known ? '<span class="codeLang">' + esc(lang) + "</span>" : "";
+  let body = null, cls = "";
+  if (highlightable && known) {
+    const html = codeCacheGet().codeHtml(code, lang.toLowerCase());
+    if (html !== null) {
+      body = html;
+      cls = ' class="hljs language-' + lang.toLowerCase() + '"';
+    }
+  }
   return '<div class="codewrap"><button type="button" class="copy" aria-label="Copy code">copy</button>' +
-    tag + "<pre><code>" + esc(code) + "</code></pre></div>";
+    tag + "<pre><code" + cls + ">" + (body === null ? esc(code) : body) + "</code></pre></div>";
 }
 function mdInline(raw) {
   // Inline code spans go into a stash first so their content never sees
@@ -1095,21 +1248,105 @@ function bubble(cls, html, raw) {
   stickScroll();
   return d;
 }
-// Streaming markdown re-render, coalesced to one paint per frame —
-// token-sized chunks would otherwise re-parse the whole buffer per event.
+// ---------- streaming pipeline ----------
+// Layered (ported from desktop-cc-gui's design): arrival coalescing
+// (rAF + 100ms fallback so a backgrounded tab still lands text), a parse
+// throttle (document-length cadence with commit-cost backoff — the full
+// document is still re-parsed for correctness, just not per frame), and a
+// reveal cursor that paces what is shown over the arrival cadence instead
+// of dumping each provider batch in one frame.
 let renderQueued = false;
-function renderStream() {
+let flushFallback = false;
+function scheduleStreamFlush() {
+  // rAF stalls while the tab is backgrounded or the window occluded; the
+  // timer keeps buffered deltas landing within ~100ms. Turn-end paths
+  // render synchronously, so a late fallback flush is a harmless no-op.
+  if (!flushFallback) {
+    flushFallback = true;
+    setTimeout(() => { flushFallback = false; flushStream(); }, 100);
+  }
   if (renderQueued) return;
   renderQueued = true;
-  requestAnimationFrame(() => {
-    renderQueued = false;
-    // Render into the dedicated body div — writing streamEl.innerHTML
-    // would wipe the copy button and timestamp bubble() appended.
-    if (streamBody) streamBody.innerHTML = mdLite(streamText);
-    if (thoughtEl) thoughtEl.querySelector(".thoughtBody").textContent = thoughtText;
-    stickScroll();
-  });
+  requestAnimationFrame(() => { renderQueued = false; flushStream(); });
 }
+function revealAnimate() {
+  return !document.hidden && !matchMedia("(prefers-reduced-motion: reduce)").matches;
+}
+function flushStream() {
+  if (thoughtEl) {
+    if (!thoughtCtrl) {
+      thoughtCtrl = new SR.StreamReveal(false);
+      const body = thoughtEl.querySelector(".thoughtBody");
+      thoughtCtrl.subscribe(0, Number.MAX_SAFE_INTEGER, () => {
+        body.textContent = thoughtReader
+          ? thoughtReader.prefix(thoughtCtrl.read(0, thoughtText.length))
+          : thoughtText;
+      });
+    }
+    if (thoughtReaderText !== thoughtText) {
+      thoughtReader = SR.createVisibleTextReader(thoughtText);
+      thoughtReaderText = thoughtText;
+    }
+    thoughtCtrl.update(thoughtText, revealAnimate());
+  }
+  if (!streamBody) return;
+  if (!revealCtrl) revealCtrl = new SR.StreamReveal(false);
+  if (!parseThrottle) {
+    parseThrottle = new SR.ThrottledText("");
+    parseThrottle.subscribe(() => commitAssistant());
+  }
+  const interval = SR.nextParseInterval(SR.streamParseInterval(streamText.length), lastCommitMs);
+  parseThrottle.update(streamText, interval);
+}
+// One throttled commit: re-parse the whole document, wrap revealable text
+// runs in offset spans, swap them in, then hand the rendered text to the
+// reveal cursor. From here to the next commit, per-frame work is only the
+// spans the cursor crosses getting a textContent update.
+function commitAssistant() {
+  if (!streamBody) return;
+  const t0 = performance.now();
+  const html = mdLite(streamText, { streaming: true });
+  const holder = document.createElement("div");
+  holder.innerHTML = html;
+  for (const off of revealUnsubs) off();
+  revealUnsubs = [];
+  const plan = SR.wrapRevealSpans(holder);
+  // Render into the dedicated body div — writing streamEl.innerHTML
+  // would wipe the copy button and timestamp bubble() appended.
+  streamBody.replaceChildren(...holder.childNodes);
+  for (const s of plan.spans) {
+    const reader = SR.createVisibleTextReader(plan.text.slice(s.start, s.start + s.length));
+    s.node.textContent = reader.prefix(revealCtrl.read(s.start, s.length));
+    revealUnsubs.push(revealCtrl.subscribe(s.start, s.length, () => {
+      s.node.textContent = reader.prefix(revealCtrl.read(s.start, s.length));
+    }));
+  }
+  // The cursor crossing spans grows the bubble — keep the view pinned
+  // without involving the commit path.
+  revealUnsubs.push(revealCtrl.subscribe(0, Number.MAX_SAFE_INTEGER, stickScroll));
+  if (streamEl) streamEl.dataset.raw = streamText;
+  revealCtrl.update(plan.text, revealAnimate());
+  lastCommitMs = performance.now() - t0;
+}
+// Publish any pending tail and drop the pacing state. Every path that
+// nulls the streaming handles calls this — turn end, session switch, a
+// failed turn.start.
+function dropStreamReveal() {
+  for (const off of revealUnsubs) off();
+  revealUnsubs = [];
+  if (revealCtrl) { revealCtrl.finish(); revealCtrl.cancel(); revealCtrl = null; }
+  if (thoughtCtrl) { thoughtCtrl.finish(); thoughtCtrl.cancel(); thoughtCtrl = null; }
+  if (parseThrottle) { parseThrottle.cancel(); parseThrottle = null; }
+  thoughtReader = null; thoughtReaderText = "";
+  lastCommitMs = 0;
+}
+// rAF suspension (hidden tab) must not leave text half-revealed: settle
+// whatever is pending; new arrivals after unhide pace again.
+document.addEventListener("visibilitychange", () => {
+  if (!document.hidden) return;
+  if (revealCtrl) revealCtrl.finish();
+  if (thoughtCtrl) thoughtCtrl.finish();
+});
 function sysline(text) {
   const d = document.createElement("div");
   d.className = "sys";
@@ -1340,7 +1577,14 @@ function onResponse(v) {
   if (!p) return;
   pending.delete(v.id);
   clearTimeout(p.timer);
-  if (v.error) p.reject(new Error(v.error.message || JSON.stringify(v.error)));
+  if (v.error) {
+    // Keep the typed payload reachable (skills-hub taxonomy in
+    // error.data.code, JSON-RPC code in error.code) — message-only
+    // Errors would force clients to parse prose.
+    const err = new Error(v.error.message || JSON.stringify(v.error));
+    err.rpc = v.error;
+    p.reject(err);
+  }
   else p.resolve(v.result);
 }
 // ---------- tool diff viewer ----------
@@ -1702,8 +1946,7 @@ function onTimeline(sid, ev) {
         streamEl.classList.add("streaming");
       }
       streamText += t;
-      streamEl.dataset.raw = streamText;
-      renderStream();
+      scheduleStreamFlush();
       break;
     }
     case "reasoning": {
@@ -1718,7 +1961,7 @@ function onTimeline(sid, ev) {
         thoughtText = "";
       }
       thoughtText += t;
-      renderStream();
+      scheduleStreamFlush();
       break;
     }
     case "tool_call":
@@ -1793,13 +2036,19 @@ function onSessionEvent(v) {
     if (ours) missedTurns.delete(sid);
     if (sid === activeSession) {
       // Final synchronous render before the streaming handles are
-      // dropped — the last rAF batch may still be pending.
+      // dropped — the last scheduled flush may still be pending. Settled
+      // mode highlights every fence and drops the reveal spans; the log
+      // is rebuilt from the store right after anyway.
+      if (parseThrottle) parseThrottle.cancel();
       if (streamBody) streamBody.innerHTML = mdLite(streamText);
+      if (streamEl) streamEl.dataset.raw = streamText;
       if (thoughtEl) {
+        if (thoughtCtrl) thoughtCtrl.finish();
         thoughtEl.querySelector(".thoughtBody").textContent = thoughtText;
         thoughtEl.open = false; // collapse the finished reasoning
       }
       setBusy(false);
+      dropStreamReveal();
       streamEl = streamBody = thoughtEl = todoEl = null;
       if (ev.type === "turn_failed") sysline("turn failed: " + (ev.error || "unknown"));
       else if (ev.type === "turn_canceled") sysline("cancelled");
@@ -2292,6 +2541,7 @@ async function newSession() {
 async function loadMessages(sid, focusMessageId) {
   log.textContent = "";
   toolEls.clear();
+  dropStreamReveal();
   streamEl = streamBody = thoughtEl = todoEl = null;
   try {
     // session.messages is paged (default 200) — walk pages so long
@@ -2514,6 +2764,7 @@ async function sendPrompt(text, imgs) {
   }
   liveTurns.add(sid);
   setBusy(true);
+  dropStreamReveal();
   streamEl = streamBody = thoughtEl = todoEl = null; streamText = thoughtText = "";
   toolEls.clear();
   const blocks = [{ type: "text", text }];
@@ -2533,6 +2784,7 @@ async function sendPrompt(text, imgs) {
     missedTurns.delete(sid);
     if (sid === activeSession) {
       setBusy(false);
+      dropStreamReveal();
       streamEl = streamBody = thoughtEl = todoEl = null;
     }
     refreshSessions();
@@ -2892,6 +3144,7 @@ function ensureFileIndex() {
 function invalidatePickerCaches() {
   if (slashCache) slashCache.fetchedAt = 0;
   if (fileCache) fileCache.fetchedAt = 0;
+  if (promptLibCache) promptLibCache.fetchedAt = 0;
 }
 
 // Precomputed scoring inputs: lowercase haystack, basename offset,
@@ -2977,21 +3230,24 @@ function findMentionTrigger(text, caret) {
   return { start, query };
 }
 
-// One detection pass per input/caret move; `/` outranks `@`.
+// One detection pass per input/caret move; `/` outranks `@` outranks
+// `!` (the prompt library trigger).
 function updatePicker() {
   if (composing) return;
   const caret = input.selectionStart;
   const slash = findSlashTrigger(input.value, caret);
-  const trig = slash || findMentionTrigger(input.value, caret);
+  const mention = findMentionTrigger(input.value, caret);
+  const bang = findBangTrigger(input.value, caret);
+  const trig = slash || mention || bang;
   if (!trig) { closePicker(); return; }
-  const kind = slash ? "slash" : "file";
+  const kind = slash ? "slash" : mention ? "file" : "prompt";
   picker.kind = kind;
   picker.start = trig.start;
   picker.query = trig.query;
   picker.active = 0;
-  const cache = kind === "slash" ? slashCache : fileCache;
+  const cache = kind === "slash" ? slashCache : kind === "file" ? fileCache : promptLibCache;
   if (!cache || cache.status === "loading")
-    (kind === "slash" ? ensureSlash() : ensureFileIndex())
+    (kind === "slash" ? ensureSlash() : kind === "file" ? ensureFileIndex() : ensurePromptLib())
       .then(() => { if (picker.kind === kind) refreshPickerItems(); });
   refreshPickerItems();
 }
@@ -3003,8 +3259,14 @@ function refreshPickerItems() {
     picker.items = src.filter(c =>
       !q || (c.name || "").toLowerCase().includes(q) || (c.description || "").toLowerCase().includes(q)
     ).slice(0, PICKER_LIMIT);
-  } else {
+  } else if (picker.kind === "file") {
     picker.items = matchMentionEntries((fileCache && fileCache.entries) || [], picker.query);
+  } else {
+    const q = picker.query.toLowerCase();
+    const src = (promptLibCache && promptLibCache.entries) || [];
+    picker.items = src.filter(p =>
+      !q || (p.name || "").toLowerCase().includes(q) || (p.description || "").toLowerCase().includes(q)
+    ).slice(0, PICKER_LIMIT);
   }
   picker.active = Math.min(picker.active, Math.max(picker.items.length - 1, 0));
   renderPicker();
@@ -3016,10 +3278,15 @@ function renderPicker() {
   if (!picker.items.length) {
     const loading = picker.kind === "slash"
       ? slashCache && slashCache.status === "loading"
-      : fileCache && fileCache.status === "loading";
+      : picker.kind === "file"
+        ? fileCache && fileCache.status === "loading"
+        : promptLibCache && promptLibCache.status === "loading";
     const d = document.createElement("div");
     d.className = "pick-empty";
-    d.textContent = loading ? "loading…" : (picker.kind === "slash" ? "no matching commands" : "no matching files");
+    d.textContent = loading ? "loading…" : (
+      picker.kind === "slash" ? "no matching commands"
+      : picker.kind === "file" ? "no matching files"
+      : "no matching prompts");
     pickerEl.append(d);
   }
   let lastKind = null;
@@ -3040,6 +3307,18 @@ function renderPicker() {
       const b = document.createElement("span");
       b.className = "pick-badge";
       b.textContent = it.source === "workspace" ? "project" : "global";
+      row.append(n, b);
+      if (it.description) {
+        const d = document.createElement("span");
+        d.className = "pick-desc";
+        d.textContent = it.description;
+        row.append(d);
+      }
+    } else if (picker.kind === "prompt") {
+      n.textContent = "!" + it.name;
+      const b = document.createElement("span");
+      b.className = "pick-badge";
+      b.textContent = it.scope === "workspace" ? "project" : "global";
       row.append(n, b);
       if (it.description) {
         const d = document.createElement("span");
@@ -3085,11 +3364,25 @@ function closePicker() {
 // Insert the chosen token over the trigger span. Slash commands are
 // plain text — the agent CLI expands /name itself; file mentions are
 // cwd-relative (the agent runs in the indexed root), quoted when they
-// contain whitespace. The trailing space ends the trigger so the
-// picker cannot re-open behind the caret.
-function selectPicker(i) {
+// contain whitespace; prompts insert their body (fetched on demand —
+// the list carries metadata only). The trailing space ends the
+// trigger so the picker cannot re-open behind the caret.
+async function selectPicker(i) {
   const it = picker.items[i];
   if (!it) { closePicker(); return; }
+  if (picker.kind === "prompt") {
+    // Keep the caret usable while the body loads; the picker closes
+    // first so Escape/arrows do not fight the async insert.
+    closePicker();
+    ghostSuffix = "";
+    try {
+      await insertPromptBody(it);
+      paintGhost();
+    } catch (e) {
+      setBanner("prompt load failed: " + (e && e.message || e));
+    }
+    return;
+  }
   const caret = input.selectionStart;
   const token = picker.kind === "slash"
     ? "/" + it.name + " "
@@ -3246,6 +3539,421 @@ $("modelSel").onchange = () => applyPick("model");
 $("modeSel").onchange = () => applyPick("mode");
 $("importBtn").onclick = runImport;
 $("token").addEventListener("keydown", e => { if (e.key === "Enter") submitToken(); });
+// ----- prompt library picker (`!` at line start) -----
+// Same cache pattern as the slash/file pickers. The picker lists
+// metadata; inserting fetches the body with prompts.get — a library
+// can hold 64 KiB bodies and the list must stay cheap.
+let promptLibCache = null;   // {status, entries, fetchedAt, inFlight}
+
+function promptLibParams() {
+  // Workspace scope needs a root; the active session's cwd is the
+  // one the composer will send into anyway.
+  return activeSession ? { sessionId: activeSession } : {};
+}
+
+function ensurePromptLib(force) {
+  if (promptLibCache && promptLibCache.inFlight) return promptLibCache.inFlight;
+  if (!force && promptLibCache && promptLibCache.status === "ready" &&
+      Date.now() - promptLibCache.fetchedAt < PICKER_TTL)
+    return Promise.resolve(promptLibCache.entries);
+  const p = request("prompts.list", promptLibParams())
+    .then(r => {
+      promptLibCache = { status: "ready", entries: r.prompts || [], fetchedAt: Date.now() };
+      return promptLibCache.entries;
+    })
+    .catch(() => {
+      const stale = (promptLibCache && promptLibCache.entries) || [];
+      promptLibCache = { status: "error", entries: stale, fetchedAt: 0, inFlight: null };
+      return stale;
+    });
+  promptLibCache = { status: "loading", entries: (promptLibCache && promptLibCache.entries) || [], fetchedAt: 0, inFlight: p };
+  return p;
+}
+
+function findBangTrigger(text, caret) {
+  if (caret <= 0 || caret > text.length) return null;
+  let start = caret - 1;
+  while (start >= 0) {
+    const ch = text[start];
+    if (ch === "!" || /\s/.test(ch)) break;
+    start--;
+  }
+  if (start < 0 || text[start] !== "!") return null;
+  if (start > 0 && text[start - 1] !== "\n") return null; // line start only
+  const query = text.slice(start + 1, caret);
+  if (query.length > 64) return null;
+  return { start, query };
+}
+
+async function insertPromptBody(entry) {
+  const detail = await request("prompts.get", { promptPath: entry.path, ...promptLibParams() });
+  const body = (detail && detail.content) || "";
+  const caret = input.selectionStart;
+  input.value = input.value.slice(0, picker.start) + body + input.value.slice(caret);
+  const pos = picker.start + body.length;
+  input.setSelectionRange(pos, pos);
+  autogrow();
+}
+
+// ----- skills hub panel -----
+const skBody = () => $("skBody");
+const sk = {
+  tab: "installed",
+  targets: [],          // [{id,label,path,available}]
+  installed: null,      // last skills.installed response
+  searchTimer: 0,
+  editing: null,        // prompt path being edited (prompts tab)
+};
+
+function openSkills() {
+  document.body.classList.add("skills-open");
+  $("skillsPanel").inert = false;
+  renderSkillsPanel();
+  // Warm both catalogs; failures render inline, not in the console.
+  refreshSkillsTargets();
+  refreshInstalled();
+}
+function closeSkills() {
+  document.body.classList.remove("skills-open");
+  $("skillsPanel").inert = true;
+}
+$("skillsBtn").onclick = openSkills;
+$("skClose").onclick = closeSkills;
+$("skBackdrop").onclick = closeSkills;
+document.addEventListener("keydown", e => {
+  if (e.key === "Escape" && document.body.classList.contains("skills-open")) closeSkills();
+});
+document.querySelectorAll(".skTab").forEach(t => {
+  t.onclick = () => {
+    sk.tab = t.dataset.tab;
+    document.querySelectorAll(".skTab").forEach(x => x.classList.toggle("active", x === t));
+    renderSkillsPanel();
+  };
+});
+
+function refreshSkillsTargets() {
+  request("skills.targets", {})
+    .then(r => { sk.targets = r.targets || []; if (sk.tab === "installed" || sk.tab === "browse") renderSkillsPanel(); })
+    .catch(() => { sk.targets = []; });
+}
+function refreshInstalled() {
+  request("skills.installed", {})
+    .then(r => { sk.installed = r.skills || []; if (sk.tab === "installed") renderSkillsPanel(); })
+    .catch(err => { sk.installed = { error: err.message || String(err) }; renderSkillsPanel(); });
+}
+
+function el(tag, cls, text) {
+  const n = document.createElement(tag);
+  if (cls) n.className = cls;
+  if (text !== undefined) n.textContent = text;
+  return n;
+}
+// Hub errors carry a taxonomy in error.data.code (attached by
+// onResponse as e.rpc) — surface it, and let the caller branch
+// (conflict → offer force).
+function hubErr(e) {
+  const code = e && e.rpc && e.rpc.data && e.rpc.data.code;
+  return { code: code || "error", message: (e && e.message) || String(e) };
+}
+
+function renderSkillsPanel() {
+  const body = skBody();
+  body.textContent = "";
+  if (sk.tab === "installed") renderSkInstalled(body);
+  else if (sk.tab === "browse") renderSkBrowse(body);
+  else renderSkPrompts(body);
+}
+
+// -- installed tab --
+function renderSkInstalled(body) {
+  const bar = el("div", "skToolbar");
+  const refresh = el("button", "skBtn", "refresh");
+  refresh.onclick = () => refreshInstalled();
+  bar.append(refresh);
+  body.append(bar);
+
+  if (!sk.installed) { body.append(el("div", "skEmpty", "loading…")); return; }
+  if (sk.installed.error) { body.append(el("div", "skErr", sk.installed.error)); return; }
+  if (!sk.installed.length) {
+    body.append(el("div", "skEmpty", "nothing installed yet — switch to Browse to add skills"));
+    return;
+  }
+  for (const s of sk.installed) {
+    const row = el("div", "skRow");
+    row.append(el("span", "skName", s.name));
+    if (s.repo) row.append(el("span", "skBadge", s.repo));
+    else if (s.sourceKind) row.append(el("span", "skBadge", s.sourceKind));
+    if (s.description) row.append(el("span", "skDesc", s.description));
+    const chips = el("div", "skChips");
+    for (const t of sk.targets) {
+      const state = (s.targetStates || {})[t.id] || "off";
+      const chip = el("button", "skChip" + (state === "synced" ? " on" : state === "orphan" ? " orphan" : ""),
+        `${t.id}:${state}`);
+      chip.title = `${t.label} — ${t.path}`;
+      if (!s.managed || s.readonly) chip.disabled = true;
+      else chip.onclick = () => toggleSkillTarget(s, t.id, state);
+      chips.append(chip);
+    }
+    row.append(chips);
+    const actions = el("div", "skChips");
+    if (s.readmeUrl) {
+      const view = el("button", "skBtn", "view");
+      view.onclick = () => viewSkillContent(s);
+      actions.append(view);
+    }
+    if (s.managed) {
+      const un = el("button", "skBtn danger", "uninstall");
+      un.onclick = () => uninstallSkill(s);
+      actions.append(un);
+    } else if (s.sourceKind === "local") {
+      const imp = el("button", "skBtn", "import");
+      imp.title = "Copy into the managed store and sync it everywhere";
+      imp.onclick = () => importSkill(s);
+      actions.append(imp);
+    }
+    row.append(actions);
+    body.append(row);
+  }
+}
+
+function toggleSkillTarget(s, id, state) {
+  const wants = state !== "synced";
+  const targets = wants
+    ? [...new Set([...(s.targets || []), id])]
+    : (s.targets || []).filter(x => x !== id);
+  request("skills.setTargets", { id: s.id, targets })
+    .then(() => refreshInstalled())
+    .catch(e => { sk.installed = { error: `${hubErr(e).code}: ${hubErr(e).message}` }; renderSkillsPanel(); });
+}
+
+function uninstallSkill(s) {
+  if (!confirm(`Uninstall ${s.name}? Removable for 5 minutes afterwards.`)) return;
+  request("skills.uninstall", { id: s.id })
+    .then(r => {
+      if (r && r.trashed) refreshInstalled();
+      else refreshInstalled();
+    })
+    .catch(e => alert(`${hubErr(e).code}: ${hubErr(e).message}`));
+}
+
+function importSkill(s) {
+  request("skills.importLocal", { directory: s.directory })
+    .then(() => refreshInstalled())
+    .catch(e => alert(`${hubErr(e).code}: ${hubErr(e).message}`));
+}
+
+function viewSkillContent(s) {
+  // readmeUrl is the GitHub page for repo skills; for local ones read
+  // through the daemon. Managed/unmanaged both resolve by directory.
+  request("skills.content", { directory: s.directory })
+    .then(r => {
+      const pre = el("pre", "skErr");
+      pre.style.color = "var(--fg)";
+      pre.style.whiteSpace = "pre-wrap";
+      pre.textContent = r.truncated ? r.markdown + "\n… (truncated)" : r.markdown;
+      const close = el("button", "skBtn", "close");
+      close.onclick = () => renderSkillsPanel();
+      skBody().textContent = "";
+      skBody().append(el("div", "skMeta", `${r.directory} — ${r.path}`), pre, close);
+    })
+    .catch(e => alert(`${hubErr(e).code}: ${hubErr(e).message}`));
+}
+
+// -- browse tab --
+let browseMode = "popular"; // or "search" or "discover"
+function renderSkBrowse(body) {
+  const bar = el("div", "skToolbar");
+  const q = el("input");
+  q.type = "search";
+  q.placeholder = "search skills.sh…";
+  q.addEventListener("input", () => {
+    clearTimeout(sk.searchTimer);
+    sk.searchTimer = setTimeout(() => {
+      browseMode = q.value.trim() ? "search" : "popular";
+      loadBrowse(q.value.trim());
+    }, 250);
+  });
+  const disc = el("button", "skBtn", "repos");
+  disc.title = "Discover from the registered GitHub repos";
+  disc.onclick = () => { browseMode = "discover"; loadBrowse(""); };
+  bar.append(q, disc);
+  body.append(bar);
+  const list = el("div");
+  list.id = "skBrowseList";
+  body.append(el("div", "skMeta", "installing syncs the skill into every checked CLI's native skills dir"));
+  body.append(list);
+  if (browseMode === "discover") loadBrowse("");
+  else loadBrowse(q.value);
+}
+
+function loadBrowse(query) {
+  const list = $("skBrowseList");
+  if (!list) return;
+  list.textContent = "";
+  list.append(el("div", "skEmpty", "loading…"));
+  const req = browseMode === "search"
+    ? request("skills.search", { q: query, limit: 30 })
+    : browseMode === "discover"
+      ? request("skills.discover", {})
+      : request("skills.popular", { limit: 40 });
+  req.then(r => {
+    if (!list.isConnected) return;
+    list.textContent = "";
+    const rows = r.skills || [];
+    if (!rows.length) { list.append(el("div", "skEmpty", browseMode === "discover" ? "no skills in the registered repos" : "nothing found")); return; }
+    for (const s of rows) {
+      const row = el("div", "skRow");
+      row.append(el("span", "skName", s.name));
+      const repo = `${s.repoOwner}/${s.repoName}`;
+      row.append(el("span", "skBadge", repo));
+      if (s.installs != null) row.append(el("span", "skBadge", `↓${s.installs}`));
+      if (s.description) row.append(el("span", "skDesc", s.description));
+      const install = el("button", "skBtn primary", "install");
+      install.onclick = () => installFromBrowse(s, row);
+      row.append(install);
+      list.append(row);
+    }
+  }).catch(e => {
+    if (!list.isConnected) return;
+    list.textContent = "";
+    const err = hubErr(e);
+    list.append(el("div", "skErr", `${err.code}: ${err.message}`));
+  });
+}
+
+function installFromBrowse(s, row) {
+  // Default targets: every available one, pre-checked.
+  const pick = { targets: sk.targets.filter(t => t.available).map(t => t.id) };
+  const row2 = el("div", "skTargetPicker");
+  for (const t of sk.targets.filter(t => t.available)) {
+    const c = el("label", "setToggle");
+    const box = document.createElement("input");
+    box.type = "checkbox";
+    box.checked = pick.targets.includes(t.id);
+    box.onchange = () => {
+      if (box.checked) pick.targets.push(t.id);
+      else pick.targets = pick.targets.filter(x => x !== t.id);
+    };
+    c.append(box, el("span", null, t.id));
+    row2.append(c);
+  }
+  const go = el("button", "skBtn primary", "confirm");
+  go.onclick = async () => {
+    go.disabled = true;
+    const params = {
+      owner: s.repoOwner, name: s.repoName, branch: s.repoBranch,
+      directory: s.directory, targets: pick.targets,
+    };
+    try {
+      await request("skills.install", params);
+      refreshInstalled();
+      go.textContent = "installed ✓";
+    } catch (e) {
+      const err = hubErr(e);
+      if (err.code === "conflict") {
+        // Local changes in the managed copy — offer the forced pass.
+        if (confirm(`${err.message}\n\nOverwrite?`)) {
+          try {
+            await request("skills.install", { ...params, force: true });
+            refreshInstalled();
+            go.textContent = "installed ✓";
+            return;
+          } catch (e2) { alert(`${hubErr(e2).code}: ${hubErr(e2).message}`); }
+        }
+        go.disabled = false;
+        return;
+      }
+      alert(`${err.code}: ${err.message}`);
+      go.disabled = false;
+    }
+  };
+  row2.append(go);
+  row.append(row2);
+}
+
+// -- prompts tab --
+function renderSkPrompts(body) {
+  if (sk.editing) return renderPromptForm(body, sk.editing);
+  const bar = el("div", "skToolbar");
+  const create = el("button", "skBtn primary", "+ new prompt");
+  create.onclick = () => { sk.editing = { name: "", isNew: true }; renderSkillsPanel(); };
+  bar.append(create);
+  body.append(bar);
+  const list = el("div");
+  list.id = "skPromptList";
+  body.append(el("div", "skMeta", "type \"!\" in the composer to insert a prompt"));
+  body.append(list);
+  request("prompts.list", promptLibParams())
+    .then(r => {
+      if (!list.isConnected) return;
+      promptLibCache = { status: "ready", entries: r.prompts || [], fetchedAt: Date.now() };
+      list.textContent = "";
+      if (!(r.prompts || []).length) { list.append(el("div", "skEmpty", "no prompts yet — create one")); return; }
+      for (const p of r.prompts) {
+        const row = el("div", "skRow");
+        row.append(el("span", "skName", p.name));
+        row.append(el("span", "skBadge", p.scope));
+        if (p.description) row.append(el("span", "skDesc", p.description));
+        const edit = el("button", "skBtn", "edit");
+        edit.onclick = () => { sk.editing = { ...p, isNew: false }; renderSkillsPanel(); };
+        const move = el("button", "skBtn", p.scope === "workspace" ? "→ global" : "→ workspace");
+        move.onclick = () => {
+          request("prompts.move", { promptPath: p.path, scope: p.scope === "workspace" ? "global" : "workspace", ...promptLibParams() })
+            .then(renderSkillsPanel)
+            .catch(e => alert(`${hubErr(e).code}: ${hubErr(e).message}`));
+        };
+        const del = el("button", "skBtn danger", "delete");
+        del.onclick = () => {
+          if (!confirm(`Delete prompt ${p.name}?`)) return;
+          request("prompts.delete", { promptPath: p.path, ...promptLibParams() })
+            .then(renderSkillsPanel)
+            .catch(e => alert(`${hubErr(e).code}: ${hubErr(e).message}`));
+        };
+        row.append(edit, move, del);
+        list.append(row);
+      }
+    })
+    .catch(e => { list.textContent = ""; list.append(el("div", "skErr", hubErr(e).message)); });
+}
+
+function renderPromptForm(body, p) {
+  const form = el("div", "skForm");
+  const name = el("input");
+  name.type = "text";
+  name.value = p.name || "";
+  name.placeholder = "name (no spaces)";
+  const desc = el("input");
+  desc.type = "text";
+  desc.value = p.description || "";
+  desc.placeholder = "description (optional)";
+  const content = el("textarea");
+  content.placeholder = "the prompt body — markdown";
+  if (!p.isNew) {
+    request("prompts.get", { promptPath: p.path, ...promptLibParams() })
+      .then(d => { if (content.isConnected) content.value = d.content || ""; })
+      .catch(() => {});
+  }
+  const actions = el("div", "skToolbar");
+  const save = el("button", "skBtn primary", p.isNew ? "create" : "save");
+  save.onclick = async () => {
+    try {
+      if (p.isNew) {
+        await request("prompts.create", { scope: "global", name: name.value, description: desc.value, content: content.value, ...promptLibParams() });
+      } else {
+        await request("prompts.update", { promptPath: p.path, name: name.value, description: desc.value, content: content.value, ...promptLibParams() });
+      }
+      sk.editing = null;
+      promptLibCache = null;   // list changed
+      renderSkillsPanel();
+    } catch (e) { alert(`${hubErr(e).code}: ${hubErr(e).message}`); }
+  };
+  const cancel = el("button", "skBtn", "cancel");
+  cancel.onclick = () => { sk.editing = null; renderSkillsPanel(); };
+  actions.append(save, cancel);
+  form.append(name, desc, content, actions);
+  body.append(form);
+}
+
 input.addEventListener("keydown", e => {
   // IME guard first: during Korean/Japanese/Chinese composition every
   // key (Enter included) commits or edits the candidate — none of the
@@ -3551,10 +4259,12 @@ if (location.protocol === "http:" || location.protocol === "https:") {
 
 setConn("pending", "connecting");
 syncEmpty();
-if (new URLSearchParams(location.search).get("pickerDemo") === "1") {
+const demoParam = new URLSearchParams(location.search).get("pickerDemo") === "1" ||
+  new URLSearchParams(location.search).get("revealDemo") === "1";
+if (demoParam) {
   // No daemon in demo mode — skip connect so the auth overlay never
-  // covers the pickers; the stubbed RPCs are the whole show.
-  setConn("off", "picker demo");
+  // covers the demo; the stubbed/synthetic events are the whole show.
+  setConn("off", "demo");
 } else {
   connect();
 }
@@ -3589,7 +4299,7 @@ if (new URLSearchParams(location.search).get("diffDemo") === "1") {
 // ghost can be checked in a browser without a daemon (works from
 // file://, like diffDemo).
 if (new URLSearchParams(location.search).get("pickerDemo") === "1") {
-  request = method => {
+  request = (method, params) => {
     if (method === "catalog.commands")
       return Promise.resolve({ commands: [
         { name: "review", description: "Review the working tree diff", source: "workspace", kind: "command" },
@@ -3610,6 +4320,46 @@ if (new URLSearchParams(location.search).get("pickerDemo") === "1") {
         { text: "run the store tests too", count: 1 },
       ] });
     if (method === "prompt.add") return Promise.resolve({ recorded: true });
+    if (method === "prompts.list")
+      return Promise.resolve({ prompts: [
+        { name: "review", description: "Review the working tree", scope: "workspace", path: "/demo/ws/.damon/prompts/review.md" },
+        { name: "release", description: "Draft release notes from the changelog", scope: "global", path: "/demo/global/prompts/release.md" },
+      ] });
+    if (method === "prompts.get" && params && params.promptPath && params.promptPath.includes("review"))
+      return Promise.resolve({ name: "review", scope: "workspace", content: "Review the working tree diff carefully, then summarize the riskiest change in one line." });
+    if (method === "prompts.get")
+      return Promise.resolve({ name: "release", scope: "global", content: "Draft release notes for the newest CHANGELOG entries, grouped by Added/Fixed." });
+    if (method === "skills.targets")
+      return Promise.resolve({ targets: [
+        { id: "claude", label: "Claude Code", path: "/demo/.claude/skills", available: true },
+        { id: "codex", label: "Codex CLI", path: "/demo/.codex/skills", available: true },
+      ] });
+    if (method === "skills.installed")
+      return Promise.resolve({ skills: [
+        { id: "o/r:skills/pdf", name: "PDF", directory: "pdf", managed: true, repo: "o/r@main",
+          description: "PDF toolkit", targets: ["claude"],
+          targetStates: { claude: "synced", codex: "orphan" } },
+        { id: "local:mine", name: "mine", directory: "mine", managed: false, sourceKind: "local",
+          description: "my own skill", readonly: false, targets: ["claude"], targetStates: { claude: "synced" } },
+      ], generatedAt: Date.now() });
+    if (method === "skills.popular")
+      return Promise.resolve({ skills: [
+        { key: "a/b:pdf", name: "pdf", description: "PDF tools", directory: "pdf", installs: 420, repoOwner: "a", repoName: "b", repoBranch: "main" },
+        { key: "a/b:xlsx", name: "xlsx", description: "Spreadsheet tools", directory: "xlsx", installs: 77, repoOwner: "a", repoName: "b", repoBranch: "main" },
+      ], cached: false, generatedAt: Date.now() });
+    if (method === "skills.search")
+      return Promise.resolve({ query: "pdf", totalCount: 1, skills: [
+        { key: "a/b:pdf", name: "pdf", description: "PDF tools", directory: "pdf", installs: 420, repoOwner: "a", repoName: "b", repoBranch: "main" },
+      ] });
+    if (method === "skills.discover")
+      return Promise.resolve({ skills: [
+        { key: "o/r:skills/pdf", name: "PDF", description: "PDF toolkit", directory: "skills/pdf",
+          repoOwner: "o", repoName: "r", repoBranch: "main", readmeUrl: "https://github.com/o/r" },
+      ], cached: false, generatedAt: Date.now() });
+    if (method === "skills.install") return Promise.resolve({ skill: {}, targetResults: [] });
+    if (method === "skills.uninstall") return Promise.resolve({ trashed: true, restoreId: "demo", ttlMs: 300000, targetResults: [] });
+    if (method === "skills.content")
+      return Promise.resolve({ directory: "pdf", path: "managed:/demo", markdown: "---\nname: PDF\n---\n# PDF\n\nThe demo body.", truncated: false });
     return Promise.reject(new Error("demo stub"));
   };
   promptItemsLoaded = true;
@@ -3617,11 +4367,59 @@ if (new URLSearchParams(location.search).get("pickerDemo") === "1") {
     { text: "run the rpc tests", count: 4 },
     { text: "run the store tests too", count: 1 },
   ];
-  sysline("composer picker demo — type / or @ below; Tab accepts the ghost, ↑/↓ recalls history");
+  sysline("composer picker demo — type / or @ or ! below; Tab accepts the ghost, ↑/↓ recalls history");
   input.value = "/";
   input.setSelectionRange(1, 1);
   input.focus();
   updatePicker();
+}
+
+// ---------- reveal demo (?revealDemo=1) ----------
+// Smoke hook: drive the real streaming pipeline (coalescing → parse
+// throttle → cached highlight → reveal cursor) with a synthetic turn at
+// OMP's ~144ms batch cadence, no daemon needed. Works from file:// like
+// diffDemo — except the scripts must load, so serve it or open via the
+// daemon's /ui route.
+if (new URLSearchParams(location.search).get("revealDemo") === "1") {
+  const sid = "demo";
+  activeSession = sid;
+  sysline("streaming reveal demo — batches land every ~144ms; watch text flow instead of dumping");
+  const chunks = [
+    { kind: "reasoning", text: "thinking… the demo asks for a mixed markdown answer. " },
+    { kind: "reasoning", text: "structure it with a table and two code fences, and exercise CJK + emoji boundaries. " },
+    { kind: "assistant_message", text: "# Streaming reveal\n\n" },
+    { kind: "assistant_message", text: "Text paces out over the arrival cadence — " },
+    { kind: "assistant_message", text: "**bold**, *emphasis*, `inline code`, " },
+    { kind: "assistant_message", text: "[a link](https://example.com), emoji 👩‍💻🇰🇷 and 안전한 한글 경계.\n\n" },
+    { kind: "assistant_message", text: "- list item one\n- list item two\n\n" },
+    { kind: "assistant_message", text: "| col | val |\n|---|---|\n| a | 1 |\n| b | 2 |\n\n" },
+    { kind: "assistant_message", text: "```rust\nfn main() {\n    println!(\"hello, damon\");\n}\n```\n\n" },
+    { kind: "assistant_message", text: "The fence below arrives unclosed first, so it stays plain until its closing marker lands:\n\n" },
+    { kind: "assistant_message", text: "```python\ndef add(a, b):\n    return a + b\n" },
+    { kind: "assistant_message", text: "\n```\n\nDone." },
+  ];
+  let i = 0;
+  const drip = () => {
+    if (i >= chunks.length) {
+      // Settle exactly like turn_completed does: settled render (every
+      // fence highlighted, reveal spans gone), pacing state dropped.
+      if (parseThrottle) parseThrottle.cancel();
+      if (streamBody) streamBody.innerHTML = mdLite(streamText);
+      if (streamEl) streamEl.dataset.raw = streamText;
+      if (thoughtEl) {
+        if (thoughtCtrl) thoughtCtrl.finish();
+        thoughtEl.querySelector(".thoughtBody").textContent = thoughtText;
+        thoughtEl.open = false;
+      }
+      dropStreamReveal();
+      streamEl = streamBody = thoughtEl = todoEl = null;
+      sysline("demo done — settled render highlights the now-closed fence");
+      return;
+    }
+    onTimeline(sid, chunks[i++]);
+    setTimeout(drip, 144);
+  };
+  drip();
 }
 </script>
 </body>

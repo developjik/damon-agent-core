@@ -1665,7 +1665,10 @@ async fn prompt_history_round_trips() {
         .iter()
         .map(|p| p["text"].as_str().unwrap())
         .collect();
-    assert!(rest.contains(&"second prompt") && rest.contains(&"third prompt"), "{r}");
+    assert!(
+        rest.contains(&"second prompt") && rest.contains(&"third prompt"),
+        "{r}"
+    );
 
     // Blank after trim is rejected outright.
     rpc_send(&mut ws, add!("   ")).await;
@@ -1839,6 +1842,259 @@ async fn picker_root_gates_client_cwds_and_unknown_sessions() {
     .await;
     let r = read_reply(&mut ws, 3).await;
     assert_eq!(r["error"]["code"], -32602, "unknown session: {r}");
+}
+
+/// Serializes tests that steer the process-global hub/prompts env.
+/// Async-aware so the guard may span the test's awaits.
+static SKILLS_HUB_ENV_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+
+/// skills.targets / skills.repos / skills.installed read surface: a
+/// fresh hub reports the seed repos, the visible target rows carry
+/// skill-dir paths, and a registry entry projects with all-off
+/// states when nothing is synced (deterministic on any machine —
+/// the managed listing never depends on what is installed).
+#[tokio::test]
+async fn skills_read_surface_projects_registry_and_defaults() {
+    let _guard = SKILLS_HUB_ENV_LOCK.lock().await;
+    let hub = std::env::temp_dir().join(format!("damon-hub-{}", uuid::Uuid::new_v4()));
+    std::fs::create_dir_all(&hub).unwrap();
+    unsafe { std::env::set_var("DAMON_SKILLS_HUB_HOME", &hub) };
+    let (_state, _store, addr) = serve(test_config(None)).await;
+    let (mut ws, _) = ws_connect(&format!("ws://{addr}/ws")).await;
+
+    // Fresh hub → the four seed repos.
+    rpc_send(&mut ws, json!({"id":1,"method":"skills.repos"})).await;
+    let r = read_reply(&mut ws, 1).await;
+    let repos = r["result"]["repos"]
+        .as_array()
+        .expect("repos array")
+        .clone();
+    assert_eq!(repos.len(), 4, "{r}");
+    assert!(repos.iter().any(|x| x["owner"] == "anthropics"), "{r}");
+    assert!(repos.iter().all(|x| x["enabled"] == true), "{r}");
+
+    // Targets: visible rows with skill-dir paths, hidden agents absent.
+    rpc_send(&mut ws, json!({"id":2,"method":"skills.targets"})).await;
+    let r = read_reply(&mut ws, 2).await;
+    let targets = r["result"]["targets"]
+        .as_array()
+        .expect("targets array")
+        .clone();
+    let claude = targets
+        .iter()
+        .find(|t| t["id"] == "claude")
+        .expect("claude row");
+    assert!(claude["path"].as_str().unwrap().contains("skills"), "{r}");
+    assert!(
+        !targets.iter().any(|t| t["id"] == "agents"),
+        "hidden target stays hidden: {r}"
+    );
+
+    // A managed entry with no synced copies: listed, managed, repo
+    // label, empty targets, per-target states present.
+    std::fs::write(
+        hub.join("registry.json"),
+        serde_json::json!({"skills": [{
+            "id": "o/r:test-skill", "name": "test-skill",
+            "directory": "test-skill", "repoOwner": "o", "repoName": "r",
+            "targets": []
+        }]})
+        .to_string(),
+    )
+    .unwrap();
+    rpc_send(&mut ws, json!({"id":3,"method":"skills.installed"})).await;
+    let r = read_reply(&mut ws, 3).await;
+    let skills = r["result"]["skills"]
+        .as_array()
+        .expect("skills array")
+        .clone();
+    let s = skills
+        .iter()
+        .find(|s| s["directory"] == "test-skill")
+        .expect("managed entry listed");
+    assert_eq!(s["managed"], true, "{r}");
+    assert_eq!(s["repo"], "o/r", "{r}");
+    assert_eq!(s["targets"].as_array().unwrap().len(), 0, "{r}");
+    assert!(s["targetStates"].is_object(), "{r}");
+    assert!(r["result"]["generatedAt"].as_u64().is_some(), "{r}");
+
+    unsafe { std::env::remove_var("DAMON_SKILLS_HUB_HOME") };
+    let _ = std::fs::remove_dir_all(&hub);
+}
+
+/// skills.* mutations without network: repo add/remove round trip,
+/// activity log, the typed `error.data.code` taxonomy, and the
+/// `[skills] enabled = false` gate.
+#[tokio::test]
+async fn skills_mutations_repos_activity_and_gate() {
+    let _guard = SKILLS_HUB_ENV_LOCK.lock().await;
+    let hub = std::env::temp_dir().join(format!("damon-hub-mut-{}", uuid::Uuid::new_v4()));
+    std::fs::create_dir_all(&hub).unwrap();
+    unsafe { std::env::set_var("DAMON_SKILLS_HUB_HOME", &hub) };
+    let (_state, _store, addr) = serve(test_config(None)).await;
+    let (mut conn, _) = ws_connect(&format!("ws://{addr}/ws")).await;
+
+    rpc_send(
+        &mut conn,
+        json!({"id":1,"method":"skills.addRepo",
+               "params":{"owner":"someone","name":"cool","branch":"dev"}}),
+    )
+    .await;
+    let r = read_reply(&mut conn, 1).await;
+    assert_eq!(r["result"]["added"], true, "{r}");
+
+    rpc_send(&mut conn, json!({"id":2,"method":"skills.repos"})).await;
+    let r = read_reply(&mut conn, 2).await;
+    let repos = r["result"]["repos"].as_array().unwrap().clone();
+    assert_eq!(repos.len(), 5, "4 seeds + the added one: {r}");
+    assert!(
+        repos
+            .iter()
+            .any(|x| x["owner"] == "someone" && x["branch"] == "dev"),
+        "{r}"
+    );
+
+    rpc_send(
+        &mut conn,
+        json!({"id":3,"method":"skills.removeRepo",
+               "params":{"owner":"someone","name":"cool"}}),
+    )
+    .await;
+    let r = read_reply(&mut conn, 3).await;
+    assert_eq!(r["result"]["removed"], true, "{r}");
+
+    rpc_send(&mut conn, json!({"id":4,"method":"skills.activity"})).await;
+    let r = read_reply(&mut conn, 4).await;
+    let activity = r["result"]["activity"].as_array().unwrap().clone();
+    assert!(!activity.is_empty(), "repo ops are logged: {r}");
+    assert_eq!(activity[0]["kind"], "removeRepo", "newest first: {r}");
+    assert!(activity.iter().any(|e| e["kind"] == "addRepo"), "{r}");
+
+    // Typed taxonomy on the wire: unknown skill → -32000 + data.code.
+    rpc_send(
+        &mut conn,
+        json!({"id":5,"method":"skills.setTargets",
+               "params":{"id":"nope","targets":["claude"]}}),
+    )
+    .await;
+    let r = read_reply(&mut conn, 5).await;
+    assert_eq!(r["error"]["code"], -32000, "{r}");
+    assert_eq!(r["error"]["data"]["code"], "not_found", "{r}");
+
+    // Unknown target id → -32602 + data.code invalid_input.
+    rpc_send(
+        &mut conn,
+        json!({"id":6,"method":"skills.setTargets",
+               "params":{"id":"nope","targets":["bogus"]}}),
+    )
+    .await;
+    let r = read_reply(&mut conn, 6).await;
+    assert_eq!(r["error"]["code"], -32602, "{r}");
+    assert_eq!(r["error"]["data"]["code"], "invalid_input", "{r}");
+
+    unsafe { std::env::remove_var("DAMON_SKILLS_HUB_HOME") };
+    let _ = std::fs::remove_dir_all(&hub);
+
+    // The enabled gate: a second daemon with the hub off refuses.
+    let mut cfg = common::mock_config(None);
+    cfg.skills.enabled = false;
+    let (_state2, _store2, addr2) = serve(Arc::new(parking_lot::RwLock::new(cfg))).await;
+    let (mut conn2, _) = ws_connect(&format!("ws://{addr2}/ws")).await;
+    rpc_send(
+        &mut conn2,
+        json!({"id":1,"method":"skills.addRepo",
+               "params":{"owner":"x","name":"y"}}),
+    )
+    .await;
+    let r = read_reply(&mut conn2, 1).await;
+    assert_eq!(
+        r["error"]["code"], -32002,
+        "NOT_SUPPORTED when disabled: {r}"
+    );
+}
+
+/// prompts.* library: create in the workspace scope (through the
+/// allowed_dirs gate), list, update (clear semantics + rename), and
+/// the jail denial for a disallowed cwd. The global root is
+/// env-isolated.
+#[tokio::test]
+async fn prompts_library_round_trip_and_jail() {
+    let _guard = SKILLS_HUB_ENV_LOCK.lock().await;
+    let home = std::env::temp_dir().join(format!("damon-prompts-{}", uuid::Uuid::new_v4()));
+    std::fs::create_dir_all(&home).unwrap();
+    unsafe { std::env::set_var("DAMON_PROMPTS_HOME", home.join("global")) };
+    let ws = std::env::temp_dir().join(format!("damon-ws-{}", uuid::Uuid::new_v4()));
+    std::fs::create_dir_all(&ws).unwrap();
+    let mut cfg = common::mock_config(None);
+    cfg.allowed_dirs = vec![ws.clone()];
+    let (_state, _store, addr) = serve(Arc::new(parking_lot::RwLock::new(cfg))).await;
+    let (mut conn, _) = ws_connect(&format!("ws://{addr}/ws")).await;
+
+    rpc_send(
+        &mut conn,
+        json!({"id":1,"method":"prompts.create",
+               "params":{"scope":"workspace","name":"review",
+                         "description":"Review the diff","argumentHint":"[file]",
+                         "content":"Please review the diff carefully.",
+                         "cwd":ws.to_string_lossy()}}),
+    )
+    .await;
+    let r = read_reply(&mut conn, 1).await;
+    assert_eq!(r["result"]["created"], true, "{r}");
+    let path = r["result"]["path"].as_str().unwrap().to_string();
+    assert!(path.ends_with("review.md"), "{r}");
+
+    rpc_send(
+        &mut conn,
+        json!({"id":2,"method":"prompts.list","params":{"cwd":ws.to_string_lossy()}}),
+    )
+    .await;
+    let r = read_reply(&mut conn, 2).await;
+    let prompts = r["result"]["prompts"].as_array().unwrap().clone();
+    let row = prompts
+        .iter()
+        .find(|p| p["name"] == "review")
+        .expect("listed");
+    assert_eq!(row["scope"], "workspace", "{r}");
+    assert_eq!(row["description"], "Review the diff", "{r}");
+
+    // Clear the description with an empty string; rename the prompt.
+    rpc_send(
+        &mut conn,
+        json!({"id":3,"method":"prompts.update",
+               "params":{"promptPath":path,"description":"","name":"deep-review",
+                         "cwd":ws.to_string_lossy()}}),
+    )
+    .await;
+    let r = read_reply(&mut conn, 3).await;
+    assert_eq!(r["result"]["updated"], true, "{r}");
+
+    rpc_send(
+        &mut conn,
+        json!({"id":4,"method":"prompts.list","params":{"cwd":ws.to_string_lossy()}}),
+    )
+    .await;
+    let r = read_reply(&mut conn, 4).await;
+    let prompts = r["result"]["prompts"].as_array().unwrap().clone();
+    let row = prompts
+        .iter()
+        .find(|p| p["name"] == "deep-review")
+        .expect("renamed row");
+    assert!(row["description"].is_null(), "cleared: {r}");
+
+    // A cwd outside allowed_dirs fails closed.
+    rpc_send(
+        &mut conn,
+        json!({"id":5,"method":"prompts.create",
+               "params":{"scope":"workspace","name":"x","content":"y","cwd":"/damon-nowhere"}}),
+    )
+    .await;
+    let r = read_reply(&mut conn, 5).await;
+    assert_eq!(r["error"]["code"], -32602, "{r}");
+
+    unsafe { std::env::remove_var("DAMON_PROMPTS_HOME") };
+    let _ = std::fs::remove_dir_all(&home);
+    let _ = std::fs::remove_dir_all(&ws);
 }
 
 /// Projects: create/list/get/set_defaults lifecycle, session.create

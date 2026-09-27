@@ -47,6 +47,17 @@
                                    # process anywhere on the machine. Hot-
                                    # reloaded.
 
+# Skills hub — install agent-skill packages once and sync them into
+# every installed CLI's native skill directory. Hot-reloaded; the hub
+# lives in <data_dir>/skills-hub and never creates an engine home for
+# a CLI that is not installed.
+# [skills]
+# enabled = true                            # false turns every skills.* method away
+# default_targets = ["claude", "codex"]     # skills.install without `targets`
+# extra_repos = [                           # additional discoverable repos,
+#   "owner/repo@branch",                    # "owner/name" defaults to main
+# ]
+
 # Remote relay — dial out so clients can reach this daemon without an
 # inbound port. Run damon-relay on a public host first; the relay also
 # serves the web UI at its root, so any browser can open the relay host,

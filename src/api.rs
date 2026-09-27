@@ -193,6 +193,8 @@ pub struct AppState {
     /// Per-source-IP token buckets for token-gated routes on non-loopback
     /// binds.
     rate_buckets: tokio::sync::Mutex<HashMap<IpAddr, (f64, Instant)>>,
+    /// Skills hub state: root + fetcher + the mutation lock.
+    pub skills: std::sync::Arc<crate::skills_hub::SkillsHub>,
 }
 
 impl AppState {
@@ -204,6 +206,12 @@ impl AppState {
         let sessions = {
             let cfg = config.read();
             SessionManager::from_config(&cfg)
+        };
+        let skills = {
+            let cfg = config.read();
+            std::sync::Arc::new(crate::skills_hub::SkillsHub::new(
+                crate::skills_hub::hub_root(cfg.data_dir.as_deref()),
+            ))
         };
         for id in sessions.available_backends() {
             info!(backend = id, "backend available");
@@ -217,6 +225,7 @@ impl AppState {
             metrics: Metrics::default(),
             ws_tickets: tokio::sync::Mutex::new(HashMap::new()),
             rate_buckets: tokio::sync::Mutex::new(HashMap::new()),
+            skills,
         });
         // Idle session sweep: backend sessions unused for
         // agent_idle_secs are closed (they reattach via the persistence
@@ -395,6 +404,8 @@ pub fn router(state: Arc<AppState>) -> Router {
         // authenticates itself through the ws ticket flow.
         .route("/ui", get(crate::ui::ui))
         .route("/relay-client.js", get(crate::ui::relay_client_js))
+        .route("/stream-reveal.js", get(crate::ui::stream_reveal_js))
+        .route("/hljs.js", get(crate::ui::hljs_js))
         // PWA assets — same trust level as /ui.
         .route("/manifest.webmanifest", get(crate::ui::manifest))
         .route("/icon.svg", get(crate::ui::icon))

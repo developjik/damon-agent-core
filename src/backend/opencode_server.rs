@@ -34,8 +34,7 @@ impl OpencodeServer {
         self.password.as_ref().map(|p| {
             format!(
                 "Basic {}",
-                base64::engine::general_purpose::STANDARD
-                    .encode(format!("opencode:{p}"))
+                base64::engine::general_purpose::STANDARD.encode(format!("opencode:{p}"))
             )
         })
     }
@@ -92,12 +91,18 @@ async fn ensure_server(command: &str) -> Result<OpencodeServer> {
     let port = free_port().context("no free port for opencode serve")?;
     let password = uuid::Uuid::new_v4().simple().to_string();
     let mut cmd = tokio::process::Command::new(command);
-    cmd.args(["serve", "--hostname", "127.0.0.1", "--port", &port.to_string()])
-        .env("OPENCODE_SERVER_PASSWORD", &password)
-        .stdin(std::process::Stdio::null())
-        .stdout(std::process::Stdio::null())
-        .stderr(std::process::Stdio::piped())
-        .kill_on_drop(true);
+    cmd.args([
+        "serve",
+        "--hostname",
+        "127.0.0.1",
+        "--port",
+        &port.to_string(),
+    ])
+    .env("OPENCODE_SERVER_PASSWORD", &password)
+    .stdin(std::process::Stdio::null())
+    .stdout(std::process::Stdio::null())
+    .stderr(std::process::Stdio::piped())
+    .kill_on_drop(true);
     #[cfg(unix)]
     cmd.process_group(0);
     let mut child = cmd

@@ -16,7 +16,7 @@
   },
   "scripts": {
     "postinstall": "node install.js",
-    "test": "node --test client.test.mjs",
+    "test": "node --test client.test.mjs stream-reveal.test.mjs",
     "typecheck": "tsc --noEmit --strict --module nodenext --moduleResolution nodenext --allowImportingTsExtensions types-smoke.ts"
   },
   "engines": {

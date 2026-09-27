@@ -99,7 +99,7 @@ impl AgentClient for OpencodeClient {
 
     async fn is_available(&self) -> bool {
         true // availability = the server could be spawned; detect()
-             // already gated the backend's presence on PATH.
+        // already gated the backend's presence on PATH.
     }
 
     async fn fetch_catalog(&self, _cwd: Option<&Path>) -> Result<ProviderCatalog> {
@@ -142,10 +142,10 @@ impl AgentClient for OpencodeClient {
     }
 
     async fn shutdown(&self) -> Result<()> {
-        if let Some(server) = self.server.get() {
-            if let Some(mut child) = server.take_child().await {
-                let _ = child.kill().await;
-            }
+        if let Some(server) = self.server.get()
+            && let Some(mut child) = server.take_child().await
+        {
+            let _ = child.kill().await;
         }
         Ok(())
     }
@@ -222,7 +222,9 @@ impl OpencodeSession {
                 let mut stream = resp.bytes_stream();
                 let mut buf = String::new();
                 loop {
-                    let Some(chunk) = stream.next().await else { break };
+                    let Some(chunk) = stream.next().await else {
+                        break;
+                    };
                     let chunk = match chunk {
                         Ok(c) => c,
                         Err(_) => break,
@@ -264,7 +266,10 @@ impl OpencodeSession {
             "message.updated" => {
                 let info = &p["info"];
                 if let (Some(id), Some(role)) = (info["id"].as_str(), info["role"].as_str()) {
-                    self.msg_roles.lock().await.insert(id.to_string(), role.to_string());
+                    self.msg_roles
+                        .lock()
+                        .await
+                        .insert(id.to_string(), role.to_string());
                     if role == "assistant"
                         && let Some(tokens) = info["tokens"].as_object()
                         && !tokens.is_empty()
@@ -286,10 +291,8 @@ impl OpencodeSession {
             "permission.asked" => self.on_permission_asked().await,
             "question.asked" => self.on_question_asked().await,
             "session.idle" => self.finish_turn().await,
-            "session.status" => {
-                if p["status"]["type"].as_str() == Some("idle") {
-                    self.finish_turn().await;
-                }
+            "session.status" if p["status"]["type"].as_str() == Some("idle") => {
+                self.finish_turn().await;
             }
             _ => {}
         }
@@ -352,10 +355,10 @@ impl OpencodeSession {
             Ok(v) => v,
             Err(_) => return,
         };
-        let Some(entry) = list
-            .as_array()
-            .and_then(|a| a.iter().find(|e| e["sessionID"].as_str() == Some(&self.session_id)))
-        else {
+        let Some(entry) = list.as_array().and_then(|a| {
+            a.iter()
+                .find(|e| e["sessionID"].as_str() == Some(&self.session_id))
+        }) else {
             return;
         };
         let tool = entry["permission"].as_str().unwrap_or("tool").to_string();
@@ -378,8 +381,12 @@ impl OpencodeSession {
             ],
             suggestions: vec![],
         };
-        self.register_ask(ask, entry["id"].as_str().unwrap_or_default().to_string(), false)
-            .await;
+        self.register_ask(
+            ask,
+            entry["id"].as_str().unwrap_or_default().to_string(),
+            false,
+        )
+        .await;
     }
 
     async fn on_question_asked(&self) {
@@ -387,10 +394,10 @@ impl OpencodeSession {
             Ok(v) => v,
             Err(_) => return,
         };
-        let Some(entry) = list
-            .as_array()
-            .and_then(|a| a.iter().find(|e| e["sessionID"].as_str() == Some(&self.session_id)))
-        else {
+        let Some(entry) = list.as_array().and_then(|a| {
+            a.iter()
+                .find(|e| e["sessionID"].as_str() == Some(&self.session_id))
+        }) else {
             return;
         };
         let Some(q) = entry["questions"].as_array().and_then(|a| a.first()) else {
@@ -420,8 +427,12 @@ impl OpencodeSession {
             actions,
             suggestions: vec![],
         };
-        self.register_ask(ask, entry["id"].as_str().unwrap_or_default().to_string(), true)
-            .await;
+        self.register_ask(
+            ask,
+            entry["id"].as_str().unwrap_or_default().to_string(),
+            true,
+        )
+        .await;
     }
 
     async fn register_ask(&self, ask: PermissionRequest, wire_id: String, is_question: bool) {
@@ -508,7 +519,11 @@ fn permission_action(id: &str, label: &str, deny: bool) -> PermissionAction {
         } else {
             PermissionBehavior::Allow
         },
-        variant: if deny { Some(ActionVariant::Danger) } else { Some(ActionVariant::Primary) },
+        variant: if deny {
+            Some(ActionVariant::Danger)
+        } else {
+            Some(ActionVariant::Primary)
+        },
     }
 }
 
@@ -659,7 +674,10 @@ impl AgentSession for OpencodeSession {
         }
         self.post_json(&format!("/session/{}/prompt_async", self.session_id), body)
             .await?;
-        self.emit(StreamEvent::in_turn(turn_id.clone(), StreamEventKind::TurnStarted));
+        self.emit(StreamEvent::in_turn(
+            turn_id.clone(),
+            StreamEventKind::TurnStarted,
+        ));
         Ok(turn_id)
     }
 
@@ -684,7 +702,9 @@ impl AgentSession for OpencodeSession {
         };
         let path = if ask.is_question {
             match &response {
-                PermissionResponse::Allow { action_id, answer, .. } => {
+                PermissionResponse::Allow {
+                    action_id, answer, ..
+                } => {
                     let value = action_id.clone().or_else(|| answer.clone());
                     self.post_json(
                         &format!("/question/{}/reply", ask.wire_id),
@@ -765,7 +785,7 @@ mod tests {
     /// metadata and the reply vocabulary is once/always/reject.
     #[test]
     fn permission_resource_maps_to_ask_actions() {
-        let actions = vec![
+        let actions = [
             permission_action("once", "Allow once", false),
             permission_action("always", "Always allow", false),
             permission_action("reject", "Reject", true),

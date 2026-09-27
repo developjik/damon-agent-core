@@ -23,5 +23,8 @@ __pycache__/
 # tooling artifacts
 .gjc/
 
+# agent session artifacts (ZCode)
+.zcode/
+
 # local security-scan history
 .mimosa/

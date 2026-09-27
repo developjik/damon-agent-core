@@ -20,6 +20,7 @@ Damon은 Rust로 만든 로컬 에이전트 컨트롤 데몬이다. Claude Code,
 - **설정 없는 백엔드** — 카탈로그 CLI 바이너리가 PATH에 있으면 자동 등록: `claude`(stream-json), `codex`(app-server), `omp`(RPC 모드), `pi`(RPC 모드, omp와 같은 프로토콜 가족), `qwen`(stream-json, Claude형 컨트롤 플레인), `droid`(JSON-RPC, Factory), `opencode`·`mimo`(HTTP+SSE, `serve` 입양 또는 스폰), `zcode`(Z.ai app-server). 카탈로그에 오르는 백엔드는 전부 네이티브 양방향 프로토콜 — 토큰 스트리밍, 턴 도중 권한 요청, 인터럽트 — 을 말하므로, Damon이 온전히 구동할 수 있는 CLI만 등재된다. `[backends.X]`는 구동 라인만 오버라이드하며 프로토콜을 추가하지는 않는다.
 - **권한은 채널 그대로** — 에이전트의 권한 요청을 웹 UI, CLI, 텔레그램/디스코드/슬랙 채팅의 `allow`/`deny` 답장으로 릴레이한다.
 - **검색 가능한 히스토리** — 모든 대화를 SQLite + FTS5에 기록. `damon search "error timeout"`으로 전체 이력 전문 검색.
+- **스킬 허브 + 프롬프트 라이브러리** — 에이전트 스킬 패키지를 한 번 설치하면(`damon skills install anthropics/skills document-skills/pdf`) 허브가 설치된 각 CLI의 네이티브 스킬 디렉터리로 싱크한다(심볼릭링크, 실패 시 복사; 스킬 로딩은 여전히 CLI 자신이). GitHub 리포 디스커버리, skills.sh 검색, 재사용 프롬프트 관리 — 웹 UI의 `/`, `@`, `!` 피커가 전부 보게 된다. `[skills] enabled = false`로 끌 수 있다.
 - **채팅 채널 내장** — Telegram, Discord, Slack 어댑터가 별도 바이너리로 나간다. 채널별 세션 자동 매핑, 스트리밍 응답.
 - **시크릿은 Damon에 없다** — 에이전트가 자기 인증을 관리한다. Damon config는 포트와 토큰 정도뿐.
 - **어디서든 접근** — 자체 인증서로 `wss` 서빙, 또는 공개 호스트에 `damon-relay`를 띄우면 데몬이 아웃바운드로 연결한다(인바운드 포트 불필요). 터널은 X25519 + AES-256-GCM으로 E2E 암호화.
@@ -56,7 +57,7 @@ curl localhost:9470/health
 # {"backends":["claude","omp"],"status":"ok",...}
 ```
 
-번들 웹 UI로 대화: `http://127.0.0.1:9470/ui` — 세션, 스트리밍, 권한 프롬프트까지, 설치 불필요.
+번들 웹 UI로 대화: `http://127.0.0.1:9470/ui` — 세션, 스트리밍, 권한 프롬프트까지, 설치 불필요. 스트리밍 답변은 도착 케이던스에 맞춰 흘러나오고(배치 덤프 없음) 그래펨 경계가 안전하며, 코드펜스는 문법 하이라이트로 렌더됩니다. `?revealDemo=1`을 붙이면 백엔드 없이 데모를 볼 수 있습니다.
 
 ## 구조
 

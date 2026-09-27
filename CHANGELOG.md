@@ -2,6 +2,71 @@
 
 ## Unreleased
 
+### Added — skills hub + prompt library (design ported from desktop-cc-gui's `skills_hub`, MIT)
+
+- **`skills.*` RPC surface** — install agent-skill packages into the
+  managed store (`<data_dir>/skills-hub/`) and sync them into every
+  targeted CLI's native skills directory (`~/.claude/skills`,
+  `~/.codex/skills`, pi/omp/opencode homes — env overrides honored) as
+  a symlink with a copy fallback. The CLIs keep loading skills
+  themselves; `catalog.commands` picks synced skills up with no extra
+  wiring. Targets whose engine home does not exist report failure
+  instead of creating it.
+- **Lifecycle** — uninstall to a 5-minute restorable trash, restore,
+  per-skill target reconciliation, local import (copy into the store,
+  the user's original preserved forever), read-only sources listed
+  (codex `.system`, plugin caches) but never importable. Mutations
+  serialize behind a lock; per-target results are reported, never
+  swallowed.
+- **Discovery** — GitHub Trees API scans of the registered repos
+  (200/repo, branch fallback, concurrency-bounded), skills.sh search
+  and popular lists, update checks against recorded source
+  signatures — all behind fingerprint+TTL disk caches. Hub errors
+  carry a taxonomy in `error.data.code` (`conflict`, `rate_limited`,
+  `readonly`, …); rate limits surface, never retry blindly.
+- **Prompt library (`prompts.*`)** — reusable markdown prompts with
+  light frontmatter at `<cwd>/.damon/prompts/` (gated by
+  `allowed_dirs`) and `<data_dir>/prompts/`; CRUD plus scope moves,
+  distinct from the `prompt.*` send-history.
+- **Web UI** — a Skills panel (Installed / Browse / Prompts tabs:
+  sync-state chips, target toggles, install with force-confirm on
+  conflicts, prompt editor) and the composer's `!` prompt picker that
+  inserts a prompt's body on demand.
+- **CLI** — `damon skills list/targets/search/popular/discover/install/uninstall/restore/show/repos`.
+- **Config** — `[skills] enabled` (default true, hot-reloaded;
+  `-32002` when off), `default_targets`, `extra_repos`.
+
+### Added — streaming reveal pipeline (web UI)
+
+- **Paced text reveal** — streaming replies now flow out over the
+  provider's arrival cadence instead of landing each batch in one
+  frame. A tail-anchored cursor (`holdback`) tracks unrevealed
+  characters, so markdown re-parsing that reshapes the rendered text
+  (`# `, `**`, link targets consumed) no longer resets the reveal and
+  dumps the backlog; per-frame steps stay small and everything is on
+  screen within 240ms of arrival. Grapheme-safe for CJK, emoji, flags
+  and combining marks (`Intl.Segmenter`). `prefers-reduced-motion`,
+  hidden tabs (rAF stalls — a 100ms timer fallback plus a stall
+  watchdog settle everything), turn end and session switch all bypass
+  the animation. Thinking panels get the same pacing.
+- **Layered rendering** — deltas coalesce at rAF + 100ms fallback;
+  full-document markdown parses are throttled by document length
+  (32/64/128ms) with a bounded backoff from the measured commit cost;
+  per-frame work is only the reveal spans the cursor crosses.
+- **Syntax highlighting** — fenced code renders through a vendored
+  highlight.js custom build (v11.12.0, 20 grammars, served same-origin
+  at `/hljs.js` to honor the CSP; `src/hljs.LICENSE.md` carries the
+  notice). Still-growing fences stay plain during a stream and light
+  up when their closing marker lands; highlighted HTML is served from
+  a bounded LRU (32 entries / 256k chars) so re-parsing stays cheap.
+- New asset `/stream-reveal.js` (the `DamonStreamReveal` classic
+  script, ported from desktop-cc-gui's MIT-licensed pipeline) served
+  like `/relay-client.js` so Node tests load it exactly like a
+  browser; `npm/stream-reveal.test.mjs` ports upstream's regression
+  battery (27 tests, including a replay of a real OMP arrival trace).
+- Smoke hook: `/ui?revealDemo=1` drives the real pipeline with a
+  synthetic 144ms-cadence turn — no daemon backend needed.
+
 ### Added — composer support (RPC)
 
 - **`catalog.commands`** — the `/` picker catalog: command and skill

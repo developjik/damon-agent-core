@@ -94,6 +94,30 @@ unchanged, so string-matching clients keep working.
 | `channel.delete_state` | `{convId, key}` | `{deleted: true}` |
 | `prompt.add` | `{text, sessionId?, cwd?}` — one sent prompt, trimmed and capped at 300 chars | `{recorded: true}` — upsert: a resend bumps the count and moves the row to newest; the newest 200 per cwd survive |
 | `prompt.recent` | `{limit? — default 50, max 200, sessionId?, cwd?}` | `{prompts: [{text, count}]}` — newest first, per cwd |
+| `skills.targets` | `{}` | `{targets: [{id, label, path, available}]}` — the agent CLIs' skill directories the hub can sync into; `available` means the engine home exists (the hub never creates one) |
+| `skills.installed` | `{}` | `{skills: [{id, name, description?, directory, managed, repo?, targets[], targetStates, sourceKind?, readonly?, targetPaths?}], generatedAt}` — registry-managed plus unmanaged finds, name-sorted |
+| `skills.repos` | `{}` | `{repos: [{owner, name, branch, enabled}]}` — registry plus `[skills] extra_repos` |
+| `skills.install` | `{owner, name, branch?, directory?, installName?, targets?, force?}` — `directory` defaults `.`; `targets` defaults `[skills].default_targets` else all available; an explicit `[]` installs without syncing | `{skill: SkillEntry, targetResults: [{target, ok, error?}]}` |
+| `skills.uninstall` | `{id}` | `{trashed, restoreId, ttlMs: 300000, targetResults}` |
+| `skills.restore` | `{id}` — within the 5-minute trash window | `{skill, targetResults}` |
+| `skills.setTargets` | `{id, targets[]}` — unknown ids fail `-32602`; newly selected sync, deselected remove | `{targetResults}` |
+| `skills.importLocal` | `{directory, targets?}` — copies a target-root skill into the managed store, preserving the source | `{skill, targetResults}` |
+| `skills.deleteLocal` | `{directory, targets?}` | `{targetResults}` — the preserved source copy is kept and reported |
+| `skills.addRepo` | `{owner, name, branch?}` | `{added: true}` |
+| `skills.removeRepo` | `{owner, name}` | `{removed: true}` — installed skills from the repo stay managed |
+| `skills.activity` | `{limit? — default 50, max 500}` | `{activity: [{ts, kind, …}]}` — newest first |
+| `skills.discover` | `{force?}` — GitHub trees of the enabled repos; 200 skills/repo, 1h cache | `{skills: [{key, name, description?, directory, readmeUrl?, repoOwner, repoName, repoBranch}], cached, generatedAt}` |
+| `skills.search` | `{q, limit? — 1-50, offset?}` — skills.sh | `{query, totalCount, skills: [{key, name, description?, directory, installs?, repoOwner, repoName, repoBranch}]}` |
+| `skills.popular` | `{limit? — 1-200, force?}` — seeded skills.sh queries, 6h cache | `{skills, cached, generatedAt}` |
+| `skills.updates` | `{force?}` — re-hashes the repos installed skills came from, 1h cache | `{updates: {skillId: has-update}, checkedAt, cached}` |
+| `skills.content` | `{directory}` — local read: managed copy, then target roots, then read-only sources | `{directory, path, markdown, truncated}` — 512 KiB cap |
+| `skills.remoteContent` | `{owner, name, branch?, directory}` — directory-name score match against the repo tree | `{name, description?, directory, markdown, truncated, branch}` |
+| `prompts.list` | `{sessionId?, cwd?}` — the prompt library (`!` picker) | `{prompts: [{name, description?, argumentHint?, scope, path}]}` — workspace first, name-sorted; `path` is the mutation handle |
+| `prompts.get` | `{promptPath, sessionId?, cwd?}` | `{name, description?, argumentHint?, scope, content}` — the body |
+| `prompts.create` | `{scope, name, description?, argumentHint?, content, sessionId?, cwd?}` — name: no whitespace/separators; body capped 64 KiB | `{created: true, path}` |
+| `prompts.update` | `{promptPath, name?, description?, argumentHint?, content?, sessionId?, cwd?}` — missing keeps, `""` clears a meta field | `{updated: true, path}` |
+| `prompts.delete` | `{promptPath, sessionId?, cwd?}` | `{deleted: bool}` — false when already gone |
+| `prompts.move` | `{promptPath, scope, sessionId?, cwd?}` — must differ from the current scope | `{moved: true, path}` |
 | `project.create` | `{name?, root, defaults?}` | `{projectId, name, root, defaults}` — root must be absolute; defaults keys: backend/model/mode/mcpServers |
 | `project.list` | `{}` | `{projects: [{projectId, name, root, defaults}]}` |
 | `project.get` | `{projectId}` | `{projectId, name, root, defaults}` |
@@ -146,6 +170,40 @@ desktop browser).
 
 `prompt` is a string or an array of blocks `[{type:"text",text},…]`.
 
+### Skills hub and prompt library
+
+The `skills.*` surface is a package manager for agent skills: install
+a skill once into the daemon's managed store
+(`<data_dir>/skills-hub/managed/`), and the hub syncs it into every
+targeted CLI's own native skills directory (`~/.claude/skills`,
+`~/.codex/skills`, pi/omp/opencode homes — env overrides like
+`CLAUDE_CONFIG_DIR` honored) as a symlink, copying where symlinks are
+unavailable. The CLIs keep loading skills themselves; `catalog.commands`
+picks the synced ones up with no extra wiring. Targets whose engine
+home does not exist report failure instead of creating it.
+
+Uninstall moves the managed copy to a 5-minute trash (restorable via
+`skills.restore`); removal from every target happens even for copies
+the registry forgot. Local skills found in the target roots list as
+unmanaged (`sourceKind: "local"`) and can be imported — copied into
+the store with the user's original preserved forever. Codex `.system`
+and plugin-cache skills list read-only (`readonly: true`,
+`error.data.code = "readonly"` on import attempts).
+
+Hub errors carry a taxonomy in `error.data.code`:
+`invalid_input` (`-32602`), `not_found`, `conflict` (local changes →
+`force`), `readonly`, `permission`, `network`, `http`,
+`rate_limited`, `internal`. Rate limits are surfaced, never retried
+blindly. Discovery (`skills.discover`) hits the GitHub Trees API of
+the registered repos; `skills.search`/`skills.popular` hit
+skills.sh — both behind fingerprint+TTL disk caches. The whole
+surface turns away with `-32002` when `[skills] enabled = false`.
+
+The prompt library (`prompts.*`) is separate from `prompt.*` history:
+markdown files with light frontmatter at `<cwd>/.damon/prompts/`
+(scope `workspace`, gated by `allowed_dirs`) and
+`<data_dir>/prompts/` (scope `global`). The web UI's `!` picker
+inserts a prompt's body into the composer via `prompts.get`.
 
 ### Listing filters, timestamps, tags
 

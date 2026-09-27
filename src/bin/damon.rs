@@ -147,12 +147,73 @@ enum Cmd {
     },
     /// Check connectivity, auth, and agent availability
     Doctor,
+    /// Skills hub: install agent skills, sync them into the CLIs
+    Skills {
+        #[command(subcommand)]
+        cmd: SkillsCmd,
+    },
     /// Print shell completions to stdout
     Completions {
         /// Shell to generate completions for
         #[arg(value_enum)]
         shell: clap_complete::Shell,
     },
+}
+
+#[derive(Subcommand)]
+enum SkillsCmd {
+    /// List installed skills (managed + unmanaged finds)
+    List,
+    /// List sync targets and their availability
+    Targets,
+    /// Search skills.sh for installable skills
+    Search {
+        query: String,
+        #[arg(long, default_value = "20")]
+        limit: u64,
+    },
+    /// Popular skills from skills.sh
+    Popular {
+        #[arg(long, default_value = "20")]
+        limit: u64,
+    },
+    /// Discover skills in the registered GitHub repos
+    Discover,
+    /// Install a skill and sync it into the targets (e.g.
+    /// `damon skills install anthropics/skills document-skills/pdf`)
+    Install {
+        /// Repo as owner/name
+        spec: String,
+        /// Source directory inside the repo ("." for the root)
+        directory: String,
+        /// Target ids (comma-separated); default = all available
+        #[arg(long, value_delimiter = ',')]
+        targets: Vec<String>,
+        /// Overwrite local changes in the managed copy
+        #[arg(long)]
+        force: bool,
+    },
+    /// Uninstall a skill by id (restorable for 5 minutes)
+    Uninstall { id: String },
+    /// Restore an uninstalled skill
+    Restore { id: String },
+    /// Print a locally-present skill's SKILL.md
+    Show { directory: String },
+    /// Manage the discoverable repos (bare `repos` lists)
+    Repos {
+        #[command(subcommand)]
+        cmd: Option<ReposCmd>,
+    },
+}
+
+#[derive(Subcommand)]
+enum ReposCmd {
+    /// List registered repos
+    List,
+    /// Add owner/name[@branch]
+    Add { spec: String },
+    /// Remove by owner name
+    Remove { owner: String, name: String },
 }
 
 #[tokio::main]
@@ -239,6 +300,10 @@ async fn main() -> anyhow::Result<()> {
                     methods,
                 ));
             }
+        }
+
+        Cmd::Skills { cmd } => {
+            skills_command(&client, args.json, cmd).await?;
         }
 
         Cmd::Logs { follow, lines } => {
@@ -626,6 +691,206 @@ fn discovery_config_path() -> Option<std::path::PathBuf> {
     }
     let p = std::path::PathBuf::from(d.config_path);
     p.exists().then_some(p)
+}
+
+/// `damon skills …` — thin RPC client over the hub surface. Output
+/// follows the house style: TSV rows by default, `--json` for whole
+/// responses.
+async fn skills_command(
+    client: &DamonClient,
+    json_out: bool,
+    cmd: SkillsCmd,
+) -> anyhow::Result<()> {
+    match cmd {
+        SkillsCmd::List => {
+            let r = client.request("skills.installed", json!({})).await?;
+            if json_out {
+                outln(r.to_string());
+            } else {
+                for s in r["skills"].as_array().into_iter().flatten() {
+                    outln(format!(
+                        "{}\t{}\t{}\t{}",
+                        s["directory"].as_str().unwrap_or("?"),
+                        s["name"].as_str().unwrap_or("?"),
+                        if s["managed"].as_bool().unwrap_or(false) {
+                            "managed"
+                        } else {
+                            "local"
+                        },
+                        s["targets"]
+                            .as_array()
+                            .map(|a| a
+                                .iter()
+                                .filter_map(|t| t.as_str())
+                                .collect::<Vec<_>>()
+                                .join(","))
+                            .unwrap_or_default(),
+                    ));
+                }
+            }
+        }
+        SkillsCmd::Targets => {
+            let r = client.request("skills.targets", json!({})).await?;
+            if json_out {
+                outln(r.to_string());
+            } else {
+                for t in r["targets"].as_array().into_iter().flatten() {
+                    outln(format!(
+                        "{}\t{}\t{}",
+                        t["id"].as_str().unwrap_or("?"),
+                        if t["available"].as_bool().unwrap_or(false) {
+                            "available"
+                        } else {
+                            "not-installed"
+                        },
+                        t["path"].as_str().unwrap_or("?"),
+                    ));
+                }
+            }
+        }
+        SkillsCmd::Search { query, limit } => {
+            let r = client
+                .request("skills.search", json!({"q": query, "limit": limit}))
+                .await?;
+            print_skill_rows(&r, &r["skills"], json_out);
+        }
+        SkillsCmd::Popular { limit } => {
+            let r = client
+                .request("skills.popular", json!({"limit": limit}))
+                .await?;
+            print_skill_rows(&r, &r["skills"], json_out);
+        }
+        SkillsCmd::Discover => {
+            let r = client.request("skills.discover", json!({})).await?;
+            print_skill_rows(&r, &r["skills"], json_out);
+        }
+        SkillsCmd::Install {
+            spec,
+            directory,
+            targets,
+            force,
+        } => {
+            let Some((owner, name)) = spec.split_once('/') else {
+                anyhow::bail!("spec must be owner/name (got {spec:?})");
+            };
+            let mut params = json!({
+                "owner": owner, "name": name, "directory": directory, "force": force,
+            });
+            if !targets.is_empty() {
+                params["targets"] = json!(targets);
+            }
+            let r = client.request("skills.install", params).await?;
+            if json_out {
+                outln(r.to_string());
+            } else {
+                let skill = &r["skill"];
+                outln(format!(
+                    "installed {} → {}",
+                    skill["directory"].as_str().unwrap_or("?"),
+                    r["targetResults"]
+                        .as_array()
+                        .map(|a| {
+                            a.iter()
+                                .filter(|t| t["ok"].as_bool().unwrap_or(false))
+                                .filter_map(|t| t["target"].as_str())
+                                .collect::<Vec<_>>()
+                                .join(",")
+                        })
+                        .unwrap_or_default(),
+                ));
+            }
+        }
+        SkillsCmd::Uninstall { id } => {
+            let r = client
+                .request("skills.uninstall", json!({"id": id}))
+                .await?;
+            if json_out {
+                outln(r.to_string());
+            } else if r["trashed"].as_bool().unwrap_or(false) {
+                outln(format!(
+                    "uninstalled (restorable: damon skills restore {})",
+                    r["restoreId"].as_str().unwrap_or("?")
+                ));
+            } else {
+                outln("uninstalled");
+            }
+        }
+        SkillsCmd::Restore { id } => {
+            client.request("skills.restore", json!({"id": id})).await?;
+            outln("restored");
+        }
+        SkillsCmd::Show { directory } => {
+            let r = client
+                .request("skills.content", json!({"directory": directory}))
+                .await?;
+            if json_out {
+                outln(r.to_string());
+            } else {
+                out(r["markdown"].as_str().unwrap_or("").to_string());
+                if r["truncated"].as_bool().unwrap_or(false) {
+                    outln("\n… (truncated)");
+                }
+            }
+        }
+        SkillsCmd::Repos { cmd } => match cmd {
+            None | Some(ReposCmd::List) => {
+                let r = client.request("skills.repos", json!({})).await?;
+                if json_out {
+                    outln(r.to_string());
+                } else {
+                    for repo in r["repos"].as_array().into_iter().flatten() {
+                        outln(format!(
+                            "{}\t{}\t{}",
+                            repo["owner"].as_str().unwrap_or("?"),
+                            repo["name"].as_str().unwrap_or("?"),
+                            repo["branch"].as_str().unwrap_or("?"),
+                        ));
+                    }
+                }
+            }
+            Some(ReposCmd::Add { spec }) => {
+                let Some((owner, name)) = spec.split_once('/') else {
+                    anyhow::bail!("spec must be owner/name[@branch] (got {spec:?})");
+                };
+                let (name, branch) = match name.split_once('@') {
+                    Some((n, b)) => (n, b),
+                    None => (name, "main"),
+                };
+                client
+                    .request(
+                        "skills.addRepo",
+                        json!({"owner": owner, "name": name, "branch": branch}),
+                    )
+                    .await?;
+                outln("added");
+            }
+            Some(ReposCmd::Remove { owner, name }) => {
+                client
+                    .request("skills.removeRepo", json!({"owner": owner, "name": name}))
+                    .await?;
+                outln("removed");
+            }
+        },
+    }
+    Ok(())
+}
+
+/// Shared row printer for the three discovery listings — the whole
+/// response (cached/generatedAt flags included) in `--json` mode.
+fn print_skill_rows(response: &Value, skills: &Value, json_out: bool) {
+    if json_out {
+        outln(response.to_string());
+        return;
+    }
+    for s in skills.as_array().into_iter().flatten() {
+        outln(format!(
+            "{}\t{}\t{}\t{}",
+            s["repoOwner"].as_str().unwrap_or("?"),
+            s["repoName"].as_str().unwrap_or("?"),
+            s["directory"].as_str().unwrap_or("."),
+            s["name"].as_str().unwrap_or("?"),
+        ));
+    }
 }
 
 /// Write one line to stdout, exiting quietly with 141 (128+SIGPIPE, the

@@ -448,10 +448,10 @@ mod tests {
         // Wait for the grandchild to publish its pid.
         let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
         let pid: libc::pid_t = loop {
-            if let Ok(s) = std::fs::read_to_string(&pid_file) {
-                if let Ok(p) = s.trim().parse() {
-                    break p;
-                }
+            if let Ok(s) = std::fs::read_to_string(&pid_file)
+                && let Ok(p) = s.trim().parse()
+            {
+                break p;
             }
             assert!(
                 std::time::Instant::now() < deadline,

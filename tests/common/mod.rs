@@ -33,6 +33,7 @@ pub fn mock_config(auth_token: Option<&str>) -> Config {
         agent_idle_secs: 0,
         max_sessions: None,
         allowed_dirs: Vec::new(),
+        skills: Default::default(),
     }
 }
 

@@ -30,37 +30,7 @@ pub struct SlashEntry {
 /// not produce an unbounded response.
 const MAX_ENTRIES: usize = 500;
 
-/// `$CLAUDE_CONFIG_DIR` when set non-empty (`~` expanded), else
-/// `~/.claude` — the env override Claude Code itself honors.
-fn claude_home() -> Option<PathBuf> {
-    env_dir("CLAUDE_CONFIG_DIR").or_else(|| home().map(|h| h.join(".claude")))
-}
-
-/// `$CODEX_HOME` when set non-empty, else `~/.codex`.
-fn codex_home() -> Option<PathBuf> {
-    env_dir("CODEX_HOME").or_else(|| home().map(|h| h.join(".codex")))
-}
-
-fn home() -> Option<PathBuf> {
-    directories::BaseDirs::new().map(|b| b.home_dir().to_path_buf())
-}
-
-/// An env-var path override: non-empty, with a leading `~` expanded
-/// against the home dir.
-fn env_dir(var: &str) -> Option<PathBuf> {
-    let raw = std::env::var(var).ok()?;
-    let raw = raw.trim();
-    if raw.is_empty() {
-        return None;
-    }
-    if let Some(rest) = raw.strip_prefix("~/") {
-        return home().map(|h| h.join(rest));
-    }
-    if raw == "~" {
-        return home();
-    }
-    Some(PathBuf::from(raw))
-}
+use crate::skills_hub::targets::{claude_home, picker_skill_roots};
 
 /// Build the catalog for one picker root (the session cwd).
 pub fn catalog(cwd: &Path) -> Vec<SlashEntry> {
@@ -95,23 +65,14 @@ pub fn catalog(cwd: &Path) -> Vec<SlashEntry> {
     commands
 }
 
-/// Global + workspace skill roots in shadow-priority order. Codex's
-/// `.system` skills sit one level deeper inside the same home.
+/// Global + workspace skill roots in shadow-priority order. The
+/// global list is the skills hub's target table (single source of
+/// truth — a skill the hub syncs into pi/omp/opencode appears here
+/// with no extra wiring); Codex's `.system` skills sit one level
+/// deeper inside the same home.
 fn skill_roots(cwd: &Path) -> Vec<(PathBuf, &'static str)> {
-    let mut roots = vec![(
-        cwd.join(".claude").join("skills"),
-        "workspace",
-    )];
-    if let Some(h) = claude_home() {
-        roots.push((h.join("skills"), "global"));
-    }
-    if let Some(h) = codex_home() {
-        roots.push((h.join("skills").join(".system"), "global"));
-        roots.push((h.join("skills"), "global"));
-    }
-    if let Some(h) = home() {
-        roots.push((h.join(".agents").join("skills"), "global"));
-    }
+    let mut roots = vec![(cwd.join(".claude").join("skills"), "workspace")];
+    roots.extend(picker_skill_roots());
     roots
 }
 
@@ -162,11 +123,10 @@ fn scan_commands(root: &Path, source: &'static str, out: &mut Vec<SlashEntry>) {
                 .unwrap_or_default();
             parts.push(stem.to_string());
             let derived = parts.join(":");
-            let (name, description, argument_hint) =
-                match read_frontmatter(&path, Some(&derived)) {
-                    Some(f) => (f.0, f.1, f.2),
-                    None => (derived, None, None),
-                };
+            let (name, description, argument_hint) = match read_frontmatter(&path, Some(&derived)) {
+                Some(f) => (f.0, f.1, f.2),
+                None => (derived, None, None),
+            };
             let name = name.trim().trim_start_matches('/').to_string();
             if name.is_empty() {
                 continue;
@@ -198,8 +158,11 @@ fn scan_skills(root: &Path, source: &'static str, out: &mut Vec<SlashEntry>) {
         if !path.join("SKILL.md").is_file() {
             continue;
         }
-        let (_, description, _) = read_frontmatter(&path.join("SKILL.md"), Some(name))
-            .unwrap_or((name.to_string(), None, None));
+        let (_, description, _) = read_frontmatter(&path.join("SKILL.md"), Some(name)).unwrap_or((
+            name.to_string(),
+            None,
+            None,
+        ));
         out.push(SlashEntry {
             name: name.to_string(),
             description,
@@ -232,7 +195,8 @@ fn read_frontmatter(
         let line = line.trim_end_matches(['\r', '\n']);
         if line == "---" {
             return Some((
-                name.or_else(|| fallback.map(String::from)).unwrap_or_default(),
+                name.or_else(|| fallback.map(String::from))
+                    .unwrap_or_default(),
                 description,
                 argument_hint,
             ));
@@ -280,10 +244,8 @@ mod tests {
 
     #[test]
     fn commands_join_directory_segments_and_read_frontmatter() {
-        let root = std::env::temp_dir().join(format!(
-            "damon-slash-{}",
-            uuid::Uuid::new_v4().simple()
-        ));
+        let root =
+            std::env::temp_dir().join(format!("damon-slash-{}", uuid::Uuid::new_v4().simple()));
         let cmds = root.join(".claude").join("commands");
         std::fs::create_dir_all(cmds.join("aimax")).unwrap();
         std::fs::write(
@@ -299,15 +261,17 @@ mod tests {
         assert_eq!(plan.kind, "command");
         assert_eq!(plan.description.as_deref(), Some("Plan the work"));
         assert_eq!(plan.argument_hint.as_deref(), Some("[goal]"));
-        assert!(entries.iter().any(|e| e.name == "plain" && e.description.is_none()));
+        assert!(
+            entries
+                .iter()
+                .any(|e| e.name == "plain" && e.description.is_none())
+        );
     }
 
     #[test]
     fn skills_need_a_skill_md_and_read_their_description() {
-        let root = std::env::temp_dir().join(format!(
-            "damon-slash-{}",
-            uuid::Uuid::new_v4().simple()
-        ));
+        let root =
+            std::env::temp_dir().join(format!("damon-slash-{}", uuid::Uuid::new_v4().simple()));
         let skills = root.join(".claude").join("skills");
         std::fs::create_dir_all(skills.join("review")).unwrap();
         std::fs::create_dir_all(skills.join("empty")).unwrap();
@@ -326,10 +290,8 @@ mod tests {
 
     #[test]
     fn unterminated_frontmatter_falls_back_to_the_path_name() {
-        let root = std::env::temp_dir().join(format!(
-            "damon-slash-{}",
-            uuid::Uuid::new_v4().simple()
-        ));
+        let root =
+            std::env::temp_dir().join(format!("damon-slash-{}", uuid::Uuid::new_v4().simple()));
         let cmds = root.join(".claude").join("commands");
         std::fs::create_dir_all(&cmds).unwrap();
         std::fs::write(cmds.join("broken.md"), "---\ndescription: never closed").unwrap();

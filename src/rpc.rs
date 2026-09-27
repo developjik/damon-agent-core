@@ -106,6 +106,11 @@ pub struct RpcError {
     /// One of [`error_code`] (or a future server code).
     pub code: i64,
     pub message: String,
+    /// Structured detail surfaced as `error.data` on the wire — the
+    /// skills hub carries its taxonomy code here (`conflict`,
+    /// `rate_limited`, …) so clients can branch without parsing
+    /// messages. Additive: pre-data clients ignore it.
+    pub data: Option<Value>,
 }
 
 impl RpcError {
@@ -113,7 +118,14 @@ impl RpcError {
         Self {
             code,
             message: message.into(),
+            data: None,
         }
+    }
+
+    /// Attach structured `error.data`.
+    pub fn with_data(mut self, data: Value) -> Self {
+        self.data = Some(data);
+        self
     }
 
     /// Wrap as `anyhow::Error` so `?` plumbing stays unchanged.
@@ -122,15 +134,26 @@ impl RpcError {
     }
 }
 
-/// (code, message) for the wire: a chained `RpcError` keeps its code,
-/// everything else renders as `INTERNAL_ERROR`. The message stays the
-/// full top-level rendering, exactly what pre-code clients matched on.
-fn error_payload(e: &anyhow::Error) -> (i64, String) {
-    let code = e
+/// (code, message, data) for the wire: a chained `RpcError` keeps its
+/// code, everything else renders as `INTERNAL_ERROR`. The message
+/// stays the full top-level rendering, exactly what pre-code clients
+/// matched on. A chained skills-hub `HubError` maps onto its nearest
+/// code and carries the taxonomy in `data.code`.
+fn error_payload(e: &anyhow::Error) -> (i64, String, Option<Value>) {
+    if let Some(r) = e.chain().find_map(|c| c.downcast_ref::<RpcError>()) {
+        return (r.code, e.to_string(), r.data.clone());
+    }
+    if let Some(h) = e
         .chain()
-        .find_map(|c| c.downcast_ref::<RpcError>())
-        .map_or(error_code::INTERNAL_ERROR, |r| r.code);
-    (code, e.to_string())
+        .find_map(|c| c.downcast_ref::<crate::skills_hub::HubError>())
+    {
+        return (
+            h.code.rpc_code(),
+            e.to_string(),
+            Some(json!({"code": h.code.as_str()})),
+        );
+    }
+    (error_code::INTERNAL_ERROR, e.to_string(), None)
 }
 
 /// A required string parameter — the most common param shape in
@@ -426,9 +449,13 @@ fn handle_frame(state: &Arc<AppState>, conn: &Arc<Conn>, text: &str) {
         let frame = match result {
             Ok(v) => json!({"id": id, "result": v}),
             Err(e) => {
-                let (code, message) = error_payload(&e);
+                let (code, message, data) = error_payload(&e);
                 state.metrics.record_rpc_error(code);
-                json!({"id": id, "error": {"code": code, "message": message}})
+                let mut error = json!({"code": code, "message": message});
+                if let Some(d) = data {
+                    error["data"] = d;
+                }
+                json!({"id": id, "error": error})
             }
         };
         // A response over the frame budget cannot cross the relay's
@@ -1114,12 +1141,239 @@ async fn dispatch(
         // the blocking pool like every other fs-heavy handler.
         "catalog.commands" => {
             let root = resolve_picker_root(state, &params).await?;
-            let commands = tokio::task::spawn_blocking(move || {
-                crate::slash_catalog::catalog(&root)
+            let commands =
+                tokio::task::spawn_blocking(move || crate::slash_catalog::catalog(&root))
+                    .await
+                    .map_err(|e| anyhow::anyhow!("catalog scan join failed: {e}"))?;
+            Ok(json!({"commands": commands}))
+        }
+
+        // Skills hub read surface. Same blocking-pool discipline: the
+        // listing walks every engine's skills dir. The hub root comes
+        // from config + env (daemon-chosen), never from the client.
+        "skills.targets" => {
+            let targets = tokio::task::spawn_blocking(crate::skills_hub::list_targets)
+                .await
+                .map_err(|e| anyhow::anyhow!("targets join failed: {e}"))?;
+            Ok(json!({"targets": targets}))
+        }
+        "skills.installed" => {
+            let hub = skills_hub_root(state);
+            let skills = tokio::task::spawn_blocking(move || crate::skills_hub::installed(&hub))
+                .await
+                .map_err(|e| anyhow::anyhow!("installed join failed: {e}"))?;
+            Ok(json!({
+                "skills": skills,
+                "generatedAt": crate::skills_hub::fsutil::now_ms(),
+            }))
+        }
+        "skills.repos" => {
+            let hub = skills_hub_root(state);
+            let extras = parse_extra_repos(state)?;
+            let repos = tokio::task::spawn_blocking(move || {
+                let reg = crate::skills_hub::registry::Registry::load(&hub);
+                crate::skills_hub::lifecycle::effective_repos(&reg, &extras)
             })
             .await
-            .map_err(|e| anyhow::anyhow!("catalog scan join failed: {e}"))?;
-            Ok(json!({"commands": commands}))
+            .map_err(|e| anyhow::anyhow!("repos join failed: {e}"))?;
+            Ok(json!({"repos": repos}))
+        }
+
+        // Skills hub mutations. The `[skills] enabled` switch (hot)
+        // turns the whole surface away; install defaults its targets
+        // from `[skills] default_targets`, else every available
+        // target. Hub taxonomy errors reach the wire as
+        // `error.data.code`.
+        "skills.install" => {
+            skills_enabled(state)?;
+            let owner = req_str(&params, "owner")?.to_string();
+            let name = req_str(&params, "name")?.to_string();
+            let branch = params["branch"].as_str().unwrap_or("main").to_string();
+            let directory = params["directory"].as_str().unwrap_or(".").to_string();
+            let targets = default_skills_targets(state, &params)?;
+            let force = params["force"].as_bool().unwrap_or(false);
+            let install_name = params["installName"].as_str().map(String::from);
+            let hub = state.skills.clone();
+            let outcome = tokio::task::spawn_blocking(move || {
+                hub.install(crate::skills_hub::InstallRequest {
+                    repo_owner: owner,
+                    repo_name: name,
+                    repo_branch: branch,
+                    directory,
+                    install_name,
+                    targets,
+                    force,
+                })
+            })
+            .await
+            .map_err(|e| anyhow::anyhow!("install join failed: {e}"))??;
+            Ok(serde_json::to_value(outcome)?)
+        }
+        "skills.uninstall" => {
+            skills_enabled(state)?;
+            let id = req_str(&params, "id")?.to_string();
+            let hub = state.skills.clone();
+            let outcome = tokio::task::spawn_blocking(move || hub.uninstall(&id))
+                .await
+                .map_err(|e| anyhow::anyhow!("uninstall join failed: {e}"))??;
+            Ok(serde_json::to_value(outcome)?)
+        }
+        "skills.restore" => {
+            skills_enabled(state)?;
+            let id = req_str(&params, "id")?.to_string();
+            let hub = state.skills.clone();
+            let outcome = tokio::task::spawn_blocking(move || hub.restore(&id))
+                .await
+                .map_err(|e| anyhow::anyhow!("restore join failed: {e}"))??;
+            Ok(serde_json::to_value(outcome)?)
+        }
+        "skills.setTargets" => {
+            skills_enabled(state)?;
+            let id = req_str(&params, "id")?.to_string();
+            let targets = string_array(&params, "targets")?;
+            let hub = state.skills.clone();
+            let results = tokio::task::spawn_blocking(move || hub.set_targets(&id, &targets))
+                .await
+                .map_err(|e| anyhow::anyhow!("setTargets join failed: {e}"))??;
+            Ok(json!({"targetResults": results}))
+        }
+        "skills.importLocal" => {
+            skills_enabled(state)?;
+            let directory = req_str(&params, "directory")?.to_string();
+            let targets = string_array(&params, "targets")?;
+            let hub = state.skills.clone();
+            let outcome =
+                tokio::task::spawn_blocking(move || hub.import_local(&directory, &targets))
+                    .await
+                    .map_err(|e| anyhow::anyhow!("importLocal join failed: {e}"))??;
+            Ok(serde_json::to_value(outcome)?)
+        }
+        "skills.deleteLocal" => {
+            skills_enabled(state)?;
+            let directory = req_str(&params, "directory")?.to_string();
+            let targets = string_array(&params, "targets")?;
+            let hub = state.skills.clone();
+            let results =
+                tokio::task::spawn_blocking(move || hub.delete_local(&directory, &targets))
+                    .await
+                    .map_err(|e| anyhow::anyhow!("deleteLocal join failed: {e}"))??;
+            Ok(json!({"targetResults": results}))
+        }
+        "skills.addRepo" => {
+            skills_enabled(state)?;
+            let owner = req_str(&params, "owner")?.to_string();
+            let name = req_str(&params, "name")?.to_string();
+            let branch = params["branch"].as_str().unwrap_or("main").to_string();
+            let hub = state.skills.clone();
+            tokio::task::spawn_blocking(move || {
+                hub.add_repo(crate::skills_hub::RepoEntry {
+                    owner,
+                    name,
+                    branch,
+                    enabled: true,
+                })
+            })
+            .await
+            .map_err(|e| anyhow::anyhow!("addRepo join failed: {e}"))??;
+            Ok(json!({"added": true}))
+        }
+        "skills.removeRepo" => {
+            skills_enabled(state)?;
+            let owner = req_str(&params, "owner")?.to_string();
+            let name = req_str(&params, "name")?.to_string();
+            let hub = state.skills.clone();
+            tokio::task::spawn_blocking(move || hub.remove_repo(&owner, &name))
+                .await
+                .map_err(|e| anyhow::anyhow!("removeRepo join failed: {e}"))??;
+            Ok(json!({"removed": true}))
+        }
+        "skills.activity" => {
+            skills_enabled(state)?;
+            let limit = params["limit"].as_u64().unwrap_or(50).min(500) as usize;
+            let hub = state.skills.clone();
+            let activity = tokio::task::spawn_blocking(move || hub.activity(limit))
+                .await
+                .map_err(|e| anyhow::anyhow!("activity join failed: {e}"))?;
+            Ok(json!({"activity": activity}))
+        }
+
+        // Discovery: repo scans, skills.sh search/popular, update
+        // checks, and the two content viewers. All hit the network
+        // behind the fetch layer with disk caches; rate limits come
+        // back as typed `error.data.code = "rate_limited"`.
+        "skills.discover" => {
+            skills_enabled(state)?;
+            let force = params["force"].as_bool().unwrap_or(false);
+            let repos = {
+                let hub = skills_hub_root(state);
+                let extras = parse_extra_repos(state)?;
+                tokio::task::spawn_blocking(move || {
+                    let reg = crate::skills_hub::registry::Registry::load(&hub);
+                    crate::skills_hub::lifecycle::effective_repos(&reg, &extras)
+                })
+                .await
+                .map_err(|e| anyhow::anyhow!("discover repos join failed: {e}"))?
+            };
+            let hub = state.skills.clone();
+            let outcome = tokio::task::spawn_blocking(move || hub.discover(repos, force))
+                .await
+                .map_err(|e| anyhow::anyhow!("discover join failed: {e}"))??;
+            Ok(serde_json::to_value(outcome)?)
+        }
+        "skills.search" => {
+            skills_enabled(state)?;
+            let q = req_str(&params, "q")?.to_string();
+            let echoed = q.clone();
+            let limit = params["limit"].as_u64().unwrap_or(20).clamp(1, 50);
+            let offset = params["offset"].as_u64().unwrap_or(0);
+            let hub = state.skills.clone();
+            let (total, skills) =
+                tokio::task::spawn_blocking(move || hub.search(&q, limit, offset))
+                    .await
+                    .map_err(|e| anyhow::anyhow!("search join failed: {e}"))??;
+            Ok(json!({"query": echoed, "totalCount": total, "skills": skills}))
+        }
+        "skills.popular" => {
+            skills_enabled(state)?;
+            let limit = params["limit"].as_u64().unwrap_or(60).clamp(1, 200);
+            let force = params["force"].as_bool().unwrap_or(false);
+            let hub = state.skills.clone();
+            let outcome = tokio::task::spawn_blocking(move || hub.popular(limit, force))
+                .await
+                .map_err(|e| anyhow::anyhow!("popular join failed: {e}"))??;
+            Ok(serde_json::to_value(outcome)?)
+        }
+        "skills.updates" => {
+            skills_enabled(state)?;
+            let force = params["force"].as_bool().unwrap_or(false);
+            let hub = state.skills.clone();
+            let outcome = tokio::task::spawn_blocking(move || hub.updates(force))
+                .await
+                .map_err(|e| anyhow::anyhow!("updates join failed: {e}"))??;
+            Ok(serde_json::to_value(outcome)?)
+        }
+        "skills.content" => {
+            skills_enabled(state)?;
+            let directory = req_str(&params, "directory")?.to_string();
+            let hub = state.skills.clone();
+            let content = tokio::task::spawn_blocking(move || hub.content(&directory))
+                .await
+                .map_err(|e| anyhow::anyhow!("content join failed: {e}"))??;
+            Ok(serde_json::to_value(content)?)
+        }
+        "skills.remoteContent" => {
+            skills_enabled(state)?;
+            let owner = req_str(&params, "owner")?.to_string();
+            let name = req_str(&params, "name")?.to_string();
+            let branch = params["branch"].as_str().unwrap_or("main").to_string();
+            let directory = req_str(&params, "directory")?.to_string();
+            let hub = state.skills.clone();
+            let content = tokio::task::spawn_blocking(move || {
+                hub.remote_content(&owner, &name, &branch, &directory)
+            })
+            .await
+            .map_err(|e| anyhow::anyhow!("remoteContent join failed: {e}"))??;
+            Ok(serde_json::to_value(content)?)
         }
         "logs.tail" => {
             let n = params["lines"].as_u64().unwrap_or(200).min(2000) as usize;
@@ -1272,23 +1526,27 @@ async fn dispatch(
             // never follows symlinks and its output is bounded by
             // construction, so the frame stays under budget.
             let root = resolve_picker_root(state, &params).await?;
-            let root = root
-                .canonicalize()
-                .map_err(|e| RpcError::error(error_code::INVALID_PARAMS, format!("{}: {e}", root.display())))?;
-            let meta = tokio::fs::metadata(&root)
-                .await
-                .map_err(|e| RpcError::error(error_code::INVALID_PARAMS, format!("{}: {e}", root.display())))?;
+            let root = root.canonicalize().map_err(|e| {
+                RpcError::error(
+                    error_code::INVALID_PARAMS,
+                    format!("{}: {e}", root.display()),
+                )
+            })?;
+            let meta = tokio::fs::metadata(&root).await.map_err(|e| {
+                RpcError::error(
+                    error_code::INVALID_PARAMS,
+                    format!("{}: {e}", root.display()),
+                )
+            })?;
             if !meta.is_dir() {
                 return Err(RpcError::error(
                     error_code::INVALID_PARAMS,
                     format!("{} is not a directory", root.display()),
                 ));
             }
-            let index = tokio::task::spawn_blocking(move || {
-                crate::file_index::build(&root)
-            })
-            .await
-            .map_err(|e| anyhow::anyhow!("index walk join failed: {e}"))??;
+            let index = tokio::task::spawn_blocking(move || crate::file_index::build(&root))
+                .await
+                .map_err(|e| anyhow::anyhow!("index walk join failed: {e}"))??;
             Ok(serde_json::to_value(index)?)
         }
 
@@ -1345,6 +1603,110 @@ async fn dispatch(
                 .map(|(text, count)| json!({"text": text, "count": count}))
                 .collect::<Vec<_>>();
             Ok(json!({"prompts": prompts}))
+        }
+
+        // Prompt library (distinct from prompt.* history above): the
+        // reusable markdown prompts behind the composer's `!` picker.
+        // Workspace scope flows through the same allowed_dirs gate as
+        // every other client-supplied cwd; the global root is
+        // daemon-chosen.
+        "prompts.list" => {
+            let cwd = resolve_picker_root(state, &params).await?;
+            let data_dir = state.config.read().data_dir.clone();
+            let prompts = tokio::task::spawn_blocking(move || {
+                crate::prompts::list(&crate::prompts::roots(Some(&cwd), data_dir.as_deref()))
+            })
+            .await
+            .map_err(|e| anyhow::anyhow!("prompts list join failed: {e}"))?;
+            Ok(json!({"prompts": prompts}))
+        }
+        "prompts.create" => {
+            let cwd = resolve_picker_root(state, &params).await?;
+            let data_dir = state.config.read().data_dir.clone();
+            let scope = req_str(&params, "scope")?.to_string();
+            let name = req_str(&params, "name")?.to_string();
+            let description = params["description"].as_str().map(String::from);
+            let hint = params["argumentHint"].as_str().map(String::from);
+            let content = req_str(&params, "content")?.to_string();
+            let path = tokio::task::spawn_blocking(move || {
+                crate::prompts::create(
+                    &crate::prompts::roots(Some(&cwd), data_dir.as_deref()),
+                    &scope,
+                    &name,
+                    description,
+                    hint,
+                    &content,
+                )
+            })
+            .await
+            .map_err(|e| anyhow::anyhow!("prompts create join failed: {e}"))??;
+            Ok(json!({"created": true, "path": path.to_string_lossy()}))
+        }
+        "prompts.update" => {
+            let cwd = resolve_picker_root(state, &params).await?;
+            let data_dir = state.config.read().data_dir.clone();
+            let prompt_path = req_str(&params, "promptPath")?.to_string();
+            let name = params["name"].as_str().map(String::from);
+            let description = params["description"].as_str().map(String::from);
+            let hint = params["argumentHint"].as_str().map(String::from);
+            let content = params["content"].as_str().map(String::from);
+            let path = tokio::task::spawn_blocking(move || {
+                crate::prompts::update(
+                    &crate::prompts::roots(Some(&cwd), data_dir.as_deref()),
+                    &prompt_path,
+                    name,
+                    description,
+                    hint,
+                    content,
+                )
+            })
+            .await
+            .map_err(|e| anyhow::anyhow!("prompts update join failed: {e}"))??;
+            Ok(json!({"updated": true, "path": path.to_string_lossy()}))
+        }
+        "prompts.get" => {
+            let cwd = resolve_picker_root(state, &params).await?;
+            let data_dir = state.config.read().data_dir.clone();
+            let prompt_path = req_str(&params, "promptPath")?.to_string();
+            let detail = tokio::task::spawn_blocking(move || {
+                crate::prompts::get(
+                    &crate::prompts::roots(Some(&cwd), data_dir.as_deref()),
+                    &prompt_path,
+                )
+            })
+            .await
+            .map_err(|e| anyhow::anyhow!("prompts get join failed: {e}"))??;
+            Ok(serde_json::to_value(detail)?)
+        }
+        "prompts.delete" => {
+            let cwd = resolve_picker_root(state, &params).await?;
+            let data_dir = state.config.read().data_dir.clone();
+            let prompt_path = req_str(&params, "promptPath")?.to_string();
+            let deleted = tokio::task::spawn_blocking(move || {
+                crate::prompts::delete(
+                    &crate::prompts::roots(Some(&cwd), data_dir.as_deref()),
+                    &prompt_path,
+                )
+            })
+            .await
+            .map_err(|e| anyhow::anyhow!("prompts delete join failed: {e}"))??;
+            Ok(json!({"deleted": deleted}))
+        }
+        "prompts.move" => {
+            let cwd = resolve_picker_root(state, &params).await?;
+            let data_dir = state.config.read().data_dir.clone();
+            let prompt_path = req_str(&params, "promptPath")?.to_string();
+            let scope = req_str(&params, "scope")?.to_string();
+            let path = tokio::task::spawn_blocking(move || {
+                crate::prompts::move_prompt(
+                    &crate::prompts::roots(Some(&cwd), data_dir.as_deref()),
+                    &prompt_path,
+                    &scope,
+                )
+            })
+            .await
+            .map_err(|e| anyhow::anyhow!("prompts move join failed: {e}"))??;
+            Ok(json!({"moved": true, "path": path.to_string_lossy()}))
         }
 
         other => Err(RpcError::error(
@@ -1431,6 +1793,72 @@ async fn stored_cwd(state: &Arc<AppState>, id: &str) -> Result<std::path::PathBu
 /// omits `cwd` (session_config's fallback), so a picker opened before
 /// the lazy first `session.create` indexes the directory the session
 /// will run in.
+/// The skills hub's root: `$DAMON_SKILLS_HUB_HOME` (tests) else
+/// `<data_dir>/skills-hub`. Daemon-chosen like every other hub path.
+fn skills_hub_root(state: &AppState) -> std::path::PathBuf {
+    let data_dir = state.config.read().data_dir.clone();
+    crate::skills_hub::hub_root(data_dir.as_deref())
+}
+
+/// The `[skills] enabled` switch — hot-reloaded, checked at the
+/// dispatch door.
+fn skills_enabled(state: &AppState) -> Result<()> {
+    if state.config.read().skills.enabled {
+        return Ok(());
+    }
+    Err(RpcError::error(
+        error_code::NOT_SUPPORTED,
+        "the skills hub is disabled in config ([skills] enabled = false)",
+    ))
+}
+
+/// `[skills] extra_repos` parsed into repo entries (invalid specs are
+/// a config error, surfaced loudly rather than skipped).
+fn parse_extra_repos(state: &AppState) -> Result<Vec<crate::skills_hub::RepoEntry>> {
+    let specs = state.config.read().skills.extra_repos.clone();
+    specs
+        .iter()
+        .map(|s| crate::skills_hub::lifecycle::parse_repo_spec(s).map_err(anyhow::Error::from))
+        .collect()
+}
+
+/// Targets for an install: the request's array (an explicit empty
+/// array installs without syncing anywhere), else `[skills]
+/// default_targets`, else every available target.
+fn default_skills_targets(state: &AppState, params: &Value) -> Result<Vec<String>> {
+    if params.get("targets").is_some() {
+        return string_array(params, "targets");
+    }
+    let configured = state.config.read().skills.default_targets.clone();
+    if !configured.is_empty() {
+        return Ok(configured);
+    }
+    Ok(crate::skills_hub::list_targets()
+        .into_iter()
+        .filter(|t| t.available)
+        .map(|t| t.id)
+        .collect())
+}
+
+/// A string-array parameter; anything else is `INVALID_PARAMS`.
+fn string_array(params: &Value, key: &str) -> Result<Vec<String>> {
+    params[key]
+        .as_array()
+        .ok_or_else(|| {
+            RpcError::error(
+                error_code::INVALID_PARAMS,
+                format!("{key} must be an array"),
+            )
+        })?
+        .iter()
+        .map(|v| {
+            v.as_str().map(String::from).ok_or_else(|| {
+                RpcError::error(error_code::INVALID_PARAMS, format!("{key} must be strings"))
+            })
+        })
+        .collect()
+}
+
 async fn resolve_picker_root(state: &Arc<AppState>, params: &Value) -> Result<std::path::PathBuf> {
     if let Some(id) = params["sessionId"].as_str() {
         return stored_cwd(state, id).await;
@@ -1822,7 +2250,10 @@ async fn drive_turn(
     // snapshot — backends adopt the native id the agent reports
     // mid-conversation (a first turn may only surface its session id
     // once it starts streaming).
-    let fresh_handle = ms.session.persistence_handle().or_else(|| ms.handle.clone());
+    let fresh_handle = ms
+        .session
+        .persistence_handle()
+        .or_else(|| ms.handle.clone());
     if let Some(h) = &fresh_handle {
         let _ = state
             .store
@@ -1923,6 +2354,24 @@ pub fn rpc_methods() -> Vec<Value> {
         json!({"name": "session.set_mode", "params": {"sessionId": "string", "mode": "string"}, "result": {}}),
         json!({"name": "catalog.models", "params": {"backend": "string"}, "result": {"models": "array", "modes": "array"}}),
         json!({"name": "catalog.commands", "params": {"sessionId": "string? — root selector", "cwd": "string? — gated by allowed_dirs like session.create"}, "result": {"commands": "array of {name, description?, argumentHint?, source, kind} — slash commands and skills the CLIs expand; workspace entries shadow same-named global ones"}}),
+        json!({"name": "skills.targets", "params": {}, "result": {"targets": "array of {id, label, path, available} — the agent CLIs' skill directories the hub can sync into (claude, codex, pi, omp, opencode; available means the engine home exists — the hub never creates one)"}}),
+        json!({"name": "skills.installed", "params": {}, "result": {"skills": "array of {id, name, description?, directory, managed, repo?, targets, targetStates, sourceKind?, readonly?, targetPaths?} — registry-managed plus unmanaged finds, name-sorted", "generatedAt": "number — ms"}}),
+        json!({"name": "skills.repos", "params": {}, "result": {"repos": "array of {owner, name, branch, enabled} — discoverable source repos (registry + [skills] extra_repos)"}}),
+        json!({"name": "skills.install", "params": {"owner": "string", "name": "string", "branch": "string? — default main, with main/master fallback", "directory": "string? — source dir inside the repo, \".\" for the root", "installName": "string? — flat name override", "targets": "string[]? — target ids, default [skills].default_targets else all available; explicit [] installs without syncing", "force": "boolean? — overwrite local changes in the managed copy"}, "result": {"skill": "the registry entry", "targetResults": "array of {target, ok, error?}"}}),
+        json!({"name": "skills.uninstall", "params": {"id": "string — skill id or key"}, "result": {"trashed": "boolean — restorable within ttlMs", "restoreId": "string", "ttlMs": "number — 300000", "targetResults": "array"}}),
+        json!({"name": "skills.restore", "params": {"id": "string"}, "result": {"skill": "the restored entry", "targetResults": "array"}}),
+        json!({"name": "skills.setTargets", "params": {"id": "string", "targets": "string[]"}, "result": {"targetResults": "array — newly selected synced, deselected removed"}}),
+        json!({"name": "skills.importLocal", "params": {"directory": "string — skill dir name found in a target root", "targets": "string[]? — default: where it was found"}, "result": {"skill": "entry with sourcePath preserved", "targetResults": "array"}}),
+        json!({"name": "skills.deleteLocal", "params": {"directory": "string", "targets": "string[]?"}, "result": {"targetResults": "array — the source copy is kept and reported"}}),
+        json!({"name": "skills.addRepo", "params": {"owner": "string", "name": "string", "branch": "string?"}, "result": {"added": "boolean"}}),
+        json!({"name": "skills.removeRepo", "params": {"owner": "string", "name": "string"}, "result": {"removed": "boolean — installed skills from the repo stay managed"}}),
+        json!({"name": "skills.activity", "params": {"limit": "number? — default 50, max 500"}, "result": {"activity": "array of {ts, kind, ...} newest first"}}),
+        json!({"name": "skills.discover", "params": {"force": "boolean? — bypass the 1h cache"}, "result": {"skills": "array of {key, name, description?, directory, readmeUrl?, repoOwner, repoName, repoBranch}", "cached": "boolean", "generatedAt": "number — ms"}}),
+        json!({"name": "skills.search", "params": {"q": "string — skills.sh query (2+ chars)", "limit": "number? — default 20, 1-50", "offset": "number?"}, "result": {"query": "string", "totalCount": "number", "skills": "array of {key, name, description?, directory, installs?, repoOwner, repoName, repoBranch}"}}),
+        json!({"name": "skills.popular", "params": {"limit": "number? — default 60, 1-200", "force": "boolean? — bypass the 6h cache"}, "result": {"skills": "array sorted by installs", "cached": "boolean", "generatedAt": "number"}}),
+        json!({"name": "skills.updates", "params": {"force": "boolean?"}, "result": {"updates": "map skillId → has-update", "checkedAt": "number", "cached": "boolean"}}),
+        json!({"name": "skills.content", "params": {"directory": "string"}, "result": {"directory": "string", "path": "string — label:absolute path of the copy found", "markdown": "string", "truncated": "boolean — 512 KiB cap"}}),
+        json!({"name": "skills.remoteContent", "params": {"owner": "string", "name": "string", "branch": "string?", "directory": "string"}, "result": {"name": "string", "description": "string?", "directory": "string", "markdown": "string", "truncated": "boolean", "branch": "string"}}),
         json!({"name": "logs.tail", "params": {"lines": "number? — most recent lines, default 200, max 2000"}, "result": {"lines": "string[] — the daemon's recent log lines, oldest first"}}),
         json!({"name": "logs.follow", "params": {"follow": "boolean? — default true; false stops a previous follow"}, "result": {"following": "boolean — when true, every new log line arrives as a log.line push"}}),
         json!({"name": "file.read", "params": {"sessionId": "string", "path": "string — relative to the session cwd or absolute inside it"}, "result": {"content": "string — base64", "bytes": "number", "path": "string"}}),
@@ -1934,6 +2383,12 @@ pub fn rpc_methods() -> Vec<Value> {
         json!({"name": "channel.delete_state", "params": {"convId": "string", "key": "string"}, "result": {"deleted": "boolean"}}),
         json!({"name": "prompt.add", "params": {"text": "string — trimmed, capped at 300 chars", "sessionId": "string? — root selector", "cwd": "string? — gated by allowed_dirs like session.create"}, "result": {"recorded": "boolean"}}),
         json!({"name": "prompt.recent", "params": {"limit": "number? — default 50, max 200", "sessionId": "string?", "cwd": "string?"}, "result": {"prompts": "array of {text, count} — newest first"}}),
+        json!({"name": "prompts.list", "params": {"sessionId": "string? — root selector", "cwd": "string? — gated by allowed_dirs; scopes the workspace root"}, "result": {"prompts": "array of {name, description?, argumentHint?, scope, path} — workspace first, name-sorted; path is the mutation handle"}}),
+        json!({"name": "prompts.create", "params": {"scope": "workspace | global", "name": "string — no whitespace or separators", "description": "string?", "argumentHint": "string?", "content": "string — body, capped at 64 KiB", "sessionId": "string?", "cwd": "string?"}, "result": {"created": "boolean", "path": "string"}}),
+        json!({"name": "prompts.update", "params": {"promptPath": "string — absolute, from prompts.list", "name": "string? — rename", "description": "string? — empty string clears", "argumentHint": "string? — empty string clears", "content": "string?", "sessionId": "string?", "cwd": "string?"}, "result": {"updated": "boolean", "path": "string — the (possibly renamed) file"}}),
+        json!({"name": "prompts.get", "params": {"promptPath": "string", "sessionId": "string?", "cwd": "string?"}, "result": {"name": "string", "description": "string?", "argumentHint": "string?", "scope": "string", "content": "string — the body"}}),
+        json!({"name": "prompts.delete", "params": {"promptPath": "string", "sessionId": "string?", "cwd": "string?"}, "result": {"deleted": "boolean — false when already gone"}}),
+        json!({"name": "prompts.move", "params": {"promptPath": "string", "scope": "workspace | global — must differ from the current one", "sessionId": "string?", "cwd": "string?"}, "result": {"moved": "boolean", "path": "string"}}),
         json!({"name": "project.create", "params": {"name": "string?", "root": "string — absolute", "defaults?": "{backend?, model?, mode?, mcpServers?}"}, "result": {"projectId": "string", "name": "string", "root": "string", "defaults": "object"}}),
         json!({"name": "project.list", "params": {}, "result": {"projects": "array of {projectId, name, root, defaults}"}}),
         json!({"name": "project.get", "params": {"projectId": "string"}, "result": {"projectId": "string", "name": "string", "root": "string", "defaults": "object"}}),

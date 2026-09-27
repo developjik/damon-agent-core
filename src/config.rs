@@ -55,6 +55,43 @@ pub struct Config {
     /// agent process run anywhere on the machine. Hot-reloaded.
     #[serde(default)]
     pub allowed_dirs: Vec<PathBuf>,
+    /// `[skills]` — the skills hub. Hot-reloaded.
+    #[serde(default)]
+    pub skills: SkillsConfig,
+}
+
+/// `[skills]` — the skills hub (install/sync manager for agent skill
+/// packages). Enabled by default; disabling turns every `skills.*`
+/// method away at the dispatch door.
+#[derive(Clone, Debug, Deserialize, PartialEq)]
+#[serde(deny_unknown_fields)]
+pub struct SkillsConfig {
+    /// Master switch for the whole `skills.*` surface. Hot-reloaded.
+    #[serde(default = "default_skills_enabled")]
+    pub enabled: bool,
+    /// Targets used when `skills.install` omits `targets` (default:
+    /// every available target).
+    #[serde(default)]
+    pub default_targets: Vec<String>,
+    /// Extra discoverable repos, `"owner/name[@branch]"`. Advisory
+    /// seeds merged into `skills.repos`; registry mutations stay in
+    /// the registry.
+    #[serde(default)]
+    pub extra_repos: Vec<String>,
+}
+
+fn default_skills_enabled() -> bool {
+    true
+}
+
+impl Default for SkillsConfig {
+    fn default() -> Self {
+        SkillsConfig {
+            enabled: true,
+            default_targets: Vec::new(),
+            extra_repos: Vec::new(),
+        }
+    }
 }
 
 /// `[agents.<id>]` — explicit launch line for one agent. Every field

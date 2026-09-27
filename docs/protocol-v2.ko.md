@@ -93,6 +93,30 @@ WebSocket(`GET /ws`) 또는 릴레이 터널 위의 JSON 메시지. 하나의 �
 | `channel.delete_state` | `{convId, key}` | `{deleted: true}` |
 | `prompt.add` | `{text, sessionId?, cwd?}` — 보낸 프롬프트 하나, trim 후 300자 상한 | `{recorded: true}` — upsert: 재전송은 카운트를 올리고 최신으로 이동; cwd당 최신 200개만 남음 |
 | `prompt.recent` | `{limit? — 기본 50, 최대 200, sessionId?, cwd?}` | `{prompts: [{text, count}]}` — 최신순, cwd별 |
+| `skills.targets` | `{}` | `{targets: [{id, label, path, available}]}` — 허브가 싱크할 수 있는 CLI들의 스킬 디렉터리; `available`은 엔진 홈이 존재한다는 뜻(허브는 절대 만들지 않는다) |
+| `skills.installed` | `{}` | `{skills: [{id, name, description?, directory, managed, repo?, targets[], targetStates, sourceKind?, readonly?, targetPaths?}], generatedAt}` — 레지스트리 관리 + 비관리 발견, 이름순 |
+| `skills.repos` | `{}` | `{repos: [{owner, name, branch, enabled}]}` — 레지스트리 + `[skills] extra_repos` |
+| `skills.install` | `{owner, name, branch?, directory?, installName?, targets?, force?}` — `directory` 기본 `.`; `targets` 기본 `[skills].default_targets`, 없으면 가능한 전부; 명시적 `[]`는 싱크 없이 설치 | `{skill: SkillEntry, targetResults: [{target, ok, error?}]}` |
+| `skills.uninstall` | `{id}` | `{trashed, restoreId, ttlMs: 300000, targetResults}` |
+| `skills.restore` | `{id}` — 5분 휴지통 창 안에서 | `{skill, targetResults}` |
+| `skills.setTargets` | `{id, targets[]}` — 모르는 id는 `-32602`; 새로 선택된 것 싱크, 해제된 것 제거 | `{targetResults}` |
+| `skills.importLocal` | `{directory, targets?}` — 타겟 루트의 스킬을 관리 스토어로 복사, 원본 보존 | `{skill, targetResults}` |
+| `skills.deleteLocal` | `{directory, targets?}` | `{targetResults}` — 보존된 원본은 남고 보고됨 |
+| `skills.addRepo` | `{owner, name, branch?}` | `{added: true}` |
+| `skills.removeRepo` | `{owner, name}` | `{removed: true}` — 그 리포의 설치된 스킬은 관리 상태 유지 |
+| `skills.activity` | `{limit? — 기본 50, 최대 500}` | `{activity: [{ts, kind, …}]}` — 최신순 |
+| `skills.discover` | `{force?}` — 활성 리포들의 GitHub 트리; 리포당 200개, 1시간 캐시 | `{skills: [{key, name, description?, directory, readmeUrl?, repoOwner, repoName, repoBranch}], cached, generatedAt}` |
+| `skills.search` | `{q, limit? — 1-50, offset?}` — skills.sh | `{query, totalCount, skills: [{key, name, description?, directory, installs?, repoOwner, repoName, repoBranch}]}` |
+| `skills.popular` | `{limit? — 1-200, force?}` — 시드 쿼리, 6시간 캐시 | `{skills, cached, generatedAt}` |
+| `skills.updates` | `{force?}` — 설치 출처 리포 재해싱, 1시간 캐시 | `{updates: {skillId: 업데이트 여부}, checkedAt, cached}` |
+| `skills.content` | `{directory}` — 로컬 읽기: 관리 사본 → 타겟 루트 → 읽기전용 소스 순 | `{directory, path, markdown, truncated}` — 512 KiB 상한 |
+| `skills.remoteContent` | `{owner, name, branch?, directory}` — 디렉터리 이름 점수 매칭 | `{name, description?, directory, markdown, truncated, branch}` |
+| `prompts.list` | `{sessionId?, cwd?}` — 프롬프트 라이브러리(`!` 피커) | `{prompts: [{name, description?, argumentHint?, scope, path}]}` — 워크스페이스 먼저, 이름순; `path`가 변경 핸들 |
+| `prompts.get` | `{promptPath, sessionId?, cwd?}` | `{name, description?, argumentHint?, scope, content}` — 본문 |
+| `prompts.create` | `{scope, name, description?, argumentHint?, content, sessionId?, cwd?}` — 이름: 공백/구분자 금지; 본문 64 KiB 상한 | `{created: true, path}` |
+| `prompts.update` | `{promptPath, name?, description?, argumentHint?, content?, sessionId?, cwd?}` — 생략은 유지, `""`는 메타 삭제 | `{updated: true, path}` |
+| `prompts.delete` | `{promptPath, sessionId?, cwd?}` | `{deleted: bool}` — 이미 없으면 false |
+| `prompts.move` | `{promptPath, scope, sessionId?, cwd?}` — 현재 스코프와 달라야 함 | `{moved: true, path}` |
 | `project.create` | `{name?, root, defaults?}` | `{projectId, name, root, defaults}` — root는 절대경로; defaults 키: backend/model/mode/mcpServers |
 | `project.list` | `{}` | `{projects: [{projectId, name, root, defaults}]}` |
 | `project.get` | `{projectId}` | `{projectId, name, root, defaults}` |
@@ -139,6 +163,39 @@ cwd별·최신 200개이며 모든 클라이언트 표면이 공유한다(릴레
 데스크톱 브라우저와 같은 완성을 본다).
 
 `prompt`는 문자열 또는 블록 배열 `[{type:"text",text},…]`다.
+
+### 스킬 허브와 프롬프트 라이브러리
+
+`skills.*` 표면은 에이전트 스킬의 패키지 매니저다: 스킬을 데몬의
+관리 스토어(`<data_dir>/skills-hub/managed/`)에 한 번 설치하면
+허브가 대상 CLI 각자의 네이티브 스킬 디렉터리(`~/.claude/skills`,
+`~/.codex/skills`, pi/omp/opencode 홈 — `CLAUDE_CONFIG_DIR` 같은 env
+오버라이드 존중)로 심볼릭링크 싱크를 하고, 심볼릭링크를 쓸 수 없는
+환경에선 복사한다. 스킬 로딩은 여전히 CLI 자신이 한다 — `catalog.commands`가
+싱크된 스킬을 별도 배선 없이 잡는다. 엔진 홈이 없는 타겟은 만들지
+않고 실패로 보고한다.
+
+언인스톨은 관리 사본을 5분짜리 휴지통으로 옮긴다(`skills.restore`로
+복원 가능); 레지스트리가 잊은 사본까지 모든 타겟에서 제거된다. 타겟
+루트에서 발견한 로컬 스킬은 비관리로 목록에 나타나고(`sourceKind:
+"local"`) 임포트할 수 있다 — 스토어로 복사되며 사용자의 원본은 영구히
+보존된다. Codex `.system`과 플러그인 캐시 스킬은 읽기전용으로 나열된다
+(`readonly: true`, 임포트 시도 시 `error.data.code = "readonly"`).
+
+허브 에러는 `error.data.code`에 택소노미를 싣는다: `invalid_input`
+(`-32602`), `not_found`, `conflict`(로컬 변경 → `force`), `readonly`,
+`permission`, `network`, `http`, `rate_limited`, `internal`.
+레이트 리밋은 표면화되지 맹목 재시도되지 않는다. 디스커버리
+(`skills.discover`)는 등록된 리포들의 GitHub Trees API를,
+`skills.search`/`skills.popular`는 skills.sh를 hit 한다 — 둘 다
+fingerprint+TTL 디스크 캐시 뒤에서. `[skills] enabled = false`면
+표면 전체가 `-32002`로 거부된다.
+
+프롬프트 라이브러리(`prompts.*`)는 `prompt.*` 히스토리와 별개다:
+가벼운 frontmatter를 가진 마크다운 파일이 `<cwd>/.damon/prompts/`
+(스코프 `workspace`, `allowed_dirs` 게이트)와 `<data_dir>/prompts/`
+(스코프 `global`)에 저장된다. 웹 UI의 `!` 피커가 `prompts.get`으로
+프롬프트 본문을 컴포저에 삽입한다.
 
 ### 목록 필터, 타임스탬프, 태그
 

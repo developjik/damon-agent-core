@@ -446,7 +446,9 @@ mod tests {
             .unwrap();
         assert_eq!(f["request"]["subtype"], "set_model");
         assert_eq!(f["request"]["model"], "qwen3.7-max");
-        let f = d.control_frame("r3", &ControlOp::SetMode("plan".into())).unwrap();
+        let f = d
+            .control_frame("r3", &ControlOp::SetMode("plan".into()))
+            .unwrap();
         assert_eq!(f["request"]["subtype"], "set_permission_mode");
         assert_eq!(f["request"]["mode"], "plan");
     }
@@ -498,7 +500,10 @@ mod tests {
         assert_eq!(f["response"]["subtype"], "success");
         assert_eq!(f["response"]["request_id"], "req-9");
         assert_eq!(f["response"]["response"]["behavior"], "allow");
-        assert_eq!(f["response"]["response"]["updatedInput"]["file_path"], "/tmp/x");
+        assert_eq!(
+            f["response"]["response"]["updatedInput"]["file_path"],
+            "/tmp/x"
+        );
     }
 
     #[tokio::test]
@@ -525,10 +530,7 @@ mod tests {
         let (ask, wire_id) = t.pending_ask().await.expect("ask registered");
         assert_eq!(ask.name, "write_file");
         assert_eq!(wire_id, "req-1");
-        assert!(matches!(
-            ask.detail,
-            Some(ToolCallDetail::Write { .. })
-        ));
+        assert!(matches!(ask.detail, Some(ToolCallDetail::Write { .. })));
     }
 
     /// The live-observed failure envelope: error is an object with a
@@ -551,10 +553,11 @@ mod tests {
             )
             .await;
         let events = t.events.lock().await;
-        let Some(StreamEventKind::TurnFailed { error, .. }) =
-            events.last().map(|e| &e.kind)
-        else {
-            panic!("expected TurnFailed, got {:?}", events.last().map(|e| &e.kind));
+        let Some(StreamEventKind::TurnFailed { error, .. }) = events.last().map(|e| &e.kind) else {
+            panic!(
+                "expected TurnFailed, got {:?}",
+                events.last().map(|e| &e.kind)
+            );
         };
         assert_eq!(error, "workspace routing discovery unauthorized (401)");
     }

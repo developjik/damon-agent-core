@@ -30,6 +30,35 @@ pub async fn relay_client_js() -> impl axum::response::IntoResponse {
     )
 }
 
+/// The streaming reveal pipeline (`DamonStreamReveal` global): paced text
+/// reveal, parse throttling and cached code highlighting for the inline UI.
+/// Same rationale as the relay client — a separate classic script so the
+/// Node test-suite loads it exactly like a browser would (`npm test`).
+pub async fn stream_reveal_js() -> impl axum::response::IntoResponse {
+    (
+        UI_HEADERS,
+        [(header::CONTENT_TYPE, "text/javascript; charset=utf-8")],
+        include_str!("stream-reveal.js"),
+    )
+}
+
+/// Vendored highlight.js custom build (v11.12.0, BSD-3-Clause — see the
+/// sibling `hljs.LICENSE.md` for provenance and the full notice). Grammars:
+/// bash, c, cpp, csharp, css, diff, dockerfile, go, ini, java, javascript,
+/// json, markdown, makefile, python, rust, sql, typescript, xml, yaml (plus
+/// aliases like sh/zsh/toml/html), bundled from the npm package with
+/// esbuild. Not served with a long cache on purpose: the URL is stable
+/// across daemon builds, and a stale cached copy would pin the old
+/// grammar set for a day after an upgrade. The UI treats a missing `hljs`
+/// global as "no highlighting" and falls back to escaped plain code.
+pub async fn hljs_js() -> impl axum::response::IntoResponse {
+    (
+        UI_HEADERS,
+        [(header::CONTENT_TYPE, "text/javascript; charset=utf-8")],
+        include_str!("hljs.min.js"),
+    )
+}
+
 /// Installability manifest for the UI. The icon is referenced by path
 /// (`/icon.svg`): Chromium's install pipeline fetches manifest icons
 /// over HTTP and does not reliably accept `data:` URLs in `src`, so an

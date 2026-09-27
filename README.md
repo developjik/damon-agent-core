@@ -20,6 +20,7 @@ If you already subscribe to an agent CLI, **there is nothing to configure**. Dam
 - **Zero-config backends** — a catalog CLI binary on PATH registers itself: `claude` (stream-json), `codex` (app-server), `omp` (RPC mode), `pi` (RPC mode, omp's protocol family), `qwen` (stream-json, Claude-shaped control plane), `droid` (JSON-RPC, Factory), `opencode`+`mimo` (HTTP+SSE, adopts or spawns `serve`), `zcode` (Z.ai app-server). Every listed backend speaks a native bidirectional protocol — token streaming, mid-turn permission asks, interrupt — so the catalog only admits CLIs Damon can drive fully. `[backends.X]` overrides launch lines; it does not add protocols.
 - **Permissions flow to your surface** — the agent's permission ask is relayed to the web UI, CLI, or a Telegram/Discord/Slack `allow`/`deny` reply.
 - **Searchable history** — every conversation lands in SQLite + FTS5. `damon search "error timeout"` full-text-searches all of it.
+- **Skills hub + prompt library** — install agent-skill packages once (`damon skills install anthropics/skills document-skills/pdf`) and the hub syncs them into every installed CLI's own native skills directory (symlink, copy fallback; the CLIs keep loading skills themselves). Discover from GitHub repos, search skills.sh, manage reusable prompts; the web UI's `/`, `@`, and `!` pickers see everything. `[skills] enabled = false` turns it off.
 - **Chat channels built in** — Telegram, Discord, and Slack adapters ship as separate binaries. Per-chat session mapping, streamed replies.
 - **Damon holds no secrets** — agents manage their own auth. The Damon config is a port and maybe a token.
 - **Reachable from anywhere** — serve `wss` with your own certs, or run `damon-relay` on a public host and the daemon dials out (no inbound port). The tunnel is X25519 + AES-256-GCM end-to-end encrypted.
@@ -56,7 +57,7 @@ curl localhost:9470/health
 # {"backends":["claude","omp"],"status":"ok",...}
 ```
 
-Chat in the bundled web UI: `http://127.0.0.1:9470/ui` — sessions, streaming, permission prompts, no install.
+Chat in the bundled web UI: `http://127.0.0.1:9470/ui` — sessions, streaming, permission prompts, no install. Streaming replies are paced over the arrival cadence (no batch dumps) with grapheme-safe rendering and syntax-highlighted code; `?revealDemo=1` on the URL demos it without a backend.
 
 ## Architecture
 

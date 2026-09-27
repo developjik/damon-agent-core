@@ -56,11 +56,7 @@ pub const BACKENDS: &[BackendSpec] = &[
         // Damon relays as a Question card; verified live against
         // codex-cli 0.157.1 (the server confirms via a `warning`
         // notification listing the enabled feature).
-        args: &[
-            "app-server",
-            "--enable",
-            "default_mode_request_user_input",
-        ],
+        args: &["app-server", "--enable", "default_mode_request_user_input"],
         env: &[],
         auth_hint: "log in with `codex` once; the subscription follows",
     },
@@ -230,8 +226,7 @@ pub fn client_for(resolved: &ResolvedBackend) -> Option<Arc<dyn AgentClient>> {
         "codex" => Some(Arc::new(codex::CodexClient::new(resolved.clone()))),
         "droid" => Some(Arc::new(droid::DroidClient::new(resolved.clone()))),
         "opencode" => Some(Arc::new(opencode::OpencodeClient::new(
-            resolved,
-            "opencode",
+            resolved, "opencode",
         ))),
         "mimo" => Some(Arc::new(opencode::OpencodeClient::new(resolved, "mimo"))),
         "zcode" => Some(Arc::new(zcode::ZcodeClient::new(resolved.clone()))),

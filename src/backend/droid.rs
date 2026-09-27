@@ -120,8 +120,10 @@ impl AgentClient for DroidClient {
         handle: &PersistenceHandle,
         config: SessionConfig,
     ) -> Result<Arc<dyn AgentSession>> {
-        Ok(DroidSession::spawn(&self.resolved, config, Some(&handle.native_handle)).await?
-            as Arc<dyn AgentSession>)
+        Ok(
+            DroidSession::spawn(&self.resolved, config, Some(&handle.native_handle)).await?
+                as Arc<dyn AgentSession>,
+        )
     }
 }
 
@@ -158,8 +160,7 @@ impl DroidSession {
             args.push("--auto".to_string());
             args.push(mode.clone());
         }
-        let transport =
-            NdjsonTransport::spawn(&resolved.command, &args, &env, &config.cwd).await?;
+        let transport = NdjsonTransport::spawn(&resolved.command, &args, &env, &config.cwd).await?;
 
         let (events, _) = broadcast::channel(512);
         let session = Arc::new(Self {
@@ -319,7 +320,11 @@ impl DroidSession {
                     name: name.clone(),
                     title: Some(format!("{name} wants to run")),
                     input: Some(input.clone()),
-                    detail: Some(map_tool_input(&name, &input, &params["toolUses"][0]["details"])),
+                    detail: Some(map_tool_input(
+                        &name,
+                        &input,
+                        &params["toolUses"][0]["details"],
+                    )),
                     actions,
                     suggestions: vec![],
                 };
@@ -440,14 +445,18 @@ impl DroidSession {
             }
             "assistant_text_delta" => {
                 if let Some(d) = n["delta"].as_str() {
-                    self.emit_timeline(TimelineItem::AssistantMessage { text: d.to_string() })
-                        .await;
+                    self.emit_timeline(TimelineItem::AssistantMessage {
+                        text: d.to_string(),
+                    })
+                    .await;
                 }
             }
             "thinking_text_delta" => {
                 if let Some(d) = n["delta"].as_str() {
-                    self.emit_timeline(TimelineItem::Reasoning { text: d.to_string() })
-                        .await;
+                    self.emit_timeline(TimelineItem::Reasoning {
+                        text: d.to_string(),
+                    })
+                    .await;
                 }
             }
             "tool_call" => {
@@ -508,13 +517,20 @@ impl DroidSession {
                         code: None,
                     },
                 };
-                self.emit(StreamEvent { turn_id: turn, kind });
+                self.emit(StreamEvent {
+                    turn_id: turn,
+                    kind,
+                });
                 self.emit(StreamEvent::new(StreamEventKind::AttentionRequired {
                     reason: AttentionReason::Finished,
                 }));
             }
-            "permission_resolved" | "settings_updated" | "droid_working_state_changed"
-            | "mcp_status_changed" | "hook_execution_started" | "hook_execution_completed" => {}
+            "permission_resolved"
+            | "settings_updated"
+            | "droid_working_state_changed"
+            | "mcp_status_changed"
+            | "hook_execution_started"
+            | "hook_execution_completed" => {}
             _ => {}
         }
     }
@@ -652,7 +668,10 @@ impl AgentSession for DroidSession {
         }
         self.request("droid.add_user_message", params, CONTROL_TIMEOUT)
             .await?;
-        self.emit(StreamEvent::in_turn(turn_id.clone(), StreamEventKind::TurnStarted));
+        self.emit(StreamEvent::in_turn(
+            turn_id.clone(),
+            StreamEventKind::TurnStarted,
+        ));
         Ok(turn_id)
     }
 
@@ -693,12 +712,7 @@ impl AgentSession for DroidSession {
                     "answer": value.unwrap_or_default()
                 }]})
             }
-            (
-                PermissionResponse::Allow {
-                    updated_input, ..
-                },
-                false,
-            ) => {
+            (PermissionResponse::Allow { updated_input, .. }, false) => {
                 let _ = updated_input; // droid takes options, not edits
                 json!({"selectedOption": "proceed_once"})
             }
