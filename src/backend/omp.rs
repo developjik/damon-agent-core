@@ -1,19 +1,23 @@
-//! Oh My Pi backend — drives `omp --mode rpc`, its newline-delimited
-//! JSON protocol over stdio.
+//! pi-family backend — drives `omp --mode rpc` / `pi --mode rpc`, the
+//! newline-delimited JSON protocol over stdio the two CLIs share.
 //!
 //! Wire shape (observed against omp 18.2.6 + rpc.md):
 //! - stdout opens with `{"type":"ready","protocolVersion":1,
-//!   "supportedProtocolVersions":[1,2],"maxFrameBytes":…}` — we answer
-//!   `negotiate_protocol` v2 so oversized frames arrive as `rpc_chunk`
-//!   sequences we reassemble.
+//!   "supportedProtocolVersions":[1,2],"maxFrameBytes":…}` — when v2 is
+//!   advertised we answer `negotiate_protocol` so oversized frames
+//!   arrive as `rpc_chunk` sequences we reassemble (a fork addition;
+//!   plain pi advertises v1 only and the negotiation is skipped).
 //! - Commands: `{id, type:"prompt"|"abort"|"new_session"|"set_model"|…}`;
 //!   responses are `{id, type:"response", command, success, data|error}`.
 //! - Events: `agent_start`, `turn_start`, `message_start`,
 //!   `message_update` (assistantMessageEvent deltas), `message_end`,
 //!   `turn_end`, `agent_end{messages, isTerminal}`, `tool_execution_*`,
 //!   `extension_ui_request` (confirm/select/input → permission asks).
-//! - `prompt` is acked immediately; a turn completes on `agent_end`
-//!   with `isTerminal !== false`.
+//! - `prompt` is acked immediately; omp settles a turn on `agent_end`
+//!   with `isTerminal !== false`, while pi additionally emits
+//!   `agent_settled` as its full settlement and its bare `agent_end`
+//!   frames (no flag, before retries) stay provisional — the
+//!   [`PiFamily::strict_terminal`] knob.
 //!
 //! One process = one session. Resume uses `switch_session` with the
 //! session file path recorded in the persistence handle.
@@ -39,15 +43,72 @@ use super::{AgentClient, AgentSession};
 const INIT_TIMEOUT: Duration = Duration::from_secs(60);
 const CONTROL_TIMEOUT: Duration = Duration::from_secs(30);
 
+/// Per-CLI profile of the shared rpc wire — where pi and its omp fork
+/// diverge, expressed as data so one session implementation drives both.
+pub struct PiFamily {
+    /// Damon-facing provider id (routing + persistence handles).
+    pub id: &'static str,
+    /// omp opens with a `ready` frame and answers negotiate_protocol
+    /// (the v2 chunking is a fork addition). pi 0.7x emits no ready
+    /// frame and silently ignores negotiate_protocol — commands work
+    /// immediately, so sending it would hang the spawn.
+    pub handshakes: bool,
+    /// pi emits `agent_end` without `isTerminal` before model retries;
+    /// with this set, only an explicit `isTerminal: true` (or pi's
+    /// `agent_settled`) settles the turn. omp always terminalizes its
+    /// `agent_end`, so it keeps the lenient default.
+    pub strict_terminal: bool,
+    /// omp takes `--approval-mode yolo|write` at launch; pi (0.8x) has
+    /// no approval switches — its mode list is honest about that.
+    pub has_mode_args: bool,
+    /// omp's rpc raises subagent lifecycle frames; plain pi's tool set
+    /// does not surface them the same way, so the capability stays off
+    /// until verified.
+    pub subagent_events: bool,
+    /// Damon permission modes the CLI accepts (launch-time only — the
+    /// rpc protocol cannot change approval at runtime).
+    pub modes: &'static [&'static str],
+    pub default_mode: Option<&'static str>,
+}
+
+/// Oh My Pi (verified against omp 18.2.6).
+pub const OMP: PiFamily = PiFamily {
+    id: "omp",
+    handshakes: true,
+    strict_terminal: false,
+    has_mode_args: true,
+    subagent_events: true,
+    modes: &["default", "acceptEdits", "bypassPermissions"],
+    default_mode: Some("default"),
+};
+
+/// pi (pi.dev, verified against 0.73.1: no ready frame, unknown
+/// commands silently ignored, get_state answers with sessionFile).
+/// Permission asks ride extension dialogs only — pi's own tools run
+/// under its trust model, so Damon surfaces no mode switches for it.
+pub const PI: PiFamily = PiFamily {
+    id: "pi",
+    handshakes: false,
+    strict_terminal: true,
+    has_mode_args: false,
+    subagent_events: false,
+    modes: &["default"],
+    default_mode: Some("default"),
+};
+
 pub struct OmpClient {
     resolved: ResolvedBackend,
     caps: Capabilities,
+    profile: &'static PiFamily,
 }
 
 impl OmpClient {
     pub fn new(resolved: ResolvedBackend) -> Self {
+        Self::with_profile(resolved, &OMP)
+    }
+
+    pub fn with_profile(resolved: ResolvedBackend, profile: &'static PiFamily) -> Self {
         Self {
-            resolved,
             caps: Capabilities {
                 streaming: true,
                 session_persistence: true,
@@ -57,8 +118,10 @@ impl OmpClient {
                 reasoning_stream: true,
                 steer: true,
                 rewind: false,
-                subagent_events: true,
+                subagent_events: profile.subagent_events,
             },
+            resolved,
+            profile,
         }
     }
 }
@@ -66,7 +129,7 @@ impl OmpClient {
 #[async_trait]
 impl AgentClient for OmpClient {
     fn provider(&self) -> &str {
-        "omp"
+        self.profile.id
     }
 
     fn capabilities(&self) -> &Capabilities {
@@ -81,6 +144,7 @@ impl AgentClient for OmpClient {
         // get_available_models needs a live session.
         let probe = OmpSession::spawn(
             &self.resolved,
+            self.profile,
             SessionConfig {
                 cwd: cwd.unwrap_or_else(|| Path::new("/")).to_path_buf(),
                 ..Default::default()
@@ -91,10 +155,12 @@ impl AgentClient for OmpClient {
         let _ = probe.close().await;
         Ok(ProviderCatalog {
             models,
-            // omp's RPC protocol has no set_approval_mode command, so modes
+            // The RPC protocol has no set_approval_mode command, so modes
             // are launch-time only (see mode_args below) — hence
             // dynamic_modes: false.
-            modes: ["default", "acceptEdits", "bypassPermissions"]
+            modes: self
+                .profile
+                .modes
                 .iter()
                 .map(|m| ModeDef {
                     id: m.to_string(),
@@ -102,12 +168,12 @@ impl AgentClient for OmpClient {
                     description: None,
                 })
                 .collect(),
-            default_mode: Some("default".to_string()),
+            default_mode: self.profile.default_mode.map(|m| m.to_string()),
         })
     }
 
     async fn create_session(&self, config: SessionConfig) -> Result<Arc<dyn AgentSession>> {
-        Ok(OmpSession::spawn(&self.resolved, config).await? as Arc<dyn AgentSession>)
+        Ok(OmpSession::spawn(&self.resolved, self.profile, config).await? as Arc<dyn AgentSession>)
     }
 
     async fn resume_session(
@@ -115,7 +181,7 @@ impl AgentClient for OmpClient {
         handle: &PersistenceHandle,
         config: SessionConfig,
     ) -> Result<Arc<dyn AgentSession>> {
-        let session = OmpSession::spawn(&self.resolved, config).await?;
+        let session = OmpSession::spawn(&self.resolved, self.profile, config).await?;
         session
             .command(
                 "switch_session",
@@ -147,8 +213,11 @@ struct ChunkBuf {
 /// Damon permission modes → omp's native `--approval-mode` (omp 18.2.6:
 /// always-ask | write | yolo). The RPC protocol cannot change it at
 /// runtime, so the mode is fixed at spawn; unknown modes defer to omp's
-/// own `tools.approvalMode` setting.
-fn mode_args(mode: Option<&str>) -> Vec<String> {
+/// own `tools.approvalMode` setting. pi has no approval switches at all.
+fn mode_args(profile: &PiFamily, mode: Option<&str>) -> Vec<String> {
+    if !profile.has_mode_args {
+        return vec![];
+    }
     match mode {
         Some("bypassPermissions") => ["--approval-mode", "yolo"],
         Some("acceptEdits") => ["--approval-mode", "write"],
@@ -162,6 +231,7 @@ fn mode_args(mode: Option<&str>) -> Vec<String> {
 pub struct OmpSession {
     transport: Arc<NdjsonTransport>,
     caps: Capabilities,
+    profile: &'static PiFamily,
     events: broadcast::Sender<StreamEvent>,
     next_id: AtomicU64,
     /// OMP session file path, from get_state — the resume token.
@@ -175,10 +245,14 @@ pub struct OmpSession {
 }
 
 impl OmpSession {
-    async fn spawn(resolved: &ResolvedBackend, config: SessionConfig) -> Result<Arc<Self>> {
+    async fn spawn(
+        resolved: &ResolvedBackend,
+        profile: &'static PiFamily,
+        config: SessionConfig,
+    ) -> Result<Arc<Self>> {
         let env: HashMap<String, String> = resolved.env.iter().cloned().collect();
         let mut args = resolved.args.clone();
-        args.extend(mode_args(config.mode.as_deref()));
+        args.extend(mode_args(profile, config.mode.as_deref()));
         let transport = NdjsonTransport::spawn(&resolved.command, &args, &env, &config.cwd).await?;
 
         let (events, _) = broadcast::channel(512);
@@ -193,8 +267,9 @@ impl OmpSession {
                 reasoning_stream: true,
                 steer: true,
                 rewind: false,
-                subagent_events: true,
+                subagent_events: profile.subagent_events,
             },
+            profile,
             events,
             next_id: AtomicU64::new(1),
             session_file: Mutex::new(None),
@@ -245,42 +320,45 @@ impl OmpSession {
             });
         }
 
-        // Handshake: wait for ready, then negotiate v2.
-        let ready = async {
-            let mut rx = transport.subscribe();
-            let mut exited = transport.exited();
-            loop {
-                tokio::select! {
-                    r = rx.recv() => match r {
-                        Ok(f) if f["type"] == "ready" => return Ok(f),
-                        Ok(_) => continue,
-                        Err(broadcast::error::RecvError::Lagged(_)) => continue,
-                        Err(broadcast::error::RecvError::Closed) => bail!("omp exited before ready"),
-                    },
-                    _ = exited.changed() => {
-                        if *exited.borrow() {
-                            bail!("omp exited before ready");
+        // Handshake: wait for ready, then negotiate v2. pi skips both —
+        // it emits no ready frame and ignores negotiate_protocol.
+        if profile.handshakes {
+            let ready = async {
+                let mut rx = transport.subscribe();
+                let mut exited = transport.exited();
+                loop {
+                    tokio::select! {
+                        r = rx.recv() => match r {
+                            Ok(f) if f["type"] == "ready" => return Ok(f),
+                            Ok(_) => continue,
+                            Err(broadcast::error::RecvError::Lagged(_)) => continue,
+                            Err(broadcast::error::RecvError::Closed) => bail!("omp exited before ready"),
+                        },
+                        _ = exited.changed() => {
+                            if *exited.borrow() {
+                                bail!("omp exited before ready");
+                            }
                         }
                     }
                 }
-            }
-        };
-        let ready = tokio::time::timeout(INIT_TIMEOUT, ready)
-            .await
-            .context("omp ready timed out")??;
-        if ready["supportedProtocolVersions"]
-            .as_array()
-            .map(|v| v.iter().any(|x| x.as_u64() == Some(2)))
-            .unwrap_or(false)
-        {
-            session
-                .command(
-                    "negotiate_protocol",
-                    json!({"type": "negotiate_protocol", "protocolVersion": 2}),
-                    CONTROL_TIMEOUT,
-                )
+            };
+            let ready = tokio::time::timeout(INIT_TIMEOUT, ready)
                 .await
-                .context("omp protocol negotiation failed")?;
+                .context("omp ready timed out")??;
+            if ready["supportedProtocolVersions"]
+                .as_array()
+                .map(|v| v.iter().any(|x| x.as_u64() == Some(2)))
+                .unwrap_or(false)
+            {
+                session
+                    .command(
+                        "negotiate_protocol",
+                        json!({"type": "negotiate_protocol", "protocolVersion": 2}),
+                        CONTROL_TIMEOUT,
+                    )
+                    .await
+                    .context("omp protocol negotiation failed")?;
+            }
         }
 
         // Record the session file for resume.
@@ -365,7 +443,13 @@ impl OmpSession {
             }
             "agent_end" => {
                 let turn = self.current_turn.lock().await.take();
-                let terminal = f["isTerminal"].as_bool().unwrap_or(true);
+                // pi emits agent_end without isTerminal before model
+                // retries — those stay provisional (the outcome arrives
+                // with agent_settled or EOF). omp always terminalizes.
+                let terminal = match (self.profile.strict_terminal, f["isTerminal"].as_bool()) {
+                    (true, None | Some(false)) => false,
+                    (_, t) => t.unwrap_or(true),
+                };
                 if terminal {
                     self.emit(StreamEvent {
                         turn_id: turn,
@@ -374,7 +458,21 @@ impl OmpSession {
                     self.emit(StreamEvent::new(StreamEventKind::AttentionRequired {
                         reason: AttentionReason::Finished,
                     }));
+                } else {
+                    *self.current_turn.lock().await = turn;
                 }
+            }
+            // pi-only: the definitive end of an agent run, emitted after
+            // every retry settled.
+            "agent_settled" => {
+                let turn = self.current_turn.lock().await.take();
+                self.emit(StreamEvent {
+                    turn_id: turn,
+                    kind: StreamEventKind::TurnCompleted { usage: None },
+                });
+                self.emit(StreamEvent::new(StreamEventKind::AttentionRequired {
+                    reason: AttentionReason::Finished,
+                }));
             }
             "message_update" => {
                 let ev = &f["assistantMessageEvent"];
@@ -739,7 +837,7 @@ impl AgentSession for OmpSession {
     fn persistence_handle(&self) -> Option<PersistenceHandle> {
         let f = self.session_file.try_lock().ok()?.clone()?;
         Some(PersistenceHandle {
-            provider: "omp".to_string(),
+            provider: self.profile.id.to_string(),
             native_handle: f,
             metadata: Value::Null,
         })
@@ -770,16 +868,39 @@ mod tests {
     #[test]
     fn mode_args_map_to_approval_mode() {
         assert_eq!(
-            mode_args(Some("bypassPermissions")),
+            mode_args(&OMP, Some("bypassPermissions")),
             vec!["--approval-mode".to_string(), "yolo".to_string()]
         );
         assert_eq!(
-            mode_args(Some("acceptEdits")),
+            mode_args(&OMP, Some("acceptEdits")),
             vec!["--approval-mode".to_string(), "write".to_string()]
         );
         // Unknown/default modes defer to omp's own tools.approvalMode.
-        assert!(mode_args(None).is_empty());
-        assert!(mode_args(Some("plan")).is_empty());
+        assert!(mode_args(&OMP, None).is_empty());
+        assert!(mode_args(&OMP, Some("plan")).is_empty());
+        // pi has no approval switches — every mode defers to the CLI.
+        assert!(mode_args(&PI, Some("bypassPermissions")).is_empty());
+    }
+
+    /// The terminality contract the two profiles encode: omp settles on
+    /// any agent_end, pi only on an explicit isTerminal (its bare
+    /// agent_end frames precede model retries).
+    #[test]
+    fn profiles_encode_terminal_semantics() {
+        let decide = |strict: bool, is_terminal: Option<bool>| {
+            match (strict, is_terminal) {
+                (true, None | Some(false)) => false,
+                (_, t) => t.unwrap_or(true),
+            }
+        };
+        // omp: lenient — missing flag means done.
+        assert!(decide(OMP.strict_terminal, None));
+        assert!(decide(OMP.strict_terminal, Some(true)));
+        assert!(!decide(OMP.strict_terminal, Some(false)));
+        // pi: strict — missing flag stays provisional.
+        assert!(!decide(PI.strict_terminal, None));
+        assert!(decide(PI.strict_terminal, Some(true)));
+        assert!(!decide(PI.strict_terminal, Some(false)));
     }
 
     #[test]

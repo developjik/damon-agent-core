@@ -10,7 +10,7 @@ use std::collections::BTreeMap;
 use std::path::PathBuf;
 use std::sync::Arc;
 
-use crate::backend::{AgentClient, amp, claude, codex, cursor, gemini, kimi, omp, qwen};
+use crate::backend::{AgentClient, claude, codex, droid, omp, opencode, qwen, zcode};
 use crate::config::AgentConfig;
 
 /// One backend entry: how to detect it and how to launch a session.
@@ -51,7 +51,16 @@ pub const BACKENDS: &[BackendSpec] = &[
         title: "Codex CLI (ChatGPT Plus/Pro)",
         detect: "codex",
         command: "codex",
-        args: &["app-server"],
+        // --enable default_mode_request_user_input turns on the model's
+        // mid-turn question channel (item/tool/requestUserInput) that
+        // Damon relays as a Question card; verified live against
+        // codex-cli 0.157.1 (the server confirms via a `warning`
+        // notification listing the enabled feature).
+        args: &[
+            "app-server",
+            "--enable",
+            "default_mode_request_user_input",
+        ],
         env: &[],
         auth_hint: "log in with `codex` once; the subscription follows",
     },
@@ -65,54 +74,93 @@ pub const BACKENDS: &[BackendSpec] = &[
         auth_hint: "configure `omp` once; its provider auth follows",
     },
     BackendSpec {
-        id: "cursor",
-        title: "Cursor Agent (Cursor subscription)",
-        detect: "cursor-agent",
-        command: "cursor-agent",
-        args: &["-p", "--output-format", "stream-json", "--trust"],
+        id: "pi",
+        title: "Pi (pi.dev)",
+        detect: "pi",
+        command: "pi",
+        // Same rpc wire as omp (its fork parent): ready/negotiate
+        // handshake, message_update deltas, extension dialogs. pi's own
+        // tools run under its trust model — no approval switches — so
+        // the catalog advertises no mode switches for it.
+        args: &["--mode", "rpc"],
         env: &[],
-        auth_hint: "log in with `cursor-agent login` or set CURSOR_API_KEY",
-    },
-    BackendSpec {
-        id: "amp",
-        title: "Amp (Sourcegraph)",
-        detect: "amp",
-        command: "amp",
-        // Launch args come from the dialect — `threads continue` is a
-        // subcommand that must precede the exec flags.
-        args: &[],
-        env: &[],
-        auth_hint: "log in with `amp` once; the login follows",
-    },
-    BackendSpec {
-        id: "kimi",
-        title: "Kimi Code (Moonshot)",
-        detect: "kimi",
-        command: "kimi",
-        args: &["-p", "--output-format", "stream-json"],
-        env: &[],
-        auth_hint: "log in with `kimi login` once; the token follows",
+        auth_hint: "configure `pi` with a provider API key; auth follows the CLI",
     },
     BackendSpec {
         id: "qwen",
         title: "Qwen Code (Alibaba)",
         detect: "qwen",
         command: "qwen",
-        args: &["-p", "--output-format", "stream-json"],
+        // Bidirectional stream-json with a Claude-shaped control plane;
+        // permission asks and interrupts relay (verified live against
+        // 0.24.6). Auth stays the CLI's own (qwen-oauth or API key in
+        // its settings) — Damon passes nothing.
+        args: &[
+            "-p",
+            "--output-format",
+            "stream-json",
+            "--input-format",
+            "stream-json",
+            "--include-partial-messages",
+        ],
         env: &[],
-        auth_hint: "log in with `qwen` once; the OAuth flow follows",
+        auth_hint: "log in with `qwen` (qwen-oauth) or configure an API key in its settings; auth follows the CLI",
     },
     BackendSpec {
-        id: "gemini",
-        title: "Gemini CLI (Google)",
-        detect: "gemini",
-        command: "gemini",
-        // One-shot headless runs; the dialect appends --prompt <text>,
-        // --approval-mode, and resume/model flags per turn. --skip-trust
-        // keeps the folder-trust prompt from blocking a non-TTY spawn.
-        args: &["--output-format", "stream-json", "--skip-trust"],
+        id: "droid",
+        title: "Droid (Factory)",
+        detect: "droid",
+        command: "droid",
+        // JSON-RPC over stdio: permission asks arrive as
+        // droid.request_permission the client must answer (verified
+        // live against 0.228.0). Custom models and auth stay in the
+        // CLI's own ~/.factory settings.
+        args: &[
+            "exec",
+            "--input-format",
+            "stream-jsonrpc",
+            "-o",
+            "stream-jsonrpc",
+        ],
         env: &[],
-        auth_hint: "log in with `gemini` once or set GEMINI_API_KEY; the quota follows",
+        auth_hint: "log in with `droid` or set FACTORY_API_KEY; custom models live in ~/.factory/settings.json",
+    },
+    BackendSpec {
+        id: "opencode",
+        title: "OpenCode (sst)",
+        detect: "opencode",
+        command: "opencode",
+        // HTTP+SSE: Damon adopts a running `opencode serve` or spawns
+        // its own; permission asks and questions round-trip over HTTP
+        // (verified live against 1.18.32).
+        args: &[],
+        env: &[],
+        auth_hint: "configure providers in opencode itself; Damon adopts or spawns `opencode serve`",
+    },
+    BackendSpec {
+        id: "mimo",
+        title: "MiMo Code (Xiaomi)",
+        detect: "mimo",
+        command: "mimo",
+        // OpenCode fork speaking the same serve surface (verified
+        // against its inherited HTTP API).
+        args: &[],
+        env: &[],
+        auth_hint: "configure providers in mimo itself; Damon adopts or spawns `mimo serve`",
+    },
+    BackendSpec {
+        id: "zcode",
+        title: "ZCode (Z.ai)",
+        detect: "zcode",
+        command: "zcode",
+        // "ZCode Protocol" v1 over stdio: {id, method, params} frames
+        // (no jsonrpc field), permission asks as interaction/
+        // requestPermission server requests (envelope + session create
+        // verified live against 3.14.3; the model turn needs a GLM
+        // login).
+        args: &["app-server", "--stdio"],
+        env: &[],
+        auth_hint: "log in with `zcode` (GLM Coding Plan); auth follows the CLI",
     },
 ];
 
@@ -179,28 +227,23 @@ pub fn client_for(resolved: &ResolvedBackend) -> Option<Arc<dyn AgentClient>> {
             resolved.clone(),
             claude::ClaudeDialect::dialect(),
         ))),
-        "cursor" => Some(Arc::new(crate::backend::streamjson::StreamJsonClient::new(
-            resolved.clone(),
-            cursor::CursorDialect::dialect(),
+        "codex" => Some(Arc::new(codex::CodexClient::new(resolved.clone()))),
+        "droid" => Some(Arc::new(droid::DroidClient::new(resolved.clone()))),
+        "opencode" => Some(Arc::new(opencode::OpencodeClient::new(
+            resolved,
+            "opencode",
         ))),
-        "amp" => Some(Arc::new(crate::backend::streamjson::StreamJsonClient::new(
+        "mimo" => Some(Arc::new(opencode::OpencodeClient::new(resolved, "mimo"))),
+        "zcode" => Some(Arc::new(zcode::ZcodeClient::new(resolved.clone()))),
+        "omp" => Some(Arc::new(omp::OmpClient::new(resolved.clone()))),
+        "pi" => Some(Arc::new(omp::OmpClient::with_profile(
             resolved.clone(),
-            amp::AmpDialect::dialect(),
-        ))),
-        "kimi" => Some(Arc::new(crate::backend::streamjson::StreamJsonClient::new(
-            resolved.clone(),
-            kimi::KimiDialect::dialect(),
+            &omp::PI,
         ))),
         "qwen" => Some(Arc::new(crate::backend::streamjson::StreamJsonClient::new(
             resolved.clone(),
             qwen::QwenDialect::dialect(),
         ))),
-        "gemini" => Some(Arc::new(crate::backend::streamjson::StreamJsonClient::new(
-            resolved.clone(),
-            gemini::GeminiDialect::dialect(),
-        ))),
-        "codex" => Some(Arc::new(codex::CodexClient::new(resolved.clone()))),
-        "omp" => Some(Arc::new(omp::OmpClient::new(resolved.clone()))),
         _ => None,
     }
 }
@@ -228,13 +271,13 @@ mod tests {
     use super::*;
 
     #[test]
-    fn catalog_has_eight_backends() {
-        assert_eq!(BACKENDS.len(), 8);
+    fn catalog_lists_supported_backends() {
+        assert_eq!(BACKENDS.len(), 9);
         let ids: Vec<_> = BACKENDS.iter().map(|b| b.id).collect();
         assert_eq!(
             ids,
             [
-                "claude", "codex", "omp", "cursor", "amp", "kimi", "qwen", "gemini"
+                "claude", "codex", "omp", "pi", "qwen", "droid", "opencode", "mimo", "zcode"
             ]
         );
     }

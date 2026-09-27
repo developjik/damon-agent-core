@@ -180,6 +180,9 @@ pub struct CodexSession {
     pending_asks: Mutex<HashMap<String, PendingAsk>>,
     /// itemId → running ToolCall so item/completed can finalize it.
     open_items: Mutex<HashMap<String, ToolCall>>,
+    /// Last-seen `thread/tokenUsage/updated` payload — newer app-servers
+    /// report usage only there, not on `turn/completed`.
+    last_usage: parking_lot::Mutex<Option<Usage>>,
 }
 
 impl CodexSession {
@@ -208,6 +211,7 @@ impl CodexSession {
             current_turn: Mutex::new(None),
             pending_asks: Mutex::new(HashMap::new()),
             open_items: Mutex::new(HashMap::new()),
+            last_usage: parking_lot::Mutex::new(None),
         });
 
         // Frame dispatch task: routes responses/notifications, and fails
@@ -393,9 +397,14 @@ impl CodexSession {
                             .to_string(),
                         code: None,
                     },
-                    _ => StreamEventKind::TurnCompleted {
-                        usage: codex_usage(params),
-                    },
+                _ => StreamEventKind::TurnCompleted {
+                    // Newer app-servers carry no usage on turn/completed
+                    // — it arrives via thread/tokenUsage/updated and is
+                    // stashed in last_usage. Prefer whichever is present.
+                    usage: codex_usage(params).or_else(|| {
+                        self.last_usage.lock().clone()
+                    }),
+                },
                 };
                 self.emit(StreamEvent { turn_id, kind });
                 self.emit(StreamEvent::new(StreamEventKind::AttentionRequired {
@@ -446,6 +455,18 @@ impl CodexSession {
                         turn_id: turn,
                         kind: StreamEventKind::Timeline(TimelineItem::Todo { items }),
                     });
+                }
+            }
+            "thread/tokenUsage/updated" => {
+                // Live usage reporting (the only usage source on newer
+                // app-servers): stash the latest snapshot; the
+                // completing turn picks it up.
+                let payload = params
+                    .get("usage")
+                    .filter(|u| u.is_object())
+                    .unwrap_or(params);
+                if let Some(u) = token_usage_event(payload) {
+                    *self.last_usage.lock() = Some(u);
                 }
             }
             "serverRequest/resolved" => {
@@ -720,6 +741,29 @@ fn codex_usage(params: &Value) -> Option<Usage> {
         output_tokens: tokens["output_tokens"].as_u64(),
         cost_usd: None,
         context_window: None,
+        context_used: None,
+    })
+}
+
+/// Parse a `thread/tokenUsage/updated` payload into [`Usage`]. Key
+/// spelling varies across app-server revisions (snake_case vs
+/// camelCase token counters, optional `modelContextWindow`) — the
+/// parser accepts both rather than pinning one revision.
+fn token_usage_event(v: &Value) -> Option<Usage> {
+    let get = |names: &[&str]| -> Option<u64> {
+        names.iter().find_map(|n| v.get(*n).and_then(Value::as_u64))
+    };
+    let input = get(&["input_tokens", "inputTokens", "input"]);
+    let output = get(&["output_tokens", "outputTokens", "output"]);
+    if input.is_none() && output.is_none() {
+        return None;
+    }
+    Some(Usage {
+        input_tokens: input,
+        cached_input_tokens: get(&["cached_input_tokens", "cachedTokens", "cached"]),
+        output_tokens: output,
+        cost_usd: None,
+        context_window: get(&["modelContextWindow", "model_context_window", "contextWindow"]),
         context_used: None,
     })
 }

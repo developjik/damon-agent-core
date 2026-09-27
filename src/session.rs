@@ -118,8 +118,10 @@ pub struct ManagedSession {
     pub provider: ProviderId,
     /// The live backend session object.
     pub session: Arc<dyn AgentSession>,
-    /// Latest persistence handle (native session id), refreshed on
-    /// ThreadStarted events.
+    /// Persistence handle (native session id) as of session
+    /// create/resume; turns re-read the live session's
+    /// `persistence_handle()` before persisting, which adopts native
+    /// ids the agent reports mid-conversation.
     pub handle: Option<PersistenceHandle>,
     /// A turn is in flight — the idle sweep must not reap this session.
     pub busy: std::sync::atomic::AtomicBool,

@@ -1,13 +1,13 @@
 //! Shared session machinery for backends whose CLI speaks stream-json
 //! over stdio (Claude Code's `--output-format stream-json` family —
-//! Amp, Cursor, Qwen, Kimi ship compatible or near-compatible dialects).
+//! other CLIs ship compatible or near-compatible dialects).
 //!
 //! Two session shapes share one dialect trait:
 //! - [`StreamJsonSession`] — bidirectional: prompts go in over stdin,
-//!   one process lives for the whole conversation (claude, amp).
+//!   one process lives for the whole conversation (claude).
 //! - [`OneShotSession`] — the CLI only takes a prompt per process;
-//!   each turn respawns with the dialect's resume flag (cursor, kimi,
-//!   qwen). Permissions still relay while a turn's process is alive.
+//!   each turn respawns with the dialect's resume flag. Permissions
+//!   still relay while a turn's process is alive.
 //!
 //! Per-vendor differences live in [`StreamJsonDialect`]: launch args,
 //! frame dispatch for vendor-private frames, permission wire format,
@@ -102,7 +102,7 @@ pub trait StreamJsonDialect: Send + Sync {
 
     /// The stdin frame carrying a mid-turn steering message. Default:
     /// identical to a prompt frame — dialects that mark steering on
-    /// the wire (amp's `steer: true`) override this.
+    /// the wire (e.g. a `steer: true` flag) override this.
     fn steer_frame(&self, prompt: &PromptInput) -> Result<Value> {
         self.prompt_frame(prompt)
     }
@@ -141,6 +141,16 @@ pub trait StreamJsonDialect: Send + Sync {
     /// What this dialect can do — copied onto client and session.
     fn capabilities(&self) -> Capabilities;
 
+    /// Optional post-spawn exchange before the session is handed out
+    /// (qwen's `initialize` control handshake). Default: none.
+    async fn handshake(
+        &self,
+        _transport: &Arc<super::transport::NdjsonTransport>,
+        _config: &SessionConfig,
+    ) -> Result<()> {
+        Ok(())
+    }
+
     /// Session shape this dialect drives.
     fn session_kind(&self) -> SessionKind {
         SessionKind::Persistent
@@ -148,7 +158,7 @@ pub trait StreamJsonDialect: Send + Sync {
 }
 
 // ---------------------------------------------------------------------------
-// Claude-frame parser (shared by the claude/amp/kimi/qwen dialects)
+// Claude-frame parser shared by Claude-family dialects
 // ---------------------------------------------------------------------------
 
 /// Dialect quirks of the Claude stream-json frame family, expressed as
@@ -156,31 +166,31 @@ pub trait StreamJsonDialect: Send + Sync {
 /// below document exactly where each dialect diverges; anything not
 /// listed is identical across the family.
 ///
-/// Cursor is deliberately NOT on this parser: its wire carries
-/// complete `tool_call` envelopes instead of assistant tool_use blocks
-/// and tool_result messages, so it keeps a private translator.
+/// A dialect whose wire is not Claude-shaped (e.g. complete
+/// `tool_call` envelopes instead of assistant tool_use blocks) keeps a
+/// private translator instead of using this parser.
 pub struct ClaudeQuirks {
     /// Normalizes a tool_use name+input into timeline detail. Dialects
-    /// with vendor tool names (claude, amp) plug their mapper in; the
+    /// with vendor tool names (claude) plug their mapper in; the
     /// default keeps the raw input so nothing is silently dropped.
     pub tool_detail: fn(name: &str, input: &Value) -> ToolCallDetail,
     /// Assistant frames may additionally carry OpenAI-style
     /// `tool_calls`, with results arriving as top-level `tool` frames
-    /// (kimi's hybrid wire).
+    /// (a hybrid some CLIs emit instead of tool_use blocks).
     pub openai_tool_calls: bool,
     /// Tool results arrive as `user` frames carrying `tool_result`
-    /// blocks. Kimi reports them as `tool` frames instead.
+    /// blocks; some CLIs report them as `tool` frames instead.
     pub user_tool_results: bool,
-    /// `usage: null` reports no usage at all (kimi, qwen) rather than
-    /// an all-None Usage (claude and amp always report one).
+    /// `usage: null` reports no usage at all rather than an
+    /// all-None Usage (claude always reports one).
     pub usage_optional: bool,
-    /// Cost comes from the frame's `total_cost_usd` (claude, qwen);
-    /// amp and kimi report none.
+    /// Cost comes from the frame's `total_cost_usd` (claude).
     pub cost_from_frame: bool,
-    /// amp reports the context window as `usage.max_tokens`.
+    /// The context window rides in `usage.max_tokens` instead of a
+    /// dedicated field.
     pub context_from_max_tokens: bool,
-    /// Failure text prefers the frame's `error` field (amp, kimi,
-    /// qwen); claude only ever reports `result`.
+    /// Failure text prefers the frame's `error` field; claude only
+    /// ever reports `result`.
     pub error_field_first: bool,
     /// claude marks user interrupts (subtype "interrupted", or
     /// terminal_reason "aborted_streaming") as a cancel, not a failure.
@@ -219,39 +229,6 @@ impl ClaudeQuirks {
             ..Self::default()
         }
     }
-
-    /// Amp: Claude-compatible frames, no cost, the context window
-    /// reported as `usage.max_tokens`, failure text preferring `error`.
-    pub fn amp() -> Self {
-        Self {
-            context_from_max_tokens: true,
-            error_field_first: true,
-            ..Self::default()
-        }
-    }
-
-    /// Kimi: hybrid wire — OpenAI `tool_calls` plus `tool` result
-    /// frames, optional usage, no user-frame tool results.
-    pub fn kimi() -> Self {
-        Self {
-            openai_tool_calls: true,
-            user_tool_results: false,
-            usage_optional: true,
-            error_field_first: true,
-            ..Self::default()
-        }
-    }
-
-    /// Qwen: Claude-shaped blocks and user-frame tool results, with
-    /// optional usage that carries the frame cost.
-    pub fn qwen() -> Self {
-        Self {
-            usage_optional: true,
-            cost_from_frame: true,
-            error_field_first: true,
-            ..Self::default()
-        }
-    }
 }
 
 /// Default tool_use detail: keep the raw input verbatim. Vendor
@@ -263,11 +240,11 @@ fn raw_tool_detail(_name: &str, input: &Value) -> ToolCallDetail {
     }
 }
 
-/// One translator for the Claude stream-json frame family. The
-/// claude/amp/kimi/qwen dialects delegate here from `on_frame` after
-/// handling their private arms (control frames, amp's error system
+/// One translator for the Claude stream-json frame family.
+/// Claude-family dialects delegate here from `on_frame` after
+/// handling their private arms (control frames, vendor error system
 /// subtypes), so content-block and result-frame logic exists exactly
-/// once instead of as four copy-pasted parsers that drift apart.
+/// once instead of as copy-pasted parsers that drift apart.
 pub struct ClaudeFrameParser {
     quirks: ClaudeQuirks,
     /// In-flight Task calls (tool_use id → identity), consulted only
@@ -296,7 +273,7 @@ impl ClaudeFrameParser {
     }
 
     /// Translate one inbound frame. Frame types the dialect owns
-    /// (control_request/control_response, amp's error subtypes) are
+    /// (control_request/control_response, vendor error subtypes) are
     /// matched by the dialect before falling through to this.
     pub async fn on_frame(&self, ctx: &Arc<dyn SessionCtx>, f: &Value) {
         match f["type"].as_str().unwrap_or_default() {
@@ -318,7 +295,7 @@ impl ClaudeFrameParser {
     }
 
     async fn on_assistant(&self, ctx: &Arc<dyn SessionCtx>, f: &Value) {
-        // `content` may be absent on kimi frames that only carry
+        // `content` may be absent on frames that only carry
         // tool_calls — no early return, or those frames would be
         // dropped before the OpenAI arm below.
         if let Some(blocks) = f["message"]["content"].as_array() {
@@ -356,7 +333,7 @@ impl ClaudeFrameParser {
                 }
             }
         }
-        // OpenAI-style tool_calls array (kimi's hybrid wire).
+        // OpenAI-style tool_calls array (hybrid wires).
         if self.quirks.openai_tool_calls
             && let Some(calls) = f["message"]["tool_calls"].as_array()
         {
@@ -373,7 +350,7 @@ impl ClaudeFrameParser {
         }
     }
 
-    /// tool_result blocks arrive as user messages (claude, amp, qwen).
+    /// tool_result blocks arrive as user messages (claude).
     async fn on_user(&self, ctx: &Arc<dyn SessionCtx>, f: &Value) {
         let Some(blocks) = f["message"]["content"].as_array() else {
             return;
@@ -412,7 +389,7 @@ impl ClaudeFrameParser {
     }
 
     /// OpenAI-style tool result frames: the result is the whole message
-    /// (`tool_call_id` + top-level `content`). Kimi only.
+    /// (`tool_call_id` + top-level `content`).
     async fn on_tool(&self, ctx: &Arc<dyn SessionCtx>, f: &Value) {
         let call_id = f["tool_call_id"]
             .as_str()
@@ -470,7 +447,10 @@ impl ClaudeFrameParser {
             }
         } else if f["is_error"].as_bool().unwrap_or(false) {
             let error = if self.quirks.error_field_first {
-                f["error"].as_str().or_else(|| f["result"].as_str())
+                f["error"]
+                    .as_str()
+                    .or_else(|| f["error"]["message"].as_str())
+                    .or_else(|| f["result"].as_str())
             } else {
                 f["result"].as_str()
             }
@@ -723,6 +703,11 @@ impl StreamJsonSession {
             });
         }
 
+        // Dialects that need a post-spawn exchange (qwen's initialize)
+        // run it before the session is handed out; a failed handshake
+        // is a failed spawn.
+        dialect.handshake(&transport, &config).await?;
+
         Ok(session)
     }
 
@@ -807,7 +792,7 @@ impl AgentSession for StreamJsonSession {
 
     async fn steer(&self, prompt: PromptInput, _expected_turn: &str) -> Result<SteerResult> {
         // stream-json dialects accept a new user message mid-turn; the
-        // CLI queues it as steering input (amp marks the frame).
+        // CLI queues it as steering input (some mark the frame).
         let frame = self.dialect.steer_frame(&prompt)?;
         self.transport.send(frame).await?;
         Ok(SteerResult::Accepted)
@@ -1191,6 +1176,11 @@ where
         bail!("no pending permission {request_id}");
     };
     let frame = dialect.permission_response_frame(&ask.request, &ask.wire_id, &response);
+    tracing::debug!(
+        backend = %shared.provider,
+        wire_id = %ask.wire_id,
+        "permission response frame: {frame}"
+    );
     send(frame).await?;
     let _ = shared
         .events
@@ -1210,6 +1200,8 @@ pub(crate) mod tests {
     pub struct TestCtx {
         pub events: TokioMutex<Vec<StreamEvent>>,
         pub asks: TokioMutex<Vec<PermissionRequest>>,
+        /// wire ids in registration order, parallel to `asks`.
+        pub ask_wires: TokioMutex<Vec<String>>,
         pub native: TokioMutex<Option<String>>,
         pub sent: TokioMutex<Vec<Value>>,
         pub turn: TokioMutex<Option<String>>,
@@ -1220,6 +1212,7 @@ pub(crate) mod tests {
             Arc::new(Self {
                 events: TokioMutex::new(vec![]),
                 asks: TokioMutex::new(vec![]),
+                ask_wires: TokioMutex::new(vec![]),
                 native: TokioMutex::new(None),
                 sent: TokioMutex::new(vec![]),
                 turn: TokioMutex::new(Some("t1".to_string())),
@@ -1228,6 +1221,13 @@ pub(crate) mod tests {
 
         pub fn as_ctx(self: &Arc<Self>) -> Arc<dyn SessionCtx> {
             self.clone()
+        }
+
+        /// The most recently registered (ask, wire_id) pair.
+        pub async fn pending_ask(&self) -> Option<(PermissionRequest, String)> {
+            let asks = self.asks.lock().await;
+            let wires = self.ask_wires.lock().await;
+            asks.last().cloned().zip(wires.last().cloned())
         }
     }
 
@@ -1245,8 +1245,9 @@ pub(crate) mod tests {
         async fn set_native_handle(&self, id: String) {
             *self.native.lock().await = Some(id);
         }
-        async fn register_ask(&self, ask: PermissionRequest, _wire_id: String) {
+        async fn register_ask(&self, ask: PermissionRequest, wire_id: String) {
             self.asks.lock().await.push(ask);
+            self.ask_wires.lock().await.push(wire_id);
         }
         async fn resolve_wire(&self, _id: &str, _result: Result<Value, Value>) {}
         async fn current_turn(&self) -> Option<String> {
@@ -1336,150 +1337,11 @@ pub(crate) mod tests {
     }
 
     // ------------------------------------------------------------------
-    // Dialect fixture tests, keyed by dialect. These moved out of the
-    // amp/kimi/qwen files when their copy-pasted frame parsers were
-    // replaced by ClaudeFrameParser — they pin each dialect's exact
-    // translation through the shared code.
+    // Dialect fixture tests, keyed by dialect — they pin each dialect's
+    // exact translation through the shared parser.
     // ------------------------------------------------------------------
 
-    use crate::backend::amp::AmpDialect;
     use crate::backend::claude::ClaudeDialect;
-    use crate::backend::kimi::KimiDialect;
-    use crate::backend::qwen::QwenDialect;
-
-    #[tokio::test]
-    async fn amp_init_captures_thread_id() {
-        let t = TestCtx::new();
-        let ctx = t.as_ctx();
-        AmpDialect::dialect()
-            .on_frame(
-                &ctx,
-                &json!({"type":"system","subtype":"init","session_id":"T-abc-123"}),
-            )
-            .await;
-        assert_eq!(t.native.lock().await.as_deref(), Some("T-abc-123"));
-    }
-
-    #[tokio::test]
-    async fn amp_assistant_text_and_tool_use() {
-        let t = TestCtx::new();
-        let ctx = t.as_ctx();
-        AmpDialect::dialect()
-            .on_frame(
-                &ctx,
-                &json!({
-                    "type":"assistant",
-                    "message":{"role":"assistant","content":[
-                        {"type":"text","text":"reading file"},
-                        {"type":"tool_use","id":"tu1","name":"Read","input":{"file_path":"/x.rs"}}
-                    ]}
-                }),
-            )
-            .await;
-        let events = t.events.lock().await;
-        assert_eq!(events.len(), 2);
-        assert!(matches!(
-            events[0].kind,
-            StreamEventKind::Timeline(TimelineItem::AssistantMessage { .. })
-        ));
-        assert!(matches!(
-            events[1].kind,
-            StreamEventKind::Timeline(TimelineItem::ToolCall(_))
-        ));
-    }
-
-    #[tokio::test]
-    async fn amp_result_finishes_with_usage() {
-        let t = TestCtx::new();
-        let ctx = t.as_ctx();
-        AmpDialect::dialect()
-            .on_frame(
-                &ctx,
-                &json!({
-                    "type":"result","subtype":"success","is_error":false,
-                    "usage":{"input_tokens":10,"output_tokens":5,"max_tokens":200000}
-                }),
-            )
-            .await;
-        let events = t.events.lock().await;
-        let Some(StreamEventKind::TurnCompleted { usage }) = events.last().map(|e| &e.kind) else {
-            panic!("expected TurnCompleted");
-        };
-        let usage = usage.as_ref().unwrap();
-        assert_eq!(usage.input_tokens, Some(10));
-        // amp's quirk: the context window rides in usage.max_tokens and
-        // no cost is reported.
-        assert_eq!(usage.context_window, Some(200000));
-        assert_eq!(usage.cost_usd, None);
-    }
-
-    #[tokio::test]
-    async fn kimi_openai_style_tool_calls() {
-        let t = TestCtx::new();
-        let ctx = t.as_ctx();
-        KimiDialect::dialect()
-            .on_frame(
-                &ctx,
-                &json!({
-                    "type":"assistant","session_id":"k-1",
-                    "message":{"role":"assistant","tool_calls":[
-                        {"id":"c1","function":{"name":"read_file","arguments":"{\"path\":\"a.rs\"}"}}
-                    ]}
-                }),
-            )
-            .await;
-        let events = t.events.lock().await;
-        let Some(StreamEventKind::Timeline(TimelineItem::ToolCall(tc))) =
-            events.first().map(|e| &e.kind)
-        else {
-            panic!("expected tool call");
-        };
-        assert_eq!(tc.name, "read_file");
-        assert_eq!(tc.call_id, "c1");
-    }
-
-    #[tokio::test]
-    async fn kimi_tool_result_frame_completes_call() {
-        let t = TestCtx::new();
-        let ctx = t.as_ctx();
-        KimiDialect::dialect()
-            .on_frame(
-                &ctx,
-                &json!({"type":"tool","tool_call_id":"c1","content":"file contents"}),
-            )
-            .await;
-        let events = t.events.lock().await;
-        let Some(StreamEventKind::Timeline(TimelineItem::ToolCall(tc))) =
-            events.first().map(|e| &e.kind)
-        else {
-            panic!("expected tool call");
-        };
-        assert_eq!(tc.status, ToolCallStatus::Completed);
-    }
-
-    #[tokio::test]
-    async fn qwen_tool_result_via_user_frame() {
-        let t = TestCtx::new();
-        let ctx = t.as_ctx();
-        QwenDialect::dialect()
-            .on_frame(
-                &ctx,
-                &json!({
-                    "type":"user",
-                    "message":{"role":"user","content":[
-                        {"type":"tool_result","tool_use_id":"tu1","content":"ok","is_error":false}
-                    ]}
-                }),
-            )
-            .await;
-        let events = t.events.lock().await;
-        let Some(StreamEventKind::Timeline(TimelineItem::ToolCall(tc))) =
-            events.first().map(|e| &e.kind)
-        else {
-            panic!("expected tool call");
-        };
-        assert_eq!(tc.status, ToolCallStatus::Completed);
-    }
 
     /// The Task tool_use keeps its tool_call timeline item AND raises
     /// an omp-shaped Subagent start event keyed by the tool_use id.

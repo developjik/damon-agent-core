@@ -80,6 +80,12 @@ impl NdjsonTransport {
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())
             .kill_on_drop(true);
+        // Own process group on Unix so one signal covers the whole
+        // tree: agent CLIs spawn tool subprocesses (bash, ripgrep, …)
+        // that must not survive an interrupt. Windows trees are walked
+        // by taskkill in [`Self::shutdown`] instead.
+        #[cfg(unix)]
+        cmd.process_group(0);
         let mut child = cmd
             .spawn()
             .with_context(|| format!("cannot spawn `{command}`"))?;
@@ -177,6 +183,7 @@ impl NdjsonTransport {
         self.closed.store(true, Ordering::SeqCst);
         let _ = self.exited.send(true);
         let mut child = self.child.lock().await;
+        kill_tree(&mut child).await;
         let _ = child.kill().await;
     }
 
@@ -204,6 +211,36 @@ impl NdjsonTransport {
     pub async fn forget(&self, id: &str) {
         self.pending.lock().await.remove(id);
     }
+}
+
+/// Kill the child's whole process tree, not just the direct child.
+/// Agent CLIs spawn tool subprocesses (bash, ripgrep, node …) that keep
+/// running when only the wrapper dies. On Unix the dedicated process
+/// group set at spawn makes one negative-pid signal cover them all; on
+/// Windows `taskkill /T /F` walks the tree and must run *before*
+/// `child.kill()` reaps the wrapper — after the reap the walk can miss
+/// grandchildren that were still attached.
+async fn kill_tree(child: &mut Child) {
+    #[cfg(unix)]
+    if let Some(pid) = child.id() {
+        // Best-effort group signal; the child.kill() that follows still
+        // reaps the wrapper. Errors (gone group, non-leader) are fine.
+        unsafe {
+            libc::kill(-(pid as libc::pid_t), libc::SIGKILL);
+        }
+    }
+    #[cfg(windows)]
+    if let Some(pid) = child.id() {
+        let _ = tokio::time::timeout(
+            std::time::Duration::from_secs(3),
+            tokio::process::Command::new("taskkill")
+                .args(["/PID", &pid.to_string(), "/T", "/F"])
+                .output(),
+        )
+        .await;
+    }
+    #[cfg(not(any(unix, windows)))]
+    let _ = child;
 }
 
 /// Line-by-line stdout reader: parses each line as JSON, broadcasts it,
@@ -367,5 +404,77 @@ fn format_error(e: &Value) -> String {
         m.to_string()
     } else {
         e.to_string()
+    }
+}
+
+#[cfg(all(test, unix))]
+mod tests {
+    use super::*;
+
+    /// Regression: a background grandchild holding the stdout pipe must
+    /// die with `shutdown()`. Killing only the direct child used to let
+    /// it run to completion — an interrupted agent kept its `sleep`/bash
+    /// trees burning.
+    #[tokio::test]
+    async fn shutdown_kills_the_process_tree() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = std::env::temp_dir().join(format!("damon-tree-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let pid_file = dir.join("grandchild.pid");
+        let script = dir.join("wrapper.sh");
+        std::fs::write(
+            &script,
+            format!(
+                "#!/bin/sh\nsh -c 'echo $$ > {}; exec sleep 60' &\necho started\nsleep 60\n",
+                pid_file.display()
+            ),
+        )
+        .unwrap();
+        let mut perms = std::fs::metadata(&script).unwrap().permissions();
+        perms.set_mode(0o755);
+        std::fs::set_permissions(&script, perms).unwrap();
+
+        let cwd = std::env::temp_dir();
+        let t = NdjsonTransport::spawn(
+            "sh",
+            &[script.to_string_lossy().into_owned()],
+            &Default::default(),
+            &cwd,
+        )
+        .await
+        .unwrap();
+
+        // Wait for the grandchild to publish its pid.
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        let pid: libc::pid_t = loop {
+            if let Ok(s) = std::fs::read_to_string(&pid_file) {
+                if let Ok(p) = s.trim().parse() {
+                    break p;
+                }
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "grandchild never started"
+            );
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        };
+
+        t.shutdown().await;
+
+        // Signal 0 probes existence without delivering anything.
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        loop {
+            let alive = unsafe { libc::kill(pid, 0) == 0 };
+            if !alive {
+                break;
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "grandchild survived the tree kill"
+            );
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        }
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

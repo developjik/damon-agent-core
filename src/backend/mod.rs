@@ -11,15 +11,15 @@ pub mod registry;
 pub mod transport;
 pub mod types;
 
-pub mod amp;
 pub mod claude;
 pub mod codex;
-pub mod cursor;
-pub mod gemini;
-pub mod kimi;
+pub mod droid;
 pub mod omp;
+pub mod opencode;
+pub mod opencode_server;
 pub mod qwen;
 pub mod streamjson;
+pub mod zcode;
 
 pub use types::*;
 
