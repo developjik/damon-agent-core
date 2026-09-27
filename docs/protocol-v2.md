@@ -82,14 +82,18 @@ unchanged, so string-matching clients keep working.
 | `session.set_model` | `{sessionId, model}` | `{}` |
 | `session.set_mode` | `{sessionId, mode}` | `{}` |
 | `catalog.models` | `{backend}` | `{models[], modes[], commands[]}` |
+| `catalog.commands` | `{sessionId?, cwd?}` — the composer's `/` picker: command and skill files the CLIs expand themselves | `{commands: [{name, description?, argumentHint?, source, kind}]}` — workspace entries shadow same-named global ones; sorted commands then skills |
 | `logs.tail` | `{lines? — default 200, max 2000}` | `{lines: string[]}` — the daemon's recent log lines, oldest first |
 | `logs.follow` | `{follow? — default true}` | `{following: bool}` — every new log line arrives as a `{"event":"log.line","data":{"line"}}` push on this connection; `follow:false` stops it |
 | `file.read` | `{sessionId, path}` | `{content: base64, bytes, path}` — jailed to the session cwd; 512 KiB read cap (`-32005` over) |
 | `file.write` | `{sessionId, path, content: base64}` | `{written, path}` — jailed to the session cwd; 1 MiB decoded cap |
 | `file.list` | `{sessionId, path? — default "."}` | `{entries: [{name, dir, bytes}], path}` — jailed to the session cwd, 1000 entries |
+| `file.index` | `{sessionId?, cwd?}` — the composer's `@path` picker: one gitignore-aware walk of the root | `{entries: [{rel, isDir}], truncated}` — `node_modules`/`target` pruned, hidden entries skipped, symlinks never followed; bounded at 10 000 entries / 512 KiB with `truncated: true` on an early stop |
 | `channel.get_state` | `{convId, key}` | `{value: string?}` |
 | `channel.set_state` | `{convId, key, value}` | `{set: true}` |
 | `channel.delete_state` | `{convId, key}` | `{deleted: true}` |
+| `prompt.add` | `{text, sessionId?, cwd?}` — one sent prompt, trimmed and capped at 300 chars | `{recorded: true}` — upsert: a resend bumps the count and moves the row to newest; the newest 200 per cwd survive |
+| `prompt.recent` | `{limit? — default 50, max 200, sessionId?, cwd?}` | `{prompts: [{text, count}]}` — newest first, per cwd |
 | `project.create` | `{name?, root, defaults?}` | `{projectId, name, root, defaults}` — root must be absolute; defaults keys: backend/model/mode/mcpServers |
 | `project.list` | `{}` | `{projects: [{projectId, name, root, defaults}]}` |
 | `project.get` | `{projectId}` | `{projectId, name, root, defaults}` |
@@ -119,6 +123,26 @@ exists, a not-yet-existing write target resolves through its deepest
 existing ancestor, and lexical `..` folding covers the rest — so an
 escape fails closed with `-32602`. Combine with `allowed_dirs` to
 bound which cwds sessions may have in the first place.
+
+### Composer support
+
+`catalog.commands`, `file.index`, `prompt.add`, and `prompt.recent`
+back the web UI's composer pickers (slash commands, `@path` mentions,
+prompt-history completion). They share one root selector: a named
+session's stored cwd (the same jail as `file.*`), else a client cwd
+through the same `allowed_dirs` gate as `session.create`, else the
+daemon's working directory — which is exactly what a cwd-less
+`session.create` lands on, so a picker opened before the lazy first
+session indexes the directory the session will run in.
+
+`catalog.commands` scans the command/skill files the installed CLIs
+already expand (`.claude/commands` recursively, `.claude/skills`, and
+the global roots the CLIs honor via `CLAUDE_CONFIG_DIR` /
+`CODEX_HOME` / `~/.agents/skills`); the daemon never expands `/name`
+itself — the selected text is sent as the prompt and the CLI does the
+rest. Prompt history is per-cwd, newest-200, shared by every client
+surface (a phone on the relay sees the same completions as the
+desktop browser).
 
 `prompt` is a string or an array of blocks `[{type:"text",text},…]`.
 

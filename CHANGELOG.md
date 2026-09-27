@@ -1,5 +1,32 @@
 # Changelog
 
+## Unreleased
+
+### Added — composer support (RPC)
+
+- **`catalog.commands`** — the `/` picker catalog: command and skill
+  files the installed CLIs already expand. Workspace
+  `.claude/commands` (recursive `.md`, `:`-joined directory names,
+  frontmatter `name`/`description`/`argument-hint`) and
+  `.claude/skills`, plus the global roots the CLIs honor
+  (`CLAUDE_CONFIG_DIR`/`~/.claude`, `CODEX_HOME`/`~/.codex/skills`
+  including `.system`, `~/.agents/skills`). Workspace entries shadow
+  same-named global ones; the daemon never expands `/name` itself.
+- **`file.index`** — the `@path` picker index: one ripgrep-walker
+  (`ignore` crate) pass over the picker root. `.gitignore`/`.ignore`/
+  global excludes honored even outside a repo, hidden entries skipped,
+  `node_modules`/`target` pruned unconditionally, symlinks never
+  followed. Bounded at 10 000 entries / 512 KiB with a `truncated`
+  flag, safely under the 1 MiB frame budget.
+- **`prompt.add` / `prompt.recent`** — daemon-side prompt history for
+  ghost completion and arrow-key recall: per-cwd, newest-200, upsert
+  bumps the use count. Stored in SQLite so every surface shares it —
+  a phone on the relay sees the desktop's completions.
+- The three share one root selector: named session's stored cwd
+  (the `file.*` jail), else a client cwd through the same
+  `allowed_dirs` gate as `session.create`, else the daemon working
+  directory (exactly where a cwd-less `session.create` lands).
+
 ## 0.5.0 — 2026-09-27
 
 ### Added — the web UI through the relay (anywhere, no VPN)

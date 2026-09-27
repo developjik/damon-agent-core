@@ -81,14 +81,18 @@ WebSocket(`GET /ws`) 또는 릴레이 터널 위의 JSON 메시지. 하나의 �
 | `session.set_model` | `{sessionId, model}` | `{}` |
 | `session.set_mode` | `{sessionId, mode}` | `{}` |
 | `catalog.models` | `{backend}` | `{models[], modes[], commands[]}` |
+| `catalog.commands` | `{sessionId?, cwd?}` — 컴포저의 `/` 피커: CLI들이 스스로 확장하는 커맨드/스킬 파일 | `{commands: [{name, description?, argumentHint?, source, kind}]}` — 워크스페이스 항목이 같은 이름의 글로벌 항목을 가림; 커맨드 → 스킬 순 정렬 |
 | `logs.tail` | `{lines? — 기본 200, 최대 2000}` | `{lines: string[]}` — 데몬의 최근 로그 라인, 오래된 것부터 |
 | `logs.follow` | `{follow? — 기본 true; false는 이전 follow 중지}` | `{following: bool}` — true면 새 로그 라인마다 이 연결로 `{"event":"log.line","data":{"line"}}` push |
 | `file.read` | `{sessionId, path}` | `{content: base64, bytes, path}` — 세션 cwd 안에 감금; 512 KiB 읽기 상한(초과 시 `-32005`) |
 | `file.write` | `{sessionId, path, content: base64}` | `{written, path}` — cwd 감금; 디코드 1 MiB 상한 |
 | `file.list` | `{sessionId, path? — 기본 "."}` | `{entries: [{name, dir, bytes}], path}` — cwd 감금, 1000 엔트리 |
+| `file.index` | `{sessionId?, cwd?}` — 컴포저의 `@path` 피커: 루트의 gitignore 인식 워크 1회 | `{entries: [{rel, isDir}], truncated}` — `node_modules`/`target` 프룬, 숨김 항목 스킵, symlink 미추적; 10 000 엔트리 / 512 KiB 상한, 조기 중단 시 `truncated: true` |
 | `channel.get_state` | `{convId, key}` | `{value: string?}` |
 | `channel.set_state` | `{convId, key, value}` | `{set: true}` |
 | `channel.delete_state` | `{convId, key}` | `{deleted: true}` |
+| `prompt.add` | `{text, sessionId?, cwd?}` — 보낸 프롬프트 하나, trim 후 300자 상한 | `{recorded: true}` — upsert: 재전송은 카운트를 올리고 최신으로 이동; cwd당 최신 200개만 남음 |
+| `prompt.recent` | `{limit? — 기본 50, 최대 200, sessionId?, cwd?}` | `{prompts: [{text, count}]}` — 최신순, cwd별 |
 | `project.create` | `{name?, root, defaults?}` | `{projectId, name, root, defaults}` — root는 절대경로; defaults 키: backend/model/mode/mcpServers |
 | `project.list` | `{}` | `{projects: [{projectId, name, root, defaults}]}` |
 | `project.get` | `{projectId}` | `{projectId, name, root, defaults}` |
@@ -115,6 +119,24 @@ symlink 홉은 해석하고, 아직 없는 쓰기 대상은 가장 깊은 존재
 해석하며, 나머지는 어휘적 `..` 접기가 커버한다 — 탈출은 `-32602`로
 fail-closed. `allowed_dirs`와 조합해 세션이 애초에 가질 수 있는 cwd를
 제한한다.
+
+### 컴포저 지원
+
+`catalog.commands`, `file.index`, `prompt.add`, `prompt.recent`는
+웹 UI 컴포저의 피커들(슬래시 커맨드, `@path` 멘션, 프롬프트 히스토리
+완성)을 뒷받침한다. 넷은 하나의 루트 셀렉터를 공유한다: 지정된 세션의
+저장된 cwd(`file.*`와 같은 감금), 아니면 `session.create`와 같은
+`allowed_dirs` 게이트를 통과한 클라이언트 cwd, 아니면 데몬 작업 디렉터리 —
+cwd 없는 `session.create`가 정확히 그곳에 착륙하므로, 늦게 만들어지는
+첫 세션 이전에 열린 피커도 세션이 실행될 디렉터리를 인덱싱한다.
+
+`catalog.commands`는 설치된 CLI들이 이미 확장하는 커맨드/스킬 파일을
+스캔한다(`.claude/commands` 재귀, `.claude/skills`, 그리고 CLI들이
+`CLAUDE_CONFIG_DIR` / `CODEX_HOME` / `~/.agents/skills`로 존중하는
+글로벌 루트); 데몬은 절대 `/name`을 스스로 확장하지 않는다 — 선택된
+텍스트는 프롬프트로 전송되고 나머지는 CLI가 한다. 프롬프트 히스토리는
+cwd별·최신 200개이며 모든 클라이언트 표면이 공유한다(릴레이의 폰이
+데스크톱 브라우저와 같은 완성을 본다).
 
 `prompt`는 문자열 또는 블록 배열 `[{type:"text",text},…]`다.
 
