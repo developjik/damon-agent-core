@@ -1740,6 +1740,69 @@ async fn catalog_commands_lists_workspace_commands_and_skills() {
     assert_eq!(review["kind"], "skill", "{r}");
 }
 
+/// file.index: gitignore-aware, node_modules/target-pruned workspace
+/// index with dir flags, over the same root selector as the other
+/// composer-support methods.
+#[tokio::test]
+async fn file_index_respects_gitignore_and_prunes() {
+    let (_state, _store, addr) = serve(test_config(None)).await;
+    let (mut ws, _) = ws_connect(&format!("ws://{addr}/ws")).await;
+    let dir = std::env::temp_dir().join(format!("damon-fidx-{}", uuid::Uuid::new_v4()));
+    std::fs::create_dir_all(dir.join("sub").join("node_modules")).unwrap();
+    std::fs::write(dir.join(".gitignore"), "*.log\n").unwrap();
+    std::fs::write(dir.join("keep.rs"), "fn main() {}").unwrap();
+    std::fs::write(dir.join("drop.log"), "x").unwrap();
+    std::fs::write(dir.join("sub").join("inner.txt"), "x").unwrap();
+    std::fs::write(dir.join("sub").join("node_modules").join("x.js"), "x").unwrap();
+
+    rpc_send(
+        &mut ws,
+        json!({"id":1,"method":"file.index",
+               "params":{"cwd":dir.to_string_lossy()}}),
+    )
+    .await;
+    let r = read_reply(&mut ws, 1).await;
+    let entries = r["result"]["entries"].as_array().unwrap().to_vec();
+    let rels: Vec<&str> = entries.iter().map(|e| e["rel"].as_str().unwrap()).collect();
+    assert!(rels.contains(&"keep.rs"), "{r}");
+    assert!(rels.contains(&"sub"), "{r}");
+    assert!(rels.contains(&"sub/inner.txt"), "{r}");
+    assert!(!rels.iter().any(|p| p.ends_with(".log")), "{r}");
+    assert!(!rels.iter().any(|p| p.contains("node_modules")), "{r}");
+    let sub = entries.iter().find(|e| e["rel"] == "sub").unwrap();
+    assert_eq!(sub["isDir"], true, "{r}");
+    let keep = entries.iter().find(|e| e["rel"] == "keep.rs").unwrap();
+    assert_eq!(keep["isDir"], false, "{r}");
+    assert_eq!(r["result"]["truncated"], false, "{r}");
+}
+
+/// The picker root gate covers file.index too — a cwd outside
+/// allowed_dirs fails closed.
+#[tokio::test]
+async fn file_index_denies_disallowed_cwd() {
+    let dir = std::env::temp_dir().join(format!("damon-fidx-{}", uuid::Uuid::new_v4()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let mut cfg = common::mock_config(None);
+    cfg.allowed_dirs = vec![dir.clone()];
+    let (_state, _store, addr) = serve(Arc::new(parking_lot::RwLock::new(cfg))).await;
+    let (mut ws, _) = ws_connect(&format!("ws://{addr}/ws")).await;
+
+    rpc_send(
+        &mut ws,
+        json!({"id":1,"method":"file.index","params":{"cwd":"/damon-nowhere"}}),
+    )
+    .await;
+    let r = read_reply(&mut ws, 1).await;
+    assert_eq!(r["error"]["code"], -32602, "{r}");
+    assert!(
+        r["error"]["message"]
+            .as_str()
+            .unwrap()
+            .contains("allowed_dirs"),
+        "{r}"
+    );
+}
+
 /// The composer-support root selector: a client-supplied cwd passes
 /// through the same `allowed_dirs` gate as session.create, and an
 /// unknown session id has no root to resolve.

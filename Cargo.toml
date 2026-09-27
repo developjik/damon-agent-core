@@ -44,6 +44,11 @@ aes-gcm = "0.10"
 tokio-util = "0.7.19"
 axum-server = { version = "0.8.0", features = ["tls-rustls"] }
 rustls = { version = "0.23.45", features = ["ring"] }
+ignore = "0.4"
+
+# Process-group signaling for tree kills on Unix (see transport.rs).
+[target.'cfg(unix)'.dependencies]
+libc = "0.2"
 
 
 [dev-dependencies]

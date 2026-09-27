@@ -5,6 +5,7 @@ pub mod client;
 pub mod config;
 pub mod discord;
 pub mod discovery;
+pub mod file_index;
 pub mod logs;
 pub mod ratelimit;
 pub mod relay;

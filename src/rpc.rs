@@ -1266,6 +1266,32 @@ async fn dispatch(
             Ok(json!({"entries": out, "path": path}))
         }
 
+        "file.index" => {
+            // The @-mention picker's workspace index. Same root
+            // resolution/jail as the other file.* calls; the walk
+            // never follows symlinks and its output is bounded by
+            // construction, so the frame stays under budget.
+            let root = resolve_picker_root(state, &params).await?;
+            let root = root
+                .canonicalize()
+                .map_err(|e| RpcError::error(error_code::INVALID_PARAMS, format!("{}: {e}", root.display())))?;
+            let meta = tokio::fs::metadata(&root)
+                .await
+                .map_err(|e| RpcError::error(error_code::INVALID_PARAMS, format!("{}: {e}", root.display())))?;
+            if !meta.is_dir() {
+                return Err(RpcError::error(
+                    error_code::INVALID_PARAMS,
+                    format!("{} is not a directory", root.display()),
+                ));
+            }
+            let index = tokio::task::spawn_blocking(move || {
+                crate::file_index::build(&root)
+            })
+            .await
+            .map_err(|e| anyhow::anyhow!("index walk join failed: {e}"))??;
+            Ok(serde_json::to_value(index)?)
+        }
+
         "channel.get_state" => {
             let conv = req_str(&params, "convId")?;
             let key = req_str(&params, "key")?;
@@ -1902,6 +1928,7 @@ pub fn rpc_methods() -> Vec<Value> {
         json!({"name": "file.read", "params": {"sessionId": "string", "path": "string — relative to the session cwd or absolute inside it"}, "result": {"content": "string — base64", "bytes": "number", "path": "string"}}),
         json!({"name": "file.write", "params": {"sessionId": "string", "path": "string", "content": "string — base64"}, "result": {"written": "number", "path": "string"}}),
         json!({"name": "file.list", "params": {"sessionId": "string", "path": "string? — default ."}, "result": {"entries": "array of {name, dir, bytes}", "path": "string"}}),
+        json!({"name": "file.index", "params": {"sessionId": "string?", "cwd": "string? — gated by allowed_dirs like session.create"}, "result": {"entries": "array of {rel, isDir} — root-relative gitignore-aware walk (node_modules/target pruned, hidden skipped, symlinks not followed)", "truncated": "boolean — the walk stopped at the 10 000-entry / 512 KiB bound"}}),
         json!({"name": "channel.get_state", "params": {"convId": "string", "key": "string"}, "result": {"value": "string?"}}),
         json!({"name": "channel.set_state", "params": {"convId": "string", "key": "string", "value": "string"}, "result": {"set": "boolean"}}),
         json!({"name": "channel.delete_state", "params": {"convId": "string", "key": "string"}, "result": {"deleted": "boolean"}}),
