@@ -346,15 +346,10 @@ impl DroidSession {
                     .unwrap_or_default();
                 let actions = options
                     .iter()
-                    .enumerate()
-                    .map(|(i, o)| PermissionAction {
+                    .map(|o| PermissionAction {
                         id: o.as_str().unwrap_or("opt").to_string(),
                         label: o.as_str().unwrap_or("opt").to_string(),
-                        behavior: if i == 0 {
-                            PermissionBehavior::Allow
-                        } else {
-                            PermissionBehavior::Allow
-                        },
+                        behavior: PermissionBehavior::Allow,
                         variant: None,
                     })
                     .collect();

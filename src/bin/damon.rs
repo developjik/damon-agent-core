@@ -993,7 +993,9 @@ async fn worktree_command(
             }
         }
         WorktreeCmd::List { repo } => {
-            let r = client.request("worktree.list", json!({"repo": repo})).await?;
+            let r = client
+                .request("worktree.list", json!({"repo": repo}))
+                .await?;
             if json_out {
                 outln(r.to_string());
             } else {
@@ -1001,16 +1003,28 @@ async fn worktree_command(
                     outln(format!(
                         "{}\t{}\t{}{}{}",
                         w["path"].as_str().unwrap_or("?"),
-                        w["branch"].as_str().unwrap_or(
-                            if w["isMain"].as_bool().unwrap_or(false) {
+                        w["branch"]
+                            .as_str()
+                            .unwrap_or(if w["isMain"].as_bool().unwrap_or(false) {
                                 "(main)"
                             } else {
                                 "(detached)"
-                            }
-                        ),
-                        if w["isMain"].as_bool().unwrap_or(false) { "main" } else { "" },
-                        if w["locked"].as_bool().unwrap_or(false) { " locked" } else { "" },
-                        if w["prunable"].as_bool().unwrap_or(false) { " prunable" } else { "" },
+                            }),
+                        if w["isMain"].as_bool().unwrap_or(false) {
+                            "main"
+                        } else {
+                            ""
+                        },
+                        if w["locked"].as_bool().unwrap_or(false) {
+                            " locked"
+                        } else {
+                            ""
+                        },
+                        if w["prunable"].as_bool().unwrap_or(false) {
+                            " prunable"
+                        } else {
+                            ""
+                        },
                     ));
                 }
             }
@@ -1036,7 +1050,9 @@ async fn worktree_command(
             } else {
                 outln("removed");
                 if r["orphanDirectory"].as_bool().unwrap_or(false) {
-                    outln("note: git refused — directory deleted directly, run `git worktree prune`");
+                    outln(
+                        "note: git refused — directory deleted directly, run `git worktree prune`",
+                    );
                 }
                 if let Some(reason) = r["branchKeptReason"].as_str() {
                     outln(format!("note: branch kept ({reason})"));
@@ -1054,11 +1070,13 @@ async fn worktree_command(
                     "#{}\t{}\t{}",
                     r["number"].as_u64().unwrap_or(0),
                     r["repo"].as_str().unwrap_or("?"),
-                    r["title"].as_str().unwrap_or(if r["degraded"].as_bool().unwrap_or(false) {
-                        "(gh unavailable — number confirmed)"
-                    } else {
-                        "?"
-                    }),
+                    r["title"]
+                        .as_str()
+                        .unwrap_or(if r["degraded"].as_bool().unwrap_or(false) {
+                            "(gh unavailable — number confirmed)"
+                        } else {
+                            "?"
+                        }),
                 ));
                 if let Some(b) = r["suggestedBranch"].as_str() {
                     outln(format!("suggested branch: {b}"));

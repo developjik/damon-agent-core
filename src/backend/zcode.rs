@@ -110,7 +110,6 @@ impl AgentClient for ZcodeClient {
 }
 
 struct PendingAsk {
-    request: PermissionRequest,
     /// The JSON-RPC id of the server→client interaction request.
     rpc_id: Value,
     /// optionId → the response payload to echo back on selection.
@@ -417,7 +416,6 @@ impl ZcodeSession {
         self.pending_asks.lock().await.insert(
             ask.id.clone(),
             PendingAsk {
-                request: ask.clone(),
                 rpc_id,
                 option_responses,
                 is_question,

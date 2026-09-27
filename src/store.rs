@@ -440,7 +440,10 @@ impl Store {
                     "kind",
                     "ALTER TABLE projects ADD COLUMN kind TEXT NOT NULL DEFAULT 'project'",
                 ),
-                ("parent_id", "ALTER TABLE projects ADD COLUMN parent_id TEXT"),
+                (
+                    "parent_id",
+                    "ALTER TABLE projects ADD COLUMN parent_id TEXT",
+                ),
                 (
                     "meta",
                     "ALTER TABLE projects ADD COLUMN meta TEXT NOT NULL DEFAULT '{}'",
@@ -1598,7 +1601,11 @@ impl Store {
         parent_id: Option<&str>,
         meta_json: &str,
     ) -> anyhow::Result<bool> {
-        let (id, parent, meta) = (id.to_string(), parent_id.map(String::from), meta_json.to_string());
+        let (id, parent, meta) = (
+            id.to_string(),
+            parent_id.map(String::from),
+            meta_json.to_string(),
+        );
         Ok(self
             .conn
             .call(move |c| {

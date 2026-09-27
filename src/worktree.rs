@@ -12,11 +12,11 @@
 //! `allowed_dirs` gate still applies — a worktree outside the allowed
 //! roots would produce sessions no client can create.
 
-use serde_json::{json, Value};
+use serde_json::{Value, json};
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 
 use crate::store::Store;
@@ -56,10 +56,7 @@ impl CreationCancel {
 
     fn check(&self) -> Result<(), WorktreeError> {
         if self.cancelled.load(Ordering::SeqCst) {
-            Err(WorktreeError::new(
-                "canceled",
-                "worktree creation canceled",
-            ))
+            Err(WorktreeError::new("canceled", "worktree creation canceled"))
         } else {
             Ok(())
         }
@@ -151,9 +148,7 @@ impl GitOut {
 /// small; fetch progress churns but only the shape matters.
 const OUTPUT_CAP: usize = 1024 * 1024;
 
-async fn read_capped<R: tokio::io::AsyncRead + Unpin>(
-    mut r: R,
-) -> std::io::Result<String> {
+async fn read_capped<R: tokio::io::AsyncRead + Unpin>(mut r: R) -> std::io::Result<String> {
     use tokio::io::AsyncReadExt;
     let mut buf: Vec<u8> = Vec::new();
     let mut chunk = [0u8; 8192];
@@ -232,7 +227,11 @@ async fn run_cmd(
     })
 }
 
-async fn run_git(repo: Option<&Path>, args: &[&str], cancel: &CreationCancel) -> anyhow::Result<GitOut> {
+async fn run_git(
+    repo: Option<&Path>,
+    args: &[&str],
+    cancel: &CreationCancel,
+) -> anyhow::Result<GitOut> {
     let mut full: Vec<String> = Vec::with_capacity(args.len() + 2);
     if let Some(r) = repo {
         full.push("-C".into());
@@ -297,11 +296,7 @@ pub fn parse_porcelain(s: &str) -> Vec<WorktreeInfo> {
         if let Some(head) = line.strip_prefix("HEAD ") {
             w.head = head.to_string();
         } else if let Some(refs) = line.strip_prefix("branch ") {
-            w.branch = Some(
-                refs.strip_prefix("refs/heads/")
-                    .unwrap_or(refs)
-                    .to_string(),
-            );
+            w.branch = Some(refs.strip_prefix("refs/heads/").unwrap_or(refs).to_string());
         } else if line == "detached" {
             // branch stays None
         } else if line == "bare" {
@@ -428,10 +423,14 @@ pub fn parse_pr_input(input: &str) -> Option<u64> {
 /// None — non-GitHub hosts get no PR preview.
 pub fn github_owner_repo(url: &str) -> Option<String> {
     let u = url.trim();
-    let path = ["https://github.com/", "http://github.com/", "ssh://git@github.com/"]
-        .iter()
-        .find_map(|p| u.strip_prefix(p))
-        .or_else(|| u.strip_prefix("git@github.com:"))?;
+    let path = [
+        "https://github.com/",
+        "http://github.com/",
+        "ssh://git@github.com/",
+    ]
+    .iter()
+    .find_map(|p| u.strip_prefix(p))
+    .or_else(|| u.strip_prefix("git@github.com:"))?;
     let path = path.strip_suffix(".git").unwrap_or(path);
     let mut parts = path.splitn(2, '/');
     let owner = parts.next()?.trim();
@@ -488,7 +487,7 @@ pub async fn create(
             return Err(WorktreeError::new(
                 "invalid_args",
                 "branch or prNumber is required",
-            ))
+            ));
         }
     };
     check_branch_name(&repo_root, &branch, cancel).await?;
@@ -502,7 +501,10 @@ pub async fn create(
         .map_err(|e| WorktreeError::new("invalid_args", format!("bad path: {e}")))?;
     if !allowed_dirs.is_empty() {
         let abs = canon_abs(&worktree_path);
-        if !allowed_dirs.iter().any(|root| abs.starts_with(canon_abs(root))) {
+        if !allowed_dirs
+            .iter()
+            .any(|root| abs.starts_with(canon_abs(root)))
+        {
             return Err(WorktreeError::new(
                 "not_allowed",
                 format!(
@@ -541,15 +543,13 @@ pub async fn create(
                         "{} exists and is not a worktree of {branch} — pick another path",
                         worktree_path.display()
                     ),
-                ))
+                ));
             }
         }
     } else if !args.existing_branch && existing {
         return Err(WorktreeError::new(
             "branch_exists",
-            format!(
-                "branch {branch:?} already exists — pass existingBranch to check it out"
-            ),
+            format!("branch {branch:?} already exists — pass existingBranch to check it out"),
         ));
     }
     if !resumed
@@ -572,8 +572,8 @@ pub async fn create(
         if let Some(n) = args.pr_number {
             progress("fetch", &format!("pull/{n}/head"));
             let url = remote_url(&repo_root, "origin", cancel).await?;
-            pr_url_opt = github_owner_repo(&url)
-                .map(|slug| format!("https://github.com/{slug}/pull/{n}"));
+            pr_url_opt =
+                github_owner_repo(&url).map(|slug| format!("https://github.com/{slug}/pull/{n}"));
             let refspec = format!("+refs/pull/{n}/head:refs/heads/{branch}");
             let out = run_git(Some(&repo_root), &["fetch", "origin", &refspec], cancel)
                 .await
@@ -800,7 +800,12 @@ async fn fetch_base(repo: &Path, base: &str, cancel: &CreationCancel) -> WResult
 async fn base_resolves(repo: &Path, base: &str, cancel: &CreationCancel) -> anyhow::Result<bool> {
     let out = run_git(
         Some(repo),
-        &["rev-parse", "--verify", "--quiet", &format!("{base}^{{commit}}")],
+        &[
+            "rev-parse",
+            "--verify",
+            "--quiet",
+            &format!("{base}^{{commit}}"),
+        ],
         cancel,
     )
     .await?;
@@ -860,14 +865,20 @@ async fn sparse_empty(path: &Path, cancel: &CreationCancel) -> WResult<bool> {
     if !out.ok() {
         return Ok(false);
     }
-    let lines: Vec<&str> = out.stdout.lines().filter(|l| !l.trim().is_empty()).collect();
+    let lines: Vec<&str> = out
+        .stdout
+        .lines()
+        .filter(|l| !l.trim().is_empty())
+        .collect();
     Ok(!lines.is_empty() && lines.iter().all(|l| l.starts_with('S')))
 }
 
 /// The repo's own project row, created on demand so a worktree always
 /// has a parent to nest under.
 async fn ensure_parent_project(store: &Store, repo_root: &Path) -> anyhow::Result<Option<String>> {
-    if let Some(row) = store.get_project_by_root(&repo_root.to_string_lossy()).await?
+    if let Some(row) = store
+        .get_project_by_root(&repo_root.to_string_lossy())
+        .await?
         && row.kind == "project"
     {
         return Ok(Some(row.id));
@@ -936,11 +947,7 @@ pub async fn list_worktrees(repo: &Path, cancel: &CreationCancel) -> WResult<Vec
 pub async fn discover_repo(path: &Path, cancel: &CreationCancel) -> WResult<PathBuf> {
     let out = run_git(
         Some(path),
-        &[
-            "rev-parse",
-            "--path-format=absolute",
-            "--git-common-dir",
-        ],
+        &["rev-parse", "--path-format=absolute", "--git-common-dir"],
         cancel,
     )
     .await
@@ -997,9 +1004,7 @@ pub async fn remove_worktree_git(
     }
     let _ = run_git(Some(repo), &["worktree", "prune"], &noop).await;
 
-    if delete_branch
-        && let Some(branch) = branch
-    {
+    if delete_branch && let Some(branch) = branch {
         // -d refuses unmerged branches; -D is the explicit override.
         let safe = run_git(Some(repo), &["branch", "-d", branch], &noop).await;
         if safe.as_ref().map(|o| o.ok()).unwrap_or(false) {
@@ -1012,13 +1017,11 @@ pub async fn remove_worktree_git(
                 let stderr = force
                     .map(|o| summarize_stderr(&o.stderr))
                     .unwrap_or_default();
-                outcome.branch_kept_reason = Some(
-                    if stderr.contains("checked out") {
-                        "checked_out_elsewhere".to_string()
-                    } else {
-                        "unknown".to_string()
-                    },
-                );
+                outcome.branch_kept_reason = Some(if stderr.contains("checked out") {
+                    "checked_out_elsewhere".to_string()
+                } else {
+                    "unknown".to_string()
+                });
             }
         }
     }
@@ -1114,9 +1117,13 @@ pub async fn resolve_pr(
 /// uncommitted-work warning. Squash merges report false (no ancestry).
 pub async fn branch_merged(repo: &Path, branch: &str, base: &str) -> WResult<bool> {
     let noop = CreationCancel::fresh();
-    let out = run_git(Some(repo), &["merge-base", "--is-ancestor", branch, base], &noop)
-        .await
-        .map_err(|e| WorktreeError::new("unknown", e.to_string()))?;
+    let out = run_git(
+        Some(repo),
+        &["merge-base", "--is-ancestor", branch, base],
+        &noop,
+    )
+    .await
+    .map_err(|e| WorktreeError::new("unknown", e.to_string()))?;
     match out.code {
         Some(0) => Ok(true),
         Some(1) => Ok(false),
@@ -1163,7 +1170,10 @@ mod tests {
         assert_eq!(sanitize_dirname("feature/x-y"), "feature-x-y");
         assert_eq!(sanitize_dirname("한글브랜치"), "worktree");
         assert_eq!(sanitize_dirname("--"), "worktree");
-        assert_eq!(default_worktree_path(Path::new("/a/b/repo"), "pr 9").to_string_lossy(), "/a/b/repo-worktrees/pr-9");
+        assert_eq!(
+            default_worktree_path(Path::new("/a/b/repo"), "pr 9").to_string_lossy(),
+            "/a/b/repo-worktrees/pr-9"
+        );
     }
 
     #[test]

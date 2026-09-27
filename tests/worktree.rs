@@ -66,7 +66,10 @@ async fn rpc_send(ws: &mut Ws, msg: Value) {
 async fn ws_connect(url: &str) -> (Ws, Value) {
     let (mut ws, _) = tokio_tungstenite::connect_async(url).await.unwrap();
     let hello = read_json(&mut ws).await;
-    assert!(hello["hello"].is_object(), "first frame must be hello: {hello}");
+    assert!(
+        hello["hello"].is_object(),
+        "first frame must be hello: {hello}"
+    );
     (ws, hello)
 }
 
@@ -134,10 +137,8 @@ fn commit_all(dir: &Path, msg: &str) {
 /// A clone whose `origin` is a local bare repo carrying main + a
 /// simulated PR (refs/pull/7/head at a second commit).
 fn pr_fixture(tag: &str) -> PathBuf {
-    let root = std::env::temp_dir().join(format!(
-        "damon-wt-{tag}-{}",
-        uuid::Uuid::new_v4().simple()
-    ));
+    let root =
+        std::env::temp_dir().join(format!("damon-wt-{tag}-{}", uuid::Uuid::new_v4().simple()));
     let origin = root.join("origin.git");
     let seed = root.join("seed");
     let repo = root.join("repo");
@@ -145,7 +146,10 @@ fn pr_fixture(tag: &str) -> PathBuf {
 
     let (ok, text) = git(&root, &["init", "-q", "--bare", &origin.to_string_lossy()]);
     assert!(ok, "bare init failed: {text}");
-    let (ok, text) = git(&root, &["init", "-q", "-b", "main", &seed.to_string_lossy()]);
+    let (ok, text) = git(
+        &root,
+        &["init", "-q", "-b", "main", &seed.to_string_lossy()],
+    );
     assert!(ok, "seed init failed: {text}");
     std::fs::write(seed.join("README.md"), "base\n").unwrap();
     commit_all(&seed, "base");
@@ -229,8 +233,7 @@ async fn create_pr_worktree_registers_project_and_resumes() {
     assert!(
         projects.iter().any(|p| p["projectId"] == parent_id.as_str()
             && p["kind"] == "project"
-            && Path::new(p["root"].as_str().unwrap())
-                == std::fs::canonicalize(&repo).unwrap()),
+            && Path::new(p["root"].as_str().unwrap()) == std::fs::canonicalize(&repo).unwrap()),
         "parent project auto-created for the repo root"
     );
 
@@ -346,7 +349,10 @@ async fn remove_deletes_branch_and_refuses_bound_sessions() {
         .find(|x| x["sessionId"] == session_id.as_str())
         .expect("session listed");
     let cwd = listed["cwd"].as_str().unwrap_or("");
-    assert!(Path::new(cwd).starts_with(&path), "session cwd is the worktree: {cwd}");
+    assert!(
+        Path::new(cwd).starts_with(&path),
+        "session cwd is the worktree: {cwd}"
+    );
 
     let (blocked, _) = call(
         &mut ws,
@@ -360,7 +366,13 @@ async fn remove_deletes_branch_and_refuses_bound_sessions() {
     assert!(store.get_project(&project_id).await.unwrap().is_some());
 
     // Free the session, then remove with branch deletion.
-    let _ = call(&mut ws, 4, "session.delete", json!({"sessionId": session_id})).await;
+    let _ = call(
+        &mut ws,
+        4,
+        "session.delete",
+        json!({"sessionId": session_id}),
+    )
+    .await;
     let (rm, _) = call(
         &mut ws,
         5,
@@ -456,7 +468,10 @@ async fn allowed_dirs_gate_and_catalog() {
         "worktree.resolve_pr",
         "worktree.merged",
     ] {
-        assert!(methods.contains(&expected), "{expected} missing from schema");
+        assert!(
+            methods.contains(&expected),
+            "{expected} missing from schema"
+        );
     }
 
     std::fs::remove_dir_all(repo.parent().unwrap()).ok();
@@ -482,7 +497,15 @@ async fn resolve_pr_shapes_and_not_github() {
 
     // A github-shaped origin resolves: number and slug are confirmed
     // without gh; details degrade rather than fail.
-    git(&repo, &["remote", "set-url", "origin", "https://github.com/acme/widget.git"]);
+    git(
+        &repo,
+        &[
+            "remote",
+            "set-url",
+            "origin",
+            "https://github.com/acme/widget.git",
+        ],
+    );
     for input in ["7", "#7", "https://github.com/acme/widget/pull/7/files"] {
         let (p, _) = call(
             &mut ws,
@@ -541,7 +564,10 @@ async fn merged_reports_ancestry() {
         json!({"repo": repo.to_string_lossy(), "branch": "pr-7", "base": "main"}),
     )
     .await;
-    assert_eq!(no["result"]["merged"], false, "refs/pull/7 is ahead of main");
+    assert_eq!(
+        no["result"]["merged"], false,
+        "refs/pull/7 is ahead of main"
+    );
 
     std::fs::remove_dir_all(repo.parent().unwrap()).ok();
 }

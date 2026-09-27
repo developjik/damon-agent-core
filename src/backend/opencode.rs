@@ -178,7 +178,6 @@ impl OpencodeClient {
 }
 
 struct PendingAsk {
-    request: PermissionRequest,
     /// The opencode permission/question request id (per_…/que_…).
     wire_id: String,
     /// true → question endpoints, false → permission endpoints.
@@ -439,7 +438,6 @@ impl OpencodeSession {
         self.pending_asks.lock().await.insert(
             ask.id.clone(),
             PendingAsk {
-                request: ask.clone(),
                 wire_id,
                 is_question,
             },

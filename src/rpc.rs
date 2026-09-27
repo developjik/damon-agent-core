@@ -649,16 +649,9 @@ async fn dispatch(
                     "data": {"stage": stage, "message": message},
                 }));
             };
-            let cancel =
-                crate::worktree::register_creation(&state.worktrees, &creation_id);
-            let result = crate::worktree::create(
-                &state.store,
-                &cancel,
-                &progress,
-                &allowed,
-                args,
-            )
-            .await;
+            let cancel = crate::worktree::register_creation(&state.worktrees, &creation_id);
+            let result =
+                crate::worktree::create(&state.store, &cancel, &progress, &allowed, args).await;
             crate::worktree::finish_creation(&state.worktrees, &creation_id);
             let outcome = result?;
             Ok(json!({
@@ -681,18 +674,9 @@ async fn dispatch(
 
         "worktree.remove" => {
             let row = if let Some(id) = params["projectId"].as_str() {
-                Some(
-                    state
-                        .store
-                        .get_project(id)
-                        .await?
-                        .ok_or_else(|| {
-                            RpcError::error(
-                                error_code::INVALID_PARAMS,
-                                format!("unknown project {id}"),
-                            )
-                        })?,
-                )
+                Some(state.store.get_project(id).await?.ok_or_else(|| {
+                    RpcError::error(error_code::INVALID_PARAMS, format!("unknown project {id}"))
+                })?)
             } else if let Some(path) = params["path"].as_str() {
                 state.store.get_project_by_root(path).await?
             } else {
@@ -744,9 +728,13 @@ async fn dispatch(
                     .await
                     .map_err(|e| RpcError::error(error_code::INVALID_PARAMS, e.to_string()))?;
             }
-            let out =
-                crate::worktree::remove_worktree_git(&repo, &path_buf, branch.as_deref(), delete_branch)
-                    .await;
+            let out = crate::worktree::remove_worktree_git(
+                &repo,
+                &path_buf,
+                branch.as_deref(),
+                delete_branch,
+            )
+            .await;
             Ok(json!({
                 "removed": true,
                 "orphanDirectory": out.orphan_directory,
@@ -814,9 +802,8 @@ async fn dispatch(
             let input = req_str(&params, "input")?;
             let branch = params["branch"].as_str();
             let noop = crate::worktree::CreationCancel::noop();
-            let p =
-                crate::worktree::resolve_pr(std::path::Path::new(repo), &noop, input, branch)
-                    .await?;
+            let p = crate::worktree::resolve_pr(std::path::Path::new(repo), &noop, input, branch)
+                .await?;
             Ok(json!({
                 "number": p.number,
                 "repo": p.repo,
@@ -835,12 +822,8 @@ async fn dispatch(
             let repo = req_str(&params, "repo")?;
             let branch = req_str(&params, "branch")?;
             let base = params["base"].as_str().unwrap_or("HEAD");
-            let merged = crate::worktree::branch_merged(
-                std::path::Path::new(repo),
-                branch,
-                base,
-            )
-            .await?;
+            let merged =
+                crate::worktree::branch_merged(std::path::Path::new(repo), branch, base).await?;
             Ok(json!({"merged": merged}))
         }
 
