@@ -29,7 +29,7 @@ Damon은 코딩 에이전트를 각자의 네이티브 CLI로, stdio subprocess�
 
 탐지: PATH에 해당 바이너리가 있으면 백엔드가 자동 등록된다.
 
-카탈로그의 모든 백엔드는 네이티브 양방향 프로토콜을 말한다 — 토큰 스트리밍, 턴 도중 권한 요청, 인터럽트가 전부 Damon을 통해 릴레이된다(`claude`와 `qwen`은 세션당 프로세스 하나로 stream-json — `qwen`의 컨트롤 플레인은 Claude형이며 스폰 시 Damon이 `initialize` 핸드셰이크를 수행한다. `omp`와 `pi`는 같은 rpc 와이어를 공유하며, omp는 프로토콜 v2 청킹을 추가로 협상하고 pi는 명시적 종료 이벤트에서만 턴을 확정한다). 헤드리스 모드가 출력뿐인(권한·질문 와이어 없음) CLI는 의도적으로 카탈로그에 넣지 않는다. `qwen`의 stream-json 입력은 텍스트 블록만 받는다 — 이미지 첨부는 조용히 버리지 않고 명시적으로 거부한다. `pi`의 도구는 자체 신뢰 모델로 동작한다 — 모드 스위치를 노출하지 않으며 권한 질문은 확장 다이얼로그로만 온다.
+카탈로그의 모든 백엔드는 네이티브 양방향 프로토콜을 말한다 — 토큰 스트리밍, 턴 도중 권한 요청, 인터럽트가 전부 Damon을 통해 릴레이된다(`claude`와 `qwen`은 세션당 프로세스 하나로 stream-json — `qwen`의 컨트롤 플레인은 Claude형이며 스폰 시 Damon이 `initialize` 핸드셰이크를 수행한다. `droid`는 Factory의 JSON-RPC를 말하며 권한 요청은 Damon이 답해야 하는 `droid.request_permission` 요청으로 도착한다. `opencode`/`mimo`는 입양하거나 스폰한 `serve`에 HTTP로 답한다. `omp`와 `pi`는 같은 rpc 와이어를 공유하며, omp는 프로토콜 v2 청킹을 추가로 협상하고 pi는 명시적 종료 이벤트에서만 턴을 확정한다). 헤드리스 모드가 출력뿐인(권한·질문 와이어 없음) CLI는 의도적으로 카탈로그에 넣지 않는다. `qwen`의 stream-json 입력은 텍스트 블록만 받는다 — 이미지 첨부는 조용히 버리지 않고 명시적으로 거부한다. `pi`의 도구는 자체 신뢰 모델로 동작한다 — 모드 스위치를 노출하지 않으며 권한 질문은 확장 다이얼로그로만 온다.
 
 오버라이드 — 구동 명령을 교체하거나 로컬 빌드를 가리키기:
 
@@ -51,7 +51,7 @@ MCP 서버는 `session.create`의 `mcpServers`가 **에이전트에게 전달**�
 
 브라우저 Origin: `auth_token`이 없으면 `Origin` 헤더를 달고 오는 요청은 루프백 origin이어야 한다. 토큰이 있으면 모든 origin이 통과한다 — 토큰이 게이트다.
 
-`GET /metrics`(토큰 게이트 뒤)는 Prometheus 카운터를 노출한다: `damon_requests_total`, `damon_live_sessions`.
+`GET /metrics`(토큰 게이트 뒤)는 Prometheus 카운터를 노출한다: `damon_requests_total`(토큰 게이트를 통과한 HTTP 요청), `damon_rpc_requests_total`, `damon_rpc_errors_total{code}`, `damon_live_sessions`, `damon_busy_sessions`, 백엔드별 `damon_turns_total{backend,status}`, 그리고 `damon_turn_seconds_*` 소요 시간 히스토그램.
 
 ## WS 프로토콜 (v2)
 
@@ -207,4 +207,4 @@ SIGKILL된 데몬은 파일을 남기므로, 읽는 쪽은 이를 증거가 아�
 | Discord | `damon-discord --bot-token <token>` | Gateway WebSocket | `DISCORD_BOT_TOKEN` env 가능. MESSAGE_CONTENT privileged intent 필요 |
 | Slack | `damon-slack --app-token xapp-… --bot-token xoxb-…` | Socket Mode | `SLACK_APP_TOKEN`/`SLACK_BOT_TOKEN` env 가능 |
 
-새 채널 추가: `damon_core::channel::ChannelApi`(`ready`/`recv`/`send`)를 구현하고 `channel::Bridge::new(channel, client).run()`에 연결하면 된다 — 세션 매핑, 이벤트 demux, 권한 흐름, 스트리밍 루프는 브리지가 소유한다.
+새 채널 추가: `damon_core::channel::ChannelApi`(`ready`/`recv`/`send`, 재정의 가능한 `send_permission`/`send_media` 훅)를 구현하고 `channel::Bridge::new(channel, client).run()`에 연결하면 된다 — 세션 매핑, 이벤트 demux, 권한 흐름, 스트리밍 루프는 브리지가 소유한다.

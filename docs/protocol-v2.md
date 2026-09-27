@@ -17,7 +17,7 @@ a long `turn.start` never serializes the socket.
 // server push (no id)
 {"event": "session.event", "sessionId": "…", "data": {…StreamEvent…}}
 // sent on connect, and as the response to a "hello" request
-{"hello": {"protocol": 2, "daemon": "damond", "version": "0.3.0",
+{"hello": {"protocol": 2, "daemon": "damond", "version": "0.5.0",
            "permissionTimeoutSecs": 300}}
 ```
 
@@ -58,7 +58,6 @@ unchanged, so string-matching clients keep working.
 | `backend.list` | — | `{backends: [{id, available, capabilities}]}` |
 | `session.create` | `{backend?, cwd?, model?, mode?, mcpServers?, projectId?}` — the project scopes the session: its root becomes the cwd default and its defaults fill unset params (explicit always wins) | `{sessionId, backend, replayed}` |
 | `session.resume` | `{sessionId}` — or `{handle:{provider,native_handle}, cwd?, title?}` to import a native session | `{sessionId, backend, replayed}` |
-| `session.list` | `{limit?, offset?, backend?, cwd?, tag?}` | `{sessions: [{sessionId, createdAt, backend, title, cwd, tags[]}]}` |
 | `session.messages` | `{sessionId, limit?, offset?}` | `{messages: [{id, session_id, role, ts, data}]}` |
 | `session.export` | `{sessionId}` | `{session: {sessionId, createdAt, backend, title, tags, cwd}, messages: [{id, role, ts, data}], usage: {contextUsed, contextSize, costUsd, turns}}` |
 | `session.import` | `{backend, cwd?}` | `{sessions: [ImportableSession]}` |

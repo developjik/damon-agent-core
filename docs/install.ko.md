@@ -62,7 +62,7 @@ damond --print-config-path   # config.toml 위치
 ```
 
 `config.example.toml` 참조. 에이전트 CLI의 로그인은 각 CLI의 자체 인증을
-그대로 사용한다(탐지된 CLI — `claude`, `codex`, `omp`, `pi`, `qwen`, `droid`, `opencode`, `zcode` — 가
+그대로 사용한다(탐지된 CLI — `claude`, `codex`, `omp`, `pi`, `qwen`, `droid`, `opencode`, `mimo`, `zcode` — 가
 각자 인증한다) — Damon이 에이전트 토큰을 보관하지 않는다.
 
 

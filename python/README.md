@@ -1,12 +1,13 @@
 # damon-agent (Python)
 
-Asyncio client for **Damon**, a local agent-control daemon. Damon is an
-ACP host: it drives coding agents (Claude Code, Codex, Gemini CLI,
-Copilot, …) over the Agent Client Protocol — the model, tools,
-credentials, and context management belong to the agents; Damon owns
-sessions, permission relaying, searchable history, and remote access.
-Your app attaches as a thin client. Same API shape as the Node
-(`damon-agent`) and Rust (`damon::client`) SDKs.
+Asyncio client for **Damon**, a local agent-control daemon. Damon
+drives nine coding-agent CLIs (Claude Code, Codex CLI, Oh My Pi, Pi,
+Qwen Code, Droid, OpenCode, MiMo, ZCode) over their native
+bidirectional protocols — the model, tools, credentials, and context
+management belong to the agents; Damon owns sessions, permission
+relaying, searchable history, and remote access. Your app attaches as
+a thin client. Same API shape as the Node (`damon-agent`) and Rust
+(`damon::client`) SDKs.
 
 - Docs, config reference, protocol: <https://github.com/developjik/damon-agent-core>
 - Install: `pip install damon-agent` (Python ≥ 3.11, single runtime
@@ -112,7 +113,21 @@ cap — until the daemon returns. Calls made while down wait up to 10s
 for the link, then raise. Kill and restart `damond` mid-conversation:
 your app sees `disconnected` → `reconnected` and keeps going.
 
-Relay links (`connect_relay` in the Node/Rust SDKs) are not part of
-this milestone.
+## Through a relay (E2E-encrypted)
+
+`connect_relay` reaches a daemon behind a `damon-relay` — the relay
+pipes frames but never sees plaintext: X25519 key exchange, AES-256-GCM
+frames with direction-separated keys and strict sequence numbers, and
+the stretched-proof `kdf: "s256"` negotiation (stdlib-only crypto):
+
+```python
+client = await DamonClient.connect_relay(
+    "ws://relay.example.com",          # the relay's ws(s)://host:port
+    name="home",                       # the daemon's registered relay name
+    token=os.environ["DAMON_TOKEN"],   # the daemon's auth_token
+)
+```
+
+From here the API surface is identical.
 
 License: MIT OR Apache-2.0.

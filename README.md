@@ -9,7 +9,7 @@
 
 **One daemon. Every coding agent.**
 
-Damon is a local agent-control daemon written in Rust. It drives Claude Code, Codex CLI, and Oh My Pi through their native CLIs — the model, tools, credentials, and context management belong to the agents; Damon owns sessions, permission relaying, searchable history, chat channels, and remote access. The CLI, Telegram bot, desktop app, and web UI are all thin clients on the same resident daemon.
+Damon is a local agent-control daemon written in Rust. It drives nine coding-agent CLIs — Claude Code, Codex CLI, Oh My Pi, Pi, Qwen Code, Droid, OpenCode, MiMo, ZCode — over their native bidirectional protocols; the model, tools, credentials, and context management belong to the agents, while Damon owns sessions, permission relaying, searchable history, chat channels, and remote access. The CLI, Telegram bot, desktop app, and web UI are all thin clients on the same resident daemon.
 
 The name is a pun on *daemon*, and literally the architecture.
 
@@ -73,8 +73,9 @@ Chat in the bundled web UI: `http://127.0.0.1:9470/ui` — sessions, streaming, 
                      ├─ session store — SQLite + FTS5 full-text search
                      └─ channel bridges / E2E relay
                               |
-            Claude Code · Codex CLI · Oh My Pi  (native CLI subprocesses)
-             — model, tools, subscription auth, context all agent-owned
+            claude · codex · omp · pi · qwen · droid · opencode · mimo · zcode
+             (native CLI subprocesses — model, tools, subscription auth,
+                        and context all agent-owned)
 ```
 
 See [docs/protocol-v2.md](docs/protocol-v2.md) for the wire protocol and [docs/integration.md](docs/integration.md) for copy-paste Node/Python/Rust clients.

@@ -1,6 +1,6 @@
 # Changelog
 
-## Unreleased
+## 0.6.0 — 2026-09-27
 
 ### Added — git worktree workspaces (design ported from desktop-cc-gui's `git_worktree.rs`, MIT)
 
@@ -137,6 +137,41 @@
   (the `file.*` jail), else a client cwd through the same
   `allowed_dirs` gate as `session.create`, else the daemon working
   directory (exactly where a cwd-less `session.create` lands).
+
+### Changed — the catalog only admits fully-drivable CLIs
+
+Every listed backend speaks a native bidirectional protocol — token
+streaming, mid-turn permission asks, and interrupt all relay — each
+verified live against the real binary.
+
+- **Added `droid`** (Factory): `droid exec` stream-jsonrpc —
+  initialize/load_session, `droid.request_permission` answered
+  end-to-end (verified 0.228.0). Custom models and auth stay in the
+  CLI's own `~/.factory` settings.
+- **Added `opencode` + `mimo`** (one surface, two CLIs): adopts a
+  healthy `opencode serve` on :4096 or spawns one (password + basic
+  auth); sessions over HTTP, events over SSE, permission/question
+  reply endpoints, abort (verified 1.18.32).
+- **Added `zcode`** (Z.ai GLM Coding Plan): `zcode app-server --stdio`
+  dialect — no `jsonrpc` field, runtime/capabilities boot,
+  interaction/requestPermission with per-option response payloads that
+  must be echoed back or the session wedges (verified 3.14.3).
+- **Added `pi`**: omp's rpc wire family (ready/negotiate, extension
+  dialogs); no mode switches surfaced — pi's tools run under its own
+  trust model.
+- **`qwen` rewritten** as bidirectional stream-json with a
+  Claude-shaped control plane; permission asks and interrupts relay
+  (verified 0.24.6); image attachments are rejected loudly (text
+  blocks only).
+- **`codex`**: `--enable default_mode_request_user_input` turns on the
+  model's mid-turn question channel (verified 0.157.1).
+- **Dropped the unverified one-shot dialects** — `cursor`, `amp`,
+  `kimi`, `gemini` — whose headless modes are output-only (no
+  permission/question wire). `streamjson.rs` shrinks to the shared
+  engine the surviving dialects use, the transport gains the
+  bidirectional plumbing, and session turns re-read the live
+  persistence handle so native ids reported mid-conversation are
+  adopted.
 
 ## 0.5.0 — 2026-09-27
 

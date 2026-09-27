@@ -9,7 +9,7 @@
 
 **데몬 하나. 모든 코딩 에이전트.**
 
-Damon은 Rust로 만든 로컬 에이전트 컨트롤 데몬이다. Claude Code, Codex CLI, Oh My Pi를 각자의 네이티브 CLI로 구동한다 — 모델·툴·인증·컨텍스트 관리는 전부 에이전트 몫이고, Damon은 세션, 권한 릴레이, 검색 가능한 히스토리, 채팅 채널, 원격 접근을 소유한다. CLI, 텔레그램 봇, 데스크톱 앱, 웹 UI는 전부 같은 상주 데몬에 붙는 얇은 클라이언트다.
+Damon은 Rust로 만든 로컬 에이전트 컨트롤 데몬이다. 아홉 코딩 에이전트 CLI — Claude Code, Codex CLI, Oh My Pi, Pi, Qwen Code, Droid, OpenCode, MiMo, ZCode — 를 각자의 네이티브 양방향 프로토콜로 구동한다. 모델·툴·인증·컨텍스트 관리는 전부 에이전트 몫이고, Damon은 세션, 권한 릴레이, 검색 가능한 히스토리, 채팅 채널, 원격 접근을 소유한다. CLI, 텔레그램 봇, 데스크톱 앱, 웹 UI는 전부 같은 상주 데몬에 붙는 얇은 클라이언트다.
 
 이름은 *daemon*의 말장난이자, 말 그대로 실제 아키텍처다.
 
@@ -73,8 +73,9 @@ curl localhost:9470/health
                      ├─ 세션 저장소 — SQLite + FTS5 전문 검색
                      └─ 채널 브리지 / E2E 릴레이
                               |
-            Claude Code · Codex CLI · Oh My Pi  (네이티브 CLI subprocess)
-             — 모델, 툴, 구독 인증, 컨텍스트는 전부 에이전트 소유
+            claude · codex · omp · pi · qwen · droid · opencode · mimo · zcode
+             (네이티브 CLI subprocess — 모델, 툴, 구독 인증,
+                        컨텍스트는 전부 에이전트 소유)
 ```
 
 와이어 프로토콜은 [docs/protocol-v2.md](docs/protocol-v2.md), Node/Python/Rust 복붙 클라이언트는 [docs/integration.ko.md](docs/integration.ko.md) 참조.
@@ -111,7 +112,7 @@ damon-discord  --bot-token <token>
 damon-slack    --app-token xapp-… --bot-token xoxb-…
 ```
 
-채널의 각 채팅이 고유한 에이전트 세션에 매핑되고, 응답은 스트리밍되며, tool 권한 요청은 Telegram/Discord/Slack 모두 네이티브 버튼으로 도착한다(Slack은 Socket Mode로 버튼 눌림이 전달된다 — 앱 설정에서 Interactivity를 Socket Mode로 활성화할 것). `allow`/`deny` 답장도 어디서든 동작하고, 채널로 보낸 파일은 프롬프트 첨부로 함께 전달된다. 표면을 넘나드는 세션 픽업: `!sessions`로 모든 화면의 최근 세션을 보고, `!resume <id|제목>`으로 이 채팅에서 이어한다(자동 감시). `!watch`/`!unwatch <id|제목>`는 세션을 따라가 턴 완료·권한 요청을 이 채팅으로 알려준다 — 턴이 웹 UI나 CLI에서 돌아도 `allow`/`deny` 답장으로 바로 승인할 수 있다. 새 채널은 `damon_core::channel::ChannelApi`(`ready`/`recv`/`send`)를 구현해 `Bridge`에 넘기면 된다 — 세션 매핑, 이벤트 demux, 권한 흐름은 이미 구현돼 있다.
+채널의 각 채팅이 고유한 에이전트 세션에 매핑되고, 응답은 스트리밍되며, tool 권한 요청은 Telegram/Discord/Slack 모두 네이티브 버튼으로 도착한다(Slack은 Socket Mode로 버튼 눌림이 전달된다 — 앱 설정에서 Interactivity를 Socket Mode로 활성화할 것). `allow`/`deny`/`always` 답장도 어디서든 동작하고, 채널로 보낸 파일은 프롬프트 첨부로 함께 전달된다(Discord CDN URL은 Slack의 `url_private`처럼 프롬프트 시점에 내려받는다). `!cwd <dir>`과 `!agent <backend>`로 대화의 프로젝트·백엔드를 정하고, `!new`/`!fork`/`!delete`/`!cancel`/`!usage`도 함께 쓴다. 표면을 넘나드는 세션 픽업: `!sessions`로 모든 화면의 최근 세션을 보고, `!resume <id|제목>`으로 이 채팅에서 이어한다(자동 감시). `!watch`/`!unwatch <id|제목>`는 세션을 따라가 턴 완료·권한 요청을 이 채팅으로 알려준다 — 턴이 웹 UI나 CLI에서 돌아도 `allow`/`deny` 답장으로 바로 승인할 수 있다. 새 채널은 `damon_core::channel::ChannelApi`(`ready`/`recv`/`send`/`send_permission`/`send_media`)를 구현해 `Bridge`에 넘기면 된다 — 세션 매핑, 이벤트 demux, 권한 흐름은 이미 구현돼 있다.
 
 ## 원격 접근
 

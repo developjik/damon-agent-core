@@ -1,6 +1,6 @@
 {
   "name": "damon-agent",
-  "version": "0.5.0",
+  "version": "0.6.0",
   "description": "Damon agent core \u2014 local multi-provider agent daemon",
   "license": "MIT OR Apache-2.0",
   "repository": "https://github.com/developjik/damon-agent-core",

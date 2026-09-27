@@ -17,7 +17,7 @@ WebSocket(`GET /ws`) 또는 릴레이 터널 위의 JSON 메시지. 하나의 �
 // 서버 push (id 없음)
 {"event": "session.event", "sessionId": "…", "data": {…StreamEvent…}}
 // 접속 시 push되고, "hello" 요청의 응답으로도 발송
-{"hello": {"protocol": 2, "daemon": "damond", "version": "0.3.0",
+{"hello": {"protocol": 2, "daemon": "damond", "version": "0.5.0",
            "permissionTimeoutSecs": 300}}
 ```
 
@@ -44,6 +44,7 @@ WebSocket(`GET /ws`) 또는 릴레이 터널 위의 JSON 메시지. 하나의 �
 | `-32004` | `max_sessions` 상한 도달 | 먼저 세션 close/delete |
 | `-32005` | 응답이 1 MiB 프레임 예산 초과 | `limit`/`offset`으로 페이징 |
 | `-32006` | 세션에 턴이 이미 실행 중 | `turn.*` 이벤트 대기, 또는 먼저 `turn.cancel` |
+| `-32007` | worktree 작업 실패 — `error.data.kind`가 택소노미를 실어준다 | `data.kind`로 분기 (`pr_not_found`, `branch_exists`, …) |
 
 0.5.0 이전 데몬은 모든 에러를 `-32000`으로 답했다; 메시지는 그대로라
 문자열 매칭 클라이언트도 계속 동작한다.
@@ -56,7 +57,6 @@ WebSocket(`GET /ws`) 또는 릴레이 터널 위의 JSON 메시지. 하나의 �
 | `backend.list` | — | `{backends: [{id, available, capabilities}]}` |
 | `session.create` | `{backend?, cwd?, model?, mode?, mcpServers?, projectId?}` — 프로젝트가 세션의 범위를 정한다: 루트가 cwd 기본값이 되고 기본값들이 미지정 파라미터를 채운다(명시 값 항상 우선) | `{sessionId, backend, replayed}` |
 | `session.resume` | `{sessionId}` — 또는 네이티브 세션 임포트는 `{handle:{provider,native_handle}, cwd?, title?}` | `{sessionId, backend, replayed}` |
-| `session.list` | `{limit?, offset?, backend?, cwd?, tag?}` | `{sessions: [{sessionId, createdAt, backend, title, cwd, tags[]}]}` |
 | `session.messages` | `{sessionId, limit?, offset?}` | `{messages: [{id, session_id, role, ts, data}]}` |
 | `session.export` | `{sessionId}` | `{session: {sessionId, createdAt, backend, title, tags, cwd}, messages: [{id, role, ts, data}], usage: {contextUsed, contextSize, costUsd, turns}}` |
 | `session.import` | `{backend, cwd?}` | `{sessions: [ImportableSession]}` |
@@ -118,10 +118,29 @@ WebSocket(`GET /ws`) 또는 릴레이 터널 위의 JSON 메시지. 하나의 �
 | `prompts.delete` | `{promptPath, sessionId?, cwd?}` | `{deleted: bool}` — 이미 없으면 false |
 | `prompts.move` | `{promptPath, scope, sessionId?, cwd?}` — 현재 스코프와 달라야 함 | `{moved: true, path}` |
 | `project.create` | `{name?, root, defaults?}` | `{projectId, name, root, defaults}` — root는 절대경로; defaults 키: backend/model/mode/mcpServers |
-| `project.list` | `{}` | `{projects: [{projectId, name, root, defaults}]}` |
-| `project.get` | `{projectId}` | `{projectId, name, root, defaults}` |
+| `project.list` | `{}` | `{projects: [{projectId, name, root, defaults, kind: "project"\|"worktree", parentId?, meta}]}` — worktree 행은 `meta`에 git 팩트를 실어준다 |
+| `project.get` | `{projectId}` | `{projectId, name, root, defaults, kind, parentId?, meta}` |
 | `project.set_defaults` | `{projectId, defaults}` | `{updated: bool}` — 목록 전체 교체 |
 | `project.delete` | `{projectId}` | `{deleted: true}` — 세션이 프로젝트를 참조하는 동안엔 `-32602`로 거부 |
+| `worktree.create` | `{repo, branch?, prNumber?, path?, baseRef?, existingBranch?, creationId?}` — `repo`는 리포 최상위로 해석; PR 흐름은 `+refs/pull/N/head`를 `branch`(기본 `pr-N`)로 fetch; 기본 경로 `<repo 부모>/<repo>-worktrees/<branch>`; `existingBranch`는 브랜치가 이미 있을 때 | `{creationId, projectId, parentProjectId?, path, branch, meta: {branch, repo, prNumber?, prUrl?, baseRef?}, resumed}` — worktree는 `kind:"worktree"` 프로젝트로 등록; `session.create {projectId}`로 에이전트가 그 안에 착륙; `resumed`는 기존 worktree-on-branch를 입양했다는 뜻 |
+| `worktree.cancel` | `{creationId}` | `{cancelled: bool}` — 그 id를 가진 진행 중 생성이 없으면 false; 실행 중 git 프로세스 그룹을 죽인다 |
+| `worktree.remove` | `{projectId?, path?, branch?, deleteBranch?}` — 행 제거가 먼저라 세션 바인딩 거부(`-32602`)는 git 효과 전에 중단 | `{removed: true, orphanDirectory, branchDeleted, branchKeptReason?}` — git 제거는 항상 `--force`; 거부 시 직접 삭제 + `worktree prune`로 폴백 |
+| `worktree.list` | `{repo? \| projectId?}` | `{repo, worktrees: [{path, branch?, head, isMain, locked, lockReason?, prunable, projectId?}], registered: [{projectId, name, path, parentId?, meta}]}` — git porcelain 뷰와 damon 행의 조인 |
+| `worktree.resolve_pr` | `{repo, input, branch?}` — `input`은 `1842`, `#1842`, GitHub PR URL; 상세는 `gh pr view`(3초 데드라인) | `{number, repo: "owner/repo", title?, state?, author?, degraded, suggestedBranch, suggestedPath, branchConflict, dirConflict}` — `degraded`는 gh 부재/지연; 번호와 슬러그는 여전히 확인됨 |
+| `worktree.merged` | `{repo, branch, base? — 기본 HEAD}` | `{merged: bool}` — 조상 검사; 스쿼시 머지는 false |
+
+`worktree.create` 실패는 `-32007`에 `data.kind`를 실어 온다:
+`not_a_repo`, `invalid_branch`, `branch_not_found`, `branch_exists`,
+`branch_checked_out`, `dir_exists`, `not_allowed`(해석된 경로가
+`allowed_dirs` 밖), `no_origin`, `pr_not_found`, `fetch_failed`,
+`base_not_found`, `add_failed`, `sparse_checkout_empty`,
+`register_failed`, `canceled`. 생성 진행 상황은 요청 연결로
+`{"event":"worktree.progress","creationId","data":{"stage","message"}}`
+프레임이 스테이지마다 하나씩 온다(`validate → fetch → add → register →
+done`) — 긴 fetch가 침묵으로 흐르지 않는다. 하나의 PR에 하나의 격리된
+에이전트 워크스페이스: `session.create {projectId}`가 에이전트를
+워크트리 체크아웃에 배치하고, 세션이 묶여 있는 worktree는 제거가
+거부된다.
 
 `session.search` 쿼리는 토크나이즈되어 FTS5 파서에 그대로 넘겨지지
 않는다: 따옴표 구간은 구문이고, `AND`/`OR`/`NOT`은 통과하며, 텀 뒤

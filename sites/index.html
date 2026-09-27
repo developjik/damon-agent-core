@@ -4,12 +4,15 @@
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>Damon — 데몬 하나. 모든 코딩 에이전트.</title>
-<meta name="description" content="Damon은 Claude Code·Codex CLI·Oh My Pi를 네이티브 양방향 프로토콜로 구동하는 Rust 로컬 에이전트 컨트롤 데몬입니다. 세션, 권한 릴레이, 검색 가능한 히스토리, 채팅 채널, 어디서든 접근을 한 곳에서.">
-<meta name="theme-color" content="#0a0e16">
+<meta name="description" content="Damon은 Claude Code·Codex CLI·Oh My Pi를 네이티브 양방향 프로토콜로 구동하는 Rust 로컬 에이전트 컨트롤 데몬입니다. 세션, 권한 릴레이, 검색 가능한 히스토리, 스킬 허브, PR 워크트리, 채팅 채널, 어디서든 접근을 한 곳에서.">
+<meta name="theme-color" content="#070b13">
+<meta name="color-scheme" content="dark">
 <meta property="og:title" content="Damon — One daemon. Every coding agent.">
-<meta property="og:description" content="Rust local agent-control daemon driving coding-agent CLIs over their native bidirectional protocols — Claude Code, Codex CLI, Oh My Pi. Sessions, permission relay, searchable history, chat channels, from-anywhere access — one resident daemon.">
+<meta property="og:description" content="Rust local agent-control daemon driving coding-agent CLIs over their native bidirectional protocols — Claude Code, Codex CLI, Oh My Pi, and more. Sessions, permission relay, searchable history, skills hub, PR worktrees, chat channels, from-anywhere access.">
 <meta property="og:type" content="website">
+<meta property="og:url" content="https://developjik.github.io/damon-agent-core/">
 <link rel="icon" href="./favicon.svg" type="image/svg+xml">
+<link rel="preconnect" href="https://cdn.jsdelivr.net" crossorigin>
 <link rel="stylesheet" href="./assets/css/main.css">
 <script type="importmap">
 {
@@ -22,6 +25,8 @@
 </head>
 <body>
 
+<div id="scroll-progress" aria-hidden="true"></div>
+
 <header class="site-header">
   <div class="container header-inner">
     <a class="brand" href="#hero">
@@ -29,6 +34,7 @@
       <span>Damon</span>
     </a>
     <nav class="site-nav" aria-label="main">
+      <a href="#whatsnew" class="nav-new" data-i18n="nav.new">신규</a>
       <a href="#features" data-i18n="nav.features">기능</a>
       <a href="#architecture" data-i18n="nav.arch">구조</a>
       <a href="#quickstart" data-i18n="nav.quick">시작하기</a>
@@ -66,22 +72,29 @@
     <div class="hero-copy">
       <p class="kicker" data-i18n="hero.badge">Rust 기반 로컬 에이전트 컨트롤 데몬</p>
       <h1><span data-i18n="hero.title1">데몬 하나.</span><br><span class="grad" data-i18n="hero.title2">모든 코딩 에이전트.</span></h1>
-      <p class="lead" data-i18n="hero.lead">Damon은 Claude Code·Codex CLI·Oh My Pi를 각자의 네이티브 양방향 프로토콜로 구동하는 Rust 상주 데몬입니다. 모델·툴·인증은 에이전트 몫 — Damon은 세션, 권한 릴레이, 검색 가능한 히스토리, 채팅 채널, 어디서든 접근을 소유합니다.</p>
+      <p class="lead" data-i18n="hero.lead">Damon은 아홉 코딩 에이전트 CLI — Claude Code·Codex CLI·Oh My Pi·Pi·Qwen Code·Droid·OpenCode·MiMo·ZCode — 를 각자의 네이티브 양방향 프로토콜로 구동하는 Rust 상주 데몬입니다. 모델·툴·인증은 에이전트 몫 — Damon은 세션, 권한 릴레이, 검색 가능한 히스토리, 스킬 허브, PR 워크트리, 채팅 채널, 어디서든 접근을 소유합니다.</p>
       <div class="badges">
         <img src="https://github.com/developjik/damon-agent-core/actions/workflows/ci.yml/badge.svg" alt="ci">
         <img src="https://img.shields.io/crates/v/damon-core.svg" alt="crates.io">
         <img src="https://img.shields.io/npm/v/damon-agent.svg" alt="npm">
         <img src="https://img.shields.io/badge/license-MIT%20OR%20Apache--2.0-blue.svg" alt="license">
       </div>
-      <div class="install-box">
-        <span class="install-label" data-i18n="hero.install.label">설치</span>
-        <code id="install-cmd">npm install -g damon-agent</code>
-        <button class="copy-btn" type="button" data-copy="npm install -g damon-agent" data-i18n-aria="copy.aria" aria-label="copy install command">
-          <svg viewBox="0 0 24 24" width="15" height="15" aria-hidden="true"><rect x="9" y="9" width="12" height="12" rx="2" fill="none" stroke="currentColor" stroke-width="2"/><path d="M5 15V5a2 2 0  0 1 2-2h10" fill="none" stroke="currentColor" stroke-width="2"/></svg>
-        </button>
+      <div class="install-box" id="install-box">
+        <div class="install-tabs" role="tablist" aria-label="install method">
+          <button class="itab active" type="button" data-cmd="npm install -g damon-agent">npm</button>
+          <button class="itab" type="button" data-cmd="cargo install damon-core">cargo</button>
+          <button class="itab" type="button" data-cmd="brew install developjik/tap/damon">brew</button>
+        </div>
+        <div class="install-line">
+          <code id="install-cmd">npm install -g damon-agent</code>
+          <button class="copy-btn" type="button" data-copy="npm install -g damon-agent" data-i18n-aria="copy.aria" aria-label="copy install command">
+            <svg viewBox="0 0 24 24" width="15" height="15" aria-hidden="true"><rect x="9" y="9" width="12" height="12" rx="2" fill="none" stroke="currentColor" stroke-width="2"/><path d="M5 15V5a2 2 0 0 1 2-2h10" fill="none" stroke="currentColor" stroke-width="2"/></svg>
+          </button>
+        </div>
       </div>
       <div class="cta-row">
-        <a class="btn btn-primary" href="#quickstart" data-i18n="hero.cta.quick">퀵스타트</a>
+        <a class="btn btn-primary" href="#whatsnew" data-i18n="hero.cta.new">새 기능 보기</a>
+        <a class="btn btn-ghost" href="#quickstart" data-i18n="hero.cta.quick">퀵스타트</a>
         <a class="btn btn-ghost" href="https://github.com/developjik/damon-agent-core" target="_blank" rel="noopener" data-i18n="hero.cta.gh">GitHub에서 보기</a>
       </div>
     </div>
@@ -93,8 +106,158 @@
   <div id="node-tip" class="node-tip" role="status" hidden></div>
 </section>
 
+<!-- ================= BACKEND MARQUEE ================= -->
+<section class="strip-section" aria-label="backends">
+  <div class="container">
+    <p class="strip-title" data-i18n="strip.title">PATH에 있으면 자동 등록 — 네이티브 양방향 백엔드</p>
+  </div>
+  <div class="marquee" aria-hidden="false">
+    <div class="marquee-track" id="marquee-track">
+      <span class="bchip" style="--c:#d97757"><i></i>Claude Code<em>stream-json</em></span>
+      <span class="bchip" style="--c:#10a37f"><i></i>Codex CLI<em>app-server</em></span>
+      <span class="bchip" style="--c:#a78bfa"><i></i>Oh My Pi<em>RPC</em></span>
+      <span class="bchip" style="--c:#c4b5fd"><i></i>Pi<em>RPC</em></span>
+      <span class="bchip" style="--c:#67e8f9"><i></i>Qwen Code<em>stream-json</em></span>
+      <span class="bchip" style="--c:#8ab4f8"><i></i>Droid<em>json-rpc</em></span>
+      <span class="bchip" style="--c:#34d399"><i></i>OpenCode<em>http+sse</em></span>
+      <span class="bchip" style="--c:#a3e635"><i></i>MiMo<em>http+sse</em></span>
+      <span class="bchip" style="--c:#f59e0b"><i></i>ZCode<em>app-server</em></span>
+      <span class="bchip bchip-dim"><i></i>[backends.X]<em>launch override</em></span>
+    </div>
+  </div>
+  <p class="strip-note" data-i18n="strip.more">권한 릴레이·질문·인터럽트가 온전히 릴레이되는 프로토콜만 카탈로그에 등재됩니다</p>
+</section>
+
+<!-- ================= WHAT'S NEW ================= -->
+<section class="section" id="whatsnew">
+  <div class="container">
+    <p class="kicker"><span class="live-dot" aria-hidden="true"></span><span data-i18n="new.kicker">방금 main에 착지</span></p>
+    <h2 data-i18n="new.title">지금 막 합류한 것들</h2>
+    <p class="section-lead" data-i18n="new.lead">네 가지가 한 번에 왔습니다 — 아래 카드는 실제 동작을 축소해서 재현한 라이브 데모입니다.</p>
+
+    <div class="bento">
+
+      <!-- worktree -->
+      <article class="bento-card bento-a">
+        <header class="bc-head">
+          <div class="bc-icon"><svg viewBox="0 0 24 24" aria-hidden="true"><path d="M6 3v12a3 3 0 0 0 3 3h6" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"/><circle cx="6" cy="3" r="2.2" fill="none" stroke="currentColor" stroke-width="2"/><circle cx="6" cy="18" r="2.2" fill="none" stroke="currentColor" stroke-width="2"/><circle cx="18" cy="18" r="2.2" fill="none" stroke="currentColor" stroke-width="2"/></svg></div>
+          <div class="bc-titles">
+            <h3 data-i18n="wt.card.t">PR 하나, 격리된 워크트리 하나</h3>
+            <p class="bc-sub">git worktree workspaces</p>
+          </div>
+          <span class="new-badge">NEW</span>
+        </header>
+        <p class="bc-desc" data-i18n="wt.card.d">PR 번호만 주면 refs/pull/N/head를 격리된 git worktree로 받아 프로젝트로 등록합니다. 단계별 진행 프레임, 진행 중 취소, gh 프리뷰 — 실패해도 메인 체크아웃은 청정합니다.</p>
+        <div class="demo wt-demo" id="demo-worktree">
+          <div class="wt-bar">
+            <code class="wt-cmd"><span class="ps1">$</span> damon worktree create . --pr <b id="wt-pr">1842</b></code>
+            <span class="wt-actions">
+              <button class="mini-btn" id="wt-run" type="button">▶</button>
+              <button class="mini-btn mini-danger" id="wt-cancel" type="button" disabled>✕</button>
+            </span>
+          </div>
+          <ol class="wt-stages" id="wt-stages">
+            <li data-stage="validate"><i></i><b>validate</b><span data-i18n="wt.s1">PR → owner/repo 확인</span></li>
+            <li data-stage="fetch"><i></i><b>fetch</b><span>refs/pull/1842/head</span></li>
+            <li data-stage="add"><i></i><b>add</b><span data-i18n="wt.s3">git worktree add</span></li>
+            <li data-stage="register"><i></i><b>register</b><span data-i18n="wt.s4">kind:"worktree" 프로젝트 등록</span></li>
+          </ol>
+          <div class="wt-progress"><i id="wt-bar"></i></div>
+          <div class="wt-result" id="wt-result" hidden>
+            <code class="wt-path">../damon-agent-core-worktrees/pull-1842</code>
+            <span class="wt-cta" data-i18n="wt.result">여기서 세션 시작 → session.create {projectId}</span>
+          </div>
+          <p class="wt-note" id="wt-note" hidden data-i18n="wt.cancelled">취소 — 진행 중인 git 프로세스 그룹을 kill 했습니다</p>
+        </div>
+      </article>
+
+      <!-- skills hub -->
+      <article class="bento-card bento-b">
+        <header class="bc-head">
+          <div class="bc-icon"><svg viewBox="0 0 24 24" aria-hidden="true"><path d="M12 2l2.6 6.3 6.8.5-5.2 4.4 1.6 6.6L12 16.2 6.2 19.8l1.6-6.6L2.6 8.8l6.8-.5z" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linejoin="round"/></svg></div>
+          <div class="bc-titles">
+            <h3 data-i18n="sk.card.t">스킬 한 번 설치, 모든 CLI에 동기화</h3>
+            <p class="bc-sub">skills hub + prompt library</p>
+          </div>
+          <span class="new-badge">NEW</span>
+        </header>
+        <p class="bc-desc" data-i18n="sk.card.d">GitHub·skills.sh에서 스킬 패키지를 찾아 설치하면, 허브가 설치된 모든 CLI의 네이티브 스킬 디렉터리로 심링크합니다. CLI는 여전히 자기 스킬을 스스로 로드합니다.</p>
+        <div class="demo sk-demo" id="demo-skills">
+          <div class="sk-hub">
+            <p class="sk-hub-title" data-i18n="sk.hub">skills-hub 스토어</p>
+            <div class="sk-chips" id="sk-chips">
+              <span class="sk-chip" data-skill="1">document-skills/pdf</span>
+              <span class="sk-chip" data-skill="2">webapp-testing</span>
+              <span class="sk-chip" data-skill="3">skill-creator</span>
+              <span class="sk-chip" data-skill="4">brand-guidelines</span>
+            </div>
+          </div>
+          <div class="sk-targets" id="sk-targets">
+            <div class="sk-target"><code>~/.claude/skills</code><span class="sk-status"></span></div>
+            <div class="sk-target"><code>~/.codex/skills</code><span class="sk-status"></span></div>
+            <div class="sk-target"><code>~/.agents/skills</code><span class="sk-status"></span></div>
+          </div>
+          <p class="dm-foot" data-i18n="sk.note">설치 → 동기화 → catalog.commands가 별도 설정 없이 스킬을 인지</p>
+        </div>
+      </article>
+
+      <!-- streaming reveal -->
+      <article class="bento-card bento-c">
+        <header class="bc-head">
+          <div class="bc-icon"><svg viewBox="0 0 24 24" aria-hidden="true"><path d="M13 3L4 14h6l-1 7 9-11h-6z" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linejoin="round"/></svg></div>
+          <div class="bc-titles">
+            <h3 data-i18n="rv.card.t">배치 덤프 없는 스트리밍 리빌</h3>
+            <p class="bc-sub">paced reveal pipeline</p>
+          </div>
+          <span class="new-badge">NEW</span>
+        </header>
+        <p class="bc-desc" data-i18n="rv.card.d">도착 박자에 맞춰 글자가 흐릅니다. 커서는 문서 꼬리에 붙어 재파싱에도 흐름이 안 끊기고, 코드펜스는 닫히는 순간 점등됩니다. 그래핌 안전 — CJK·이모지도 뜯기지 않습니다.</p>
+        <div class="demo rv-demo" id="demo-reveal">
+          <div class="dm-top">
+            <span class="dm-chip dm-chip-a"><i class="live-dot"></i>stream · claude</span>
+            <button class="mini-btn" id="rv-replay" type="button" data-i18n-aria="rv.replay" aria-label="replay">▶ <span data-i18n="rv.replay">재생</span></button>
+          </div>
+          <div class="dm-bubble" id="rv-bubble" aria-live="polite"></div>
+        </div>
+      </article>
+
+      <!-- composer -->
+      <article class="bento-card bento-d">
+        <header class="bc-head">
+          <div class="bc-icon"><svg viewBox="0 0 24 24" aria-hidden="true"><path d="M4 6h16M4 12h10M4 18h7" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"/><path d="M18 15l3 3-3 3" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"/></svg></div>
+          <div class="bc-titles">
+            <h3 data-i18n="cp.card.t">입력줄이 곧 런처 — / · @ · !</h3>
+            <p class="bc-sub">composer pickers</p>
+          </div>
+          <span class="new-badge">NEW</span>
+        </header>
+        <p class="bc-desc" data-i18n="cp.card.d"><code>/</code>는 CLI가 이미 아는 커맨드·스킬 카탈로그, <code>@</code>는 ripgrep 워커가 걸어 만든 파일 인덱스, <code>!</code>는 프롬프트 라이브러리. 프롬프트 히스토리는 데몬이 저장 — 폰에서도 데스크톱 완성이 보입니다. 직접 입력해 보세요.</p>
+        <div class="demo cp-demo" id="demo-composer">
+          <div class="dm-stage">
+            <div class="dm-msg"><span data-i18n="cp.msg">이 PR 리뷰해줘</span></div>
+            <div class="dm-picker" id="cp-picker" hidden>
+              <div class="dm-pick-head"><span id="cp-kind">/ commands</span><span class="dm-pick-src" data-i18n="cp.shadow">workspace가 같은 이름의 글로벌 항목을 가립니다</span></div>
+              <ul id="cp-list"></ul>
+            </div>
+            <div class="dm-inputrow">
+              <button class="dm-key" type="button" data-k="/">/</button>
+              <button class="dm-key" type="button" data-k="@">@</button>
+              <button class="dm-key" type="button" data-k="!">!</button>
+              <input id="cp-input" type="text" spellcheck="false" autocomplete="off" aria-label="composer input" data-i18n-ph="cp.ph">
+              <span class="dm-flash" id="cp-flash" hidden></span>
+              <button class="dm-send" id="cp-send" type="button" aria-label="send">↵</button>
+            </div>
+          </div>
+          <p class="dm-foot"><kbd>/</kbd><kbd>@</kbd><kbd>!</kbd> <span data-i18n="cp.hint">를 누르거나 직접 타이핑 — ▶ 버튼은 자동 재생</span></p>
+        </div>
+      </article>
+
+    </div>
+  </div>
+</section>
+
 <!-- ================= FEATURES ================= -->
-<section class="section" id="features">
+<section class="section section-alt" id="features">
   <div class="container">
     <p class="kicker" data-i18n="feat.kicker">왜 Damon인가</p>
     <h2 data-i18n="feat.title">에이전트는 그대로, 제어는 한 곳에서</h2>
@@ -103,7 +266,7 @@
       <article class="card">
         <div class="card-icon"><svg viewBox="0 0 24 24"><path d="M4 17l6-6-6-6M12 19h8" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"/></svg></div>
         <h3 data-i18n="f1t">설정 없는 백엔드</h3>
-        <p data-i18n="f1d">PATH의 claude·codex·omp면 자동 등록됩니다. 카탈로그 백엔드는 전부 네이티브 양방향 프로토콜 — 스트리밍·권한 릴레이·인터럽트 — 을 말합니다.</p>
+        <p data-i18n="f1d">PATH의 claude·codex·omp·pi·qwen·droid·opencode·mimo·zcode면 자동 등록됩니다. 카탈로그 백엔드는 전부 네이티브 양방향 프로토콜 — 스트리밍·권한 릴레이·인터럽트 — 을 말합니다.</p>
       </article>
       <article class="card">
         <div class="card-icon"><svg viewBox="0 0 24 24"><path d="M12 22s8-4 8-10V5l-8-3-8 3v7c0 6 8 10 8 10z" fill="none" stroke="currentColor" stroke-width="2" stroke-linejoin="round"/><path d="M9 12l2 2 4-4" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"/></svg></div>
@@ -128,35 +291,24 @@
       <article class="card">
         <div class="card-icon"><svg viewBox="0 0 24 24"><circle cx="12" cy="12" r="10" fill="none" stroke="currentColor" stroke-width="2"/><path d="M2 12h20M12 2a15.3 15.3 0 014 10 15.3 15.3 0 01-4 10 15.3 15.3 0 01-4-10 15.3 15.3 0 014-10z" fill="none" stroke="currentColor" stroke-width="2"/></svg></div>
         <h3 data-i18n="f6t">어디서든 접근</h3>
-        <p data-i18n="f6d"><code>wss</code> 직접 서빙 또는 <code>damon-relay</code> 아웃바운드 터널 — X25519 + AES-256-GCM E2E 암호화.</p>
+        <p data-i18n="f6d"><code>wss</code> 직접 서빙 또는 <code>damon-relay</code> 아웃바운드 터널 — X25519 + AES-256-GCM E2E 암호화. 릴레이는 웹 UI도 서빙합니다.</p>
       </article>
       <article class="card">
         <div class="card-icon"><svg viewBox="0 0 24 24"><rect x="4" y="4" width="16" height="16" rx="2" fill="none" stroke="currentColor" stroke-width="2"/><rect x="9" y="9" width="6" height="6" fill="none" stroke="currentColor" stroke-width="2"/><path d="M9 1v3m6-3v3M9 20v3m6-3v3M1 9h3m-3 6h3m16-6h3m-3 6h3" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"/></svg></div>
         <h3 data-i18n="f7t">상주하도록 설계</h3>
         <p data-i18n="f7d">Rust 데몬 본체는 가볍게 유지됩니다. 에이전트 프로세스는 에이전트의 몫입니다.</p>
       </article>
-    </div>
-
-    <div class="backend-strip">
-      <p class="backend-strip-title" data-i18n="strip.title">PATH에 있으면 자동 등록 — 네이티브 양방향 백엔드</p>
-      <div class="backend-chips">
-        <span class="bchip" style="--c:#d97757"><i></i>Claude Code<em>stream-json</em></span>
-        <span class="bchip" style="--c:#10a37f"><i></i>Codex CLI<em>app-server</em></span>
-        <span class="bchip" style="--c:#a78bfa"><i></i>Oh My Pi<em>RPC</em></span>
-        <span class="bchip" style="--c:#c4b5fd"><i></i>Pi<em>RPC</em></span>
-        <span class="bchip" style="--c:#67e8f9"><i></i>Qwen Code<em>stream-json</em></span>
-        <span class="bchip" style="--c:#8ab4f8"><i></i>Droid<em>json-rpc</em></span>
-        <span class="bchip" style="--c:#34d399"><i></i>OpenCode<em>http+sse</em></span>
-        <span class="bchip" style="--c:#a3e635"><i></i>MiMo<em>http+sse</em></span>
-        <span class="bchip" style="--c:#f59e0b"><i></i>ZCode<em>app-server</em></span>
-      </div>
-      <p class="backend-strip-more" data-i18n="strip.more">권한 릴레이·질문·인터럽트가 온전히 릴레이되는 프로토콜만 카탈로그에 등재됩니다</p>
+      <article class="card">
+        <div class="card-icon"><svg viewBox="0 0 24 24"><path d="M14 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V8z" fill="none" stroke="currentColor" stroke-width="2" stroke-linejoin="round"/><path d="M14 2v6h6M9 13h6M9 17h4" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"/></svg></div>
+        <h3 data-i18n="f8t">프롬프트도 버전 관리</h3>
+        <p data-i18n="f8d">재사용 프롬프트를 마크다운 + 가벼운 프론트매터로 저장. <code>prompts.*</code> CRUD와 스코프 이동, 컴포저 <code>!</code> 피커에 그대로 노출됩니다.</p>
+      </article>
     </div>
   </div>
 </section>
 
 <!-- ================= ARCHITECTURE ================= -->
-<section class="section section-alt" id="architecture">
+<section class="section" id="architecture">
   <div class="container">
     <p class="kicker" data-i18n="arch.kicker">아키텍처</p>
     <h2 data-i18n="arch.title">하나의 API, 하나의 데몬</h2>
@@ -181,6 +333,8 @@
           <div class="module"><code data-i18n="arch.m1">백엔드 레지스트리 — CLI 탐지·구동·재시작</code></div>
           <div class="module"><code data-i18n="arch.m2">세션 매니저 — 생명주기·권한 릴레이·취소</code></div>
           <div class="module"><code data-i18n="arch.m3">세션 저장소 — SQLite + FTS5</code></div>
+          <div class="module"><code data-i18n="arch.m5">스킬 허브 · 프롬프트 라이브러리</code></div>
+          <div class="module"><code data-i18n="arch.m6">워크트리 워크스페이스 — PR 격리 체크아웃</code></div>
           <div class="module"><code data-i18n="arch.m4">채널 브리지 / E2E 릴레이</code></div>
         </div>
       </div>
@@ -208,7 +362,7 @@
 </section>
 
 <!-- ================= QUICKSTART ================= -->
-<section class="section" id="quickstart">
+<section class="section section-alt" id="quickstart">
   <div class="container">
     <p class="kicker" data-i18n="quick.kicker">퀵스타트</p>
     <h2 data-i18n="quick.title">3줄이면 충분합니다</h2>
@@ -228,7 +382,7 @@
           <button class="copy-btn" type="button" data-copy="damond" aria-label="copy"><svg viewBox="0 0 24 24" width="14" height="14" aria-hidden="true"><rect x="9" y="9" width="12" height="12" rx="2" fill="none" stroke="currentColor" stroke-width="2"/><path d="M5 15V5a2 2 0 0 1 2-2h10" fill="none" stroke="currentColor" stroke-width="2"/></svg></button>
         </div>
         <pre><code><span class="ps1">$</span> damond    <span class="cmt" data-i18n="quick.run.c1">첫 실행 시 스타터 config 생성</span>
-<span class="ps1">$</span> damon doctor  <span class="cmt" data-i18n="quick.run.c2">어떤 백엔드가 설치됐는지 확인</span></code></pre>
+<span class="ps1">$</span> damond doctor <span class="cmt" data-i18n="quick.run.c2">어떤 백엔드가 설치됐는지 확인</span></code></pre>
       </div>
 
       <div class="term">
@@ -236,7 +390,7 @@
           <button class="copy-btn" type="button" data-copy="curl localhost:9470/health" aria-label="copy"><svg viewBox="0 0 24 24" width="14" height="14" aria-hidden="true"><rect x="9" y="9" width="12" height="12" rx="2" fill="none" stroke="currentColor" stroke-width="2"/><path d="M5 15V5a2 2 0 0 1 2-2h10" fill="none" stroke="currentColor" stroke-width="2"/></svg></button>
         </div>
         <pre><code><span class="ps1">$</span> curl localhost:9470/health
-<span class="out">{"backends":["amp","claude","codex","cursor","gemini","kimi","omp","qwen"],"status":"ok"}</span><span class="blink" aria-hidden="true">▍</span></code></pre>
+<span class="out">{"backends":["claude","omp","codex","qwen"],"status":"ok"}</span><span class="blink" aria-hidden="true">▍</span></code></pre>
       </div>
 
       <div class="term">
@@ -251,7 +405,7 @@
     <div class="ui-note">
       <div>
         <strong data-i18n="quick.ui.t">번들 웹 UI로 바로 대화</strong>
-        <p data-i18n="quick.ui.p">세션, 스트리밍, 권한 프롬프트까지 — 설치 불필요.</p>
+        <p data-i18n="quick.ui.p">세션, 스트리밍, 권한 프롬프트, /·@·! 피커까지 — 설치 불필요. <code>?revealDemo=1</code>로 리빌 파이프라인 데모.</p>
       </div>
       <code class="ui-url">http://127.0.0.1:9470/ui</code>
     </div>
@@ -268,9 +422,9 @@
     <div class="qs-grid">
       <div class="term">
         <div class="term-head"><span></span><span></span><span></span><em data-i18n="tools.t1">대화</em>
-          <button class="copy-btn" type="button" data-copy="damon chat --backend cursor" aria-label="copy"><svg viewBox="0 0 24 24" width="14" height="14" aria-hidden="true"><rect x="9" y="9" width="12" height="12" rx="2" fill="none" stroke="currentColor" stroke-width="2"/><path d="M5 15V5a2 2 0 0 1 2-2h10" fill="none" stroke="currentColor" stroke-width="2"/></svg></button>
+          <button class="copy-btn" type="button" data-copy="damon chat" aria-label="copy"><svg viewBox="0 0 24 24" width="14" height="14" aria-hidden="true"><rect x="9" y="9" width="12" height="12" rx="2" fill="none" stroke="currentColor" stroke-width="2"/><path d="M5 15V5a2 2 0 0 1 2-2h10" fill="none" stroke="currentColor" stroke-width="2"/></svg></button>
         </div>
-        <pre><code><span class="ps1">$</span> damon chat --backend cursor
+        <pre><code><span class="ps1">$</span> damon chat
 <span class="ps1">$</span> damon resume a1b2    <span class="cmt" data-i18n="tools.c1">이전 세션 이어서</span>
 <span class="ps1">$</span> damon import claude  <span class="cmt" data-i18n="tools.c2">데몬 밖에서 만든 세션 흡수</span></code></pre>
       </div>
@@ -292,6 +446,15 @@
 <span class="ps1">$</span> damon export a1b2 --md   <span class="cmt" data-i18n="tools.c5">Markdown 트랜스크립트</span>
 <span class="ps1">$</span> damon backup             <span class="cmt" data-i18n="tools.c6">실행 중에도 안전한 스냅샷</span></code></pre>
       </div>
+
+      <div class="term">
+        <div class="term-head"><span></span><span></span><span></span><em><i class="dot" style="--c:#7dd3fc"></i><span data-i18n="tools.t4">신규 CLI 그룹</span></em>
+          <button class="copy-btn" type="button" data-copy="damon worktree create . --pr 1842" aria-label="copy"><svg viewBox="0 0 24 24" width="14" height="14" aria-hidden="true"><rect x="9" y="9" width="12" height="12" rx="2" fill="none" stroke="currentColor" stroke-width="2"/><path d="M5 15V5a2 2 0 0 1 2-2h10" fill="none" stroke="currentColor" stroke-width="2"/></svg></button>
+        </div>
+        <pre><code><span class="ps1">$</span> damon worktree create . --pr 1842
+<span class="ps1">$</span> damon skills install anthropics/skills document-skills/pdf
+<span class="ps1">$</span> damon skills targets</code></pre>
+      </div>
     </div>
   </div>
 </section>
@@ -301,7 +464,7 @@
   <div class="container">
     <p class="kicker" data-i18n="chan.kicker">채팅 채널</p>
     <h2 data-i18n="chan.title">채팅 앱이 곧 컨트롤 룸</h2>
-    <p class="section-lead" data-i18n="chan.lead">각 채팅이 고유한 에이전트 세션에 매핑되고 응답은 스트리밍됩니다. tool 권한 요청은 <code>allow</code>/<code>deny</code> 답장으로 승인합니다.</p>
+    <p class="section-lead" data-i18n="chan.lead">각 채팅이 고유한 에이전트 세션에 매핑되고 응답은 스트리밍됩니다. tool 권한 요청은 네이티브 버튼이나 <code>allow</code>/<code>deny</code> 답장으로 승인합니다. 파일은 프롬프트 첨부로 ride along.</p>
 
     <div class="chan-grid">
       <div class="term">
@@ -323,13 +486,25 @@
         <pre><code><span class="ps1">$</span> damon-slack --app-token xapp-… --bot-token xoxb-…</code></pre>
       </div>
     </div>
+
+    <div class="cmd-chips" aria-label="chat commands">
+      <span class="cchip"><b>!new</b><span data-i18n="ch.c1">새 세션</span></span>
+      <span class="cchip"><b>!fork</b><span data-i18n="ch.c2">분기</span></span>
+      <span class="cchip"><b>!cancel</b><span data-i18n="ch.c3">턴 취소</span></span>
+      <span class="cchip"><b>!cwd</b><span data-i18n="ch.c4">프로젝트 변경</span></span>
+      <span class="cchip"><b>!agent</b><span data-i18n="ch.c5">백엔드 변경</span></span>
+      <span class="cchip"><b>!usage</b><span data-i18n="ch.c6">토큰 사용량</span></span>
+      <span class="cchip"><b>!sessions</b><span data-i18n="ch.c7">전체 세션</span></span>
+      <span class="cchip"><b>!resume</b><span data-i18n="ch.c8">이어잡기</span></span>
+      <span class="cchip"><b>!watch</b><span data-i18n="ch.c9">완료·권한 알림</span></span>
+    </div>
   </div>
 </section>
 
 <!-- ================= ANYWHERE ================= -->
 <section class="section" id="anywhere">
   <div class="container">
-    <p class="kicker" data-i18n="any.kicker">어디서든 <span class="new-pill">NEW</span></p>
+    <p class="kicker" data-i18n="any.kicker">어디서든 <span class="new-pill">0.5</span></p>
     <h2 data-i18n="any.title">인터넷만 되면, 어디서든</h2>
     <p class="section-lead" data-i18n="any.lead">책상에서 시작한 작업은 집을 나선 뒤에도 계속됩니다. 폰의 채팅과 브라우저가 같은 데몬의 리모컨이 됩니다 — 모든 통신은 종단간 암호화.</p>
 
@@ -361,17 +536,17 @@
 
     <div class="feature-grid three">
       <article class="card any-card">
-        <span class="new-badge" data-i18n="any.badge">NEW</span>
+        <span class="ver-badge">0.5</span>
         <h3 data-i18n="any.c1t">화면이 꺼져도 작업은 계속</h3>
         <p data-i18n="any.c1d"><code>turn.start {detach: true}</code> — 연결이 끊겨도 턴이 끝까지 돌고 결과는 히스토리에 남습니다. 다시 접속하면 이어서 보입니다.</p>
       </article>
       <article class="card any-card">
-        <span class="new-badge" data-i18n="any.badge">NEW</span>
+        <span class="ver-badge">0.5</span>
         <h3 data-i18n="any.c2t">채팅에서 이어잡기 + 알림</h3>
         <p data-i18n="any.c2d"><code>!sessions</code>·<code>!resume</code>·<code>!watch</code> — 어느 화면에서 돌든 세션이 끝나거나 권한을 요청하면 채팅으로 알리고, 답장으로 승인합니다.</p>
       </article>
       <article class="card any-card">
-        <span class="new-badge" data-i18n="any.badge">NEW</span>
+        <span class="ver-badge">0.5</span>
         <h3 data-i18n="any.c3t">릴레이가 웹 UI를 서빙</h3>
         <p data-i18n="any.c3d">브라우저로 릴레이 호스트를 열고 데몬 이름+토큰 입력 — 페이지가 직접 E2E 핸드셰이크합니다. VPN·포트포워딩·호스팅 불필요.</p>
       </article>
@@ -436,7 +611,7 @@
 </footer>
 
 <noscript>
-  <style>.scene-hint{display:none}</style>
+  <style>.scene-hint,.dm-caret{display:none}</style>
 </noscript>
 <script type="module" src="./assets/js/main.mjs"></script>
 </body>

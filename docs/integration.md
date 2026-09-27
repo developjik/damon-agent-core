@@ -32,15 +32,17 @@ Detection: the binary on PATH registers the backend automatically.
 Every catalog backend speaks a native bidirectional protocol — token
 streaming, mid-turn permission asks, and interrupt all relay through Damon
 (`claude` and `qwen` keep one process per session over stream-json —
-`qwen`'s control plane is Claude-shaped with an `initialize` handshake
-`droid` speaks Factory's JSON-RPC where permission asks arrive as `droid.request_permission` requests Damon must answer; `opencode`/`mimo` answer over HTTP against an adopted-or-spawned `serve`; `omp` and `pi` share one rpc wire where omp
-additionally negotiates protocol v2 chunking and pi settles only on
-explicit terminal events). CLIs whose headless mode is output-only (no
-permission/question wire) are deliberately not in the catalog. `qwen`'s
-stream-json input accepts text blocks only — image attachments are
-rejected loudly rather than dropped. `pi`'s own tools run under its trust
-model — Damon surfaces no mode switches for it, and permission asks ride
-extension dialogs.
+`qwen`'s control plane is Claude-shaped with an `initialize` handshake at
+spawn; `droid` speaks Factory's JSON-RPC where permission asks arrive as
+`droid.request_permission` requests Damon must answer; `opencode`/`mimo`
+answer over HTTP against an adopted-or-spawned `serve`; `omp` and `pi`
+share one rpc wire where omp additionally negotiates protocol v2 chunking
+and pi settles only on explicit terminal events). CLIs whose headless mode
+is output-only (no permission/question wire) are deliberately not in the
+catalog. `qwen`'s stream-json input accepts text blocks only — image
+attachments are rejected loudly rather than dropped. `pi`'s own tools run
+under its trust model — Damon surfaces no mode switches for it, and
+permission asks ride extension dialogs.
 
 Overrides — replace a launch line or point at a local build:
 
@@ -62,7 +64,7 @@ Only needed when `auth_token` is set. `/ws` takes the same bearer token via the 
 
 Browser Origin: without `auth_token`, requests carrying an `Origin` header must be loopback origins. With a token, all origins pass — the token is the gate.
 
-`GET /metrics` (behind the token gate) exposes Prometheus counters: `damon_requests_total` and `damon_live_sessions`.
+`GET /metrics` (behind the token gate) exposes Prometheus counters: `damon_requests_total` (HTTP through the token gate), `damon_rpc_requests_total`, `damon_rpc_errors_total{code}`, `damon_live_sessions`, `damon_busy_sessions`, per-backend `damon_turns_total{backend,status}`, and the `damon_turn_seconds_*` duration histogram.
 
 ## WS protocol (v2)
 
@@ -188,7 +190,7 @@ parsing its config: at boot `damond` writes `~/.damon/daemon.json` and
 removes it on clean shutdown.
 
 ```json
-{"port": 9470, "pid": 1234, "version": "0.3.0", "tls": false, "configPath": "/path/to/config.toml"}
+{"port": 9470, "pid": 1234, "version": "0.5.0", "tls": false, "configPath": "/path/to/config.toml"}
 ```
 
 The file carries no secrets — `port`, `pid`, `version`, `tls`, and the
@@ -219,4 +221,4 @@ Cross-surface pickup: `!sessions` lists recent sessions from every surface, `!re
 | Discord | `damon-discord --bot-token <token>` | Gateway WebSocket | `DISCORD_BOT_TOKEN` env works; MESSAGE_CONTENT privileged intent required |
 | Slack | `damon-slack --app-token xapp-… --bot-token xoxb-…` | Socket Mode | `SLACK_APP_TOKEN`/`SLACK_BOT_TOKEN` env works |
 
-New channel: implement `damon_core::channel::ChannelApi` (`ready`/`recv`/`send`) and hand it to `channel::Bridge::new(channel, client).run()` — session mapping, event demux, the permission flow, and the streaming loop belong to the bridge.
+New channel: implement `damon_core::channel::ChannelApi` (`ready`/`recv`/`send`, plus the overridable `send_permission`/`send_media` hooks) and hand it to `channel::Bridge::new(channel, client).run()` — session mapping, event demux, the permission flow, and the streaming loop belong to the bridge.

@@ -1,25 +1,54 @@
-// Damon intro site — i18n, copy buttons, 3D architecture scene.
+// Damon intro site — i18n, copy buttons, 3D architecture scene, live demos.
 
 /* ------------------------------ i18n ------------------------------ */
 
 const I18N = {
   ko: {
     "meta.title": "Damon — 데몬 하나. 모든 코딩 에이전트.",
-    "nav.features": "기능", "nav.arch": "구조", "nav.quick": "시작하기", "nav.tools": "도구",
-    "nav.chan": "채널", "nav.any": "어디서든", "nav.eco": "생태계",
+    "nav.new": "신규", "nav.features": "기능", "nav.arch": "구조", "nav.quick": "시작하기",
+    "nav.tools": "도구", "nav.chan": "채널", "nav.any": "어디서든", "nav.eco": "생태계",
     "hero.badge": "Rust 기반 로컬 에이전트 컨트롤 데몬",
     "hero.title1": "데몬 하나.",
     "hero.title2": "모든 코딩 에이전트.",
-    "hero.lead": "Damon은 Claude Code·Codex CLI·Oh My Pi를 각자의 네이티브 양방향 프로토콜로 구동하는 Rust 상주 데몬입니다. 모델·툴·인증은 에이전트 몫 — Damon은 세션, 권한 릴레이, 검색 가능한 히스토리, 채팅 채널, 어디서든 접근을 소유합니다.",
-    "hero.install.label": "설치",
+    "hero.lead": "Damon은 아홉 코딩 에이전트 CLI — Claude Code·Codex CLI·Oh My Pi·Pi·Qwen Code·Droid·OpenCode·MiMo·ZCode — 를 각자의 네이티브 양방향 프로토콜로 구동하는 Rust 상주 데몬입니다. 모델·툴·인증은 에이전트 몫 — Damon은 세션, 권한 릴레이, 검색 가능한 히스토리, 스킬 허브, PR 워크트리, 채팅 채널, 어디서든 접근을 소유합니다.",
+    "hero.cta.new": "새 기능 보기",
     "hero.cta.quick": "퀵스타트",
     "hero.cta.gh": "GitHub에서 보기",
     "hero.hint": "드래그로 회전 · 스크롤로 확대 · 노드 클릭",
+    "strip.title": "PATH에 있으면 자동 등록 — 네이티브 양방향 백엔드",
+    "strip.more": "권한 릴레이·질문·인터럽트가 온전히 릴레이되는 프로토콜만 카탈로그에 등재됩니다",
+    "new.kicker": "방금 main에 착지",
+    "new.title": "지금 막 합류한 것들",
+    "new.lead": "네 가지가 한 번에 왔습니다 — 아래 카드는 실제 동작을 축소해서 재현한 라이브 데모입니다.",
+    "wt.card.t": "PR 하나, 격리된 워크트리 하나",
+    "wt.card.d": "PR 번호만 주면 refs/pull/N/head를 격리된 git worktree로 받아 프로젝트로 등록합니다. 단계별 진행 프레임, 진행 중 취소, gh 프리뷰 — 실패해도 메인 체크아웃은 청정합니다.",
+    "wt.s1": "PR → owner/repo 확인",
+    "wt.s3": "git worktree add",
+    "wt.s4": "kind:\"worktree\" 프로젝트 등록",
+    "wt.result": "여기서 세션 시작 → session.create {projectId}",
+    "wt.cancelled": "취소 — 진행 중인 git 프로세스 그룹을 kill 했습니다",
+    "sk.card.t": "스킬 한 번 설치, 모든 CLI에 동기화",
+    "sk.card.d": "GitHub·skills.sh에서 스킬 패키지를 찾아 설치하면, 허브가 설치된 모든 CLI의 네이티브 스킬 디렉터리로 심링크합니다. CLI는 여전히 자기 스킬을 스스로 로드합니다.",
+    "sk.hub": "skills-hub 스토어",
+    "sk.note": "설치 → 동기화 → catalog.commands가 별도 설정 없이 스킬을 인지",
+    "rv.card.t": "배치 덤프 없는 스트리밍 리빌",
+    "rv.card.d": "도착 박자에 맞춰 글자가 흐릅니다. 커서는 문서 꼬리에 붙어 재파싱에도 흐름이 안 끊기고, 코드펜스는 닫히는 순간 점등됩니다. 그래핌 안전 — CJK·이모지도 뜯기지 않습니다.",
+    "rv.replay": "재생",
+    "rv.s1": "**페이싱된 리빌**은 배치 덤프를 없앱니다 — 도착 박자에 맞춰 글자가 흐릅니다.",
+    "rv.s2": "커서는 문서 꼬리에 붙어 — 재파싱이 리빌을 리셋하지 않습니다. 펜스가 닫히면 코드가 점등됩니다.",
+    "cp.card.t": "입력줄이 곧 런처 — / · @ · !",
+    "cp.card.d": "<code>/</code>는 CLI가 이미 아는 커맨드·스킬 카탈로그, <code>@</code>는 ripgrep 워커가 걸어 만든 파일 인덱스, <code>!</code>는 프롬프트 라이브러리. 프롬프트 히스토리는 데몬이 저장 — 폰에서도 데스크톱 완성이 보입니다. 직접 입력해 보세요.",
+    "cp.ph": "/ 커맨드 · @ 파일 · ! 프롬프트",
+    "cp.msg": "이 PR 리뷰해줘",
+    "cp.shadow": "workspace가 같은 이름의 글로벌 항목을 가립니다",
+    "cp.hint": "를 누르거나 직접 타이핑 — ▶ 버튼은 자동 재생",
+    "cp.empty": "일치하는 항목 없음",
+    "cp.sent": "프롬프트 본문 삽입됨",
     "feat.kicker": "왜 Damon인가",
     "feat.title": "에이전트는 그대로, 제어는 한 곳에서",
     "feat.lead": "이미 에이전트 CLI를 구독 중이라면 설정할 게 하나도 없습니다. Damon은 설치된 CLI를 감지해 로그인과 툴을 그대로 물려받습니다.",
     "f1t": "설정 없는 백엔드",
-    "f1d": "PATH의 claude·codex·omp면 자동 등록됩니다. 카탈로그 백엔드는 전부 네이티브 양방향 프로토콜 — 스트리밍·권한 릴레이·인터럽트 — 을 말합니다.",
+    "f1d": "PATH의 claude·codex·omp·pi·qwen·droid·opencode·mimo·zcode면 자동 등록됩니다. 카탈로그 백엔드는 전부 네이티브 양방향 프로토콜 — 스트리밍·권한 릴레이·인터럽트 — 을 말합니다.",
     "f2t": "권한은 당신 채널로",
     "f2d": "에이전트의 권한 요청을 웹 UI·CLI·텔레그램/디스코드/슬랙의 <code>allow</code>/<code>deny</code> 답장으로 릴레이합니다.",
     "f3t": "검색 가능한 히스토리",
@@ -32,6 +61,8 @@ const I18N = {
     "f6d": "<code>wss</code> 직접 서빙 또는 <code>damon-relay</code> 아웃바운드 터널 — X25519 + AES-256-GCM E2E 암호화. 릴레이는 웹 UI도 서빙합니다.",
     "f7t": "상주하도록 설계",
     "f7d": "Rust 데몬 본체는 가볍게 유지됩니다. 에이전트 프로세스는 에이전트의 몫입니다.",
+    "f8t": "프롬프트도 버전 관리",
+    "f8d": "재사용 프롬프트를 마크다운 + 가벼운 프론트매터로 저장. <code>prompts.*</code> CRUD와 스코프 이동, 컴포저 <code>!</code> 피커에 그대로 노출됩니다.",
     "arch.kicker": "아키텍처",
     "arch.title": "하나의 API, 하나의 데몬",
     "arch.lead": "모든 클라이언트가 같은 JSON-RPC over WebSocket(<code>/ws</code>, 프로토콜 v2)에 붙고, 데몬이 에이전트 CLI를 서브프로세스로 구동합니다.",
@@ -42,6 +73,8 @@ const I18N = {
     "arch.m2": "세션 매니저 — 생명주기·권한 릴레이·취소",
     "arch.m3": "세션 저장소 — SQLite + FTS5",
     "arch.m4": "채널 브리지 / E2E 릴레이",
+    "arch.m5": "스킬 허브 · 프롬프트 라이브러리",
+    "arch.m6": "워크트리 워크스페이스 — PR 격리 체크아웃",
     "arch.agents.note": "모델·툴·구독 인증·컨텍스트는 전부 에이전트 소유",
     "arch.proto": "와이어 프로토콜 문서 →",
     "arch.integration": "클라이언트 연동 가이드 →",
@@ -56,10 +89,12 @@ const I18N = {
     "quick.service": "OS 서비스로 상주",
     "quick.service.c1": "launchd / systemd user / Task Scheduler",
     "quick.ui.t": "번들 웹 UI로 바로 대화",
-    "quick.ui.p": "세션, 스트리밍, 권한 프롬프트까지 — 설치 불필요.",
+    "quick.ui.p": "세션, 스트리밍, 권한 프롬프트, /·@·! 피커까지 — 설치 불필요. <code>?revealDemo=1</code>로 리빌 파이프라인 데모.",
     "chan.kicker": "채팅 채널",
     "chan.title": "채팅 앱이 곧 컨트롤 룸",
-    "chan.lead": "각 채팅이 고유한 에이전트 세션에 매핑되고 응답은 스트리밍됩니다. tool 권한 요청은 <code>allow</code>/<code>deny</code> 답장으로 승인합니다.",
+    "chan.lead": "각 채팅이 고유한 에이전트 세션에 매핑되고 응답은 스트리밍됩니다. tool 권한 요청은 네이티브 버튼이나 <code>allow</code>/<code>deny</code> 답장으로 승인합니다. 파일은 프롬프트 첨부로 ride along.",
+    "ch.c1": "새 세션", "ch.c2": "분기", "ch.c3": "턴 취소", "ch.c4": "프로젝트 변경",
+    "ch.c5": "백엔드 변경", "ch.c6": "토큰 사용량", "ch.c7": "전체 세션", "ch.c8": "이어잡기", "ch.c9": "완료·권한 알림",
     "any.kicker": "어디서든",
     "any.title": "인터넷만 되면, 어디서든",
     "any.lead": "책상에서 시작한 작업은 집을 나선 뒤에도 계속됩니다. 폰의 채팅과 브라우저가 같은 데몬의 리모컨이 됩니다 — 모든 통신은 종단간 암호화.",
@@ -71,7 +106,6 @@ const I18N = {
     "any.f3d": "<code>!sessions</code> → <code>!resume</code>로 이어잡기",
     "any.f4t": "완료 · 알림",
     "any.f4d": "끝나면 채팅으로 소식 — 권한도 답장으로 승인",
-    "any.badge": "NEW",
     "any.c1t": "화면이 꺼져도 작업은 계속",
     "any.c1d": "<code>turn.start {detach: true}</code> — 연결이 끊겨도 턴이 끝까지 돌고 결과는 히스토리에 남습니다. 다시 접속하면 이어서 보입니다.",
     "any.c2t": "채팅에서 이어잡기 + 알림",
@@ -87,12 +121,10 @@ const I18N = {
     "eco.py.d": "asyncio 기반 공식 클라이언트.",
     "eco.py.link": "python/ 디렉터리 →",
     "eco.rs.d": "crates.io의 코어 크레이트.",
-    "strip.title": "PATH에 있으면 자동 등록 — 네이티브 양방향 백엔드",
-    "strip.more": "권한 릴레이·질문·인터럽트가 온전히 릴레이되는 프로토콜만 카탈로그에 등재됩니다",
     "tools.kicker": "세션 도구상자",
     "tools.title": "히스토리는 자산입니다",
     "tools.lead": "모든 대화가 SQLite에 쌓입니다 — 검색하고, 분기하고, 내보내고, 백업하세요. 데몬이 살아 있는 동안에도 안전합니다.",
-    "tools.t1": "대화", "tools.t2": "탐색", "tools.t3": "보존",
+    "tools.t1": "대화", "tools.t2": "탐색", "tools.t3": "보존", "tools.t4": "신규 CLI 그룹",
     "tools.c1": "이전 세션 이어서",
     "tools.c2": "데몬 밖에서 만든 세션 흡수",
     "tools.c3": "토큰 사용량",
@@ -107,21 +139,50 @@ const I18N = {
   },
   en: {
     "meta.title": "Damon — One daemon. Every coding agent.",
-    "nav.features": "Features", "nav.arch": "Architecture", "nav.quick": "Quickstart", "nav.tools": "Toolbox",
-    "nav.chan": "Channels", "nav.any": "Anywhere", "nav.eco": "Ecosystem",
+    "nav.new": "New", "nav.features": "Features", "nav.arch": "Architecture", "nav.quick": "Quickstart",
+    "nav.tools": "Toolbox", "nav.chan": "Channels", "nav.any": "Anywhere", "nav.eco": "Ecosystem",
     "hero.badge": "Local agent-control daemon in Rust",
     "hero.title1": "One daemon.",
     "hero.title2": "Every coding agent.",
-    "hero.lead": "Damon is a resident Rust daemon that drives Claude Code, Codex CLI, and Oh My Pi through their native bidirectional protocols. Model, tools, and auth belong to the agents — Damon owns sessions, permission relaying, searchable history, chat channels, and from-anywhere access.",
-    "hero.install.label": "Install",
+    "hero.lead": "Damon is a resident Rust daemon that drives nine coding-agent CLIs — Claude Code, Codex CLI, Oh My Pi, Pi, Qwen Code, Droid, OpenCode, MiMo, ZCode — over their native bidirectional protocols. Model, tools, and auth belong to the agents — Damon owns sessions, permission relaying, searchable history, the skills hub, PR worktrees, chat channels, and from-anywhere access.",
+    "hero.cta.new": "See what's new",
     "hero.cta.quick": "Quickstart",
     "hero.cta.gh": "View on GitHub",
     "hero.hint": "Drag to rotate · scroll to zoom · click a node",
+    "strip.title": "On PATH, self-registered — native bidirectional backends",
+    "strip.more": "Only protocols whose permission relay, questions, and interrupt fully round-trip make the catalog",
+    "new.kicker": "just landed on main",
+    "new.title": "Fresh off the main branch",
+    "new.lead": "Four things at once — every card below is a live demo replaying the real behavior in miniature.",
+    "wt.card.t": "One PR, one isolated worktree",
+    "wt.card.d": "Give it a PR number and it fetches refs/pull/N/head into an isolated git worktree and registers it as a project. Per-stage progress frames, mid-fetch cancellation, gh previews — and your main checkout stays clean whatever happens.",
+    "wt.s1": "resolve PR → owner/repo",
+    "wt.s3": "git worktree add",
+    "wt.s4": "register kind:\"worktree\" project",
+    "wt.result": "start a session here → session.create {projectId}",
+    "wt.cancelled": "cancelled — the in-flight git process group was killed",
+    "sk.card.t": "Install a skill once, sync it everywhere",
+    "sk.card.d": "Discover skill packages on GitHub and skills.sh; the hub symlinks them into every installed CLI's native skills directory. The CLIs keep loading skills themselves.",
+    "sk.hub": "skills-hub store",
+    "sk.note": "install → sync → catalog.commands picks skills up with no extra wiring",
+    "rv.card.t": "Streaming reveal without batch dumps",
+    "rv.card.d": "Text flows out over the arrival cadence. A tail-anchored cursor survives re-parsing, and code fences light up the moment their closing marker lands. Grapheme-safe — CJK and emoji don't tear.",
+    "rv.replay": "Replay",
+    "rv.s1": "**Paced reveal** kills the batch dump — characters flow out over the arrival cadence.",
+    "rv.s2": "The cursor rides the document tail — re-parsing never resets the reveal. Fences light up when they close.",
+    "cp.card.t": "The input line is a launcher — / · @ · !",
+    "cp.card.d": "<code>/</code> opens the command and skill catalog the CLIs already know, <code>@</code> a file index walked by a ripgrep worker, <code>!</code> the prompt library. Prompt history lives in the daemon — your phone sees your desktop's completions. Type into it.",
+    "cp.ph": "/ commands · @ files · ! prompts",
+    "cp.msg": "review this PR for me",
+    "cp.shadow": "workspace shadows same-named global entries",
+    "cp.hint": "or just type — ▶ plays the scripted tour",
+    "cp.empty": "no matches",
+    "cp.sent": "prompt body inserted",
     "feat.kicker": "Why Damon",
     "feat.title": "Agents stay theirs, control stays yours",
     "feat.lead": "If you already subscribe to an agent CLI, there is nothing to configure. Damon detects installed CLIs and inherits their logins and tools.",
     "f1t": "Zero-config backends",
-    "f1d": "claude, codex, and omp on PATH register themselves. Every catalog backend speaks a native bidirectional protocol — streaming, permission relay, interrupt.",
+    "f1d": "claude, codex, omp, pi, qwen, droid, opencode, mimo, and zcode on PATH register themselves. Every catalog backend speaks a native bidirectional protocol — streaming, permission relay, interrupt.",
     "f2t": "Permissions flow to your surface",
     "f2d": "The agent's permission ask is relayed to the web UI, CLI, or an <code>allow</code>/<code>deny</code> reply in Telegram, Discord, or Slack.",
     "f3t": "Searchable history",
@@ -134,6 +195,8 @@ const I18N = {
     "f6d": "Serve <code>wss</code> with your certs, or run <code>damon-relay</code> and dial out — X25519 + AES-256-GCM E2E encrypted. The relay serves the web UI too.",
     "f7t": "Built to stay resident",
     "f7d": "The Rust daemon stays lean. Agent processes are the agents' business.",
+    "f8t": "Prompts under version control",
+    "f8d": "Reusable prompts live as markdown with light frontmatter. <code>prompts.*</code> CRUD and scope moves, exposed straight in the composer's <code>!</code> picker.",
     "arch.kicker": "Architecture",
     "arch.title": "One API, one daemon",
     "arch.lead": "Every client speaks the same JSON-RPC over WebSocket (<code>/ws</code>, protocol v2), and the daemon drives the agent CLIs as subprocesses.",
@@ -144,6 +207,8 @@ const I18N = {
     "arch.m2": "Session manager — lifecycle, permission relay, cancel",
     "arch.m3": "Session store — SQLite + FTS5",
     "arch.m4": "Channel bridges / E2E relay",
+    "arch.m5": "Skills hub · prompt library",
+    "arch.m6": "Worktree workspaces — isolated PR checkouts",
     "arch.agents.note": "Model, tools, subscription auth, and context are all agent-owned",
     "arch.proto": "Wire protocol docs →",
     "arch.integration": "Client integration guide →",
@@ -158,10 +223,12 @@ const I18N = {
     "quick.service": "Keep it resident",
     "quick.service.c1": "launchd / systemd user / Task Scheduler",
     "quick.ui.t": "Chat in the bundled web UI",
-    "quick.ui.p": "Sessions, streaming, permission prompts — no install.",
+    "quick.ui.p": "Sessions, streaming, permission prompts, /·@·! pickers — no install. <code>?revealDemo=1</code> demos the reveal pipeline.",
     "chan.kicker": "Chat channels",
     "chan.title": "Your chat app is the control room",
-    "chan.lead": "Each chat maps to its own agent session, replies stream, and tool-permission requests are approved with an <code>allow</code>/<code>deny</code> reply.",
+    "chan.lead": "Each chat maps to its own agent session, replies stream, and tool-permission requests are approved with native buttons or an <code>allow</code>/<code>deny</code> reply. Files ride along as prompt attachments.",
+    "ch.c1": "new session", "ch.c2": "fork", "ch.c3": "cancel turn", "ch.c4": "change project",
+    "ch.c5": "change backend", "ch.c6": "token usage", "ch.c7": "all sessions", "ch.c8": "pick up", "ch.c9": "finish/permission pings",
     "any.kicker": "Anywhere",
     "any.title": "Anywhere there's internet",
     "any.lead": "Work started at your desk keeps going after you leave. Your phone's chat and browser become remotes for the same daemon — every message end-to-end encrypted.",
@@ -173,7 +240,6 @@ const I18N = {
     "any.f3d": "<code>!sessions</code> → <code>!resume</code> to pick it up",
     "any.f4t": "Done · notified",
     "any.f4d": "the chat hears when it finishes — approve asks by reply",
-    "any.badge": "NEW",
     "any.c1t": "Turns outlive the screen",
     "any.c1d": "<code>turn.start {detach: true}</code> — a dropped connection never cancels the turn; the outcome lands in history and greets you on reconnect.",
     "any.c2t": "Pick up + notifications in chat",
@@ -189,12 +255,10 @@ const I18N = {
     "eco.py.d": "The official asyncio client.",
     "eco.py.link": "python/ directory →",
     "eco.rs.d": "The core crate on crates.io.",
-    "strip.title": "On PATH, self-registered — native bidirectional backends",
-    "strip.more": "Only protocols whose permission relay, questions, and interrupt fully round-trip make the catalog",
     "tools.kicker": "Session toolbox",
     "tools.title": "History is an asset",
     "tools.lead": "Every conversation lands in SQLite — search it, fork it, export it, back it up. Safe even while the daemon runs.",
-    "tools.t1": "Chat", "tools.t2": "Mine", "tools.t3": "Keep",
+    "tools.t1": "Chat", "tools.t2": "Mine", "tools.t3": "Keep", "tools.t4": "New CLI groups",
     "tools.c1": "pick up an old session",
     "tools.c2": "adopt sessions made outside damon",
     "tools.c3": "token usage",
@@ -229,6 +293,9 @@ function applyLang() {
   }
   for (const el of document.querySelectorAll("[data-i18n-aria]")) {
     el.setAttribute("aria-label", t(el.dataset.i18nAria));
+  }
+  for (const el of document.querySelectorAll("[data-i18n-ph]")) {
+    el.setAttribute("placeholder", t(el.dataset.i18nPh));
   }
   const toggle = document.getElementById("lang-toggle");
   if (toggle) toggle.textContent = lang === "ko" ? "EN" : "한국어";
@@ -276,10 +343,49 @@ document.addEventListener("click", async (e) => {
   }
 });
 
+/* --------------------------- install tabs --------------------------- */
+
+const installBox = document.getElementById("install-box");
+if (installBox) {
+  const code = installBox.querySelector("#install-cmd");
+  const copyBtn = installBox.querySelector(".copy-btn");
+  installBox.querySelectorAll(".itab").forEach((tab) => {
+    tab.addEventListener("click", () => {
+      installBox.querySelectorAll(".itab").forEach((b) => b.classList.remove("active"));
+      tab.classList.add("active");
+      code.textContent = tab.dataset.cmd;
+      copyBtn.dataset.copy = tab.dataset.cmd;
+    });
+  });
+}
+
+/* --------------------------- scroll progress --------------------------- */
+
+const progressBar = document.getElementById("scroll-progress");
+function updateProgress() {
+  if (!progressBar) return;
+  const max = document.documentElement.scrollHeight - innerHeight;
+  progressBar.style.transform = `scaleX(${max > 0 ? Math.min(scrollY / max, 1) : 0})`;
+}
+addEventListener("scroll", updateProgress, { passive: true });
+addEventListener("resize", updateProgress, { passive: true });
+updateProgress();
+
+/* --------------------------- marquee --------------------------- */
+
+const marqueeTrack = document.getElementById("marquee-track");
+if (marqueeTrack && !matchMedia("(prefers-reduced-motion: reduce)").matches) {
+  for (const child of [...marqueeTrack.children]) {
+    const clone = child.cloneNode(true);
+    clone.setAttribute("aria-hidden", "true");
+    marqueeTrack.appendChild(clone);
+  }
+}
+
 /* --------------------------- scroll reveal --------------------------- */
 
 const REVEAL_SELS =
-  ".section .card, .term, .ui-note, .backend-strip, .arch-api, .arch-core, .arch-row, .docs-links, .flow-step, .transport-strip";
+  ".section .card, .bento-card, .term, .ui-note, .arch-api, .arch-core, .arch-row, .docs-links, .flow-step, .transport-strip, .cchip";
 const revealOK = "IntersectionObserver" in window
   && !matchMedia("(prefers-reduced-motion: reduce)").matches;
 if (revealOK) {
@@ -300,6 +406,465 @@ if (revealOK) {
     }
   }, { rootMargin: "0px 0px -6% 0px", threshold: 0.06 });
   els.forEach((el) => io.observe(el));
+}
+
+/* ------------------------ shared demo helpers ------------------------ */
+
+const reduced = matchMedia("(prefers-reduced-motion: reduce)").matches;
+const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
+
+// Run `fn` once, the first time `el` scrolls into view.
+function whenVisible(el, fn) {
+  if (!el) return;
+  if (!("IntersectionObserver" in window)) { fn(); return; }
+  const io = new IntersectionObserver((entries) => {
+    for (const en of entries) {
+      if (!en.isIntersecting) continue;
+      io.disconnect();
+      fn();
+    }
+  }, { threshold: 0.3 });
+  io.observe(el);
+}
+
+/* --------------------------- worktree demo --------------------------- */
+
+function initWorktreeDemo() {
+  const root = document.getElementById("demo-worktree");
+  if (!root) return;
+  const stages = [...root.querySelectorAll(".wt-stages li")];
+  const bar = root.querySelector("#wt-bar");
+  const progress = root.querySelector(".wt-progress");
+  const result = root.querySelector("#wt-result");
+  const note = root.querySelector("#wt-note");
+  const runBtn = root.querySelector("#wt-run");
+  const cancelBtn = root.querySelector("#wt-cancel");
+  let token = 0;
+  let running = false;
+
+  function reset() {
+    token += 1;
+    running = false;
+    stages.forEach((s) => s.classList.remove("active", "done", "cancelled"));
+    bar.style.width = "0%";
+    progress.classList.remove("stalled");
+    result.hidden = true;
+    note.hidden = true;
+    cancelBtn.disabled = true;
+  }
+
+  async function run() {
+    reset();
+    running = true;
+    cancelBtn.disabled = false;
+    const my = token;
+    for (let i = 0; i < stages.length; i++) {
+      if (my !== token) return;
+      stages[i].classList.add("active");
+      await sleep(reduced ? 60 : 720);
+      if (my !== token) return;
+      stages[i].classList.remove("active");
+      stages[i].classList.add("done");
+      bar.style.width = `${((i + 1) / stages.length) * 100}%`;
+    }
+    if (my !== token) return;
+    result.hidden = false;
+    running = false;
+    cancelBtn.disabled = true;
+  }
+
+  function cancel() {
+    if (!running) return;
+    running = false;
+    token += 1;
+    const active = stages.find((s) => s.classList.contains("active"));
+    if (active) {
+      active.classList.remove("active");
+      active.classList.add("cancelled");
+    }
+    progress.classList.add("stalled");
+    note.hidden = false;
+    cancelBtn.disabled = true;
+  }
+
+  runBtn.addEventListener("click", run);
+  cancelBtn.addEventListener("click", cancel);
+  whenVisible(root, () => { if (!reduced) sleep(500).then(run); });
+}
+
+/* --------------------------- skills demo --------------------------- */
+
+function initSkillsDemo() {
+  const root = document.getElementById("demo-skills");
+  if (!root) return;
+  const chips = [...root.querySelectorAll(".sk-chip")];
+  const targets = [...root.querySelectorAll(".sk-target")];
+  let token = 0;
+
+  function reset() {
+    token += 1;
+    chips.forEach((c) => c.classList.remove("hl", "sent"));
+    targets.forEach((tr) => tr.classList.remove("lit"));
+  }
+
+  async function run() {
+    reset();
+    const my = token;
+    for (const chip of chips) {
+      if (my !== token) return;
+      chip.classList.add("hl");
+      if (chip === chips[0]) {
+        for (const tr of targets) {
+          if (my !== token) return;
+          await sleep(reduced ? 40 : 340);
+          tr.classList.add("lit");
+          tr.querySelector(".sk-status").textContent = "＋ symlink";
+        }
+      } else {
+        // already-lit targets re-echo the sync with a brief flash
+        targets.forEach((tr) => {
+          tr.classList.remove("lit");
+          void tr.offsetWidth;
+          tr.classList.add("lit");
+        });
+        await sleep(reduced ? 40 : 420);
+      }
+      if (my !== token) return;
+      chip.classList.remove("hl");
+      chip.classList.add("sent");
+    }
+  }
+
+  whenVisible(root, () => { if (!reduced) sleep(700).then(run); });
+
+  root.addEventListener("click", (e) => {
+    if (e.target.closest(".sk-chip")) run();
+  });
+}
+
+/* --------------------------- reveal demo --------------------------- */
+
+const RV_CODE = "pub fn pace(d: Duration) -> Duration {\n    d.clamp(MIN_STEP, MAX_STEP)\n}";
+const RV_CODE_HL =
+  '<span class="k">pub</span> <span class="k">fn</span> <span class="f">pace</span>' +
+  '(d: <span class="t">Duration</span>) -&gt; <span class="t">Duration</span> {\n' +
+  '    d.<span class="f">clamp</span>(MIN_STEP, MAX_STEP)\n}';
+
+function graphemes(str) {
+  if (typeof Intl !== "undefined" && Intl.Segmenter) {
+    const seg = new Intl.Segmenter(lang, { granularity: "grapheme" });
+    return [...seg.segment(str)].map((s) => s.segment);
+  }
+  return [...str];
+}
+
+function initRevealDemo() {
+  const bubble = document.getElementById("rv-bubble");
+  if (!bubble) return;
+
+  let token = 0;
+
+  function makeCaret() {
+    const c = document.createElement("span");
+    c.className = "dm-caret";
+    return c;
+  }
+
+  // Reveal `text` into `el` grapheme by grapheme; resolves when done.
+  // `finish` swaps in the final markup (markdown re-parse / highlight).
+  function revealInto(el, text, finish, my, cps) {
+    return new Promise((resolve) => {
+      const chars = graphemes(text);
+      el.appendChild(document.createTextNode(""));
+      const caret = makeCaret();
+      el.appendChild(caret);
+      let i = 0;
+      function tick() {
+        if (my !== token) { resolve(); return; }
+        const step = Math.max(1, Math.round(chars.length / cps));
+        const end = Math.min(i + step, chars.length);
+        caret.before(document.createTextNode(chars.slice(i, end).join("")));
+        i = end;
+        if (i >= chars.length) {
+          finish(el);
+          resolve();
+          return;
+        }
+        setTimeout(tick, 1000 / cps);
+      }
+      if (reduced) {
+        el.textContent = text;
+        finish(el);
+        resolve();
+        return;
+      }
+      tick();
+    });
+  }
+
+  async function run() {
+    token += 1;
+    const my = token;
+    bubble.innerHTML = "";
+
+    // paragraph 1 — raw markdown during reveal, bold after the "re-parse"
+    const p1 = document.createElement("p");
+    bubble.appendChild(p1);
+    await revealInto(p1, t("rv.s1"), (el) => {
+      el.innerHTML = t("rv.s1").replace(/\*\*(.+?)\*\*/g, "<strong>$1</strong>");
+    }, my, 52);
+    if (my !== token) return;
+    await sleep(reduced ? 0 : 240);
+    if (my !== token) return;
+
+    // code block — plain while streaming, highlighted when the fence closes
+    const pre = document.createElement("div");
+    pre.className = "rv-code";
+    const code = document.createElement("code");
+    pre.appendChild(code);
+    bubble.appendChild(pre);
+    await revealInto(code, RV_CODE, (el) => { el.innerHTML = RV_CODE_HL; }, my, 110);
+    if (my !== token) return;
+    await sleep(reduced ? 0 : 240);
+    if (my !== token) return;
+
+    // paragraph 2
+    const p2 = document.createElement("p");
+    bubble.appendChild(p2);
+    await revealInto(p2, t("rv.s2"), () => {}, my, 52);
+  }
+
+  const replay = document.getElementById("rv-replay");
+  if (replay) replay.addEventListener("click", run);
+  whenVisible(bubble.closest(".rv-demo"), () => sleep(400).then(run));
+}
+
+/* --------------------------- composer demo --------------------------- */
+
+const CP_ITEMS = {
+  slash: [
+    { n: "/review", d: { ko: "PR 리뷰 체크리스트", en: "PR review checklist" }, src: "workspace" },
+    { n: "/release", d: { ko: "릴리스 체크리스트", en: "release checklist" }, src: "global" },
+    { n: "/explain", d: { ko: "커서 주변 코드 설명", en: "explain the code near the cursor" }, src: "global" },
+    { n: "/compact", d: { ko: "대화 요약 압축", en: "compact the conversation" }, src: "global" },
+  ],
+  at: [
+    { n: "src/lib.rs", tag: "rs" },
+    { n: "src/protocol.rs", tag: "rs" },
+    { n: "docs/protocol-v2.md", tag: "md" },
+    { n: "config.example.toml", tag: "toml" },
+    { n: "npm/client.mjs", tag: "mjs" },
+    { n: "python/damon/client.py", tag: "py" },
+  ],
+  bang: [
+    { n: { ko: "커밋 메시지", en: "commit message" }, d: { ko: "컨벤셔널 커밋으로 작성", en: "conventional commits style" }, src: "store" },
+    { n: { ko: "코드리뷰 — 직설 모드", en: "code review — blunt" }, d: { ko: "거침없는 리뷰 어조", en: "no-nonsense review tone" }, src: "workspace" },
+    { n: { ko: "주간 회고", en: "weekly retro" }, d: { ko: "회고 템플릿으로 요약", en: "summarize with the retro template" }, src: "store" },
+  ],
+};
+
+function itemName(item) {
+  return typeof item.n === "string" ? item.n : item.n[lang];
+}
+
+function initComposerDemo() {
+  const root = document.getElementById("demo-composer");
+  if (!root) return;
+  const input = root.querySelector("#cp-input");
+  const picker = root.querySelector("#cp-picker");
+  const list = root.querySelector("#cp-list");
+  const kindEl = root.querySelector("#cp-kind");
+  const sendBtn = root.querySelector("#cp-send");
+  const flash = root.querySelector("#cp-flash");
+  let mode = null; // "slash" | "at" | "bang" | null
+  let sel = 0;
+  let tourToken = 0;
+  let tourRunning = false;
+
+  function itemsFor(m) {
+    if (!m) return [];
+    const q = input.value.slice(1).trim().toLowerCase();
+    const items = CP_ITEMS[m];
+    if (!q) return items;
+    return items.filter((it) => itemName(it).toLowerCase().includes(q));
+  }
+
+  function closePicker() {
+    mode = null;
+    picker.hidden = true;
+  }
+
+  function renderPicker() {
+    const m = mode;
+    if (!m) { closePicker(); return; }
+    const items = itemsFor(m);
+    kindEl.textContent = m === "slash" ? "/ commands" : m === "at" ? "@ files" : "! prompts";
+    list.innerHTML = "";
+    if (!items.length) {
+      const li = document.createElement("li");
+      li.className = "pd";
+      li.style.cursor = "default";
+      li.textContent = t("cp.empty");
+      list.appendChild(li);
+    }
+    items.forEach((it, i) => {
+      const li = document.createElement("li");
+      if (i === sel) li.classList.add("sel");
+      const pn = document.createElement("span");
+      pn.className = "pn";
+      pn.textContent = itemName(it);
+      li.appendChild(pn);
+      if (it.d) {
+        const pd = document.createElement("span");
+        pd.className = "pd";
+        pd.textContent = it.d[lang];
+        li.appendChild(pd);
+      } else {
+        const pd = document.createElement("span");
+        pd.className = "pd";
+        li.appendChild(pd);
+      }
+      if (it.tag) {
+        const pt = document.createElement("span");
+        pt.className = "pt";
+        pt.textContent = `.${it.tag}`;
+        li.appendChild(pt);
+      }
+      if (it.src) {
+        const ps = document.createElement("span");
+        ps.className = `ps ${it.src}`;
+        ps.textContent = it.src;
+        li.appendChild(ps);
+      }
+      li.addEventListener("click", () => pick(it));
+      list.appendChild(li);
+    });
+    picker.hidden = false;
+  }
+
+  function showFlash(text) {
+    flash.hidden = false;
+    flash.textContent = text;
+    const fresh = flash; // restart the CSS animation
+    fresh.style.animation = "none";
+    void fresh.offsetWidth;
+    fresh.style.animation = "";
+    setTimeout(() => { flash.hidden = true; }, 1500);
+  }
+
+  function pick(it) {
+    if (mode === "bang") {
+      input.value = "";
+      showFlash(`⚡ ${t("cp.sent")} — ${itemName(it)}`);
+    } else {
+      const prefix = mode === "at" ? "@" : "";
+      input.value = `${prefix}${itemName(it)} `;
+      input.focus();
+    }
+    closePicker();
+  }
+
+  function detectMode(v) {
+    if (v.startsWith("/")) return "slash";
+    if (v.startsWith("@")) return "at";
+    if (v.startsWith("!")) return "bang";
+    return null;
+  }
+
+  input.addEventListener("input", () => {
+    stopTour();
+    const m = detectMode(input.value);
+    if (m !== mode) { mode = m; sel = 0; }
+    if (!mode) { closePicker(); return; }
+    renderPicker();
+  });
+  input.addEventListener("keydown", (e) => {
+    stopTour();
+    if (!mode) return;
+    const items = itemsFor(mode);
+    if (e.key === "ArrowDown") {
+      e.preventDefault();
+      sel = Math.min(sel + 1, items.length - 1);
+      renderPicker();
+    } else if (e.key === "ArrowUp") {
+      e.preventDefault();
+      sel = Math.max(sel - 1, 0);
+      renderPicker();
+    } else if (e.key === "Enter" && mode && items.length) {
+      e.preventDefault();
+      pick(items[Math.min(sel, items.length - 1)]);
+    } else if (e.key === "Escape") {
+      closePicker();
+    }
+  });
+
+  for (const keyBtn of root.querySelectorAll(".dm-key")) {
+    keyBtn.addEventListener("click", () => {
+      stopTour();
+      input.value = keyBtn.dataset.k;
+      mode = detectMode(input.value);
+      sel = 0;
+      renderPicker();
+      input.focus();
+    });
+  }
+
+  sendBtn.addEventListener("click", () => {
+    stopTour();
+    if (!input.value.trim()) return;
+    sendBtn.classList.add("ok");
+    setTimeout(() => sendBtn.classList.remove("ok"), 900);
+    input.value = "";
+    closePicker();
+  });
+
+  function stopTour() {
+    if (tourRunning) tourRunning = false;
+    tourToken += 1;
+  }
+
+  // Scripted tour: / → @ → !, with real keystrokes into the input.
+  async function tour() {
+    stopTour();
+    tourRunning = true;
+    const my = ++tourToken;
+    const alive = () => tourRunning && my === tourToken;
+
+    async function typeText(str) {
+      input.value = "";
+      for (const ch of str) {
+        if (!alive()) return false;
+        input.value += ch;
+        const m = detectMode(input.value);
+        if (m !== mode) { mode = m; sel = 0; }
+        if (mode) renderPicker();
+        await sleep(reduced ? 0 : 85);
+      }
+      return alive();
+    }
+
+    closePicker();
+    if (!await typeText("/rev")) return;
+    await sleep(reduced ? 0 : 620); if (!alive()) return;
+    pick(CP_ITEMS.slash[0]);
+    await sleep(reduced ? 0 : 760); if (!alive()) return;
+
+    if (!await typeText("@src")) return;
+    await sleep(reduced ? 0 : 620); if (!alive()) return;
+    pick(CP_ITEMS.at[0]);
+    await sleep(reduced ? 0 : 760); if (!alive()) return;
+
+    if (!await typeText(lang === "ko" ? "!커밋" : "!comm")) return;
+    await sleep(reduced ? 0 : 620); if (!alive()) return;
+    pick(CP_ITEMS.bang[0]);
+    await sleep(reduced ? 0 : 900); if (!alive()) return;
+
+    input.value = "";
+    closePicker();
+    tourRunning = false;
+  }
+
+  whenVisible(root, () => { if (!reduced) sleep(600).then(tour); });
 }
 
 /* ----------------------------- 3D scene ----------------------------- */
@@ -451,7 +1016,6 @@ async function initScene() {
     return;
   }
 
-  const reduced = matchMedia("(prefers-reduced-motion: reduce)").matches;
   const motion = reduced ? 0 : 1;
 
   renderer.setPixelRatio(Math.min(devicePixelRatio || 1, 2));
@@ -459,7 +1023,7 @@ async function initScene() {
   container.appendChild(renderer.domElement);
 
   const scene = new THREE.Scene();
-  scene.fog = new THREE.Fog(0x0a0e16, 26, 60);
+  scene.fog = new THREE.Fog(0x070b13, 26, 60);
 
   const camera = new THREE.PerspectiveCamera(
     42, container.clientWidth / container.clientHeight, 0.1, 120);
@@ -625,7 +1189,7 @@ async function initScene() {
     return hits.length ? hits[0].object.userData.node : null;
   }
 
-  function showTip(node, e) {
+  function showTip(node) {
     if (!tip || !node) return;
     const rect = renderer.domElement.getBoundingClientRect();
     (node === NODES.core ? tmpA : node.mesh.getWorldPosition(tmpA));
@@ -645,7 +1209,7 @@ async function initScene() {
   renderer.domElement.addEventListener("pointermove", (e) => {
     hovered = pick(e);
     renderer.domElement.style.cursor = hovered ? "pointer" : "grab";
-    if (hovered) showTip(hovered, e);
+    if (hovered) showTip(hovered);
     else if (tip) tip.hidden = true;
   });
   renderer.domElement.addEventListener("pointerleave", () => {
@@ -752,13 +1316,13 @@ async function initScene() {
       const defs = [NODES.core, ...NODES.agents, ...NODES.clients];
       for (const d of defs) {
         if (!d.label) continue;
-d.label.material.map?.dispose();
-const fresh = makeLabelSprite(THREE, d.name[l], d.color);
-d.label.material.map = fresh.material.map;
-d.label.material.needsUpdate = true;
-d.label.scale.copy(fresh.scale);
-fresh.material.map = null;
-fresh.material.dispose();
+        d.label.material.map?.dispose();
+        const fresh = makeLabelSprite(THREE, d.name[l], d.color);
+        d.label.material.map = fresh.material.map;
+        d.label.material.needsUpdate = true;
+        d.label.scale.copy(fresh.scale);
+        fresh.material.map = null;
+        fresh.material.dispose();
       }
       if (hovered && tip && !tip.hidden) {
         tip.querySelector("strong").textContent = hovered.name[l];
@@ -768,5 +1332,11 @@ fresh.material.dispose();
   };
 }
 
+/* ------------------------------- boot ------------------------------- */
+
+initWorktreeDemo();
+initSkillsDemo();
+initRevealDemo();
+initComposerDemo();
 applyLang();
 initScene();
