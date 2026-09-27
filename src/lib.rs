@@ -19,3 +19,4 @@ pub mod slash_catalog;
 pub mod store;
 pub mod telegram;
 pub mod ui;
+pub mod worktree;

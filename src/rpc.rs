@@ -95,6 +95,9 @@ pub mod error_code {
     pub const RESPONSE_TOO_LARGE: i64 = -32005;
     /// A turn is already running on the session — one at a time.
     pub const TURN_IN_PROGRESS: i64 = -32006;
+    /// A worktree operation failed — `error.data.kind` carries the
+    /// machine taxonomy (`pr_not_found`, `branch_exists`, …).
+    pub const WORKTREE_FAILED: i64 = -32007;
 }
 
 /// An error carrying a typed JSON-RPC code to the wire. Produced via
@@ -151,6 +154,16 @@ fn error_payload(e: &anyhow::Error) -> (i64, String, Option<Value>) {
             h.code.rpc_code(),
             e.to_string(),
             Some(json!({"code": h.code.as_str()})),
+        );
+    }
+    if let Some(w) = e
+        .chain()
+        .find_map(|c| c.downcast_ref::<crate::worktree::WorktreeError>())
+    {
+        return (
+            error_code::WORKTREE_FAILED,
+            e.to_string(),
+            Some(json!({"kind": w.kind})),
         );
     }
     (error_code::INTERNAL_ERROR, e.to_string(), None)
@@ -551,6 +564,13 @@ async fn dispatch(
                         "root": p.root,
                         "defaults": serde_json::from_str::<Value>(&p.defaults)
                             .unwrap_or_default(),
+                        // Worktree workspaces (worktree.create rows) are
+                        // the same shape plus their git facts; plain
+                        // projects read as before.
+                        "kind": p.kind,
+                        "parentId": p.parent_id,
+                        "meta": serde_json::from_str::<Value>(&p.meta)
+                            .unwrap_or_default(),
                     })
                 })
                 .collect();
@@ -565,6 +585,8 @@ async fn dispatch(
             Ok(json!({
                 "projectId": p.id, "name": p.name, "root": p.root,
                 "defaults": serde_json::from_str::<Value>(&p.defaults).unwrap_or_default(),
+                "kind": p.kind, "parentId": p.parent_id,
+                "meta": serde_json::from_str::<Value>(&p.meta).unwrap_or_default(),
             }))
         }
 
@@ -592,6 +614,234 @@ async fn dispatch(
                 .await
                 .map_err(|e| RpcError::error(error_code::INVALID_PARAMS, e.to_string()))?;
             Ok(json!({"deleted": true}))
+        }
+
+        "worktree.create" => {
+            use std::path::PathBuf;
+            let args = crate::worktree::CreateArgs {
+                repo: PathBuf::from(req_str(&params, "repo")?),
+                branch: params["branch"].as_str().map(String::from),
+                path: params["path"].as_str().map(PathBuf::from),
+                base_ref: params["baseRef"].as_str().map(String::from),
+                pr_number: params["prNumber"].as_u64(),
+                existing_branch: params["existingBranch"].as_bool().unwrap_or(false),
+            };
+            if args.branch.is_none() && args.pr_number.is_none() {
+                return Err(RpcError::error(
+                    error_code::INVALID_PARAMS,
+                    "branch or prNumber required",
+                ));
+            }
+            let creation_id = params["creationId"]
+                .as_str()
+                .map(String::from)
+                .unwrap_or_else(|| uuid::Uuid::new_v4().to_string());
+            let allowed = state.config.read().allowed_dirs.clone();
+            // Progress frames ride the requesting connection — the
+            // creator's surface is the one showing the pipeline; other
+            // clients see the finished project via project.list.
+            let pconn = conn.clone();
+            let pid = creation_id.clone();
+            let progress = move |stage: &str, message: &str| {
+                pconn.send(json!({
+                    "event": "worktree.progress",
+                    "creationId": pid,
+                    "data": {"stage": stage, "message": message},
+                }));
+            };
+            let cancel =
+                crate::worktree::register_creation(&state.worktrees, &creation_id);
+            let result = crate::worktree::create(
+                &state.store,
+                &cancel,
+                &progress,
+                &allowed,
+                args,
+            )
+            .await;
+            crate::worktree::finish_creation(&state.worktrees, &creation_id);
+            let outcome = result?;
+            Ok(json!({
+                "creationId": creation_id,
+                "projectId": outcome.project_id,
+                "parentProjectId": outcome.parent_project_id,
+                "path": outcome.path.to_string_lossy(),
+                "branch": outcome.branch,
+                "meta": outcome.meta,
+                "resumed": outcome.resumed,
+            }))
+        }
+
+        "worktree.cancel" => {
+            let id = req_str(&params, "creationId")?;
+            Ok(json!({
+                "cancelled": crate::worktree::cancel_creation(&state.worktrees, id)
+            }))
+        }
+
+        "worktree.remove" => {
+            let row = if let Some(id) = params["projectId"].as_str() {
+                Some(
+                    state
+                        .store
+                        .get_project(id)
+                        .await?
+                        .ok_or_else(|| {
+                            RpcError::error(
+                                error_code::INVALID_PARAMS,
+                                format!("unknown project {id}"),
+                            )
+                        })?,
+                )
+            } else if let Some(path) = params["path"].as_str() {
+                state.store.get_project_by_root(path).await?
+            } else {
+                return Err(RpcError::error(
+                    error_code::INVALID_PARAMS,
+                    "projectId or path required",
+                ));
+            };
+            let path = row
+                .as_ref()
+                .map(|r| r.root.clone())
+                .or_else(|| params["path"].as_str().map(String::from))
+                .ok_or_else(|| {
+                    RpcError::error(error_code::INVALID_PARAMS, "projectId or path required")
+                })?;
+            if let Some(r) = &row
+                && r.kind != "worktree"
+            {
+                return Err(RpcError::error(
+                    error_code::INVALID_PARAMS,
+                    format!("project {} is not a worktree (kind {:?})", r.id, r.kind),
+                ));
+            }
+            let meta: Value = row
+                .as_ref()
+                .and_then(|r| serde_json::from_str(&r.meta).ok())
+                .unwrap_or(json!({}));
+            let path_buf = std::path::PathBuf::from(&path);
+            let repo = match meta["repo"].as_str() {
+                Some(r) => std::path::PathBuf::from(r),
+                // No registered row (or pre-meta row): discover the
+                // owning repo from the checkout itself.
+                None => {
+                    let noop = crate::worktree::CreationCancel::noop();
+                    crate::worktree::discover_repo(&path_buf, &noop).await?
+                }
+            };
+            let branch = params["branch"]
+                .as_str()
+                .or(meta["branch"].as_str())
+                .map(String::from);
+            let delete_branch = params["deleteBranch"].as_bool().unwrap_or(false);
+            // Row first: a bound-sessions refusal must abort before any
+            // git side effect — the checkout outlives the row.
+            if let Some(r) = &row {
+                state
+                    .store
+                    .delete_project(&r.id)
+                    .await
+                    .map_err(|e| RpcError::error(error_code::INVALID_PARAMS, e.to_string()))?;
+            }
+            let out =
+                crate::worktree::remove_worktree_git(&repo, &path_buf, branch.as_deref(), delete_branch)
+                    .await;
+            Ok(json!({
+                "removed": true,
+                "orphanDirectory": out.orphan_directory,
+                "branchDeleted": out.branch_deleted,
+                "branchKeptReason": out.branch_kept_reason,
+            }))
+        }
+
+        "worktree.list" => {
+            let repo = if let Some(id) = params["projectId"].as_str() {
+                state
+                    .store
+                    .get_project(id)
+                    .await?
+                    .ok_or_else(|| {
+                        RpcError::error(error_code::INVALID_PARAMS, format!("unknown project {id}"))
+                    })?
+                    .root
+            } else {
+                req_str(&params, "repo")?.to_string()
+            };
+            let noop = crate::worktree::CreationCancel::noop();
+            let infos = crate::worktree::list_worktrees(std::path::Path::new(&repo), &noop).await?;
+            let rows = state.store.list_projects().await?;
+            let registered: Vec<Value> = rows
+                .iter()
+                .filter(|r| r.kind == "worktree")
+                .map(|r| {
+                    json!({
+                        "projectId": r.id,
+                        "name": r.name,
+                        "path": r.root,
+                        "parentId": r.parent_id,
+                        "meta": serde_json::from_str::<Value>(&r.meta).unwrap_or_default(),
+                    })
+                })
+                .collect();
+            let infos: Vec<Value> = infos
+                .iter()
+                .map(|w| {
+                    let project = rows.iter().find(|r| {
+                        r.kind == "worktree"
+                            && crate::worktree::same_path(
+                                std::path::Path::new(&r.root),
+                                std::path::Path::new(&w.path),
+                            )
+                    });
+                    json!({
+                        "path": w.path,
+                        "branch": w.branch,
+                        "head": w.head,
+                        "isMain": w.is_main,
+                        "locked": w.locked,
+                        "lockReason": w.lock_reason,
+                        "prunable": w.prunable,
+                        "projectId": project.map(|r| r.id.clone()),
+                    })
+                })
+                .collect();
+            Ok(json!({"repo": repo, "worktrees": infos, "registered": registered}))
+        }
+
+        "worktree.resolve_pr" => {
+            let repo = req_str(&params, "repo")?;
+            let input = req_str(&params, "input")?;
+            let branch = params["branch"].as_str();
+            let noop = crate::worktree::CreationCancel::noop();
+            let p =
+                crate::worktree::resolve_pr(std::path::Path::new(repo), &noop, input, branch)
+                    .await?;
+            Ok(json!({
+                "number": p.number,
+                "repo": p.repo,
+                "title": p.title,
+                "state": p.state,
+                "author": p.author,
+                "degraded": p.degraded,
+                "suggestedBranch": p.suggested_branch,
+                "suggestedPath": p.suggested_path,
+                "branchConflict": p.branch_conflict,
+                "dirConflict": p.dir_conflict,
+            }))
+        }
+
+        "worktree.merged" => {
+            let repo = req_str(&params, "repo")?;
+            let branch = req_str(&params, "branch")?;
+            let base = params["base"].as_str().unwrap_or("HEAD");
+            let merged = crate::worktree::branch_merged(
+                std::path::Path::new(repo),
+                branch,
+                base,
+            )
+            .await?;
+            Ok(json!({"merged": merged}))
         }
 
         "session.create" => {
@@ -2390,10 +2640,17 @@ pub fn rpc_methods() -> Vec<Value> {
         json!({"name": "prompts.delete", "params": {"promptPath": "string", "sessionId": "string?", "cwd": "string?"}, "result": {"deleted": "boolean — false when already gone"}}),
         json!({"name": "prompts.move", "params": {"promptPath": "string", "scope": "workspace | global — must differ from the current one", "sessionId": "string?", "cwd": "string?"}, "result": {"moved": "boolean", "path": "string"}}),
         json!({"name": "project.create", "params": {"name": "string?", "root": "string — absolute", "defaults?": "{backend?, model?, mode?, mcpServers?}"}, "result": {"projectId": "string", "name": "string", "root": "string", "defaults": "object"}}),
-        json!({"name": "project.list", "params": {}, "result": {"projects": "array of {projectId, name, root, defaults}"}}),
+        json!({"name": "project.list", "params": {}, "result": {"projects": "array of {projectId, name, root, defaults, kind: 'project'|'worktree', parentId?, meta: worktree git facts}"}}),
         json!({"name": "project.get", "params": {"projectId": "string"}, "result": {"projectId": "string", "name": "string", "root": "string", "defaults": "object"}}),
         json!({"name": "project.set_defaults", "params": {"projectId": "string", "defaults": "object — replaces the whole set"}, "result": {"updated": "boolean"}}),
         json!({"name": "project.delete", "params": {"projectId": "string"}, "result": {"deleted": "boolean — refuses -32602 while sessions reference the project"}}),
+        json!({"name": "worktree.create", "params": {"repo": "string — path inside the repo (resolved to its top level)", "branch": "string?", "prNumber": "number? — PR flow: fetches +refs/pull/N/head into branch (default name pr-N)", "path": "string? — worktree path (default <repo parent>/<repo>-worktrees/<branch>)", "baseRef": "string? — branch flow base (default HEAD)", "existingBranch": "boolean? — branch is expected to exist already", "creationId": "string? — echoes back; used to match worktree.progress events and target worktree.cancel"}, "result": {"creationId": "string", "projectId": "string — the registered worktree project (session.create {projectId} lands in it)", "parentProjectId": "string?", "path": "string", "branch": "string", "meta": "{branch, repo, prNumber?, prUrl?, baseRef?}", "resumed": "boolean — adopted an existing worktree-on-branch instead of re-adding"}, "errors": "-32007 data.kind: not_a_repo | invalid_branch | branch_not_found | branch_exists | branch_checked_out | dir_exists | not_allowed | no_origin | pr_not_found | fetch_failed | base_not_found | add_failed | sparse_checkout_empty | register_failed | canceled"}),
+        json!({"name": "worktree.progress", "kind": "event (not callable)", "shape": {"event": "worktree.progress", "creationId": "string", "data": {"stage": "validate | fetch | add | register | done", "message": "string"}}}),
+        json!({"name": "worktree.cancel", "params": {"creationId": "string"}, "result": {"cancelled": "boolean — false when no live creation holds the id"}}),
+        json!({"name": "worktree.remove", "params": {"projectId": "string? — or path", "path": "string?", "branch": "string? — defaults to the registered meta.branch", "deleteBranch": "boolean? — git branch -d then -D"}, "result": {"removed": "boolean", "orphanDirectory": "boolean — git refused and the dir needed a direct delete", "branchDeleted": "boolean", "branchKeptReason": "checked_out_elsewhere | unknown?"}}),
+        json!({"name": "worktree.list", "params": {"repo": "string? — or projectId", "projectId": "string?"}, "result": {"repo": "string", "worktrees": "array of {path, branch?, head, isMain, locked, lockReason?, prunable, projectId?} — git's own view (porcelain)", "registered": "array of {projectId, name, path, parentId?, meta} — damon's worktree project rows"}}),
+        json!({"name": "worktree.resolve_pr", "params": {"repo": "string", "input": "string — 1842 | #1842 | GitHub PR URL", "branch": "string? — pre-flight this branch name"}, "result": {"number": "number", "repo": "owner/repo", "title": "string? — via gh, absent when degraded", "state": "string?", "author": "string?", "degraded": "boolean — gh missing/hung; number+repo are still confirmed", "suggestedBranch": "string", "suggestedPath": "string", "branchConflict": "boolean", "dirConflict": "boolean"}, "errors": "-32007 data.kind: invalid_pr_input | no_origin | not_github"}),
+        json!({"name": "worktree.merged", "params": {"repo": "string", "branch": "string", "base": "string? — default HEAD"}, "result": {"merged": "boolean — false negatives for squash merges (no ancestry)"}}),
     ]
 }
 

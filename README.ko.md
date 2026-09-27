@@ -21,6 +21,7 @@ Damon은 Rust로 만든 로컬 에이전트 컨트롤 데몬이다. Claude Code,
 - **권한은 채널 그대로** — 에이전트의 권한 요청을 웹 UI, CLI, 텔레그램/디스코드/슬랙 채팅의 `allow`/`deny` 답장으로 릴레이한다.
 - **검색 가능한 히스토리** — 모든 대화를 SQLite + FTS5에 기록. `damon search "error timeout"`으로 전체 이력 전문 검색.
 - **스킬 허브 + 프롬프트 라이브러리** — 에이전트 스킬 패키지를 한 번 설치하면(`damon skills install anthropics/skills document-skills/pdf`) 허브가 설치된 각 CLI의 네이티브 스킬 디렉터리로 싱크한다(심볼릭링크, 실패 시 복사; 스킬 로딩은 여전히 CLI 자신이). GitHub 리포 디스커버리, skills.sh 검색, 재사용 프롬프트 관리 — 웹 UI의 `/`, `@`, `!` 피커가 전부 보게 된다. `[skills] enabled = false`로 끌 수 있다.
+- **워크트리 워크스페이스 — PR 하나, 에이전트 하나** — `damon worktree create . --pr 123`이 `refs/pull/123/head`를 격리된 `git worktree`로 받아 프로젝트로 등록하고, `session.create {projectId}`로 에이전트를 깨끗한 체크아웃에 배치한다. 스테이지 진행 실시간 표시(`validate → fetch → add → register`), fetch 도중 취소 가능, `gh` 기반 PR 미리보기(gh가 없어도 번호·리포는 확인), 세션이 묶여 있으면 제거 거부.
 - **채팅 채널 내장** — Telegram, Discord, Slack 어댑터가 별도 바이너리로 나간다. 채널별 세션 자동 매핑, 스트리밍 응답.
 - **시크릿은 Damon에 없다** — 에이전트가 자기 인증을 관리한다. Damon config는 포트와 토큰 정도뿐.
 - **어디서든 접근** — 자체 인증서로 `wss` 서빙, 또는 공개 호스트에 `damon-relay`를 띄우면 데몬이 아웃바운드로 연결한다(인바운드 포트 불필요). 터널은 X25519 + AES-256-GCM으로 E2E 암호화.

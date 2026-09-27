@@ -2,6 +2,52 @@
 
 ## Unreleased
 
+### Added — git worktree workspaces (design ported from desktop-cc-gui's `git_worktree.rs`, MIT)
+
+- **`worktree.*` RPC surface** — one PR, one isolated agent workspace:
+  `worktree.create` fetches `+refs/pull/<n>/head` (or a branch) and
+  checks it out as a `git worktree` in a staged pipeline
+  (validate → fetch → add → register → done), registering it as a
+  `kind:"worktree"` project row nested under the repo's own project
+  (auto-created on first use). `session.create {projectId}` lands an
+  agent inside the isolated checkout; the default layout is a sibling
+  `<repo>-worktrees/<branch>` directory so the main checkout stays
+  clean. All git goes through the CLI (killable mid-fetch, honest
+  stderr); no libgit2 dependency.
+- **Progress + cancellation** — each stage pushes a
+  `worktree.progress` frame to the requesting connection;
+  `worktree.cancel` kills the in-flight git process group (unix
+  process group / Windows `taskkill /T`) between and during stages.
+  A retry of a finished creation adopts the existing worktree
+  (`resumed: true`) instead of bouncing off `branch_exists`.
+- **Removal semantics** — `worktree.remove` deletes the project row
+  first, so a bound-sessions refusal aborts before any git effect;
+  then `git worktree remove --force` with a direct-delete + `prune`
+  fallback (`orphanDirectory`), and optional branch deletion
+  (`-d` then `-D`, `branchKeptReason` reports why a branch survived).
+- **PR resolution** — `worktree.resolve_pr` maps `1842` / `#1842` /
+  PR URLs to `owner/repo`, enriching title/state via `gh pr view`
+  behind a 3s deadline — a missing or hung gh degrades to
+  number+slug, never blocks the dialog. Suggested branch/path and
+  conflict flags pre-flight the form.
+- **Typed errors** — failures carry `-32007` with the machine kind in
+  `error.data.kind` (`pr_not_found`, `branch_exists`,
+  `branch_checked_out`, `sparse_checkout_empty`, `not_allowed`, …);
+  `allowed_dirs` gates the resolved worktree path exactly like
+  session cwds.
+- **Surfaces** — `damon worktree create|list|remove|pr` CLI group
+  (create streams stage lines to stderr) and a web-UI dialog
+  (⑂ Worktrees): repo defaults to the open session's cwd, PR preview,
+  live progress, "start a session here" (renames to `PR #N`), list
+  with open/remove. `project.list`/`project.get` now expose
+  `kind`/`parentId`/`meta` (additive).
+- **Tests** — `tests/worktree.rs`: real-git integration against a
+  local bare origin with a pushed `refs/pull/7/head` (no network):
+  happy path + progress frames, resume, branch_exists, remove +
+  bound-session refusal, dir_exists with the user directory
+  untouched, the allowed_dirs gate, resolve_pr forms/degradation, and
+  the method-catalog check.
+
 ### Added — skills hub + prompt library (design ported from desktop-cc-gui's `skills_hub`, MIT)
 
 - **`skills.*` RPC surface** — install agent-skill packages into the

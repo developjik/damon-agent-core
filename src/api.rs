@@ -195,6 +195,9 @@ pub struct AppState {
     rate_buckets: tokio::sync::Mutex<HashMap<IpAddr, (f64, Instant)>>,
     /// Skills hub state: root + fetcher + the mutation lock.
     pub skills: std::sync::Arc<crate::skills_hub::SkillsHub>,
+    /// In-flight `worktree.create` runs keyed by creationId — the
+    /// cancel handles `worktree.cancel` signals.
+    pub worktrees: crate::worktree::CreationRegistry,
 }
 
 impl AppState {
@@ -226,6 +229,7 @@ impl AppState {
             ws_tickets: tokio::sync::Mutex::new(HashMap::new()),
             rate_buckets: tokio::sync::Mutex::new(HashMap::new()),
             skills,
+            worktrees: crate::worktree::new_registry(),
         });
         // Idle session sweep: backend sessions unused for
         // agent_idle_secs are closed (they reattach via the persistence

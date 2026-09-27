@@ -220,7 +220,7 @@ impl NdjsonTransport {
 /// Windows `taskkill /T /F` walks the tree and must run *before*
 /// `child.kill()` reaps the wrapper — after the reap the walk can miss
 /// grandchildren that were still attached.
-async fn kill_tree(child: &mut Child) {
+pub(crate) async fn kill_tree(child: &mut Child) {
     #[cfg(unix)]
     if let Some(pid) = child.id() {
         // Best-effort group signal; the child.kill() that follows still

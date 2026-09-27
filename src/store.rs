@@ -68,12 +68,33 @@ pub struct SessionFilter {
 
 /// One projects row. `defaults` is the raw JSON string
 /// ({backend?, model?, mode?, mcpServers?}) — parsed at the RPC layer.
+/// `kind` distinguishes plain projects from worktree workspaces
+/// registered by `worktree.create`; a worktree row carries its git
+/// facts in `meta` ({branch, prNumber?, ...}) and points at the repo's
+/// own project via `parent_id`.
 #[derive(Debug, Clone)]
 pub struct ProjectRow {
     pub id: String,
     pub name: String,
     pub root: String,
     pub defaults: String,
+    pub kind: String,
+    pub parent_id: Option<String>,
+    pub meta: String,
+}
+
+/// Row mapper shared by every projects SELECT (column order:
+/// id, name, root, defaults, kind, parent_id, meta).
+fn project_row(r: &rusqlite::Row<'_>) -> rusqlite::Result<ProjectRow> {
+    Ok(ProjectRow {
+        id: r.get(0)?,
+        name: r.get(1)?,
+        root: r.get(2)?,
+        defaults: r.get(3)?,
+        kind: r.get(4)?,
+        parent_id: r.get(5)?,
+        meta: r.get(6)?,
+    })
 }
 
 /// Narrowing for full-text search. `since_ms`/`until_ms` are unix
@@ -273,7 +294,13 @@ impl Store {
                     root TEXT NOT NULL,
                     -- JSON: {backend?, model?, mode?, mcpServers?}
                     defaults TEXT NOT NULL DEFAULT '{}',
-                    created_at TEXT NOT NULL DEFAULT (datetime('now'))
+                    created_at TEXT NOT NULL DEFAULT (datetime('now')),
+                    -- 'project' | 'worktree' (worktree.create rows);
+                    -- meta mirrors the git facts: {branch, baseRef?,
+                    -- prNumber?, prTitle?, prUrl?, repo}
+                    kind TEXT NOT NULL DEFAULT 'project',
+                    parent_id TEXT,
+                    meta TEXT NOT NULL DEFAULT '{}'
                 );
                  CREATE INDEX IF NOT EXISTS idx_usage_session
                      ON usage(session_id, id);
@@ -393,6 +420,38 @@ impl Store {
                     // Same concurrent-damond duplicate-column re-check.
                     let now: std::collections::HashSet<String> = c
                         .prepare("PRAGMA table_info(messages)")?
+                        .query_map([], |r| r.get::<_, String>(1))?
+                        .collect::<Result<_, _>>()?;
+                    if !now.contains(col) {
+                        return Err(e.into());
+                    }
+                }
+            }
+            // Worktree workspaces (same column-existence pattern): a
+            // project row can now be kind='worktree' with a parent
+            // project and git metadata. Existing rows default to plain
+            // projects, which is what they always were.
+            let pcols: std::collections::HashSet<String> = c
+                .prepare("PRAGMA table_info(projects)")?
+                .query_map([], |r| r.get::<_, String>(1))?
+                .collect::<Result<_, _>>()?;
+            for (col, ddl) in [
+                (
+                    "kind",
+                    "ALTER TABLE projects ADD COLUMN kind TEXT NOT NULL DEFAULT 'project'",
+                ),
+                ("parent_id", "ALTER TABLE projects ADD COLUMN parent_id TEXT"),
+                (
+                    "meta",
+                    "ALTER TABLE projects ADD COLUMN meta TEXT NOT NULL DEFAULT '{}'",
+                ),
+            ] {
+                if !pcols.contains(col)
+                    && let Err(e) = c.execute_batch(ddl)
+                {
+                    // Same concurrent-damond duplicate-column re-check.
+                    let now: std::collections::HashSet<String> = c
+                        .prepare("PRAGMA table_info(projects)")?
                         .query_map([], |r| r.get::<_, String>(1))?
                         .collect::<Result<_, _>>()?;
                     if !now.contains(col) {
@@ -572,7 +631,10 @@ impl Store {
                     name TEXT NOT NULL DEFAULT '',
                     root TEXT NOT NULL,
                     defaults TEXT NOT NULL DEFAULT '{}',
-                    created_at TEXT NOT NULL DEFAULT (datetime('now'))
+                    created_at TEXT NOT NULL DEFAULT (datetime('now')),
+                    kind TEXT NOT NULL DEFAULT 'project',
+                    parent_id TEXT,
+                    meta TEXT NOT NULL DEFAULT '{}'
                 );
                 CREATE INDEX IF NOT EXISTS idx_sessions_agent
                     ON sessions(agent, agent_session);
@@ -1427,17 +1489,42 @@ impl Store {
         root: &str,
         defaults_json: &str,
     ) -> anyhow::Result<()> {
+        self.create_project_full(id, name, root, defaults_json, "project", None, "{}")
+            .await
+    }
+
+    /// Create a project or worktree row. Worktree rows (kind="worktree")
+    /// carry their parent project id and a raw-JSON `meta` of git facts;
+    /// the RPC layer validates the shape.
+    #[allow(clippy::too_many_arguments)]
+    pub async fn create_project_full(
+        &self,
+        id: &str,
+        name: &str,
+        root: &str,
+        defaults_json: &str,
+        kind: &str,
+        parent_id: Option<&str>,
+        meta_json: &str,
+    ) -> anyhow::Result<()> {
         let (id, name, root, d) = (
             id.to_string(),
             name.to_string(),
             root.to_string(),
             defaults_json.to_string(),
         );
+        let (kind, parent, meta) = (
+            kind.to_string(),
+            parent_id.map(String::from),
+            meta_json.to_string(),
+        );
         self.conn
             .call(move |c| {
                 c.execute(
-                    "INSERT INTO projects (id, name, root, defaults) VALUES (?1, ?2, ?3, ?4)",
-                    rusqlite::params![id, name, root, d],
+                    "INSERT INTO projects
+                        (id, name, root, defaults, kind, parent_id, meta)
+                     VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+                    rusqlite::params![id, name, root, d, kind, parent, meta],
                 )?;
                 Ok::<(), tokio_rusqlite::Error>(())
             })
@@ -1452,16 +1539,31 @@ impl Store {
             .conn
             .call(move |c| {
                 c.query_row(
-                    "SELECT id, name, root, defaults FROM projects WHERE id = ?1",
+                    "SELECT id, name, root, defaults, kind, parent_id, meta
+                     FROM projects WHERE id = ?1",
                     [&id],
-                    |r| {
-                        Ok(ProjectRow {
-                            id: r.get(0)?,
-                            name: r.get(1)?,
-                            root: r.get(2)?,
-                            defaults: r.get(3)?,
-                        })
-                    },
+                    project_row,
+                )
+                .optional()
+                .map_err(tokio_rusqlite::Error::from)
+            })
+            .await?)
+    }
+
+    /// One project row by workspace root; None when no row (project or
+    /// worktree) claims that path. The worktree flow uses this to find
+    /// (or create) the parent project for a repo.
+    pub async fn get_project_by_root(&self, root: &str) -> anyhow::Result<Option<ProjectRow>> {
+        let root = root.to_string();
+        Ok(self
+            .conn
+            .call(move |c| {
+                c.query_row(
+                    "SELECT id, name, root, defaults, kind, parent_id, meta
+                     FROM projects WHERE root = ?1
+                     ORDER BY kind != 'project', created_at LIMIT 1",
+                    [&root],
+                    project_row,
                 )
                 .optional()
                 .map_err(tokio_rusqlite::Error::from)
@@ -1475,19 +1577,37 @@ impl Store {
             .conn
             .call(move |c| {
                 let mut stmt = c.prepare(
-                    "SELECT id, name, root, defaults FROM projects ORDER BY created_at, id",
+                    "SELECT id, name, root, defaults, kind, parent_id, meta
+                     FROM projects ORDER BY created_at, id",
                 )?;
                 let rows = stmt
-                    .query_map([], |r| {
-                        Ok(ProjectRow {
-                            id: r.get(0)?,
-                            name: r.get(1)?,
-                            root: r.get(2)?,
-                            defaults: r.get(3)?,
-                        })
-                    })?
+                    .query_map([], project_row)?
                     .collect::<Result<Vec<_>, _>>()?;
                 Ok::<Vec<ProjectRow>, tokio_rusqlite::Error>(rows)
+            })
+            .await?)
+    }
+
+    /// Update a worktree row's parent link and git metadata (used when
+    /// `worktree.create` re-registers an already-registered path, e.g.
+    /// a retry after a crash between register stages). Returns whether
+    /// a row changed.
+    pub async fn set_project_meta(
+        &self,
+        id: &str,
+        parent_id: Option<&str>,
+        meta_json: &str,
+    ) -> anyhow::Result<bool> {
+        let (id, parent, meta) = (id.to_string(), parent_id.map(String::from), meta_json.to_string());
+        Ok(self
+            .conn
+            .call(move |c| {
+                Ok::<bool, tokio_rusqlite::Error>(
+                    c.execute(
+                        "UPDATE projects SET parent_id = ?2, meta = ?3 WHERE id = ?1",
+                        rusqlite::params![id, parent, meta],
+                    )? != 0,
+                )
             })
             .await?)
     }

@@ -796,6 +796,48 @@
     cursor: pointer; font-size: 12px; display: grid; place-items: center;
   }
   #skClose:hover { color: var(--fg); border-color: var(--border2); }
+
+  /* ---- worktree panel (mirrors the skills dialog) ---- */
+  #wtBackdrop {
+    display: none; position: fixed; inset: 0; z-index: 26;
+    background: rgba(0,0,0,.5); border: 0; padding: 0; cursor: pointer;
+    backdrop-filter: blur(2px);
+  }
+  body.wt-open #wtBackdrop { display: block; }
+  #wtPanel {
+    display: none; position: fixed; z-index: 27;
+    left: 50%; top: 50%; transform: translate(-50%, -50%);
+    width: min(680px, 94vw); height: min(560px, 88vh);
+    background: var(--bg2); border: 1px solid var(--border); border-radius: 12px;
+    flex-direction: column; overflow: hidden;
+    box-shadow: 0 18px 60px rgba(0,0,0,.5);
+  }
+  body.wt-open #wtPanel { display: flex; }
+  #wtClose {
+    margin-left: auto; border: 1px solid var(--border); background: var(--panel);
+    color: var(--muted); width: 26px; height: 26px; border-radius: 7px;
+    cursor: pointer; font-size: 12px; display: grid; place-items: center;
+  }
+  #wtClose:hover { color: var(--fg); border-color: var(--border2); }
+  #wtBody { flex: 1; min-height: 0; overflow-y: auto; padding: 12px 16px 16px; }
+  .wtField { display: flex; align-items: center; gap: 8px; margin-bottom: 8px; }
+  .wtLabel { width: 84px; flex: none; font-size: 11.5px; color: var(--muted); }
+  .wtInput {
+    flex: 1; min-width: 0; background: var(--panel); border: 1px solid var(--border);
+    color: var(--fg); border-radius: 7px; padding: 7px 9px; font: 12.5px/1.3 inherit;
+  }
+  .wtPreview { font-size: 11.5px; color: var(--muted); margin: 6px 0; min-height: 16px; white-space: pre-wrap; }
+  .wtProgress { font-size: 11.5px; color: var(--accent); margin: 6px 0 12px; min-height: 16px; white-space: pre-wrap; }
+  .wtRow {
+    display: flex; align-items: center; gap: 8px;
+    padding: 7px 0; border-bottom: 1px solid var(--border);
+  }
+  .wtRow:last-child { border-bottom: 0; }
+  .wtName { font-size: 12.5px; font-weight: 600; flex: none; }
+  .wtPath {
+    flex: 1; min-width: 0; font-size: 10.5px; color: var(--faint);
+    overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
+  }
   #skBody { flex: 1; min-height: 0; overflow-y: auto; padding: 12px 16px 16px; }
   .skToolbar { display: flex; gap: 8px; margin-bottom: 10px; flex-wrap: wrap; }
   .skToolbar input[type="search"], .skForm input[type="text"] {
@@ -863,6 +905,7 @@
     <button id="newBtn">+ New session</button>
     <button id="importBtn" title="Import a session the agent made outside damon">⇩ Import</button>
     <button id="skillsBtn" title="Skills hub — install agent skills and manage prompts">✦ Skills</button>
+    <button id="wtBtn" title="Worktrees — one PR, one isolated agent workspace">⑂ Worktrees</button>
     <input id="search" type="search" placeholder="search history…" title="Full-text search over all sessions (Ctrl/Cmd+K)">
     <div id="sessions"></div>
   </aside>
@@ -957,6 +1000,14 @@
       <button id="skClose" aria-label="Close">✕</button>
     </div>
     <div id="skBody" role="tabpanel"></div>
+  </div>
+  <button id="wtBackdrop" aria-label="Close worktrees panel" tabindex="-1"></button>
+  <div id="wtPanel" role="dialog" aria-modal="true" aria-label="Worktree workspaces" inert>
+    <div class="skHead">
+      <h2>⑂ Worktrees</h2>
+      <button id="wtClose" aria-label="Close">✕</button>
+    </div>
+    <div id="wtBody"></div>
   </div>
   <aside id="setPanel" role="dialog" aria-modal="true" aria-label="Settings and status" inert>
     <div class="setHead">
@@ -1528,6 +1579,7 @@ async function connect() {
     try { v = JSON.parse(ev.data); } catch { return; }
     if (v.id !== undefined) onResponse(v);
     else if (v.event === "session.event") onSessionEvent(v);
+    else if (v.event === "worktree.progress") onWorktreeProgress(v);
     else if (v.hello) daemonInfo = Object.assign(daemonInfo || {}, v.hello);
   };
   ws.onclose = (ev) => {
@@ -3655,6 +3707,259 @@ function hubErr(e) {
   const code = e && e.rpc && e.rpc.data && e.rpc.data.code;
   return { code: code || "error", message: (e && e.message) || String(e) };
 }
+
+// ---------- worktree panel ----------
+// One PR, one isolated agent workspace: fetch refs/pull/N/head, check
+// it out as a git worktree, register it as a project, and open a
+// session inside it. The create pipeline pushes worktree.progress
+// frames; only the progress line re-renders (never the form — typing
+// must survive stage updates).
+const wt = {
+  list: null,
+  creating: null, // {creationId, stages[], message, result, error}
+};
+
+function openWorktrees() {
+  document.body.classList.add("wt-open");
+  $("wtPanel").inert = false;
+  buildWorktreeDOM();
+  refreshWorktreeList();
+}
+function closeWorktrees() {
+  document.body.classList.remove("wt-open");
+  $("wtPanel").inert = true;
+}
+$("wtBtn").onclick = openWorktrees;
+$("wtClose").onclick = closeWorktrees;
+$("wtBackdrop").onclick = closeWorktrees;
+document.addEventListener("keydown", e => {
+  if (e.key === "Escape" && document.body.classList.contains("wt-open")) closeWorktrees();
+});
+
+function wtErrText(e) {
+  const kind = e && e.rpc && e.rpc.data && e.rpc.data.kind;
+  return (kind ? kind + ": " : "") + ((e && e.message) || String(e));
+}
+
+function buildWorktreeDOM() {
+  const body = $("wtBody");
+  body.textContent = "";
+  // The active session's cwd is the most likely repo.
+  const cur = (sessionsCache || []).find(s => s.sessionId === activeSession);
+
+  const repoRow = el("div", "wtField");
+  repoRow.append(el("label", "wtLabel", "repo"));
+  const repoInput = el("input", "wtInput");
+  repoInput.id = "wtRepo";
+  repoInput.spellcheck = false;
+  repoInput.placeholder = "/path/inside/the/repo";
+  repoInput.value = (cur && cur.cwd) || "";
+  repoRow.append(repoInput);
+  body.append(repoRow);
+
+  const prRow = el("div", "wtField");
+  prRow.append(el("label", "wtLabel", "PR or branch"));
+  const prInput = el("input", "wtInput");
+  prInput.id = "wtInput";
+  prInput.spellcheck = false;
+  prInput.placeholder = "PR number / #num / URL — or a branch name";
+  prRow.append(prInput);
+  const previewBtn = el("button", "skBtn", "preview");
+  previewBtn.onclick = wtPreview;
+  prRow.append(previewBtn);
+  body.append(prRow);
+
+  const preview = el("div", "wtPreview");
+  preview.id = "wtPreview";
+  body.append(preview);
+
+  const actRow = el("div", "wtField");
+  const createBtn = el("button", "skBtn primary", "create worktree");
+  createBtn.id = "wtCreate";
+  createBtn.onclick = wtCreate;
+  actRow.append(createBtn);
+  body.append(actRow);
+
+  const prog = el("div", "wtProgress");
+  prog.id = "wtProgress";
+  body.append(prog);
+
+  body.append(el("div", "panelHead", "worktrees"));
+  const listBar = el("div", "skToolbar");
+  const refBtn = el("button", "skBtn", "refresh");
+  refBtn.onclick = refreshWorktreeList;
+  listBar.append(refBtn);
+  body.append(listBar);
+  const list = el("div");
+  list.id = "wtList";
+  body.append(list);
+}
+
+// Digits / #digits / a URL with /pull/<n> — anything else is a branch.
+function wtPrNumber(input) {
+  const t = input.trim();
+  if (/^#\d+$/.test(t)) return Number(t.slice(1));
+  if (/^\d+$/.test(t)) return Number(t);
+  const m = t.match(/\/pull\/(\d+)/);
+  if (m && /^https?:\/\//.test(t)) return Number(m[1]);
+  return null;
+}
+
+function wtPreview() {
+  const repo = $("wtRepo").value.trim();
+  const input = $("wtInput").value.trim();
+  const p = $("wtPreview");
+  if (!repo || !input) { p.textContent = "repo and PR/branch required"; return; }
+  const n = wtPrNumber(input);
+  if (n === null) {
+    p.textContent = `branch ${input} — checked out as a worktree`;
+    return;
+  }
+  p.textContent = "resolving…";
+  request("worktree.resolve_pr", { repo, input })
+    .then(r => {
+      p.textContent =
+        `#${r.number} ${r.repo}` +
+        (r.degraded
+          ? " — gh unavailable, number and repo confirmed"
+          : ` — ${r.state || "?"} · ${r.title || "(untitled)"}` + (r.author ? ` · ${r.author}` : "")) +
+        (r.branchConflict ? `\n⚠ branch ${r.suggestedBranch} already exists` : "") +
+        (r.dirConflict ? `\n⚠ ${r.suggestedPath} already exists` : "");
+    })
+    .catch(e => { p.textContent = wtErrText(e); });
+}
+
+function onWorktreeProgress(v) {
+  if (!wt.creating || v.creationId !== wt.creating.creationId) return;
+  const d = v.data || {};
+  if (d.stage) {
+    wt.creating.stages.push(d.stage);
+    wt.creating.message = d.message || "";
+  }
+  renderWtProgress();
+}
+
+function wtCreate() {
+  const repo = $("wtRepo").value.trim();
+  const input = $("wtInput").value.trim();
+  if (!repo) { $("wtPreview").textContent = "repo is required"; return; }
+  if (!input) { $("wtPreview").textContent = "PR number or branch is required"; return; }
+  const params = {
+    repo,
+    creationId: "wt-" + Date.now().toString(36) + "-" + Math.random().toString(36).slice(2, 8),
+  };
+  const n = wtPrNumber(input);
+  if (n !== null) params.prNumber = n;
+  else params.branch = input;
+  wt.creating = { creationId: params.creationId, stages: [], message: "", result: null, error: null };
+  renderWtProgress();
+  request("worktree.create", params)
+    .then(r => {
+      wt.creating.result = r;
+      renderWtProgress();
+      refreshWorktreeList();
+    })
+    .catch(e => {
+      wt.creating.error = e;
+      renderWtProgress();
+    });
+}
+
+function renderWtProgress() {
+  const p = $("wtProgress");
+  if (!p || !wt.creating) return;
+  p.textContent = "";
+  if (wt.creating.error) {
+    p.style.color = "var(--err)";
+    p.textContent = "✕ " + wtErrText(wt.creating.error);
+    return;
+  }
+  p.style.color = "";
+  if (wt.creating.result) {
+    const r = wt.creating.result;
+    p.textContent =
+      "✓ " + (r.resumed ? "adopted existing worktree — " : "") + r.path;
+    const start = el("button", "skBtn primary", "start a session here");
+    start.style.marginLeft = "8px";
+    start.onclick = async () => {
+      try {
+        const s = await request("session.create", { projectId: r.projectId });
+        if (r.meta && r.meta.prNumber)
+          request("session.rename", { sessionId: s.sessionId, title: "PR #" + r.meta.prNumber }).catch(() => {});
+        closeWorktrees();
+        await selectSession(s.sessionId);
+      } catch (e) {
+        p.style.color = "var(--err)";
+        p.textContent = "✕ session: " + wtErrText(e);
+      }
+    };
+    p.append(start);
+    return;
+  }
+  p.textContent =
+    wt.creating.stages.map(s => "· " + s).join("  ") +
+    (wt.creating.message ? "  " + wt.creating.message : "");
+}
+
+function refreshWorktreeList() {
+  const list = $("wtList");
+  const repo = $("wtRepo").value.trim();
+  if (!list) return;
+  if (!repo) { list.textContent = "set a repo above to list its worktrees"; return; }
+  list.textContent = "loading…";
+  request("worktree.list", { repo })
+    .then(r => renderWtList(r))
+    .catch(e => { list.textContent = wtErrText(e); });
+}
+
+function renderWtList(r) {
+  const list = $("wtList");
+  list.textContent = "";
+  const rows = (r.worktrees || []).filter(w => !w.isMain);
+  if (!rows.length) {
+    list.append(el("div", "skEmpty", "no worktrees yet — create one above"));
+    return;
+  }
+  for (const w of rows) {
+    const row = el("div", "wtRow");
+    const label = (w.branch || "(detached)") +
+      (w.locked ? " 🔒" : "") +
+      (w.prunable ? " ⚠ dir missing" : "");
+    row.append(el("div", "wtName", label));
+    row.append(el("div", "wtPath", w.path));
+    if (w.projectId) {
+      const open = el("button", "skBtn", "open");
+      open.onclick = async () => {
+        try {
+          const s = await request("session.create", { projectId: w.projectId });
+          await selectSession(s.sessionId);
+        } catch (e) { $("wtPreview").textContent = wtErrText(e); }
+      };
+      row.append(open);
+    }
+    const rm = el("button", "skBtn danger", "remove");
+    rm.title = "removes the checkout and its project row" +
+      ((w.branch || "").startsWith("pr-") ? " and the pr-* branch" : "");
+    rm.onclick = async () => {
+      if (!confirm(`remove worktree ${w.branch || w.path}?`)) return;
+      const isPr = (w.branch || "").startsWith("pr-");
+      const params = w.projectId
+        ? { projectId: w.projectId, deleteBranch: isPr }
+        : { path: w.path, deleteBranch: isPr };
+      try {
+        const res = await request("worktree.remove", params);
+        let note = "";
+        if (res.orphanDirectory) note = "git refused — directory deleted directly; run `git worktree prune` in the repo";
+        if (res.branchKeptReason) note += (note ? " · " : "") + `branch kept (${res.branchKeptReason})`;
+        $("wtPreview").textContent = note;
+        refreshWorktreeList();
+      } catch (e) { $("wtPreview").textContent = wtErrText(e); }
+    };
+    row.append(rm);
+    list.append(row);
+  }
+}
+
 
 function renderSkillsPanel() {
   const body = skBody();

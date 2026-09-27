@@ -45,6 +45,7 @@ parsing messages:
 | `-32004` | `max_sessions` cap reached | close/delete a session first |
 | `-32005` | response over the 1 MiB frame budget | page via `limit`/`offset` |
 | `-32006` | a turn is already running on the session | wait for `turn.*` events, or `turn.cancel` first |
+| `-32007` | worktree operation failed — `error.data.kind` carries the taxonomy | branch on `data.kind` (`pr_not_found`, `branch_exists`, …) |
 
 Pre-0.5.0 daemons answered every error with `-32000`; messages are
 unchanged, so string-matching clients keep working.
@@ -119,10 +120,27 @@ unchanged, so string-matching clients keep working.
 | `prompts.delete` | `{promptPath, sessionId?, cwd?}` | `{deleted: bool}` — false when already gone |
 | `prompts.move` | `{promptPath, scope, sessionId?, cwd?}` — must differ from the current scope | `{moved: true, path}` |
 | `project.create` | `{name?, root, defaults?}` | `{projectId, name, root, defaults}` — root must be absolute; defaults keys: backend/model/mode/mcpServers |
-| `project.list` | `{}` | `{projects: [{projectId, name, root, defaults}]}` |
-| `project.get` | `{projectId}` | `{projectId, name, root, defaults}` |
+| `project.list` | `{}` | `{projects: [{projectId, name, root, defaults, kind: "project"\|"worktree", parentId?, meta}]}` — worktree rows carry their git facts in `meta` |
+| `project.get` | `{projectId}` | `{projectId, name, root, defaults, kind, parentId?, meta}` |
 | `project.set_defaults` | `{projectId, defaults}` | `{updated: bool}` — replaces the whole set |
 | `project.delete` | `{projectId}` | `{deleted: true}` — refuses `-32602` while sessions reference the project |
+| `worktree.create` | `{repo, branch?, prNumber?, path?, baseRef?, existingBranch?, creationId?}` — `repo` resolves to its top level; PR flow fetches `+refs/pull/N/head` into `branch` (default name `pr-N`); default path `<repo parent>/<repo>-worktrees/<branch>`; `existingBranch` expects the branch to exist | `{creationId, projectId, parentProjectId?, path, branch, meta: {branch, repo, prNumber?, prUrl?, baseRef?}, resumed}` — the worktree registers as a `kind:"worktree"` project; `session.create {projectId}` lands an agent in it; `resumed` adopted an existing worktree-on-branch |
+| `worktree.cancel` | `{creationId}` | `{cancelled: bool}` — false when no live creation holds the id; kills the in-flight git process group |
+| `worktree.remove` | `{projectId?, path?, branch?, deleteBranch?}` — row removal happens first, so a bound-sessions refusal (`-32602`) aborts before any git effect | `{removed: true, orphanDirectory, branchDeleted, branchKeptReason?}` — git's own remove is always `--force`; a refusal falls back to a direct delete + `worktree prune` |
+| `worktree.list` | `{repo? \| projectId?}` | `{repo, worktrees: [{path, branch?, head, isMain, locked, lockReason?, prunable, projectId?}], registered: [{projectId, name, path, parentId?, meta}]}` — git's porcelain view joined with damon's rows |
+| `worktree.resolve_pr` | `{repo, input, branch?}` — `input` is `1842`, `#1842`, or a GitHub PR URL; details come from `gh pr view` (3s deadline) | `{number, repo: "owner/repo", title?, state?, author?, degraded, suggestedBranch, suggestedPath, branchConflict, dirConflict}` — `degraded` means gh was missing/hung; number and slug are still confirmed |
+| `worktree.merged` | `{repo, branch, base? — default HEAD}` | `{merged: bool}` — ancestry check; squash merges report false |
+
+`worktree.create` errors are `-32007` with `data.kind`:
+`not_a_repo`, `invalid_branch`, `branch_not_found`, `branch_exists`,
+`branch_checked_out`, `dir_exists`, `not_allowed` (the resolved path
+is outside `allowed_dirs`), `no_origin`, `pr_not_found`,
+`fetch_failed`, `base_not_found`, `add_failed`,
+`sparse_checkout_empty`, `register_failed`, `canceled`. Creation
+progress arrives on the requesting connection as
+`{"event":"worktree.progress","creationId","data":{"stage","message"}}`
+with stages `validate → fetch → add → register → done` — one frame per
+stage, so a long fetch is not silent.
 
 `session.search` queries are tokenized, never passed to the FTS5
 parser raw: quoted spans are phrases, `AND`/`OR`/`NOT` pass through,

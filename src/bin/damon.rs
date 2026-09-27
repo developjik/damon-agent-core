@@ -152,6 +152,11 @@ enum Cmd {
         #[command(subcommand)]
         cmd: SkillsCmd,
     },
+    /// Worktree workspaces: one PR, one isolated agent checkout
+    Worktree {
+        #[command(subcommand)]
+        cmd: WorktreeCmd,
+    },
     /// Print shell completions to stdout
     Completions {
         /// Shell to generate completions for
@@ -214,6 +219,53 @@ enum ReposCmd {
     Add { spec: String },
     /// Remove by owner name
     Remove { owner: String, name: String },
+}
+
+#[derive(Subcommand)]
+enum WorktreeCmd {
+    /// Create a worktree from a PR or branch, register it as a project
+    Create {
+        /// Path inside the repo (resolved to its top level)
+        repo: String,
+        /// PR number — fetches refs/pull/N/head into a pr-N branch
+        #[arg(long)]
+        pr: Option<u64>,
+        /// Branch to check out (new branches base on --base)
+        #[arg(long)]
+        branch: Option<String>,
+        /// Base ref for a new branch (default HEAD)
+        #[arg(long)]
+        base: Option<String>,
+        /// Explicit worktree path (default <repo parent>/<repo>-worktrees/<branch>)
+        #[arg(long)]
+        path: Option<String>,
+        /// The branch is expected to exist already
+        #[arg(long)]
+        existing_branch: bool,
+    },
+    /// List git's worktrees for a repo plus damon's registered rows
+    List {
+        /// Path inside the repo
+        repo: String,
+    },
+    /// Remove a worktree (git cleanup + project row)
+    Remove {
+        /// Worktree path (or --project)
+        path: Option<String>,
+        /// Registered worktree project id
+        #[arg(long)]
+        project: Option<String>,
+        /// Delete the branch too (git branch -d, then -D)
+        #[arg(long)]
+        delete_branch: bool,
+    },
+    /// Resolve a PR number/URL to title/state (gh provides the details)
+    Pr {
+        /// Path inside the repo
+        repo: String,
+        /// PR number, #number, or GitHub PR URL
+        input: String,
+    },
 }
 
 #[tokio::main]
@@ -304,6 +356,10 @@ async fn main() -> anyhow::Result<()> {
 
         Cmd::Skills { cmd } => {
             skills_command(&client, args.json, cmd).await?;
+        }
+
+        Cmd::Worktree { cmd } => {
+            worktree_command(&client, args.json, cmd).await?;
         }
 
         Cmd::Logs { follow, lines } => {
@@ -871,6 +927,144 @@ async fn skills_command(
                 outln("removed");
             }
         },
+    }
+    Ok(())
+}
+
+async fn worktree_command(
+    client: &DamonClient,
+    json_out: bool,
+    cmd: WorktreeCmd,
+) -> anyhow::Result<()> {
+    match cmd {
+        WorktreeCmd::Create {
+            repo,
+            pr,
+            branch,
+            base,
+            path,
+            existing_branch,
+        } => {
+            if pr.is_none() && branch.is_none() {
+                anyhow::bail!("--pr or --branch is required");
+            }
+            // The create request blocks through the whole pipeline;
+            // drain its progress frames to stderr so a long fetch is
+            // not silent.
+            let mut events = client.events().await;
+            let progress = tokio::spawn(async move {
+                while let Some(ev) = events.recv().await {
+                    if let ClientEvent::Event { event, .. } = ev
+                        && let Some(stage) = event["stage"].as_str()
+                    {
+                        eprintln!("[{stage}] {}", event["message"].as_str().unwrap_or(""));
+                    }
+                }
+            });
+            let mut params = json!({"repo": repo, "existingBranch": existing_branch});
+            if let Some(n) = pr {
+                params["prNumber"] = json!(n);
+            }
+            if let Some(b) = branch {
+                params["branch"] = json!(b);
+            }
+            if let Some(b) = base {
+                params["baseRef"] = json!(b);
+            }
+            if let Some(p) = path {
+                params["path"] = json!(p);
+            }
+            let r = client.request("worktree.create", params).await;
+            progress.abort();
+            let r = r?;
+            if json_out {
+                outln(r.to_string());
+            } else {
+                outln(format!(
+                    "{}\t{}\t{}",
+                    r["path"].as_str().unwrap_or("?"),
+                    r["branch"].as_str().unwrap_or("?"),
+                    r["projectId"].as_str().unwrap_or("?"),
+                ));
+                outln(format!(
+                    "session.create {{\"projectId\": {:?}}} lands an agent here",
+                    r["projectId"].as_str().unwrap_or("?")
+                ));
+            }
+        }
+        WorktreeCmd::List { repo } => {
+            let r = client.request("worktree.list", json!({"repo": repo})).await?;
+            if json_out {
+                outln(r.to_string());
+            } else {
+                for w in r["worktrees"].as_array().into_iter().flatten() {
+                    outln(format!(
+                        "{}\t{}\t{}{}{}",
+                        w["path"].as_str().unwrap_or("?"),
+                        w["branch"].as_str().unwrap_or(
+                            if w["isMain"].as_bool().unwrap_or(false) {
+                                "(main)"
+                            } else {
+                                "(detached)"
+                            }
+                        ),
+                        if w["isMain"].as_bool().unwrap_or(false) { "main" } else { "" },
+                        if w["locked"].as_bool().unwrap_or(false) { " locked" } else { "" },
+                        if w["prunable"].as_bool().unwrap_or(false) { " prunable" } else { "" },
+                    ));
+                }
+            }
+        }
+        WorktreeCmd::Remove {
+            path,
+            project,
+            delete_branch,
+        } => {
+            if path.is_none() && project.is_none() {
+                anyhow::bail!("a worktree path or --project is required");
+            }
+            let mut params = json!({"deleteBranch": delete_branch});
+            if let Some(p) = path {
+                params["path"] = json!(p);
+            }
+            if let Some(p) = project {
+                params["projectId"] = json!(p);
+            }
+            let r = client.request("worktree.remove", params).await?;
+            if json_out {
+                outln(r.to_string());
+            } else {
+                outln("removed");
+                if r["orphanDirectory"].as_bool().unwrap_or(false) {
+                    outln("note: git refused — directory deleted directly, run `git worktree prune`");
+                }
+                if let Some(reason) = r["branchKeptReason"].as_str() {
+                    outln(format!("note: branch kept ({reason})"));
+                }
+            }
+        }
+        WorktreeCmd::Pr { repo, input } => {
+            let r = client
+                .request("worktree.resolve_pr", json!({"repo": repo, "input": input}))
+                .await?;
+            if json_out {
+                outln(r.to_string());
+            } else {
+                outln(format!(
+                    "#{}\t{}\t{}",
+                    r["number"].as_u64().unwrap_or(0),
+                    r["repo"].as_str().unwrap_or("?"),
+                    r["title"].as_str().unwrap_or(if r["degraded"].as_bool().unwrap_or(false) {
+                        "(gh unavailable — number confirmed)"
+                    } else {
+                        "?"
+                    }),
+                ));
+                if let Some(b) = r["suggestedBranch"].as_str() {
+                    outln(format!("suggested branch: {b}"));
+                }
+            }
+        }
     }
     Ok(())
 }
