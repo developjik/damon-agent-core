@@ -230,10 +230,14 @@ async fn create_pr_worktree_registers_project_and_resumes() {
         .expect("worktree project row");
     assert_eq!(wt["kind"], "worktree");
     assert_eq!(wt["parentId"], parent_id.as_str());
+    let canon_repo = std::fs::canonicalize(&repo).unwrap();
     assert!(
         projects.iter().any(|p| p["projectId"] == parent_id.as_str()
             && p["kind"] == "project"
-            && Path::new(p["root"].as_str().unwrap()) == std::fs::canonicalize(&repo).unwrap()),
+            && p["root"]
+                .as_str()
+                .and_then(|r| std::fs::canonicalize(r).ok())
+                .is_some_and(|root| root == canon_repo)),
         "parent project auto-created for the repo root"
     );
 
