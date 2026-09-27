@@ -17,7 +17,7 @@ The name is a pun on *daemon*, and literally the architecture.
 
 If you already subscribe to an agent CLI, **there is nothing to configure**. Damon detects the installed CLIs and inherits their logins and tools. Token rotation, provider translation, API keys — not Damon's problem anymore.
 
-- **Zero-config backends** — a catalog CLI binary on PATH registers itself: `claude` (stream-json), `codex` (app-server), `omp` (RPC mode), `cursor-agent`, `amp`, `kimi`, `qwen`, `gemini` (stream-json). Any other agent plugs in via an explicit `[backends.X]` block.
+- **Zero-config backends** — a catalog CLI binary on PATH registers itself: `claude` (stream-json), `codex` (app-server), `omp` (RPC mode), `pi` (RPC mode, omp's protocol family), `qwen` (stream-json, Claude-shaped control plane), `droid` (JSON-RPC, Factory), `opencode`+`mimo` (HTTP+SSE, adopts or spawns `serve`), `zcode` (Z.ai app-server). Every listed backend speaks a native bidirectional protocol — token streaming, mid-turn permission asks, interrupt — so the catalog only admits CLIs Damon can drive fully. `[backends.X]` overrides launch lines; it does not add protocols.
 - **Permissions flow to your surface** — the agent's permission ask is relayed to the web UI, CLI, or a Telegram/Discord/Slack `allow`/`deny` reply.
 - **Searchable history** — every conversation lands in SQLite + FTS5. `damon search "error timeout"` full-text-searches all of it.
 - **Chat channels built in** — Telegram, Discord, and Slack adapters ship as separate binaries. Per-chat session mapping, streamed replies.
@@ -94,10 +94,9 @@ One TOML file in the platform config dir; hot-reloaded:
 # [backends.claude.env]
 # ANTHROPIC_MODEL = "claude-sonnet-4-5"
 
-# MCP servers forwarded to every session (agents spawn and permission them):
-# [mcp_servers.filesystem]
-# command = "npx"
-# args    = ["-y", "@modelcontextprotocol/server-filesystem", "/tmp"]
+# MCP servers are per-session, not daemon config: pass `mcpServers` in
+# session.create — the agent spawns and permissions them itself
+# (claude forwards them today; other backends ignore the param).
 ```
 
 Full reference: [config.example.toml](config.example.toml).

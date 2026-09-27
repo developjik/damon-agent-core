@@ -17,7 +17,7 @@ Damon은 Rust로 만든 로컬 에이전트 컨트롤 데몬이다. Claude Code,
 
 이미 에이전트 CLI를 구독으로 쓰고 있다면 **설정이 하나도 없다**. Damon은 설치된 CLI를 감지하고, 로그인 상태와 툴을 그대로 물려받는다. 토큰 로테이션도, 프로바이더 번역도, API 키도 더 이상 Damon 몫이 아니다.
 
-- **설정 없는 백엔드** — 카탈로그 CLI 바이너리가 PATH에 있으면 자동 등록: `claude`(stream-json), `codex`(app-server), `omp`(RPC 모드). 그 외 에이전트는 `[backends.X]` 블록을 명시하면 연결된다.
+- **설정 없는 백엔드** — 카탈로그 CLI 바이너리가 PATH에 있으면 자동 등록: `claude`(stream-json), `codex`(app-server), `omp`(RPC 모드), `pi`(RPC 모드, omp와 같은 프로토콜 가족), `qwen`(stream-json, Claude형 컨트롤 플레인), `droid`(JSON-RPC, Factory), `opencode`·`mimo`(HTTP+SSE, `serve` 입양 또는 스폰), `zcode`(Z.ai app-server). 카탈로그에 오르는 백엔드는 전부 네이티브 양방향 프로토콜 — 토큰 스트리밍, 턴 도중 권한 요청, 인터럽트 — 을 말하므로, Damon이 온전히 구동할 수 있는 CLI만 등재된다. `[backends.X]`는 구동 라인만 오버라이드하며 프로토콜을 추가하지는 않는다.
 - **권한은 채널 그대로** — 에이전트의 권한 요청을 웹 UI, CLI, 텔레그램/디스코드/슬랙 채팅의 `allow`/`deny` 답장으로 릴레이한다.
 - **검색 가능한 히스토리** — 모든 대화를 SQLite + FTS5에 기록. `damon search "error timeout"`으로 전체 이력 전문 검색.
 - **채팅 채널 내장** — Telegram, Discord, Slack 어댑터가 별도 바이너리로 나간다. 채널별 세션 자동 매핑, 스트리밍 응답.
@@ -94,10 +94,9 @@ curl localhost:9470/health
 # [backends.claude.env]
 # ANTHROPIC_MODEL = "claude-sonnet-4-5"
 
-# 모든 세션에 전달할 MCP 서버 (에이전트가 직접 구동·승인):
-# [mcp_servers.filesystem]
-# command = "npx"
-# args    = ["-y", "@modelcontextprotocol/server-filesystem", "/tmp"]
+# MCP 서버는 데몬 설정이 아니라 세션 단위다: session.create의
+# `mcpServers`로 전달 — 에이전트가 직접 구동·승인한다
+# (현재 claude만 전달하며, 다른 백엔드는 이 파라미터를 무시한다).
 ```
 
 전체 레퍼런스: [config.example.toml](config.example.toml).

@@ -18,17 +18,18 @@ Damon은 코딩 에이전트를 각자의 네이티브 CLI로, stdio subprocess�
 | id | 에이전트 | 구동 | 인증 |
 |---|---|---|---|
 | `claude` | Claude Code (Claude Pro/Max) | `claude -p --output-format stream-json --input-format stream-json --verbose` | `claude` CLI 로그인 |
-| `codex` | Codex CLI (ChatGPT Plus/Pro) | `codex app-server` | `codex` CLI 로그인 |
+| `codex` | Codex CLI (ChatGPT Plus/Pro) | `codex app-server --enable default_mode_request_user_input` | `codex` CLI 로그인 |
 | `omp` | Oh My Pi (자체 관리 프로바이더 키) | `omp --mode rpc` | OMP 자체 auth 저장소 |
-| `cursor` | Cursor Agent (Cursor 구독) | `cursor-agent -p --output-format stream-json --trust` | `cursor-agent login` 또는 `CURSOR_API_KEY` |
-| `amp` | Amp (Sourcegraph) | `amp --execute --stream-json --stream-json-input` | `amp` CLI 로그인 |
-| `kimi` | Kimi Code (Moonshot) | `kimi -p --output-format stream-json` | `kimi` CLI 로그인 |
-| `qwen` | Qwen Code (Alibaba) | `qwen -p --output-format stream-json` | `qwen` CLI 로그인 |
-| `gemini` | Gemini CLI (Google) | `gemini --output-format stream-json --skip-trust` | `gemini` CLI 로그인 또는 `GEMINI_API_KEY` |
+| `pi` | Pi (pi.dev) | `pi --mode rpc` | `pi`에 설정된 프로바이더 API 키 |
+| `qwen` | Qwen Code (Alibaba) | `qwen -p --output-format stream-json --input-format stream-json --include-partial-messages` | `qwen` 로그인(qwen-oauth) 또는 설정의 API 키 |
+| `droid` | Droid (Factory) | `droid exec --input-format stream-jsonrpc -o stream-jsonrpc` | `droid` 로그인 또는 `FACTORY_API_KEY`; 커스텀 모델은 `~/.factory/settings.json` |
+| `opencode` | OpenCode (sst) | `opencode serve` (4096 입양 또는 스폰) | opencode 자체 프로바이더 설정 |
+| `mimo` | MiMo Code (샤오미) | `mimo serve` (opencode와 같은 표면) | mimo 자체 프로바이더 설정 |
+| `zcode` | ZCode (Z.ai) | `zcode app-server --stdio` | `zcode` 로그인 (GLM Coding Plan) |
 
 탐지: PATH에 해당 바이너리가 있으면 백엔드가 자동 등록된다.
 
-세션 형태는 백엔드마다 다르다: `claude`와 `amp`는 세션당 프로세스 하나를 유지한다(양방향 stream-json — 권한 릴레이, 스티어링, 인터럽트 동작). `cursor`, `kimi`, `qwen`, `gemini`는 턴별 원샷 — 각 프롬프트마다 resume 플래그(`--resume`/`--session`)로 CLI를 다시 띄우므로 턴 도중 스티어링과 권한 릴레이는 불가능하고, 헤드리스 실행은 CLI 자체의 자동 승인 정책을 따른다.
+카탈로그의 모든 백엔드는 네이티브 양방향 프로토콜을 말한다 — 토큰 스트리밍, 턴 도중 권한 요청, 인터럽트가 전부 Damon을 통해 릴레이된다(`claude`와 `qwen`은 세션당 프로세스 하나로 stream-json — `qwen`의 컨트롤 플레인은 Claude형이며 스폰 시 Damon이 `initialize` 핸드셰이크를 수행한다. `omp`와 `pi`는 같은 rpc 와이어를 공유하며, omp는 프로토콜 v2 청킹을 추가로 협상하고 pi는 명시적 종료 이벤트에서만 턴을 확정한다). 헤드리스 모드가 출력뿐인(권한·질문 와이어 없음) CLI는 의도적으로 카탈로그에 넣지 않는다. `qwen`의 stream-json 입력은 텍스트 블록만 받는다 — 이미지 첨부는 조용히 버리지 않고 명시적으로 거부한다. `pi`의 도구는 자체 신뢰 모델로 동작한다 — 모드 스위치를 노출하지 않으며 권한 질문은 확장 다이얼로그로만 온다.
 
 오버라이드 — 구동 명령을 교체하거나 로컬 빌드를 가리키기:
 

@@ -18,22 +18,29 @@ Damon drives coding agents through their native CLIs as stdio subprocesses. Mode
 | id | Agent | Launch | Auth |
 |---|---|---|---|
 | `claude` | Claude Code (Claude Pro/Max) | `claude -p --output-format stream-json --input-format stream-json --verbose` | `claude` CLI login |
-| `codex` | Codex CLI (ChatGPT Plus/Pro) | `codex app-server` | `codex` CLI login |
+| `codex` | Codex CLI (ChatGPT Plus/Pro) | `codex app-server --enable default_mode_request_user_input` | `codex` CLI login |
 | `omp` | Oh My Pi (any provider keys it manages) | `omp --mode rpc` | OMP's own auth store |
-| `cursor` | Cursor Agent (Cursor subscription) | `cursor-agent -p --output-format stream-json --trust` | `cursor-agent login` or `CURSOR_API_KEY` |
-| `amp` | Amp (Sourcegraph) | `amp --execute --stream-json --stream-json-input` | `amp` CLI login |
-| `kimi` | Kimi Code (Moonshot) | `kimi -p --output-format stream-json` | `kimi login` |
-| `qwen` | Qwen Code (Alibaba) | `qwen -p --output-format stream-json` | `qwen` CLI login |
-| `gemini` | Gemini CLI (Google) | `gemini --output-format stream-json --skip-trust` | `gemini` CLI login or `GEMINI_API_KEY` |
+| `pi` | Pi (pi.dev) | `pi --mode rpc` | provider API key configured in `pi` |
+| `qwen` | Qwen Code (Alibaba) | `qwen -p --output-format stream-json --input-format stream-json --include-partial-messages` | `qwen` login (qwen-oauth) or API key in its settings |
+| `droid` | Droid (Factory) | `droid exec --input-format stream-jsonrpc -o stream-jsonrpc` | `droid` login or `FACTORY_API_KEY`; custom models in `~/.factory/settings.json` |
+| `opencode` | OpenCode (sst) | `opencode serve` (adopted on :4096 or spawned) | providers configured in opencode itself |
+| `mimo` | MiMo Code (Xiaomi) | `mimo serve` (same surface as opencode) | providers configured in mimo itself |
+| `zcode` | ZCode (Z.ai) | `zcode app-server --stdio` | `zcode` login (GLM Coding Plan) |
 
 Detection: the binary on PATH registers the backend automatically.
 
-Session shapes differ per backend: `claude` and `amp` keep one process per
-session (bidirectional stream-json — permission relay, steering, interrupts
-work). `cursor`, `kimi`, `qwen`, and `gemini` are one-shot per turn — each
-prompt respawns the CLI with a resume flag (`--resume`/`--session`), so
-mid-turn steering and permission relay are unavailable; headless runs use
-the CLI's own auto-approval policy.
+Every catalog backend speaks a native bidirectional protocol — token
+streaming, mid-turn permission asks, and interrupt all relay through Damon
+(`claude` and `qwen` keep one process per session over stream-json —
+`qwen`'s control plane is Claude-shaped with an `initialize` handshake
+`droid` speaks Factory's JSON-RPC where permission asks arrive as `droid.request_permission` requests Damon must answer; `opencode`/`mimo` answer over HTTP against an adopted-or-spawned `serve`; `omp` and `pi` share one rpc wire where omp
+additionally negotiates protocol v2 chunking and pi settles only on
+explicit terminal events). CLIs whose headless mode is output-only (no
+permission/question wire) are deliberately not in the catalog. `qwen`'s
+stream-json input accepts text blocks only — image attachments are
+rejected loudly rather than dropped. `pi`'s own tools run under its trust
+model — Damon surfaces no mode switches for it, and permission asks ride
+extension dialogs.
 
 Overrides — replace a launch line or point at a local build:
 

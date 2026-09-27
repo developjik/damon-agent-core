@@ -4,10 +4,10 @@
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>Damon — 데몬 하나. 모든 코딩 에이전트.</title>
-<meta name="description" content="Damon은 Claude Code·Codex CLI·Oh My Pi·Cursor·Amp·Kimi·Qwen·Gemini를 네이티브 CLI로 구동하는 Rust 로컬 에이전트 컨트롤 데몬입니다. 세션, 권한 릴레이, 검색 가능한 히스토리, 채팅 채널, 어디서든 접근을 한 곳에서.">
+<meta name="description" content="Damon은 Claude Code·Codex CLI·Oh My Pi를 네이티브 양방향 프로토콜로 구동하는 Rust 로컬 에이전트 컨트롤 데몬입니다. 세션, 권한 릴레이, 검색 가능한 히스토리, 채팅 채널, 어디서든 접근을 한 곳에서.">
 <meta name="theme-color" content="#0a0e16">
 <meta property="og:title" content="Damon — One daemon. Every coding agent.">
-<meta property="og:description" content="Rust local agent-control daemon driving eight coding-agent CLIs natively — Claude Code, Codex CLI, Oh My Pi, Cursor, Amp, Kimi, Qwen, Gemini. Sessions, permission relay, searchable history, chat channels, from-anywhere access — one resident daemon.">
+<meta property="og:description" content="Rust local agent-control daemon driving coding-agent CLIs over their native bidirectional protocols — Claude Code, Codex CLI, Oh My Pi. Sessions, permission relay, searchable history, chat channels, from-anywhere access — one resident daemon.">
 <meta property="og:type" content="website">
 <link rel="icon" href="./favicon.svg" type="image/svg+xml">
 <link rel="stylesheet" href="./assets/css/main.css">
@@ -66,7 +66,7 @@
     <div class="hero-copy">
       <p class="kicker" data-i18n="hero.badge">Rust 기반 로컬 에이전트 컨트롤 데몬</p>
       <h1><span data-i18n="hero.title1">데몬 하나.</span><br><span class="grad" data-i18n="hero.title2">모든 코딩 에이전트.</span></h1>
-      <p class="lead" data-i18n="hero.lead">Damon은 Claude Code·Codex CLI·Oh My Pi·Cursor·Amp·Kimi·Qwen·Gemini를 각자의 네이티브 CLI로 구동하는 Rust 상주 데몬입니다. 모델·툴·인증은 에이전트 몫 — Damon은 세션, 권한 릴레이, 검색 가능한 히스토리, 채팅 채널, 어디서든 접근을 소유합니다.</p>
+      <p class="lead" data-i18n="hero.lead">Damon은 Claude Code·Codex CLI·Oh My Pi를 각자의 네이티브 양방향 프로토콜로 구동하는 Rust 상주 데몬입니다. 모델·툴·인증은 에이전트 몫 — Damon은 세션, 권한 릴레이, 검색 가능한 히스토리, 채팅 채널, 어디서든 접근을 소유합니다.</p>
       <div class="badges">
         <img src="https://github.com/developjik/damon-agent-core/actions/workflows/ci.yml/badge.svg" alt="ci">
         <img src="https://img.shields.io/crates/v/damon-core.svg" alt="crates.io">
@@ -103,7 +103,7 @@
       <article class="card">
         <div class="card-icon"><svg viewBox="0 0 24 24"><path d="M4 17l6-6-6-6M12 19h8" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"/></svg></div>
         <h3 data-i18n="f1t">설정 없는 백엔드</h3>
-        <p data-i18n="f1d">PATH의 claude·codex·omp·cursor·amp·kimi·qwen이면 자동 등록됩니다. 다른 에이전트도 <code>[backends.X]</code> 블록 하나면 연결됩니다.</p>
+        <p data-i18n="f1d">PATH의 claude·codex·omp면 자동 등록됩니다. 카탈로그 백엔드는 전부 네이티브 양방향 프로토콜 — 스트리밍·권한 릴레이·인터럽트 — 을 말합니다.</p>
       </article>
       <article class="card">
         <div class="card-icon"><svg viewBox="0 0 24 24"><path d="M12 22s8-4 8-10V5l-8-3-8 3v7c0 6 8 10 8 10z" fill="none" stroke="currentColor" stroke-width="2" stroke-linejoin="round"/><path d="M9 12l2 2 4-4" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"/></svg></div>
@@ -138,18 +138,19 @@
     </div>
 
     <div class="backend-strip">
-      <p class="backend-strip-title" data-i18n="strip.title">PATH에 있으면 자동 등록 — 여덟 개 네이티브 백엔드</p>
+      <p class="backend-strip-title" data-i18n="strip.title">PATH에 있으면 자동 등록 — 네이티브 양방향 백엔드</p>
       <div class="backend-chips">
         <span class="bchip" style="--c:#d97757"><i></i>Claude Code<em>stream-json</em></span>
         <span class="bchip" style="--c:#10a37f"><i></i>Codex CLI<em>app-server</em></span>
         <span class="bchip" style="--c:#a78bfa"><i></i>Oh My Pi<em>RPC</em></span>
-        <span class="bchip" style="--c:#e8ecf4"><i></i>Cursor Agent<em>stream-json</em></span>
-        <span class="bchip" style="--c:#fbbf24"><i></i>Amp<em>amp dialect</em></span>
-        <span class="bchip" style="--c:#fb7185"><i></i>Kimi Code<em>stream-json</em></span>
+        <span class="bchip" style="--c:#c4b5fd"><i></i>Pi<em>RPC</em></span>
         <span class="bchip" style="--c:#67e8f9"><i></i>Qwen Code<em>stream-json</em></span>
-        <span class="bchip" style="--c:#8ab4f8"><i></i>Gemini CLI<em>stream-json</em></span>
+        <span class="bchip" style="--c:#8ab4f8"><i></i>Droid<em>json-rpc</em></span>
+        <span class="bchip" style="--c:#34d399"><i></i>OpenCode<em>http+sse</em></span>
+        <span class="bchip" style="--c:#a3e635"><i></i>MiMo<em>http+sse</em></span>
+        <span class="bchip" style="--c:#f59e0b"><i></i>ZCode<em>app-server</em></span>
       </div>
-      <p class="backend-strip-more" data-i18n="strip.more">그 외 어떤 에이전트 CLI도 <code>[backends.X]</code> 블록 하나로</p>
+      <p class="backend-strip-more" data-i18n="strip.more">권한 릴레이·질문·인터럽트가 온전히 릴레이되는 프로토콜만 카탈로그에 등재됩니다</p>
     </div>
   </div>
 </section>
@@ -188,11 +189,12 @@
         <span class="chip chip-agent" style="--c:#d97757">Claude Code</span>
         <span class="chip chip-agent" style="--c:#10a37f">Codex CLI</span>
         <span class="chip chip-agent" style="--c:#a78bfa">Oh My Pi</span>
-        <span class="chip chip-agent" style="--c:#e8ecf4">Cursor Agent</span>
-        <span class="chip chip-agent" style="--c:#fbbf24">Amp</span>
-        <span class="chip chip-agent" style="--c:#fb7185">Kimi Code</span>
+        <span class="chip chip-agent" style="--c:#c4b5fd">Pi</span>
         <span class="chip chip-agent" style="--c:#67e8f9">Qwen Code</span>
-        <span class="chip chip-agent" style="--c:#8ab4f8">Gemini CLI</span>
+        <span class="chip chip-agent" style="--c:#8ab4f8">Droid</span>
+        <span class="chip chip-agent" style="--c:#34d399">OpenCode</span>
+        <span class="chip chip-agent" style="--c:#a3e635">MiMo</span>
+        <span class="chip chip-agent" style="--c:#f59e0b">ZCode</span>
         <span class="chip chip-dim">+ [backends.X]</span>
       </div>
       <p class="arch-note" data-i18n="arch.agents.note">모델·툴·구독 인증·컨텍스트는 전부 에이전트 소유</p>

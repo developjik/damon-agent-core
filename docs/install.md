@@ -62,8 +62,8 @@ damond --print-config-path   # where config.toml lives
 ```
 
 See `config.example.toml`. Agent CLIs keep their own logins (each detected
-CLI — `claude`, `codex`, `omp`, `cursor`, `amp`, `kimi`, `qwen`, `gemini` —
-authenticates itself) — Damon stores no agent tokens.
+CLI — `claude`, `codex`, `omp`, `pi`, `qwen`, `droid`, `opencode`, `zcode` — authenticates itself) —
+Damon stores no agent tokens.
 
 
 ## Remote relay
