@@ -188,6 +188,10 @@ fn now_ms() -> i64 {
         .unwrap_or(0)
 }
 
+/// Per-cwd ceiling on `prompt_history` rows — the trim target in
+/// `record_prompt`, and the ceiling on `prompt.recent`'s limit.
+pub(crate) const PROMPT_HISTORY_CAP: i64 = 200;
+
 impl Store {
     pub async fn open(path: &Path) -> anyhow::Result<Self> {
         if let Some(parent) = path.parent() {
@@ -255,6 +259,13 @@ impl Store {
                     key TEXT NOT NULL,
                     value TEXT NOT NULL,
                     PRIMARY KEY (conv_id, key)
+                );
+                CREATE TABLE IF NOT EXISTS prompt_history (
+                    cwd TEXT NOT NULL,
+                    text TEXT NOT NULL,
+                    use_count INTEGER NOT NULL DEFAULT 1,
+                    updated_at INTEGER NOT NULL,
+                    PRIMARY KEY (cwd, text)
                 );
                 CREATE TABLE IF NOT EXISTS projects (
                     id TEXT PRIMARY KEY,
@@ -548,6 +559,13 @@ impl Store {
                     key TEXT NOT NULL,
                     value TEXT NOT NULL,
                     PRIMARY KEY (conv_id, key)
+                );
+                CREATE TABLE prompt_history (
+                    cwd TEXT NOT NULL,
+                    text TEXT NOT NULL,
+                    use_count INTEGER NOT NULL DEFAULT 1,
+                    updated_at INTEGER NOT NULL,
+                    PRIMARY KEY (cwd, text)
                 );
                 CREATE TABLE projects (
                     id TEXT PRIMARY KEY,
@@ -1345,6 +1363,59 @@ impl Store {
             })
             .await?;
         Ok(())
+    }
+
+    /// Record one sent prompt for the composer's ghost completion and
+    /// ↑/↓ recall. The upsert bumps the use count and stamps recency
+    /// (a resend moves the row to newest); the per-cwd trim keeps only
+    /// the newest [`PROMPT_HISTORY_CAP`] rows so the table cannot grow
+    /// without bound.
+    pub async fn record_prompt(&self, cwd: &str, text: &str) -> anyhow::Result<()> {
+        let (cwd, text) = (cwd.to_string(), text.to_string());
+        self.conn
+            .call(move |c| {
+                c.execute(
+                    "INSERT INTO prompt_history (cwd, text, use_count, updated_at)
+                     VALUES (?1, ?2, 1, ?3)
+                     ON CONFLICT(cwd, text) DO UPDATE
+                     SET use_count = use_count + 1, updated_at = excluded.updated_at",
+                    rusqlite::params![cwd, text, now_ms()],
+                )?;
+                c.execute(
+                    "DELETE FROM prompt_history WHERE cwd = ?1 AND (cwd, text) NOT IN (
+                         SELECT cwd, text FROM prompt_history WHERE cwd = ?1
+                         ORDER BY updated_at DESC, use_count DESC LIMIT ?2)",
+                    rusqlite::params![cwd, PROMPT_HISTORY_CAP],
+                )?;
+                Ok::<(), tokio_rusqlite::Error>(())
+            })
+            .await?;
+        Ok(())
+    }
+
+    /// Newest-first prompt history for one cwd, with per-prompt use
+    /// counts (the caller ranks ghost completions by count, not us).
+    pub async fn recent_prompts(
+        &self,
+        cwd: &str,
+        limit: u32,
+    ) -> anyhow::Result<Vec<(String, i64)>> {
+        let cwd = cwd.to_string();
+        Ok(self
+            .conn
+            .call(move |c| {
+                let mut stmt = c.prepare(
+                    "SELECT text, use_count FROM prompt_history WHERE cwd = ?1
+                     ORDER BY updated_at DESC, use_count DESC LIMIT ?2",
+                )?;
+                let rows = stmt
+                    .query_map(rusqlite::params![cwd, limit], |r| {
+                        Ok((r.get::<_, String>(0)?, r.get::<_, i64>(1)?))
+                    })?
+                    .collect::<Result<_, _>>()?;
+                Ok::<Vec<(String, i64)>, tokio_rusqlite::Error>(rows)
+            })
+            .await?)
     }
 
     /// Create a project. `defaults_json` is stored verbatim (the RPC

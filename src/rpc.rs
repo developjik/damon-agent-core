@@ -1274,6 +1274,39 @@ async fn dispatch(
             Ok(json!({"deleted": true}))
         }
 
+        "prompt.add" => {
+            let text = req_str(&params, "text")?.trim().to_string();
+            let text: String = text.chars().take(300).collect();
+            if text.is_empty() {
+                return Err(RpcError::error(
+                    error_code::INVALID_PARAMS,
+                    "text required (nothing after trim)",
+                ));
+            }
+            let cwd = resolve_picker_root(state, &params).await?;
+            state
+                .store
+                .record_prompt(&cwd.to_string_lossy(), &text)
+                .await?;
+            Ok(json!({"recorded": true}))
+        }
+
+        "prompt.recent" => {
+            let limit = params["limit"]
+                .as_u64()
+                .unwrap_or(50)
+                .min(crate::store::PROMPT_HISTORY_CAP as u64) as u32;
+            let cwd = resolve_picker_root(state, &params).await?;
+            let prompts = state
+                .store
+                .recent_prompts(&cwd.to_string_lossy(), limit)
+                .await?
+                .into_iter()
+                .map(|(text, count)| json!({"text": text, "count": count}))
+                .collect::<Vec<_>>();
+            Ok(json!({"prompts": prompts}))
+        }
+
         other => Err(RpcError::error(
             error_code::METHOD_NOT_FOUND,
             format!("unknown method: {other}"),
@@ -1348,6 +1381,25 @@ async fn stored_cwd(state: &Arc<AppState>, id: &str) -> Result<std::path::PathBu
         .await?
         .map(std::path::PathBuf::from)
         .ok_or_else(|| RpcError::error(error_code::INVALID_PARAMS, format!("unknown session {id}")))
+}
+
+/// Root for the composer-support RPCs (`catalog.commands`,
+/// `file.index`, `prompt.*`): the named session's stored cwd (the
+/// same jail file.* uses), else a client-supplied cwd through the
+/// same `allowed_dirs` gate as session.create, else the daemon's own
+/// working directory — which is exactly what a session gets when it
+/// omits `cwd` (session_config's fallback), so a picker opened before
+/// the lazy first `session.create` indexes the directory the session
+/// will run in.
+async fn resolve_picker_root(state: &Arc<AppState>, params: &Value) -> Result<std::path::PathBuf> {
+    if let Some(id) = params["sessionId"].as_str() {
+        return stored_cwd(state, id).await;
+    }
+    if let Some(cwd) = params["cwd"].as_str().map(std::path::PathBuf::from) {
+        check_cwd_allowed(state, &cwd)?;
+        return Ok(cwd);
+    }
+    Ok(std::env::current_dir().unwrap_or_else(|_| ".".into()))
 }
 
 /// Lexical absolute path: fold `.`/`..` component-wise without touching
@@ -1726,7 +1778,12 @@ async fn drive_turn(
     let _ = state.store.touch(&ms.id).await;
 
     // Refresh the persisted resume token if the backend reported one.
-    if let Some(h) = &ms.handle {
+    // Read it from the live session rather than the create-time
+    // snapshot — backends adopt the native id the agent reports
+    // mid-conversation (a first turn may only surface its session id
+    // once it starts streaming).
+    let fresh_handle = ms.session.persistence_handle().or_else(|| ms.handle.clone());
+    if let Some(h) = &fresh_handle {
         let _ = state
             .store
             .set_agent_session(&ms.id, &h.provider, &h.native_handle)
@@ -1833,6 +1890,8 @@ pub fn rpc_methods() -> Vec<Value> {
         json!({"name": "channel.get_state", "params": {"convId": "string", "key": "string"}, "result": {"value": "string?"}}),
         json!({"name": "channel.set_state", "params": {"convId": "string", "key": "string", "value": "string"}, "result": {"set": "boolean"}}),
         json!({"name": "channel.delete_state", "params": {"convId": "string", "key": "string"}, "result": {"deleted": "boolean"}}),
+        json!({"name": "prompt.add", "params": {"text": "string — trimmed, capped at 300 chars", "sessionId": "string? — root selector", "cwd": "string? — gated by allowed_dirs like session.create"}, "result": {"recorded": "boolean"}}),
+        json!({"name": "prompt.recent", "params": {"limit": "number? — default 50, max 200", "sessionId": "string?", "cwd": "string?"}, "result": {"prompts": "array of {text, count} — newest first"}}),
         json!({"name": "project.create", "params": {"name": "string?", "root": "string — absolute", "defaults?": "{backend?, model?, mode?, mcpServers?}"}, "result": {"projectId": "string", "name": "string", "root": "string", "defaults": "object"}}),
         json!({"name": "project.list", "params": {}, "result": {"projects": "array of {projectId, name, root, defaults}"}}),
         json!({"name": "project.get", "params": {"projectId": "string"}, "result": {"projectId": "string", "name": "string", "root": "string", "defaults": "object"}}),

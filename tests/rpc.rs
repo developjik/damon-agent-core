@@ -1622,6 +1622,81 @@ async fn file_api_round_trips_inside_the_cwd_jail() {
     assert_eq!(unknown["error"]["code"], -32602, "{unknown}");
 }
 
+/// Prompt history: `prompt.add` upserts (a resend bumps the count and
+/// moves the row to newest), `prompt.recent` returns newest-first with
+/// counts and is scoped per cwd, blank text is rejected, and the
+/// per-cwd trim keeps the table bounded.
+#[tokio::test]
+async fn prompt_history_round_trips() {
+    let (_state, _store, addr) = serve(test_config(None)).await;
+    let (mut ws, _) = ws_connect(&format!("ws://{addr}/ws")).await;
+    let dir = std::env::temp_dir().join(format!("damon-hist-{}", uuid::Uuid::new_v4()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let cwd = dir.to_string_lossy().into_owned();
+
+    let mut id = 0u64;
+    macro_rules! add {
+        ($text:expr) => {{
+            id += 1;
+            json!({"id": id, "method": "prompt.add", "params": {"cwd": cwd, "text": $text}})
+        }};
+    }
+    for text in ["first prompt", "second prompt", "third prompt"] {
+        rpc_send(&mut ws, add!(text)).await;
+        let r = read_reply(&mut ws, id).await;
+        assert_eq!(r["result"]["recorded"], true, "{r}");
+    }
+    // Resend — dedup: the count bumps and the row moves to newest.
+    rpc_send(&mut ws, add!("first prompt")).await;
+    let r = read_reply(&mut ws, id).await;
+    assert_eq!(r["result"]["recorded"], true, "{r}");
+
+    rpc_send(
+        &mut ws,
+        json!({"id":100,"method":"prompt.recent","params":{"cwd":cwd}}),
+    )
+    .await;
+    let r = read_reply(&mut ws, 100).await;
+    let prompts = r["result"]["prompts"].as_array().unwrap().to_vec();
+    assert_eq!(prompts.len(), 3, "{r}");
+    assert_eq!(prompts[0]["text"], "first prompt", "{r}");
+    assert_eq!(prompts[0]["count"], 2, "{r}");
+    let rest: Vec<&str> = prompts[1..]
+        .iter()
+        .map(|p| p["text"].as_str().unwrap())
+        .collect();
+    assert!(rest.contains(&"second prompt") && rest.contains(&"third prompt"), "{r}");
+
+    // Blank after trim is rejected outright.
+    rpc_send(&mut ws, add!("   ")).await;
+    let r = read_reply(&mut ws, id).await;
+    assert_eq!(r["error"]["code"], -32602, "{r}");
+
+    // Scoped per cwd — a different root sees nothing.
+    rpc_send(
+        &mut ws,
+        json!({"id":101,"method":"prompt.recent","params":{"cwd":"/damon-nowhere"}}),
+    )
+    .await;
+    let r = read_reply(&mut ws, 101).await;
+    assert_eq!(r["result"]["prompts"].as_array().unwrap().len(), 0, "{r}");
+
+    // The per-cwd trim keeps only the newest 200 rows and the recent
+    // limit is clamped to the same cap.
+    for i in 0..205 {
+        rpc_send(&mut ws, add!(format!("bulk {i}"))).await;
+        read_reply(&mut ws, id).await;
+    }
+    rpc_send(
+        &mut ws,
+        json!({"id":102,"method":"prompt.recent","params":{"cwd":cwd,"limit":500}}),
+    )
+    .await;
+    let r = read_reply(&mut ws, 102).await;
+    let prompts = r["result"]["prompts"].as_array().unwrap();
+    assert_eq!(prompts.len(), 200, "trim must keep exactly 200: {r}");
+}
+
 /// Projects: create/list/get/set_defaults lifecycle, session.create
 /// integration (root-as-cwd-default, defaults fill unset params,
 /// explicit params win), list/search/usage filters, and delete
