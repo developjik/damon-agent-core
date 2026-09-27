@@ -71,10 +71,11 @@ pub fn catalog(cwd: &Path) -> Vec<SlashEntry> {
     if let Some(root) = dir_exists(&cwd.join(".claude").join("commands")) {
         scan_commands(&root, "workspace", &mut commands);
     }
-    if let Some(root) = claude_home().map(|h| h.join("commands")) {
-        if let Some(root) = dir_exists(&root) {
-            scan_commands(&root, "global", &mut commands);
-        }
+    if let Some(root) = claude_home()
+        .map(|h| h.join("commands"))
+        .and_then(|p| dir_exists(&p))
+    {
+        scan_commands(&root, "global", &mut commands);
     }
 
     // Skills: one directory per child that holds a SKILL.md — not
@@ -269,7 +270,7 @@ fn strip_quotes(v: &str) -> Option<String> {
 fn dedup_and_sort(mut entries: Vec<SlashEntry>) -> Vec<SlashEntry> {
     let mut seen = HashSet::new();
     entries.retain(|e| seen.insert(e.name.to_lowercase()));
-    entries.sort_by(|a, b| a.name.to_lowercase().cmp(&b.name.to_lowercase()));
+    entries.sort_by_key(|e| e.name.to_lowercase());
     entries
 }
 

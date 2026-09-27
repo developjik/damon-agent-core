@@ -552,13 +552,52 @@
     flex: 1; display: flex; align-items: flex-end; gap: 6px;
     background: var(--panel); border: 1px solid var(--border); border-radius: 13px;
     padding: 4px 4px 4px 13px; transition: border-color .15s, box-shadow .15s;
+    position: relative;
   }
   #inputWrap:focus-within { border-color: var(--accent); box-shadow: 0 0 0 3px var(--accent-dim); }
   #inputWrap.dropping { border-color: var(--accent); border-style: dashed; box-shadow: 0 0 0 3px var(--accent-dim); }
+  /* taWrap hugs the textarea so the ghost mirror can align with it
+     exactly (same font/padding/wrapping) and the picker can anchor. */
+  #taWrap { position: relative; flex: 1; min-width: 0; }
   #input {
-    flex: 1; resize: none; background: none; color: var(--fg);
+    display: block; width: 100%; resize: none; background: none; color: var(--fg);
     border: 0; padding: 7px 0; font: inherit; max-height: 160px; min-height: 30px;
+    position: relative; z-index: 1;
   }
+  /* Ghost completion: a mirror div behind the textarea — the typed
+     text is transparent (it only reserves the exact layout), the
+     suggested suffix shows through in faint. Never selectable. */
+  #ghost {
+    position: absolute; inset: 0; z-index: 0; overflow: hidden;
+    pointer-events: none; color: transparent; font: inherit; padding: 7px 0;
+    white-space: pre-wrap; overflow-wrap: break-word;
+  }
+  #ghost .g { color: var(--faint); }
+  /* Slash-command / @path mention picker, floating above the composer. */
+  #picker {
+    position: absolute; bottom: calc(100% + 8px); left: 0; z-index: 20;
+    width: min(100%, 640px); max-height: 244px; overflow-y: auto;
+    background: var(--panel); border: 1px solid var(--border2); border-radius: 12px;
+    box-shadow: var(--glow);
+  }
+  #picker[hidden] { display: none; }
+  .pick-head {
+    padding: 7px 12px 3px; font-size: 10px; letter-spacing: .08em;
+    text-transform: uppercase; color: var(--faint); font-weight: 700;
+  }
+  .pick-row {
+    display: flex; align-items: baseline; gap: 8px;
+    padding: 7px 12px; cursor: pointer; font-size: 12.5px;
+  }
+  .pick-row.active, .pick-row:hover { background: var(--hover); }
+  .pick-name { font-family: var(--mono); color: var(--fg); flex: none; max-width: 55%; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+  .pick-desc { color: var(--muted); font-size: 11.5px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+  .pick-badge {
+    flex: none; font-size: 10px; padding: 1px 6px; border-radius: 8px;
+    color: var(--accent); background: var(--accent-dim);
+  }
+  .pick-badge.dir { color: var(--warn); background: none; padding: 1px 0; }
+  .pick-empty { padding: 10px 12px; color: var(--faint); font-size: 12px; }
   #input:focus { outline: none; }
   #attachBtn {
     background: none; color: var(--faint); border: 0;
@@ -773,9 +812,13 @@
       <select id="modelSel" title="Model — applies to the active session, or the next one"></select>
       <select id="modeSel" title="Mode — applies to the active session, or the next one"></select>
       <div id="inputWrap">
-        <textarea id="input" rows="1" placeholder="Message — Enter to send, Shift+Enter for newline"></textarea>
+        <div id="taWrap">
+          <div id="ghost" aria-hidden="true"></div>
+          <textarea id="input" rows="1" placeholder="Message — Enter to send, Shift+Enter for newline"></textarea>
+        </div>
         <input id="attach" type="file" accept="image/*" style="display:none">
         <button id="attachBtn" title="Attach an image" aria-label="Attach an image">📎</button>
+        <div id="picker" hidden></div>
       </div>
       <button id="sendBtn" title="Send (Enter)">➤</button>
       <button id="cancelBtn" style="display:none" title="Stop the running turn">■</button>
@@ -1261,6 +1304,8 @@ async function connect() {
       p.reject(new Error("connection closed"));
     }
     pending.clear();
+    invalidatePickerCaches(); // fresh daemon epoch — picker caches revalidate
+    promptItemsLoaded = false; // history may differ (another surface sent prompts)
     liveTurns.clear(); // tracking resets; detached turns keep running server-side
     missedTurns.clear();
     setConn("off", "reconnecting");
@@ -2439,6 +2484,12 @@ async function sendPrompt(text, imgs) {
     text = input.value;
     imgs = attachments.splice(0);
     if (!text.trim() && !imgs.length) return;
+    // Recorded before the busy check so queued prompts count too —
+    // explicit-arg callers (queue flush) must not double-record.
+    recordPromptHistory(text);
+    closePicker();
+    ghostSuffix = "";
+    ghostEl.textContent = "";
     if (busy) {
       promptQueue.push({ sessionId: activeSession, text, imgs });
       input.value = "";
@@ -2785,6 +2836,391 @@ function notifyTurnDone(stopReason, err) {
   attention("damon — done", body);
 }
 
+// ---------- composer pickers: /commands, @files, prompt ghost ----------
+// Ported from desktop-cc-gui's composer: a `/` at line start opens the
+// command/skill catalog (catalog.commands), an `@` after whitespace
+// opens the workspace file index (file.index), and sent prompts feed a
+// daemon-side history (prompt.add/prompt.recent) surfaced as ghost
+// completion (Tab) and ArrowUp/Down recall. The pickers keep the
+// textarea focused — rows swallow mousedown so the caret never moves.
+const pickerEl = $("picker"), ghostEl = $("ghost");
+const picker = { kind: null, start: 0, query: "", items: [], active: 0 };
+const PICKER_TTL = 60000, PICKER_LIMIT = 50;
+let slashCache = null, fileCache = null;   // {status, entries, fetchedAt, inFlight}
+let composing = false;                     // IME candidate in progress
+
+function ensureSlash() {
+  if (slashCache && slashCache.inFlight) return slashCache.inFlight;
+  if (slashCache && slashCache.status === "ready" && Date.now() - slashCache.fetchedAt < PICKER_TTL)
+    return Promise.resolve(slashCache.entries);
+  const p = request("catalog.commands", {})
+    .then(r => {
+      slashCache = { status: "ready", entries: r.commands || [], fetchedAt: Date.now() };
+      return slashCache.entries;
+    })
+    .catch(() => {
+      // Serve stale rows on a failed refresh; only a failed first
+      // fetch leaves the picker empty. inFlight must clear or every
+      // later call would keep returning this settled promise.
+      const stale = (slashCache && slashCache.entries) || [];
+      slashCache = { status: "error", entries: stale, fetchedAt: 0, inFlight: null };
+      return stale;
+    });
+  slashCache = { status: "loading", entries: (slashCache && slashCache.entries) || [], fetchedAt: 0, inFlight: p };
+  return p;
+}
+
+function ensureFileIndex() {
+  if (fileCache && fileCache.inFlight) return fileCache.inFlight;
+  if (fileCache && fileCache.status === "ready" && Date.now() - fileCache.fetchedAt < PICKER_TTL)
+    return Promise.resolve(fileCache.entries);
+  const p = request("file.index", {})
+    .then(r => {
+      fileCache = { status: "ready", entries: prepareMentionEntries(r.entries || []), fetchedAt: Date.now() };
+      return fileCache.entries;
+    })
+    .catch(() => {
+      const stale = (fileCache && fileCache.entries) || [];
+      fileCache = { status: "error", entries: stale, fetchedAt: 0, inFlight: null };
+      return stale;
+    });
+  fileCache = { status: "loading", entries: (fileCache && fileCache.entries) || [], fetchedAt: 0, inFlight: p };
+  return p;
+}
+
+// A reconnect means a fresh daemon epoch — both caches must revalidate.
+function invalidatePickerCaches() {
+  if (slashCache) slashCache.fetchedAt = 0;
+  if (fileCache) fileCache.fetchedAt = 0;
+}
+
+// Precomputed scoring inputs: lowercase haystack, basename offset,
+// depth. Sorted depth-then-alphabetical so a bare `@` lists shallow
+// entries first.
+function prepareMentionEntries(entries) {
+  const out = entries.map(e => {
+    const rel = e.rel || "";
+    const slash = rel.lastIndexOf("/");
+    return {
+      rel, isDir: !!e.isDir,
+      name: slash >= 0 ? rel.slice(slash + 1) : rel,
+      depth: (rel.match(/\//g) || []).length,
+      key: rel.toLowerCase(),
+      nameStart: slash >= 0 ? slash + 1 : 0,
+    };
+  });
+  out.sort((a, b) => a.depth - b.depth || (a.key < b.key ? -1 : a.key > b.key ? 1 : 0));
+  return out;
+}
+
+// Greedy subsequence score: +1 per match, +4 contiguous run, +8
+// segment start (after / - _ space dot), +3 inside the basename,
+// with a small length penalty so short paths win ties.
+function scoreMention(entry, q) {
+  const key = entry.key;
+  let qi = 0, score = 0, prev = -2;
+  for (let i = 0; i < key.length && qi < q.length; i++) {
+    if (key.charCodeAt(i) !== q.charCodeAt(qi)) continue;
+    score += 1;
+    if (i === prev + 1) score += 4;
+    if (i === 0 || "/-_ .".includes(key[i - 1])) score += 8;
+    if (i >= entry.nameStart) score += 3;
+    prev = i; qi++;
+  }
+  if (qi < q.length) return null;
+  return score - key.length * 0.05;
+}
+
+function matchMentionEntries(entries, query) {
+  const q = query.replace(/\\/g, "/").toLowerCase();
+  if (!q) return entries.slice(0, PICKER_LIMIT);
+  const scored = [];
+  for (const e of entries) {
+    const s = scoreMention(e, q);
+    if (s !== null) scored.push([s, e]);
+  }
+  scored.sort((a, b) => b[0] - a[0] || a[1].depth - b[1].depth || (a[1].key < b[1].key ? -1 : 1));
+  return scored.slice(0, PICKER_LIMIT).map(x => x[1]);
+}
+
+// Trigger finders — caret is selectionStart on the textarea. A slash
+// only opens at line start (mid-line ones are paths); an @ needs
+// start-of-text or whitespace before it (x@y is an email, not a
+// mention). Both cap the query so a paste never scans a huge span.
+function findSlashTrigger(text, caret) {
+  if (caret <= 0 || caret > text.length) return null;
+  let start = caret - 1;
+  while (start >= 0) {
+    const ch = text[start];
+    if (ch === "/" || /\s/.test(ch)) break;
+    start--;
+  }
+  if (start < 0 || text[start] !== "/") return null;
+  if (start > 0 && text[start - 1] !== "\n") return null;
+  const query = text.slice(start + 1, caret);
+  if (query.length > 64) return null;
+  return { start, query };
+}
+
+function findMentionTrigger(text, caret) {
+  if (caret <= 0 || caret > text.length) return null;
+  let start = caret - 1;
+  while (start >= 0) {
+    const ch = text[start];
+    if (ch === "@" || /\s/.test(ch)) break;
+    start--;
+  }
+  if (start < 0 || text[start] !== "@") return null;
+  if (start > 0 && !/\s/.test(text[start - 1])) return null;
+  const query = text.slice(start + 1, caret);
+  if (query.length > 128) return null;
+  return { start, query };
+}
+
+// One detection pass per input/caret move; `/` outranks `@`.
+function updatePicker() {
+  if (composing) return;
+  const caret = input.selectionStart;
+  const slash = findSlashTrigger(input.value, caret);
+  const trig = slash || findMentionTrigger(input.value, caret);
+  if (!trig) { closePicker(); return; }
+  const kind = slash ? "slash" : "file";
+  picker.kind = kind;
+  picker.start = trig.start;
+  picker.query = trig.query;
+  picker.active = 0;
+  const cache = kind === "slash" ? slashCache : fileCache;
+  if (!cache || cache.status === "loading")
+    (kind === "slash" ? ensureSlash() : ensureFileIndex())
+      .then(() => { if (picker.kind === kind) refreshPickerItems(); });
+  refreshPickerItems();
+}
+
+function refreshPickerItems() {
+  if (picker.kind === "slash") {
+    const q = picker.query.toLowerCase();
+    const src = (slashCache && slashCache.entries) || [];
+    picker.items = src.filter(c =>
+      !q || (c.name || "").toLowerCase().includes(q) || (c.description || "").toLowerCase().includes(q)
+    ).slice(0, PICKER_LIMIT);
+  } else {
+    picker.items = matchMentionEntries((fileCache && fileCache.entries) || [], picker.query);
+  }
+  picker.active = Math.min(picker.active, Math.max(picker.items.length - 1, 0));
+  renderPicker();
+}
+
+function renderPicker() {
+  pickerEl.textContent = "";
+  if (!picker.kind) { pickerEl.hidden = true; return; }
+  if (!picker.items.length) {
+    const loading = picker.kind === "slash"
+      ? slashCache && slashCache.status === "loading"
+      : fileCache && fileCache.status === "loading";
+    const d = document.createElement("div");
+    d.className = "pick-empty";
+    d.textContent = loading ? "loading…" : (picker.kind === "slash" ? "no matching commands" : "no matching files");
+    pickerEl.append(d);
+  }
+  let lastKind = null;
+  picker.items.forEach((it, i) => {
+    if (picker.kind === "slash" && it.kind !== lastKind) {
+      lastKind = it.kind;
+      const h = document.createElement("div");
+      h.className = "pick-head";
+      h.textContent = it.kind === "skill" ? "skills" : "commands";
+      pickerEl.append(h);
+    }
+    const row = document.createElement("div");
+    row.className = "pick-row" + (i === picker.active ? " active" : "");
+    const n = document.createElement("span");
+    n.className = "pick-name";
+    if (picker.kind === "slash") {
+      n.textContent = "/" + it.name;
+      const b = document.createElement("span");
+      b.className = "pick-badge";
+      b.textContent = it.source === "workspace" ? "project" : "global";
+      row.append(n, b);
+      if (it.description) {
+        const d = document.createElement("span");
+        d.className = "pick-desc";
+        d.textContent = it.description;
+        row.append(d);
+      }
+    } else {
+      n.textContent = it.rel + (it.isDir ? "/" : "");
+      row.append(n);
+      if (it.isDir) {
+        const b = document.createElement("span");
+        b.className = "pick-badge dir";
+        b.textContent = "dir";
+        row.append(b);
+      }
+    }
+    row.addEventListener("mousedown", e => e.preventDefault()); // keep the caret
+    row.addEventListener("click", () => selectPicker(i));
+    row.addEventListener("mouseenter", () => {
+      if (picker.active !== i) { picker.active = i; markActiveRow(); }
+    });
+    pickerEl.append(row);
+  });
+  pickerEl.hidden = false;
+  markActiveRow();
+}
+
+function markActiveRow() {
+  const rows = pickerEl.querySelectorAll(".pick-row");
+  rows.forEach((r, i) => r.classList.toggle("active", i === picker.active));
+  const act = rows[picker.active];
+  if (act) act.scrollIntoView({ block: "nearest" });
+}
+
+function closePicker() {
+  if (!picker.kind) return;
+  picker.kind = null;
+  picker.items = [];
+  pickerEl.hidden = true;
+}
+
+// Insert the chosen token over the trigger span. Slash commands are
+// plain text — the agent CLI expands /name itself; file mentions are
+// cwd-relative (the agent runs in the indexed root), quoted when they
+// contain whitespace. The trailing space ends the trigger so the
+// picker cannot re-open behind the caret.
+function selectPicker(i) {
+  const it = picker.items[i];
+  if (!it) { closePicker(); return; }
+  const caret = input.selectionStart;
+  const token = picker.kind === "slash"
+    ? "/" + it.name + " "
+    : /\s/.test(it.rel) ? "@\"" + it.rel + "\" " : "@" + it.rel + " ";
+  input.value = input.value.slice(0, picker.start) + token + input.value.slice(caret);
+  const pos = picker.start + token.length;
+  input.setSelectionRange(pos, pos);
+  closePicker();
+  autogrow();
+  ghostSuffix = "";
+  paintGhost();
+}
+
+function moveActive(delta) {
+  if (!picker.items.length) return;
+  picker.active = (Math.min(picker.active, picker.items.length - 1) + delta + picker.items.length) % picker.items.length;
+  markActiveRow();
+}
+
+// ----- prompt history: ghost completion + ArrowUp/Down recall -----
+let promptItems = [];          // newest first: {text, count}
+let promptItemsLoaded = false;
+let ghostTimer = 0, ghostSuffix = "";
+let historyIdx = -1, historyDraft = "";
+
+function loadPromptHistory() {
+  request("prompt.recent", { limit: 200 })
+    .then(r => { promptItems = (r.prompts || []).map(p => ({ text: p.text, count: p.count })); })
+    .catch(() => { /* offline: recall still works with the local rows */ });
+}
+
+function recordPromptHistory(text) {
+  const t = text.trim().slice(0, 300);
+  if (!t) return;
+  // Optimistic local update so the next completion is instant.
+  const hit = promptItems.findIndex(p => p.text === t);
+  if (hit >= 0) {
+    const [prev] = promptItems.splice(hit, 1);
+    promptItems.unshift({ text: t, count: prev.count + 1 });
+  } else {
+    promptItems.unshift({ text: t, count: 1 });
+  }
+  if (promptItems.length > 200) promptItems.length = 200;
+  request("prompt.add", { text: t }).catch(() => {});
+}
+
+function caretAtEnd() {
+  return input.selectionStart === input.selectionEnd && input.selectionStart === input.value.length;
+}
+
+function scheduleGhost() {
+  clearTimeout(ghostTimer);
+  ghostTimer = setTimeout(() => {
+    ghostSuffix = "";
+    if (!picker.kind && !composing && document.activeElement === input && caretAtEnd()) {
+      const clean = input.value;
+      // Matching a trimmed history against untrimmed input would paint
+      // a completion that never accepts — only complete whole words.
+      if (clean === clean.trim() && clean.length >= 2) {
+        const lower = clean.toLowerCase();
+        let best = null;
+        for (const p of promptItems) {
+          const t = p.text;
+          if (t.length <= clean.length) continue;
+          if (!t.toLowerCase().startsWith(lower)) continue;
+          if (!best || p.count > best.count ||
+              (p.count === best.count && t.length < best.text.length)) best = p;
+        }
+        if (best) ghostSuffix = best.text.slice(clean.length);
+      }
+    }
+    paintGhost();
+  }, 100);
+}
+
+// The typed half renders transparent in the mirror so only the
+// suggested suffix shows through, perfectly aligned with the textarea.
+function paintGhost() {
+  ghostEl.textContent = "";
+  if (!ghostSuffix || picker.kind || !caretAtEnd() || document.activeElement !== input) return;
+  ghostEl.append(input.value);
+  const s = document.createElement("span");
+  s.className = "g";
+  s.textContent = ghostSuffix;
+  ghostEl.append(s);
+  ghostEl.scrollTop = input.scrollTop;
+}
+
+function acceptGhost() {
+  if (!ghostSuffix) return;
+  input.value += ghostSuffix;
+  ghostSuffix = "";
+  const pos = input.value.length;
+  input.setSelectionRange(pos, pos);
+  autogrow();
+  scheduleGhost();
+}
+
+// ArrowUp starts recall only from an empty field; ArrowDown never
+// starts it, and dropping past the newest row restores the draft.
+// Real typing resets historyIdx in the input listener.
+function historyNav(key) {
+  if (!promptItems.length) return false;
+  if (historyIdx < 0 && (key === "ArrowDown" || input.value.trim())) return false;
+  if (historyIdx < 0) historyDraft = input.value;
+  if (key === "ArrowUp") {
+    historyIdx = historyIdx < 0 ? 0 : Math.min(historyIdx + 1, promptItems.length - 1);
+  } else {
+    historyIdx -= 1;
+    if (historyIdx < 0) {
+      setComposerText(historyDraft);
+      return true;
+    }
+  }
+  setComposerText(promptItems[historyIdx].text);
+  return true;
+}
+
+function setComposerText(v) {
+  input.value = v;
+  input.setSelectionRange(v.length, v.length);
+  autogrow();
+  ghostSuffix = "";
+  paintGhost();
+}
+
+function autogrow() {
+  input.style.height = "auto";
+  input.style.height = Math.min(input.scrollHeight, 160) + "px";
+}
+
 // ---------- wiring ----------
 $("newBtn").onclick = newSession;
 $("emptyNewBtn").onclick = newSession;
@@ -2811,16 +3247,68 @@ $("modeSel").onchange = () => applyPick("mode");
 $("importBtn").onclick = runImport;
 $("token").addEventListener("keydown", e => { if (e.key === "Enter") submitToken(); });
 input.addEventListener("keydown", e => {
-  // Enter during IME composition (Korean/Japanese/Chinese) commits the
-  // candidate, it must not send the message.
-  if (e.key === "Enter" && !e.shiftKey && !e.isComposing && e.keyCode !== 229) {
+  // IME guard first: during Korean/Japanese/Chinese composition every
+  // key (Enter included) commits or edits the candidate — none of the
+  // picker/history/ghost handling may fire.
+  if (e.isComposing || e.keyCode === 229) return;
+  const pick = !!picker.kind;
+  // Escape closes an open picker without also closing drawers — the
+  // document-level Escape handler must not see this event.
+  if (pick && e.key === "Escape") {
     e.preventDefault();
-    sendPrompt();
+    e.stopPropagation();
+    closePicker();
+    return;
+  }
+  // Arrows navigate the picker — swallowed even with zero items so
+  // history recall can never steal them while it is open.
+  if (pick && (e.key === "ArrowUp" || e.key === "ArrowDown")) {
+    e.preventDefault();
+    e.stopPropagation();
+    moveActive(e.key === "ArrowUp" ? -1 : 1);
+    return;
+  }
+  if (e.key === "Tab") {
+    if (pick && picker.items.length) { e.preventDefault(); selectPicker(picker.active); return; }
+    if (!pick && ghostSuffix && caretAtEnd()) { e.preventDefault(); acceptGhost(); return; }
+    return; // default Tab focus move
+  }
+  if (e.key === "Enter" && !e.shiftKey) {
+    e.preventDefault();
+    if (pick && picker.items.length) selectPicker(picker.active);
+    else sendPrompt();
+    return;
+  }
+  if (!pick && (e.key === "ArrowUp" || e.key === "ArrowDown") && !e.metaKey && !e.ctrlKey && !e.altKey) {
+    if (historyNav(e.key)) e.preventDefault();
   }
 });
 input.addEventListener("input", () => {
-  input.style.height = "auto";
-  input.style.height = Math.min(input.scrollHeight, 160) + "px";
+  historyIdx = -1;             // editing exits history recall
+  autogrow();
+  if (!composing) updatePicker();
+  scheduleGhost();
+});
+input.addEventListener("compositionstart", () => { composing = true; });
+input.addEventListener("compositionend", () => {
+  composing = false;
+  updatePicker();
+  scheduleGhost();
+});
+input.addEventListener("focus", () => {
+  if (!promptItemsLoaded) { promptItemsLoaded = true; loadPromptHistory(); }
+});
+input.addEventListener("blur", () => { closePicker(); ghostEl.textContent = ""; });
+input.addEventListener("scroll", () => { ghostEl.scrollTop = input.scrollTop; });
+// Caret moves without input (click, arrows in some paths) re-evaluate
+// the trigger and the ghost's caret-at-end condition.
+document.addEventListener("selectionchange", () => {
+  if (document.activeElement !== input || composing) return;
+  updatePicker();
+  paintGhost();
+});
+document.addEventListener("mousedown", e => {
+  if (picker.kind && e.target !== input && !pickerEl.contains(e.target)) closePicker();
 });
 log.addEventListener("scroll", () => {
   stick = atBottom();
@@ -3063,7 +3551,13 @@ if (location.protocol === "http:" || location.protocol === "https:") {
 
 setConn("pending", "connecting");
 syncEmpty();
-connect();
+if (new URLSearchParams(location.search).get("pickerDemo") === "1") {
+  // No daemon in demo mode — skip connect so the auth overlay never
+  // covers the pickers; the stubbed RPCs are the whole show.
+  setConn("off", "picker demo");
+} else {
+  connect();
+}
 
 // ---------- diff demo (?diffDemo=1) ----------
 // Smoke hook: three synthetic tool cards (edit, write, shell) so the
@@ -3088,6 +3582,46 @@ if (new URLSearchParams(location.search).get("diffDemo") === "1") {
     call_id: "demo-bash", name: "Bash", status: "completed",
     detail: { type: "shell", command: "cargo test --color always", output: "test result: ok. 42 passed", exit_code: 0 },
   });
+}
+
+// ---------- picker demo (?pickerDemo=1) ----------
+// Smoke hook: stub the three composer RPCs so the pickers and the
+// ghost can be checked in a browser without a daemon (works from
+// file://, like diffDemo).
+if (new URLSearchParams(location.search).get("pickerDemo") === "1") {
+  request = method => {
+    if (method === "catalog.commands")
+      return Promise.resolve({ commands: [
+        { name: "review", description: "Review the working tree diff", source: "workspace", kind: "command" },
+        { name: "aimax:plan", description: "Plan the next milestone", argumentHint: "[goal]", source: "workspace", kind: "command" },
+        { name: "commit", source: "global", kind: "command" },
+        { name: "pdf", description: "PDF toolkit", source: "global", kind: "skill" },
+      ] });
+    if (method === "file.index")
+      return Promise.resolve({ entries: [
+        { rel: "src/main.rs", isDir: false },
+        { rel: "src/ui.html", isDir: false },
+        { rel: "docs/protocol-v2.md", isDir: false },
+        { rel: "tests", isDir: true },
+      ], truncated: false });
+    if (method === "prompt.recent")
+      return Promise.resolve({ prompts: [
+        { text: "run the rpc tests", count: 4 },
+        { text: "run the store tests too", count: 1 },
+      ] });
+    if (method === "prompt.add") return Promise.resolve({ recorded: true });
+    return Promise.reject(new Error("demo stub"));
+  };
+  promptItemsLoaded = true;
+  promptItems = [
+    { text: "run the rpc tests", count: 4 },
+    { text: "run the store tests too", count: 1 },
+  ];
+  sysline("composer picker demo — type / or @ below; Tab accepts the ghost, ↑/↓ recalls history");
+  input.value = "/";
+  input.setSelectionRange(1, 1);
+  input.focus();
+  updatePicker();
 }
 </script>
 </body>
