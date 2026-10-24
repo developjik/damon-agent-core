@@ -198,6 +198,30 @@ pub struct AppState {
     /// In-flight `worktree.create` runs keyed by creationId — the
     /// cancel handles `worktree.cancel` signals.
     pub worktrees: crate::worktree::CreationRegistry,
+    /// Injectable process runner for CLI lifecycle probes/updates —
+    /// tests substitute a mock so no probe ever spawns a process or
+    /// touches the network. Unset = the real runner.
+    pub cli_runner: std::sync::OnceLock<std::sync::Arc<dyn crate::cli_lifecycle::CommandRunner>>,
+    /// In-flight `backend.update` runs keyed by creationId — the cancel
+    /// handles `backend.update_cancel` signals.
+    pub cli_updates: crate::cli_lifecycle::UpdateRegistry,
+    /// Injectable MCP probe runner — tests substitute a mock so no
+    /// dispatch test ever spawns an MCP server. Unset = real probes.
+    pub mcp_probe: std::sync::OnceLock<std::sync::Arc<dyn crate::mcp_inventory::ProbeRunner>>,
+    /// Non-loopback WS connections currently live — the "remote control
+    /// active" badge counts exactly these: a phone or second machine on
+    /// the LAN holding a direct `/ws` connection. Relayed phones ride
+    /// the daemon's own outbound tunnel instead of an inbound socket,
+    /// so they are not counted (documented cut — counting them needs
+    /// relay tunnel state, not a connection accept).
+    pub remote_ws: std::sync::atomic::AtomicUsize,
+    /// Single-flight history scan — `Some(scanId)` while one runs; a
+    /// second `session.rescan` returns the in-flight id.
+    pub history_scan: parking_lot::Mutex<Option<String>>,
+    /// Live mission runs: per-run event fanout, cancel token, and the
+    /// human-respond command inbox. Persisted state lives in the store;
+    /// this holds only what a LIVE scheduler needs.
+    pub missions: crate::mission::MissionRegistry,
 }
 
 impl AppState {
@@ -230,7 +254,33 @@ impl AppState {
             rate_buckets: tokio::sync::Mutex::new(HashMap::new()),
             skills,
             worktrees: crate::worktree::new_registry(),
+            cli_runner: std::sync::OnceLock::new(),
+            cli_updates: crate::cli_lifecycle::UpdateRegistry::new(),
+            mcp_probe: std::sync::OnceLock::new(),
+            remote_ws: std::sync::atomic::AtomicUsize::new(0),
+            history_scan: parking_lot::Mutex::new(None),
+            missions: crate::mission::MissionRegistry::new(),
         });
+        // Crash-honest mission convergence: runs with unfinished work
+        // and no end timestamp are orphans of a dead daemon — mark them
+        // interrupted, cancel their non-terminal tasks, close their
+        // pending inbox. Never faked as still-running.
+        {
+            let state2 = state.clone();
+            tokio::spawn(async move {
+                match state2
+                    .store
+                    .recover_interrupted_mission_runs(state2.missions.live_run_ids())
+                    .await
+                {
+                    Ok(runs) if !runs.is_empty() => {
+                        tracing::info!(count = runs.len(), "recovered interrupted mission runs");
+                    }
+                    Ok(_) => {}
+                    Err(e) => tracing::error!(error = %e, "mission recovery failed"),
+                }
+            });
+        }
         // Idle session sweep: backend sessions unused for
         // agent_idle_secs are closed (they reattach via the persistence
         // handle on next use); 0 disables. Sessions with a live turn are
@@ -271,6 +321,68 @@ impl AppState {
                         Ok(_) => {}
                         Err(e) => warn!(error = %e, "session retention sweep failed"),
                     }
+                }
+            });
+        }
+        // History scan: a boot pass (delayed — the daemon settles first)
+        // plus an optional interval (`[history] scan_interval_secs`, 0 =
+        // off). Single-flight: background sweeps share the same lock the
+        // session.rescan RPC holds, so a manual scan can never race a
+        // scheduled one.
+        let scan_interval = state.config.read().history.scan_interval_secs;
+        {
+            let state = state.clone();
+            tokio::spawn(async move {
+                // Disabled: the automatic sweeps (boot + interval) are
+                // off entirely; only an explicit session.rescan runs.
+                if !state.config.read().history.enabled {
+                    return;
+                }
+                // A few seconds in — backends settle, and an early scan
+                // would race the boot log for nothing.
+                tokio::time::sleep(Duration::from_secs(5)).await;
+                {
+                    let mut slot = state.history_scan.lock();
+                    if slot.is_none() {
+                        *slot = Some(uuid::Uuid::new_v4().to_string());
+                    }
+                }
+                let report = crate::history_scan::scan_history_quiet(&state).await;
+                *state.history_scan.lock() = None;
+                match report {
+                    Ok(r) if r.scanned > 0 || r.reparsed > 0 || r.archived > 0 => {
+                        info!(
+                            scanned = r.scanned,
+                            reparsed = r.reparsed,
+                            reused = r.reused,
+                            archived = r.archived,
+                            "history scan complete"
+                        )
+                    }
+                    Ok(_) => {}
+                    Err(e) => warn!(error = %e, "history scan failed"),
+                }
+                if scan_interval == 0 {
+                    return; // boot scan only — explicit session.rescan after that
+                }
+                loop {
+                    tokio::time::sleep(Duration::from_secs(scan_interval)).await;
+                    {
+                        let mut slot = state.history_scan.lock();
+                        if slot.is_some() {
+                            continue; // a manual scan owns the flight
+                        }
+                        *slot = Some(uuid::Uuid::new_v4().to_string());
+                    }
+                    match crate::history_scan::scan_history_quiet(&state).await {
+                        Ok(r) => info!(
+                            scanned = r.scanned,
+                            imported = r.reparsed,
+                            "scheduled history scan"
+                        ),
+                        Err(e) => warn!(error = %e, "scheduled history scan failed"),
+                    }
+                    *state.history_scan.lock() = None;
                 }
             });
         }
@@ -390,19 +502,27 @@ impl AppState {
 pub fn router(state: Arc<AppState>) -> Router {
     // /v1/ws_ticket keeps its historical path so the web UI and the npm
     // client keep working; the model endpoints are gone — agents answer,
-    // not an OpenAI-compatible proxy.
+    // not an OpenAI-compatible proxy. The ticket route carries its OWN
+    // auth (master bearer OR an approved device token — see ws_ticket)
+    // instead of the shared require_token layer, and stays rate-limited:
+    // device tokens are 256-bit random, but a throttled brute-force
+    // surface costs nothing to keep.
     let v1 = Router::new()
-        .route("/ws_ticket", post(ws_ticket))
-        .route_layer(axum::middleware::from_fn_with_state(
-            state.clone(),
-            require_token,
-        ))
+        .route("/pair", post(pair))
+        .route("/pair/status", post(pair_status))
         .route_layer(axum::middleware::from_fn_with_state(
             state.clone(),
             rate_limit,
         ));
 
     Router::new()
+        .route(
+            "/v1/ws_ticket",
+            post(ws_ticket).route_layer(axum::middleware::from_fn_with_state(
+                state.clone(),
+                rate_limit,
+            )),
+        )
         .route("/health", get(health))
         // Embedded chat UI — static markup, no secrets; the page
         // authenticates itself through the ws ticket flow.
@@ -471,9 +591,59 @@ async fn metrics(State(state): State<Arc<AppState>>) -> Response {
         .into_response()
 }
 
-/// POST /v1/ws_ticket — issue a one-shot ticket usable as /ws?ticket=
-/// for clients that can't set an Authorization header on a WS upgrade.
-async fn ws_ticket(State(state): State<Arc<AppState>>) -> Response {
+/// POST /v1/ws_ticket — issue a one-shot ticket usable as /ws?ticket=.
+/// Two credentials mint tickets: the master token via the Authorization
+/// header (the historical path, byte-for-byte the old require_token
+/// rules), or — new — an APPROVED web device's token in the JSON body
+/// (`{"deviceToken": …}`): the per-device revokable credential for
+/// remote surfaces. Pending and revoked devices mint nothing; a device
+/// token works even while the master secret is unresolvable, because
+/// the device row is its own credential. Loopback + no token
+/// configured stays open.
+#[derive(serde::Deserialize, Default)]
+#[serde(rename_all = "camelCase", default)]
+struct TicketRequest {
+    device_token: Option<String>,
+}
+
+async fn ws_ticket(
+    State(state): State<Arc<AppState>>,
+    headers: axum::http::HeaderMap,
+    body: Option<Json<TicketRequest>>,
+) -> Response {
+    // Master path — the exact rules require_token applied.
+    let master_ok = match state.auth_token().await {
+        Some(Ok(t)) => headers
+            .get("authorization")
+            .and_then(|v| v.to_str().ok())
+            .and_then(|v| v.strip_prefix("Bearer "))
+            .is_some_and(|got| crate::config::constant_time_eq(got.as_bytes(), t.as_bytes())),
+        // Configured but unresolvable: the master path fails closed —
+        // an approved device's own credential still works (its row is
+        // independent of the master secret).
+        Some(Err(_)) => false,
+        None => state.bind.ip().is_loopback(),
+    };
+    if master_ok {
+        return issue_ticket(&state).await;
+    }
+    if let Some(token) = body
+        .and_then(|Json(b)| b.device_token)
+        .filter(|t| !t.trim().is_empty())
+    {
+        let hash = crate::cli_lifecycle::hash_device_token(token.trim());
+        // Fail closed on store errors: unwrap_or(false).
+        if state.store.device_token_ok(&hash).await.unwrap_or(false) {
+            // Throttled last-seen — the store bounds the writes.
+            let _ = state.store.touch_device(&hash).await;
+            return issue_ticket(&state).await;
+        }
+    }
+    StatusCode::UNAUTHORIZED.into_response()
+}
+
+/// Mint one single-use ticket (sweep-on-insert as before).
+async fn issue_ticket(state: &Arc<AppState>) -> Response {
     let ticket = uuid::Uuid::new_v4().to_string();
     let mut tickets = state.ws_tickets.lock().await;
     // Sweep expired entries on insert — a ticket abandoned without a
@@ -481,6 +651,81 @@ async fn ws_ticket(State(state): State<Arc<AppState>>) -> Response {
     tickets.retain(|_, issued| issued.elapsed() < WS_TICKET_TTL);
     tickets.insert(ticket.clone(), Instant::now());
     Json(json!({ "ticket": ticket })).into_response()
+}
+
+/// POST /v1/pair — spend a one-time pairing key on one device: the key
+/// is consumed AND rotated in a single locked step (a code opens
+/// exactly one pairing), the device row starts `pending`, and the
+/// device token — returned exactly once, here — mints nothing until a
+/// trusted surface approves the row.
+#[derive(serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct PairRequest {
+    pairing_key: String,
+    name: Option<String>,
+}
+
+async fn pair(State(state): State<Arc<AppState>>, Json(body): Json<PairRequest>) -> Response {
+    let Some(_fresh) = state
+        .store
+        .consume_pairing_key(&body.pairing_key)
+        .await
+        .unwrap_or(None)
+    else {
+        return (
+            StatusCode::UNAUTHORIZED,
+            Json(json!({
+                "error": "invalid pairing key"
+            })),
+        )
+            .into_response();
+    };
+    let token = crate::cli_lifecycle::generate_device_token();
+    let hash = crate::cli_lifecycle::hash_device_token(&token);
+    let Ok(id) = state
+        .store
+        .create_device(body.name.as_deref().unwrap_or_default(), &hash)
+        .await
+    else {
+        // The key was spent but the row failed — fail closed: rotate a
+        // new key in so the shown one is never half-spent.
+        let _ = state.store.pairing_key_ensure().await;
+        return StatusCode::INTERNAL_SERVER_ERROR.into_response();
+    };
+    Json(json!({
+        "deviceId": id,
+        "token": token,
+        "status": "pending",
+    }))
+    .into_response()
+}
+
+/// POST /v1/pair/status — the waiting page's poll. The row is matched
+/// by id AND token hash (the device proves it owns the credential);
+/// a missing row reads `revoked` — fail closed, and a denied/revoked
+/// device stops polling with a reason.
+#[derive(serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct PairStatusRequest {
+    device_id: String,
+    token: String,
+}
+
+async fn pair_status(
+    State(state): State<Arc<AppState>>,
+    Json(body): Json<PairStatusRequest>,
+) -> Response {
+    let hash = crate::cli_lifecycle::hash_device_token(body.token.trim());
+    let status = match state
+        .store
+        .device_pair_status(&body.device_id, &hash)
+        .await
+        .unwrap_or(None)
+    {
+        Some(status) => status,
+        None => "revoked".to_string(),
+    };
+    Json(json!({ "status": status })).into_response()
 }
 
 /// Per-source-IP token bucket for token-gated routes — only on

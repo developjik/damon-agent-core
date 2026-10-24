@@ -51,7 +51,23 @@
 # every installed CLI's native skill directory. Hot-reloaded; the hub
 # lives in <data_dir>/skills-hub and never creates an engine home for
 # a CLI that is not installed.
-# [skills]
+# History scanner — walks every backend's own native session storage
+# (honoring env overrides like CLAUDE_CONFIG_DIR), creates damon
+# bookmark rows for sessions the daemon has never seen, and archives a
+# bookmark when its native file vanishes. Explicit deletes are
+# remembered — a deleted session is never re-imported. `damond` also
+# runs one scan at boot (a few seconds after start); `session.rescan`
+# runs one on demand.
+# [history]
+# enabled = true                              # false turns the automatic
+#                                             # sweeps (boot + interval)
+#                                             # off; session.rescan still
+#                                             # works
+# scan_interval_secs = 0                      # seconds between automatic
+#                                             # scans; 0 (default) = boot
+#                                             # scan + session.rescan only
+
+[skills]
 # enabled = true                            # false turns every skills.* method away
 # default_targets = ["claude", "codex"]     # skills.install without `targets`
 # extra_repos = [                           # additional discoverable repos,

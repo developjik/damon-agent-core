@@ -158,3 +158,247 @@ async fn auth_token_cache_re_resolves_after_ttl() {
         std::env::remove_var("DAMON_TEST_TOK_CACHE");
     }
 }
+
+/// The full device-pairing loop over a real server: wrong key refused,
+/// key spent exactly once (consumed + rotated), pending device cannot
+/// mint a ticket, approval unlocks ticket minting, the ticket opens a
+/// WebSocket (hello arrives), revocation kills the token immediately,
+/// and the master-token path is byte-for-byte unchanged.
+#[tokio::test]
+async fn web_device_pairing_full_flow() {
+    use futures::StreamExt;
+    use tokio_tungstenite::tungstenite::Message;
+
+    let cfg = common::mock_config(Some("master-tok"));
+    let shared: damon_core::config::SharedConfig = Arc::new(parking_lot::RwLock::new(cfg));
+    let store = damon_core::store::Store::in_memory().await.unwrap();
+    let state = damon_core::api::AppState::new(shared, store.clone()).await;
+    state
+        .sessions
+        .insert_client("mock".to_string(), common::mock_client());
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let server_state = state.clone();
+    tokio::spawn(async move {
+        let _ = axum::serve(
+            listener,
+            damon_core::api::router(server_state)
+                .into_make_service_with_connect_info::<std::net::SocketAddr>(),
+        )
+        .await;
+    });
+    let base = format!("http://{addr}");
+    // Router with the auth middleware for one-shot requests.
+    // The oneshot router MUST share the state above — same store, same
+    // pairing keys (app() would build a second in-memory store).
+    let gated = damon_core::api::router(state.clone());
+
+    // Master regression, both directions.
+    let resp = gated
+        .clone()
+        .clone()
+        .oneshot(Request::post("/v1/ws_ticket").body(Body::empty()).unwrap())
+        .await
+        .unwrap();
+    assert_eq!(
+        resp.status(),
+        StatusCode::UNAUTHORIZED,
+        "no bearer, no device"
+    );
+    let resp = gated
+        .clone()
+        .oneshot(
+            Request::post("/v1/ws_ticket")
+                .header("authorization", "Bearer master-tok")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK, "master path unchanged");
+
+    // Pairing: wrong key refused.
+    let resp = gated
+        .clone()
+        .oneshot(
+            Request::post("/v1/pair")
+                .header("content-type", "application/json")
+                .body(Body::from(r#"{"pairingKey":"NOPE","name":"pixel"}"#))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
+
+    // The desktop shows a key (store call — the RPC arm wraps this).
+    let key = store.pairing_key_ensure().await.unwrap();
+
+    // Pair: the key is spent exactly once.
+    let resp = gated
+        .clone()
+        .clone()
+        .oneshot(
+            Request::post("/v1/pair")
+                .header("content-type", "application/json")
+                .body(Body::from(format!(
+                    r#"{{"pairingKey":"{key}","name":"pixel"}}"#
+                )))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    let body = axum::body::to_bytes(resp.into_body(), 1 << 20)
+        .await
+        .unwrap();
+    let paired: serde_json::Value = serde_json::from_slice(&body).unwrap();
+    let device_id = paired["deviceId"].as_str().unwrap().to_string();
+    let device_token = paired["token"].as_str().unwrap().to_string();
+    assert_eq!(paired["status"], "pending");
+    assert!(!device_token.is_empty());
+
+    // The spent key is dead — consumed AND rotated in one step.
+    let resp = gated
+        .clone()
+        .oneshot(
+            Request::post("/v1/pair")
+                .header("content-type", "application/json")
+                .body(Body::from(format!(
+                    r#"{{"pairingKey":"{key}","name":"again"}}"#
+                )))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
+    let fresh = store.pairing_key_ensure().await.unwrap();
+    assert_ne!(fresh, key, "a fresh key rotated in");
+
+    // Pending device: no ticket.
+    let resp = gated
+        .clone()
+        .clone()
+        .oneshot(
+            Request::post("/v1/ws_ticket")
+                .header("content-type", "application/json")
+                .body(Body::from(format!(r#"{{"deviceToken":"{device_token}"}}"#)))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        resp.status(),
+        StatusCode::UNAUTHORIZED,
+        "pending mints nothing"
+    );
+
+    // Pair status: pending while waiting.
+    let resp = gated
+        .clone()
+        .oneshot(
+            Request::post("/v1/pair/status")
+                .header("content-type", "application/json")
+                .body(Body::from(format!(
+                    r#"{{"deviceId":"{device_id}","token":"{device_token}"}}"#
+                )))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    let body = axum::body::to_bytes(resp.into_body(), 1 << 20)
+        .await
+        .unwrap();
+    let v: serde_json::Value = serde_json::from_slice(&body).unwrap();
+    assert_eq!(v["status"], "pending", "{v}");
+
+    // Approve (the device.* RPC arm is a thin store call) → ticket mints.
+    assert!(store.approve_device(&device_id).await.unwrap());
+    let resp = gated
+        .clone()
+        .clone()
+        .oneshot(
+            Request::post("/v1/ws_ticket")
+                .header("content-type", "application/json")
+                .body(Body::from(format!(r#"{{"deviceToken":"{device_token}"}}"#)))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    let body = axum::body::to_bytes(resp.into_body(), 1 << 20)
+        .await
+        .unwrap();
+    let ticket = serde_json::from_slice::<serde_json::Value>(&body).unwrap()["ticket"]
+        .as_str()
+        .unwrap()
+        .to_string();
+
+    // The ticket OPENS a WebSocket — hello arrives.
+    let (mut ws, _) = tokio_tungstenite::connect_async(format!("ws://{addr}/ws?ticket={ticket}"))
+        .await
+        .unwrap();
+    let hello = tokio::time::timeout(std::time::Duration::from_secs(5), ws.next())
+        .await
+        .unwrap()
+        .unwrap()
+        .unwrap();
+    let hello: serde_json::Value = serde_json::from_slice(
+        match hello {
+            Message::Text(t) => t.as_bytes().to_vec(),
+            other => panic!("expected text frame: {other:?}"),
+        }
+        .as_slice(),
+    )
+    .unwrap();
+    assert_eq!(hello["hello"]["protocol"], 2, "{hello}");
+
+    // Revoke → the token is dead immediately; pair status reads revoked.
+    assert!(store.revoke_device(&device_id).await.unwrap());
+    let resp = gated
+        .clone()
+        .clone()
+        .oneshot(
+            Request::post("/v1/ws_ticket")
+                .header("content-type", "application/json")
+                .body(Body::from(format!(r#"{{"deviceToken":"{device_token}"}}"#)))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        resp.status(),
+        StatusCode::UNAUTHORIZED,
+        "revoked mints nothing"
+    );
+    let resp = gated
+        .clone()
+        .oneshot(
+            Request::post("/v1/pair/status")
+                .header("content-type", "application/json")
+                .body(Body::from(format!(
+                    r#"{{"deviceId":"{device_id}","token":"{device_token}"}}"#
+                )))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    let body = axum::body::to_bytes(resp.into_body(), 1 << 20)
+        .await
+        .unwrap();
+    let v: serde_json::Value = serde_json::from_slice(&body).unwrap();
+    assert_eq!(v["status"], "revoked", "{v}");
+
+    // Master path still fine after everything.
+    let resp = gated
+        .clone()
+        .oneshot(
+            Request::post("/v1/ws_ticket")
+                .header("authorization", "Bearer master-tok")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    let _ = base;
+}

@@ -23,7 +23,7 @@
 //! session file path recorded in the persistence handle.
 
 use std::collections::HashMap;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::sync::Weak;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -68,6 +68,10 @@ pub struct PiFamily {
     /// Damon permission modes the CLI accepts (launch-time only — the
     /// rpc protocol cannot change approval at runtime).
     pub modes: &'static [&'static str],
+    /// On-disk agent dir holding `sessions/<cwd-slug>/<ts>_<ulid>.jsonl`
+    /// transcripts — the listing scan root. Env overrides win over the
+    /// `~/` default (skills_hub::targets resolution, shared with the hub).
+    pub sessions_home: fn() -> Option<PathBuf>,
     pub default_mode: Option<&'static str>,
 }
 
@@ -79,6 +83,7 @@ pub const OMP: PiFamily = PiFamily {
     has_mode_args: true,
     subagent_events: true,
     modes: &["default", "acceptEdits", "bypassPermissions"],
+    sessions_home: crate::skills_hub::targets::omp_home,
     default_mode: Some("default"),
 };
 
@@ -93,6 +98,7 @@ pub const PI: PiFamily = PiFamily {
     has_mode_args: false,
     subagent_events: false,
     modes: &["default"],
+    sessions_home: crate::skills_hub::targets::pi_home,
     default_mode: Some("default"),
 };
 
@@ -112,13 +118,14 @@ impl OmpClient {
             caps: Capabilities {
                 streaming: true,
                 session_persistence: true,
-                session_listing: false,
+                session_listing: true,
                 dynamic_modes: false,
                 mcp_servers: false,
                 reasoning_stream: true,
                 steer: true,
                 rewind: false,
                 subagent_events: profile.subagent_events,
+                tool_allowlist: false,
             },
             resolved,
             profile,
@@ -191,6 +198,23 @@ impl AgentClient for OmpClient {
             .await?;
         Ok(session as Arc<dyn AgentSession>)
     }
+
+    /// Native sessions for this cwd, scanned off disk. Storage shape
+    /// (verified against omp 18.6.0 / pi 0.73.1):
+    /// `<agent-dir>/sessions/<cwd-slug>/<timestamp>_<ulid>.jsonl`, where
+    /// the slug is the absolute cwd with `/` → `-` and the file's own
+    /// path is the resume token `switch_session` consumes. The scan runs
+    /// on the blocking pool; a missing agent/slug dir simply yields none.
+    async fn list_importable_sessions(&self, cwd: &Path) -> Result<Vec<ImportableSession>> {
+        let Some(agent_dir) = (self.profile.sessions_home)() else {
+            return Ok(vec![]);
+        };
+        let provider = self.profile.id;
+        let cwd = cwd.to_path_buf();
+        tokio::task::spawn_blocking(move || scan_importable_sessions(&agent_dir, &cwd, provider))
+            .await
+            .context("session scan join failed")
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -228,6 +252,116 @@ fn mode_args(profile: &PiFamily, mode: Option<&str>) -> Vec<String> {
     .collect()
 }
 
+/// Result cap per scan — bounds work on a large session library.
+const IMPORT_SCAN_LIMIT: usize = 200;
+/// Transcript head inspected for the `{"type":"session"}` header line.
+const SESSION_HEAD_LINES: usize = 8;
+
+/// Sessions on disk for `cwd` (sync — runs inside `spawn_blocking`).
+/// Only top-level `<timestamp>_<ulid>.jsonl` files of the cwd's slug dir
+/// count: nested subdirectories hold subagent task transcripts
+/// (`<Task>.jsonl`), and omp keeps same-stem directories beside the
+/// session files. The parsed `cwd` is matched exactly against the
+/// argument — slugs collide (`/work/project` and `/work-project` both
+/// slug to `-work-project`), so the header check is what makes the
+/// listing honest. Ordered newest-first.
+fn scan_importable_sessions(
+    agent_dir: &Path,
+    cwd: &Path,
+    provider: &str,
+) -> Vec<ImportableSession> {
+    let dir = agent_dir
+        .join("sessions")
+        .join(cwd.to_string_lossy().replace('/', "-"));
+    let Ok(entries) = std::fs::read_dir(&dir) else {
+        return vec![];
+    };
+    let mut out: Vec<ImportableSession> = Vec::new();
+    for entry in entries.flatten() {
+        if out.len() >= IMPORT_SCAN_LIMIT {
+            break;
+        }
+        let path = entry.path();
+        if !entry.file_type().map(|t| t.is_file()).unwrap_or(false) {
+            continue;
+        }
+        if path.extension().and_then(|e| e.to_str()) != Some("jsonl") {
+            continue;
+        }
+        let Some(name) = path.file_name().and_then(|n| n.to_str()) else {
+            continue;
+        };
+        if !is_session_file_name(name) {
+            continue;
+        }
+        let Some((session_cwd, title)) = session_head(&path) else {
+            continue;
+        };
+        if session_cwd.as_path() != cwd {
+            continue;
+        }
+        let meta = entry.metadata().ok();
+        let modified_at = meta
+            .as_ref()
+            .and_then(|m| m.modified().ok())
+            .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
+            .map(|d| d.as_secs());
+        out.push(ImportableSession {
+            handle: PersistenceHandle {
+                provider: provider.to_string(),
+                native_handle: path.to_string_lossy().into_owned(),
+                metadata: Value::Null,
+            },
+            title,
+            cwd: Some(cwd.to_path_buf()),
+            modified_at,
+            size: meta.as_ref().map(|m| m.len()),
+        });
+    }
+    out.sort_by_key(|s| std::cmp::Reverse(s.modified_at));
+    out
+}
+
+/// `2026-09-20T15-20-30-799Z_01a09ba1-….jsonl` — real sessions open with
+/// a date-time prefix before the `_`; task-named transcripts don't.
+fn is_session_file_name(name: &str) -> bool {
+    let Some((ts, _)) = name.split_once('_') else {
+        return false;
+    };
+    let b = ts.as_bytes();
+    b.len() >= 11
+        && b[..4].iter().all(u8::is_ascii_digit)
+        && b[4] == b'-'
+        && b[5..7].iter().all(u8::is_ascii_digit)
+        && b[7] == b'-'
+        && b[8..10].iter().all(u8::is_ascii_digit)
+        && b[10] == b'T'
+}
+
+/// The `{"type":"session"}` header of a transcript: its cwd and title.
+/// The header also carries an id and timestamp, but the normalized shape
+/// needs neither — the resume token is the file path and ordering uses
+/// fs mtimes. Returns None for transcripts without a cwd-bearing header
+/// in the bounded head (not sessions, or truncated/foreign files).
+fn session_head(path: &Path) -> Option<(PathBuf, Option<String>)> {
+    use std::io::{BufRead, BufReader};
+    let f = std::fs::File::open(path).ok()?;
+    let mut cwd = None;
+    let mut title = None;
+    for line in BufReader::new(f).lines().take(SESSION_HEAD_LINES) {
+        let Ok(line) = line else { break };
+        let Ok(v) = serde_json::from_str::<Value>(&line) else {
+            continue;
+        };
+        if v["type"] == "session" {
+            cwd = v["cwd"].as_str().map(PathBuf::from);
+            title = v["title"].as_str().map(String::from);
+            break;
+        }
+    }
+    cwd.map(|c| (c, title))
+}
+
 pub struct OmpSession {
     transport: Arc<NdjsonTransport>,
     caps: Capabilities,
@@ -261,13 +395,14 @@ impl OmpSession {
             caps: Capabilities {
                 streaming: true,
                 session_persistence: true,
-                session_listing: false,
+                session_listing: true,
                 dynamic_modes: false,
                 mcp_servers: false,
                 reasoning_stream: true,
                 steer: true,
                 rewind: false,
                 subagent_events: profile.subagent_events,
+                tool_allowlist: false,
             },
             profile,
             events,
@@ -619,6 +754,7 @@ impl OmpSession {
             detail: None,
             actions,
             suggestions: vec![],
+            questions: Vec::new(),
         };
         self.pending_asks.lock().await.insert(
             ask_id.clone(),
@@ -917,5 +1053,170 @@ mod tests {
         }
         assert!(compaction_item("message_update").is_none());
         assert!(compaction_item("").is_none());
+    }
+
+    // -- session listing -------------------------------------------------
+
+    /// Timestamped session-file name as omp/pi write it on disk.
+    const TS: &str = "2026-09-20T15-20-30-799Z";
+
+    /// A transcript head: an auto title line, then the session header.
+    fn head_lines(cwd: &str, title: Option<&str>) -> String {
+        let title_line = json!({"type":"title","v":1,"title":"auto","source":"auto"}).to_string();
+        let mut session = json!({
+            "type": "session",
+            "version": 3,
+            "id": "01a09ba1-4f6a-7000-bfa4-cf2e63cbfa2d",
+            "timestamp": "2026-09-20T15:20:30.799Z",
+            "cwd": cwd,
+        });
+        if let Some(t) = title {
+            session["title"] = json!(t);
+        }
+        format!("{title_line}\n{session}\n")
+    }
+
+    /// A throwaway agent-dir tree, removed on drop (no tempfile dep).
+    struct Fixture(PathBuf);
+
+    impl Fixture {
+        fn new() -> Self {
+            let dir =
+                std::env::temp_dir().join(format!("damon-omp-sessions-{}", uuid::Uuid::new_v4()));
+            std::fs::create_dir_all(dir.join("sessions")).unwrap();
+            Self(dir)
+        }
+
+        fn write(&self, rel: &str, body: &str) -> PathBuf {
+            let path = self.0.join(rel);
+            std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+            std::fs::write(&path, body).unwrap();
+            path
+        }
+
+        fn set_mtime(&self, rel: &str, secs: u64) {
+            let f = std::fs::OpenOptions::new()
+                .append(true)
+                .open(self.0.join(rel))
+                .unwrap();
+            f.set_modified(std::time::UNIX_EPOCH + std::time::Duration::from_secs(secs))
+                .unwrap();
+        }
+    }
+
+    impl Drop for Fixture {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.0);
+        }
+    }
+
+    /// Slug dirs collide (`/work/project` and `/work-project` both slug
+    /// to `-work-project`), so the scan must verify the header cwd — and
+    /// skip nested subagent transcripts, task-named files, same-stem
+    /// directories, and order survivors by mtime.
+    #[test]
+    fn scan_matches_filters_and_orders_fixture() {
+        let fx = Fixture::new();
+        let slug = "-work-project";
+        let keep_old = format!("{TS}_01a09ba1-4f6a-7000-bfa4-cf2e63cbfa2d.jsonl");
+        let keep_new = format!("{TS}_01a0bf67-914f-7000-a2df-5439f834b5f1.jsonl");
+        fx.write(
+            &format!("sessions/{slug}/{keep_old}"),
+            &head_lines("/work/project", Some("older task")),
+        );
+        // Title-less header — the title stays None.
+        fx.write(
+            &format!("sessions/{slug}/{keep_new}"),
+            &head_lines("/work/project", None),
+        );
+        // Same slug dir, but the header cwd is the colliding path.
+        fx.write(
+            &format!("sessions/{slug}/{TS}_01a0bf68-fb68-7000-9761-affcc27c0801.jsonl"),
+            &head_lines("/work-project", Some("slug collision")),
+        );
+        // Subagent transcript nested in a subdirectory of the slug dir.
+        fx.write(
+            &format!("sessions/{slug}/subagents/{TS}_01a0d156-6363-7000-8b9b-8867c19f544e.jsonl"),
+            &head_lines("/work/project", Some("nested subagent")),
+        );
+        // Task-named top-level transcript: no timestamp prefix.
+        fx.write(
+            &format!("sessions/{slug}/Refactor auth.jsonl"),
+            &head_lines("/work/project", Some("task transcript")),
+        );
+        // Same-stem directory kept beside the session file (observed on
+        // this machine's ~/.omp/agent/sessions).
+        std::fs::create_dir_all(fx.0.join(format!(
+            "sessions/{slug}/{TS}_01a0bf67-914f-7000-a2df-5439f834b5f1"
+        )))
+        .unwrap();
+
+        fx.set_mtime(&format!("sessions/{slug}/{keep_old}"), 1_700_000_100);
+        fx.set_mtime(&format!("sessions/{slug}/{keep_new}"), 1_700_000_500);
+
+        let out = scan_importable_sessions(&fx.0, Path::new("/work/project"), "omp");
+        assert_eq!(out.len(), 2, "only real sessions of the cwd surface");
+        assert_eq!(out[0].modified_at, Some(1_700_000_500), "newest first");
+        assert_eq!(out[0].title, None);
+        assert_eq!(out[0].cwd.as_deref(), Some(Path::new("/work/project")));
+        assert_eq!(out[1].title.as_deref(), Some("older task"));
+        assert_eq!(out[1].modified_at, Some(1_700_000_100));
+        assert_eq!(out[1].handle.provider, "omp");
+        assert!(
+            out[1].handle.native_handle.ends_with(&keep_old),
+            "resume token is the session file path: {}",
+            out[1].handle.native_handle
+        );
+        // pi shares the storage layout — only the provider id differs.
+        let pi = scan_importable_sessions(&fx.0, Path::new("/work/project"), "pi");
+        assert_eq!(pi.len(), 2);
+        assert_eq!(pi[0].handle.provider, "pi");
+    }
+
+    #[test]
+    fn client_advertises_session_listing() {
+        let resolved = ResolvedBackend {
+            id: "omp".to_string(),
+            title: "omp".to_string(),
+            command: "omp".to_string(),
+            args: vec![],
+            env: vec![],
+            auth_hint: String::new(),
+            detected: true,
+        };
+        for profile in [&OMP, &PI] {
+            let client = OmpClient::with_profile(resolved.clone(), profile);
+            assert!(client.capabilities().session_listing);
+        }
+    }
+
+    #[test]
+    fn session_head_reads_bounded_prefix() {
+        let fx = Fixture::new();
+        // Header past the bounded head → not a listing candidate.
+        let mut body = "{}\n".repeat(SESSION_HEAD_LINES);
+        body.push_str(r#"{"type":"session","cwd":"/w/p","title":"too late"}"#);
+        let late = fx.write("sessions/late.jsonl", &body);
+        assert_eq!(session_head(&late), None);
+
+        let early = fx.write("sessions/early.jsonl", &head_lines("/w/p", Some("found")));
+        assert_eq!(
+            session_head(&early),
+            Some((PathBuf::from("/w/p"), Some("found".to_string())))
+        );
+
+        // No header at all — foreign or truncated transcript.
+        let none = fx.write("sessions/none.jsonl", "{}\n");
+        assert_eq!(session_head(&none), None);
+    }
+
+    #[test]
+    fn session_file_names_require_timestamp_prefix() {
+        assert!(is_session_file_name(
+            "2026-09-20T15-20-30-799Z_01a0bf67-914f-7000-a2df-5439f834b5f1.jsonl"
+        ));
+        assert!(!is_session_file_name("Refactor auth.jsonl"));
+        assert!(!is_session_file_name("2026-09-20X15-20-30-799Z_ulid.jsonl"));
+        assert!(!is_session_file_name("no_underscores_here.jsonl"));
     }
 }

@@ -350,21 +350,41 @@ async fn doctor(path: &Path) -> anyhow::Result<()> {
     };
 
     // Backends: the whole provider story. Each available backend brings
-    // its own login, models, and tools.
+    // its own login, models, and tools. Detected backends get a
+    // `--version` probe too (10s cap, all in parallel — doctor stays
+    // fast); a probe that times out or prints nothing degrades to
+    // "version unknown" instead of failing the check.
     let cfg_for_backends = cfg
         .clone()
         .unwrap_or_else(|| toml::from_str("").expect("empty config parses"));
     let resolved = damon_core::backend::registry::resolve_backends(&cfg_for_backends.backends);
+    let runner: std::sync::Arc<dyn damon_core::cli_lifecycle::CommandRunner> =
+        std::sync::Arc::new(damon_core::cli_lifecycle::RealRunner);
+    let probes = resolved.iter().map(|b| {
+        let runner = runner.clone();
+        let cmd = b.command.clone();
+        async move {
+            if b.detected {
+                damon_core::cli_lifecycle::probe_local_version(runner.as_ref(), &cmd).await
+            } else {
+                (false, None)
+            }
+        }
+    });
+    let probed = futures::future::join_all(probes).await;
     let mut any_available = false;
-    for b in &resolved {
-        let status = if b.detected {
-            "installed"
-        } else {
-            "not installed"
-        };
+    for (b, (_detected, version)) in resolved.iter().zip(probed) {
         if b.detected {
             any_available = true;
         }
+        let status = if b.detected {
+            format!(
+                "installed, {}",
+                damon_core::cli_lifecycle::doctor_version_suffix(version.as_deref())
+            )
+        } else {
+            "not installed".to_string()
+        };
         report(
             &mut ok,
             b.detected,

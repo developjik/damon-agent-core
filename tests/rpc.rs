@@ -470,6 +470,186 @@ async fn permission_ask_round_trip_and_timeout_advertised() {
     assert_eq!(text, "denied", "deny never reached the backend");
 }
 
+/// A structured question card (`kind: question` with a `questions`
+/// payload) streams out with its options intact, and `permission.respond`
+/// with `answers` delivers the canonical `{question → label}` map to the
+/// backend — the mock echoes what it received.
+#[tokio::test]
+async fn question_card_round_trip_delivers_structured_answers() {
+    let (_state, _store, addr) = serve(Arc::new(parking_lot::RwLock::new(common::mock_config(
+        None,
+    ))))
+    .await;
+
+    let (mut ws, _hello) = ws_connect(&format!("ws://{addr}/ws")).await;
+    rpc_send(
+        &mut ws,
+        json!({"id":1,"method":"session.create","params":{"cwd":"/tmp"}}),
+    )
+    .await;
+    let new = read_reply(&mut ws, 1).await;
+    let session_id = new["result"]["sessionId"].as_str().unwrap().to_string();
+
+    // "question card multi" makes the mock raise a two-question card.
+    rpc_send(
+        &mut ws,
+        json!({"id":2,"method":"turn.start",
+               "params":{"sessionId":session_id,"prompt":"question card multi"}}),
+    )
+    .await;
+
+    let request_id = loop {
+        let v = tokio::time::timeout(std::time::Duration::from_secs(15), read_json(&mut ws))
+            .await
+            .expect("question card never arrived");
+        if v["event"] == "session.event" && v["data"]["type"] == "permission_requested" {
+            let data = &v["data"];
+            assert_eq!(data["kind"], "question", "card kind: {data}");
+            let questions = data["questions"].as_array().expect("questions array");
+            assert_eq!(questions.len(), 2, "both questions ride the wire: {data}");
+            assert_eq!(questions[0]["question"], "Which database?");
+            assert_eq!(questions[0]["header"], "DB");
+            assert_eq!(questions[0]["options"].as_array().unwrap().len(), 2);
+            assert_eq!(questions[0]["options"][0]["label"], "Postgres");
+            assert_eq!(questions[1]["question"], "Anything else?");
+            assert!(
+                questions[1].get("options").is_none(),
+                "free-text questions carry no options on the wire"
+            );
+            break data["id"].as_str().unwrap().to_string();
+        }
+    };
+
+    rpc_send(
+        &mut ws,
+        json!({"id":3,"method":"permission.respond",
+               "params":{"sessionId":session_id,"requestId":request_id,
+                         "response":{"behavior":"allow",
+                                     "answers":{"Which database?":"Postgres",
+                                                "Anything else?":"ship it"}}}}),
+    )
+    .await;
+
+    let mut text = String::new();
+    let (mut turn, mut respond) = (None, None);
+    while turn.is_none() || respond.is_none() {
+        let v = tokio::time::timeout(std::time::Duration::from_secs(15), read_json(&mut ws))
+            .await
+            .expect("turn never finished after question respond");
+        let data = &v["data"];
+        if v["event"] == "session.event" && data["kind"] == "assistant_message" {
+            text.push_str(data["text"].as_str().unwrap_or(""));
+        }
+        match v["id"].as_u64() {
+            Some(2) => turn = Some(v),
+            Some(3) => respond = Some(v),
+            _ => {}
+        }
+    }
+    assert!(
+        respond.as_ref().unwrap().get("error").is_none(),
+        "question respond failed: {respond:?}"
+    );
+    assert_eq!(turn.as_ref().unwrap()["result"]["stopReason"], "completed");
+    let echo = text
+        .strip_prefix("answered: ")
+        .expect("mock echoes answers");
+    let got: serde_json::Value = serde_json::from_str(echo).expect("echo is valid JSON");
+    assert_eq!(got["Which database?"], "Postgres");
+    assert_eq!(got["Anything else?"], "ship it");
+}
+
+/// An allow without answers is a skip — the backend sees no answers at
+/// all, not an empty map.
+#[tokio::test]
+async fn question_allow_without_answers_is_a_skip() {
+    let (_state, _store, addr) = serve(Arc::new(parking_lot::RwLock::new(common::mock_config(
+        None,
+    ))))
+    .await;
+
+    let (mut ws, _hello) = ws_connect(&format!("ws://{addr}/ws")).await;
+    rpc_send(
+        &mut ws,
+        json!({"id":1,"method":"session.create","params":{"cwd":"/tmp"}}),
+    )
+    .await;
+    let new = read_reply(&mut ws, 1).await;
+    let session_id = new["result"]["sessionId"].as_str().unwrap().to_string();
+
+    rpc_send(
+        &mut ws,
+        json!({"id":2,"method":"turn.start",
+               "params":{"sessionId":session_id,"prompt":"question card"}}),
+    )
+    .await;
+    let request_id = loop {
+        let v = tokio::time::timeout(std::time::Duration::from_secs(15), read_json(&mut ws))
+            .await
+            .expect("question card never arrived");
+        if v["event"] == "session.event" && v["data"]["type"] == "permission_requested" {
+            break v["data"]["id"].as_str().unwrap().to_string();
+        }
+    };
+
+    rpc_send(
+        &mut ws,
+        json!({"id":3,"method":"permission.respond",
+               "params":{"sessionId":session_id,"requestId":request_id,
+                         "response":{"behavior":"allow"}}}),
+    )
+    .await;
+
+    let mut text = String::new();
+    let mut turn = None;
+    while turn.is_none() {
+        let v = tokio::time::timeout(std::time::Duration::from_secs(15), read_json(&mut ws))
+            .await
+            .expect("turn never finished after skip");
+        let data = &v["data"];
+        if v["event"] == "session.event" && data["kind"] == "assistant_message" {
+            text.push_str(data["text"].as_str().unwrap_or(""));
+        }
+        if v["id"].as_u64() == Some(2) {
+            turn = Some(v);
+        }
+    }
+    assert_eq!(turn.unwrap()["result"]["stopReason"], "completed");
+    assert_eq!(text, "answered: none", "skip must deliver no answers");
+}
+
+/// Answering an already-settled (or never-existing) ask fails with the
+/// typed ASK_NOT_FOUND code so clients know not to retry.
+#[tokio::test]
+async fn permission_respond_unknown_request_id_maps_to_ask_not_found() {
+    let (_state, _store, addr) = serve(Arc::new(parking_lot::RwLock::new(common::mock_config(
+        None,
+    ))))
+    .await;
+
+    let (mut ws, _hello) = ws_connect(&format!("ws://{addr}/ws")).await;
+    rpc_send(
+        &mut ws,
+        json!({"id":1,"method":"session.create","params":{"cwd":"/tmp"}}),
+    )
+    .await;
+    let new = read_reply(&mut ws, 1).await;
+    let session_id = new["result"]["sessionId"].as_str().unwrap().to_string();
+
+    rpc_send(
+        &mut ws,
+        json!({"id":2,"method":"permission.respond",
+               "params":{"sessionId":session_id,"requestId":"no-such-ask",
+                         "response":{"behavior":"deny","interrupt":false}}}),
+    )
+    .await;
+    let reply = read_reply(&mut ws, 2).await;
+    assert_eq!(
+        reply["error"]["code"], -32008,
+        "unknown ask must map onto ASK_NOT_FOUND: {reply}"
+    );
+}
+
 /// POST /v1/ws_ticket issues a one-shot ticket that authenticates /ws.
 #[tokio::test]
 async fn ws_ticket_authenticates() {
@@ -505,6 +685,15 @@ async fn ws_ticket_authenticates() {
     for expected in [
         "hello",
         "backend.list",
+        "backend.versions",
+        "backend.update_plan",
+        "backend.update",
+        "backend.update_cancel",
+        "device.pairing_key",
+        "device.list",
+        "device.approve",
+        "device.rename",
+        "device.revoke",
         "session.create",
         "session.resume",
         "session.list",
@@ -512,6 +701,7 @@ async fn ws_ticket_authenticates() {
         "session.export",
         "session.import",
         "session.delete",
+        "session.rescan",
         "session.close",
         "session.restart",
         "session.status",
@@ -521,10 +711,14 @@ async fn ws_ticket_authenticates() {
         "session.set_tags",
         "session.usage",
         "session.search",
+        "usage.summary",
+        "usage.clear",
         "turn.start",
         "turn.steer",
         "turn.cancel",
         "permission.respond",
+        "plan.list",
+        "plan.respond",
         "session.set_model",
         "session.set_mode",
         "catalog.models",
@@ -533,9 +727,25 @@ async fn ws_ticket_authenticates() {
         "file.read",
         "file.write",
         "file.list",
+        "file.grant",
+        "file.grants",
+        "file.ungrant",
+        "device.pairing_key",
+        "device.list",
+        "device.approve",
+        "device.rename",
+        "device.revoke",
         "channel.get_state",
         "channel.set_state",
         "channel.delete_state",
+        "mission.create",
+        "mission.start",
+        "mission.cancel",
+        "mission.respond",
+        "mission.list",
+        "mission.get",
+        "mission.watch",
+        "mission.unwatch",
         "project.create",
         "project.list",
         "project.get",
@@ -1098,6 +1308,89 @@ async fn compaction_event_is_persisted() {
         .collect();
     assert_eq!(compactions.len(), 1, "one compaction row: {msgs}");
     assert_eq!(compactions[0]["data"]["content"], "compacted 3 messages");
+}
+
+/// The turn's final todo snapshot persists as a `todo` row — the live
+/// card is ephemeral, the ending state is part of the transcript, and
+/// a late subscriber's replay re-raises it as a timeline event.
+#[tokio::test]
+async fn todo_snapshot_is_persisted() {
+    let (_state, _store, addr) = serve(test_config(None)).await;
+    let (mut ws, _) = ws_connect(&format!("ws://{addr}/ws")).await;
+
+    rpc_send(
+        &mut ws,
+        json!({"id":1,"method":"session.create","params":{"cwd":"/tmp"}}),
+    )
+    .await;
+    let sid = read_reply(&mut ws, 1).await["result"]["sessionId"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    rpc_send(
+        &mut ws,
+        json!({"id":2,"method":"turn.start",
+               "params":{"sessionId":sid,"prompt":"plan the work"}}),
+    )
+    .await;
+    let done = read_reply(&mut ws, 2).await;
+    assert_eq!(done["result"]["stopReason"], "completed", "{done}");
+
+    rpc_send(
+        &mut ws,
+        json!({"id":3,"method":"session.messages","params":{"sessionId":sid}}),
+    )
+    .await;
+    let msgs = read_reply(&mut ws, 3).await["result"]["messages"].clone();
+    let todos: Vec<&Value> = msgs
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter(|m| m["role"] == "todo")
+        .collect();
+    // Two live snapshots arrived; only the final state may persist.
+    assert_eq!(todos.len(), 1, "one todo row: {msgs}");
+    assert_eq!(
+        todos[0]["data"]["items"],
+        json!([
+            {"content": "step one", "status": "completed"},
+            {"content": "step two", "status": "completed"},
+        ]),
+        "{msgs}"
+    );
+
+    // A late subscriber sees the same state in its replay, tagged as such.
+    let (mut ws2, _) = ws_connect(&format!("ws://{addr}/ws")).await;
+    rpc_send(
+        &mut ws2,
+        json!({"id":1,"method":"session.resume","params":{"sessionId":sid}}),
+    )
+    .await;
+    let mut saw_todo = false;
+    let resumed = loop {
+        let v = tokio::time::timeout(std::time::Duration::from_secs(15), read_json(&mut ws2))
+            .await
+            .expect("resume never resolved");
+        if v.get("id").and_then(|i| i.as_u64()) == Some(1) {
+            break v;
+        }
+        if v["event"] == "session.event"
+            && v["data"]["type"] == "timeline"
+            && v["data"]["kind"] == "todo"
+        {
+            assert_eq!(v["replay"], true, "replayed todo must be tagged: {v}");
+            assert_eq!(
+                v["data"]["items"][1]["status"], "completed",
+                "replay carries the final snapshot: {v}"
+            );
+            saw_todo = true;
+        }
+    };
+    assert!(saw_todo, "todo missing from replay");
+    assert!(
+        resumed["result"]["replayed"].as_u64().unwrap() >= 2,
+        "{resumed}"
+    );
 }
 
 /// session.close kills the live backend process but keeps the row:
@@ -3433,6 +3726,83 @@ async fn session_usage_daily_rollup() {
     );
 }
 
+/// usage.summary groups the seeded usage per day × backend × model
+/// with a window total (defaults 7 days / UTC), days:1 keeps the same
+/// today-only shape, and usage.clear empties the rollup.
+#[tokio::test]
+async fn usage_summary_groups_and_usage_clear_empties() {
+    let (_state, store, addr) = serve(test_config(None)).await;
+    store
+        .create_session("a", "/tmp", Some("claude"))
+        .await
+        .unwrap();
+    store
+        .create_session("b", "/tmp", Some("codex"))
+        .await
+        .unwrap();
+    store
+        .record_usage("a", "opus", 10, 100, 0.10)
+        .await
+        .unwrap();
+    store
+        .record_usage("b", "sonnet", 20, 100, 0.20)
+        .await
+        .unwrap();
+    let (mut ws, _) = ws_connect(&format!("ws://{addr}/ws")).await;
+
+    rpc_send(
+        &mut ws,
+        json!({"id":1,"method":"usage.summary","params":{}}),
+    )
+    .await;
+    let reply = read_reply(&mut ws, 1).await;
+    let rows = reply["result"]["rows"].as_array().unwrap();
+    assert_eq!(rows.len(), 2, "{reply}");
+    // Ordered by date, backend, model.
+    assert_eq!(rows[0]["backend"], "claude", "{reply}");
+    assert_eq!(rows[0]["model"], "opus", "{reply}");
+    assert_eq!(rows[0]["turns"], 1, "{reply}");
+    assert_eq!(rows[0]["contextUsed"], 10, "{reply}");
+    assert_eq!(rows[1]["backend"], "codex", "{reply}");
+    assert_eq!(rows[1]["model"], "sonnet", "{reply}");
+    let total = &reply["result"]["total"];
+    assert_eq!(total["turns"], 2, "{reply}");
+    assert_eq!(total["contextUsed"], 30, "{reply}");
+    assert!(
+        (total["costUsd"].as_f64().unwrap() - 0.30).abs() < 1e-9,
+        "{reply}"
+    );
+
+    // days:1 is today-only; every seeded row was recorded just now.
+    rpc_send(
+        &mut ws,
+        json!({"id":2,"method":"usage.summary","params":{"days":1}}),
+    )
+    .await;
+    let reply = read_reply(&mut ws, 2).await;
+    assert_eq!(
+        reply["result"]["rows"].as_array().unwrap().len(),
+        2,
+        "{reply}"
+    );
+
+    rpc_send(&mut ws, json!({"id":3,"method":"usage.clear","params":{}})).await;
+    let reply = read_reply(&mut ws, 3).await;
+    assert_eq!(reply["result"]["cleared"], true, "{reply}");
+
+    rpc_send(
+        &mut ws,
+        json!({"id":4,"method":"usage.summary","params":{}}),
+    )
+    .await;
+    let reply = read_reply(&mut ws, 4).await;
+    assert!(
+        reply["result"]["rows"].as_array().unwrap().is_empty(),
+        "{reply}"
+    );
+    assert_eq!(reply["result"]["total"]["turns"], 0, "{reply}");
+}
+
 /// session.fork copies the usage history and the suffixed title: the
 /// fork's export reports the source's cost/turns under "… (fork)".
 #[tokio::test]
@@ -3646,4 +4016,1055 @@ async fn rpc_send_raw(ws: &mut Ws, text: &str) {
     ws.send(tungstenite::Message::Text(text.into()))
         .await
         .unwrap();
+}
+
+/// Granted roots close the loop on an out-of-jail denial: file.read of
+/// an outside file fails → file.grant widens the jail (canonical form
+/// returned, duplicates idempotent) → the read succeeds → file.ungrant
+/// re-confines. Validation is fail-closed (relative / missing / file),
+/// and with no grants the jail is exactly the historical cwd-only one.
+#[tokio::test]
+async fn file_jail_widens_with_grants_and_closes_on_revoke() {
+    let (_state, _store, addr) = serve(test_config(None)).await;
+    let (mut ws, _) = ws_connect(&format!("ws://{addr}/ws")).await;
+    let base = std::env::temp_dir().join(format!("damon-grant-{}", uuid::Uuid::new_v4()));
+    let jail = base.join("jail");
+    let outside = base.join("outside");
+    std::fs::create_dir_all(&jail).unwrap();
+    std::fs::create_dir_all(&outside).unwrap();
+    std::fs::write(outside.join("secret.txt"), "granted").unwrap();
+
+    rpc_send(
+        &mut ws,
+        json!({"id":1,"method":"session.create","params":{"cwd":jail}}),
+    )
+    .await;
+    let sid = read_reply(&mut ws, 1).await["result"]["sessionId"]
+        .as_str()
+        .unwrap()
+        .to_string();
+
+    use base64::Engine as _;
+    let outside_file = outside.join("secret.txt");
+
+    // Denied before any grant — the cwd-only jail.
+    rpc_send(
+        &mut ws,
+        json!({"id":2,"method":"file.read",
+               "params":{"sessionId":sid,"path":outside_file}}),
+    )
+    .await;
+    let denied = read_reply(&mut ws, 2).await;
+    assert_eq!(denied["error"]["code"], -32602, "{denied}");
+
+    // Grant: canonical root comes back; re-granting is idempotent.
+    rpc_send(
+        &mut ws,
+        json!({"id":3,"method":"file.grant","params":{"path":outside}}),
+    )
+    .await;
+    let granted = read_reply(&mut ws, 3).await;
+    assert_eq!(granted["result"]["granted"], true, "{granted}");
+    let root = granted["result"]["root"].as_str().unwrap().to_string();
+    assert!(
+        std::path::Path::new(&root).is_absolute(),
+        "stored form must be canonical: {granted}"
+    );
+    rpc_send(
+        &mut ws,
+        json!({"id":4,"method":"file.grant","params":{"path":outside}}),
+    )
+    .await;
+    assert_eq!(read_reply(&mut ws, 4).await["result"]["granted"], true);
+
+    // Listed among effective grants — global scope, no projectId key.
+    rpc_send(&mut ws, json!({"id":5,"method":"file.grants","params":{}})).await;
+    let list = read_reply(&mut ws, 5).await;
+    let grants = list["result"]["grants"].as_array().unwrap();
+    assert_eq!(grants.len(), 1, "{list}");
+    assert_eq!(grants[0]["root"], root.as_str(), "{list}");
+    assert!(grants[0].get("projectId").is_none(), "{list}");
+
+    // The outside file reads now.
+    rpc_send(
+        &mut ws,
+        json!({"id":6,"method":"file.read",
+               "params":{"sessionId":sid,"path":outside_file}}),
+    )
+    .await;
+    let read = read_reply(&mut ws, 6).await;
+    assert_eq!(
+        base64::engine::general_purpose::STANDARD
+            .decode(read["result"]["content"].as_str().unwrap())
+            .unwrap(),
+        b"granted",
+        "{read}"
+    );
+
+    // Validation is fail-closed: relative, missing, and non-directory.
+    rpc_send(
+        &mut ws,
+        json!({"id":7,"method":"file.grant","params":{"path":"relative/dir"}}),
+    )
+    .await;
+    assert_eq!(read_reply(&mut ws, 7).await["error"]["code"], -32602);
+    rpc_send(
+        &mut ws,
+        json!({"id":8,"method":"file.grant","params":{"path":"/definitely/not/there"}}),
+    )
+    .await;
+    assert_eq!(read_reply(&mut ws, 8).await["error"]["code"], -32602);
+    rpc_send(
+        &mut ws,
+        json!({"id":9,"method":"file.grant","params":{"path":outside_file}}),
+    )
+    .await;
+    assert_eq!(read_reply(&mut ws, 9).await["error"]["code"], -32602);
+
+    // Revoke closes the jail again.
+    rpc_send(
+        &mut ws,
+        json!({"id":10,"method":"file.ungrant","params":{"path":outside}}),
+    )
+    .await;
+    let revoked = read_reply(&mut ws, 10).await;
+    assert_eq!(revoked["result"]["revoked"], true, "{revoked}");
+    rpc_send(
+        &mut ws,
+        json!({"id":11,"method":"file.read",
+               "params":{"sessionId":sid,"path":outside_file}}),
+    )
+    .await;
+    assert_eq!(read_reply(&mut ws, 11).await["error"]["code"], -32602);
+
+    // Revoking an absent grant reports false instead of erroring.
+    rpc_send(
+        &mut ws,
+        json!({"id":12,"method":"file.ungrant","params":{"path":outside}}),
+    )
+    .await;
+    assert_eq!(read_reply(&mut ws, 12).await["result"]["revoked"], false);
+    rpc_send(
+        &mut ws,
+        json!({"id":13,"method":"file.ungrant","params":{"path":"/definitely/not/there"}}),
+    )
+    .await;
+    assert_eq!(read_reply(&mut ws, 13).await["result"]["revoked"], false);
+
+    let _ = std::fs::remove_dir_all(&base);
+}
+
+/// Poll `plan.list` until the detached collector has recorded an open
+/// review row (the ask races the turn.start return).
+async fn wait_for_plan(ws: &mut Ws, id: u64, sid: &str) -> Value {
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+    loop {
+        rpc_send(
+            ws,
+            json!({"id":id,"method":"plan.list","params":{"sessionId":sid}}),
+        )
+        .await;
+        let reply = read_reply(ws, id).await;
+        let plans = reply["result"]["plans"]
+            .as_array()
+            .cloned()
+            .unwrap_or_default();
+        if let Some(row) = plans.iter().find(|p| p["status"] == "awaiting_review") {
+            return row.clone();
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "plan row never appeared: {reply}"
+        );
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+    }
+}
+
+/// Poll the persisted transcript until it contains `needle` — the
+/// detached turn's completion is asynchronous.
+async fn wait_for_message(ws: &mut Ws, id: u64, sid: &str, needle: &str) {
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+    loop {
+        rpc_send(
+            ws,
+            json!({"id":id,"method":"session.messages",
+                   "params":{"sessionId":sid,"limit":100}}),
+        )
+        .await;
+        let reply = read_reply(ws, id).await;
+        let msgs = reply["result"]["messages"]
+            .as_array()
+            .cloned()
+            .unwrap_or_default();
+        if msgs.iter().any(|m| {
+            m["data"]["content"]
+                .as_str()
+                .is_some_and(|c| c.contains(needle))
+        }) {
+            return;
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "{needle:?} never persisted: {reply}"
+        );
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+    }
+}
+
+/// The typed plan gate end-to-end: a plan ask records a durable row,
+/// plan.respond approves through the CAS gate (applied to the live
+/// ask), the double-submit on the same revision loses with -32009, and
+/// exactly one decision reaches the agent.
+#[tokio::test]
+async fn plan_respond_approves_once_then_conflicts() {
+    let (_state, store, addr) = serve(test_config(None)).await;
+    let (mut ws, _) = ws_connect(&format!("ws://{addr}/ws")).await;
+
+    rpc_send(
+        &mut ws,
+        json!({"id":1,"method":"session.create","params":{"cwd":"/tmp"}}),
+    )
+    .await;
+    let sid = read_reply(&mut ws, 1).await["result"]["sessionId"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    rpc_send(
+        &mut ws,
+        json!({"id":2,"method":"turn.start",
+               "params":{"sessionId":sid,"prompt":"plan review","detach":true}}),
+    )
+    .await;
+    assert_eq!(read_reply(&mut ws, 2).await["result"]["detached"], true);
+
+    let row = wait_for_plan(&mut ws, 3, &sid).await;
+    assert_eq!(row["revision"], 1, "{row}");
+    assert_eq!(row["complete"], true, "{row}");
+    assert!(row["content"].as_str().unwrap().contains("survey the repo"));
+
+    rpc_send(
+        &mut ws,
+        json!({"id":4,"method":"plan.respond",
+               "params":{"planId":row["planId"],"expectedRevision":1,"decision":"approve"}}),
+    )
+    .await;
+    let win = read_reply(&mut ws, 4).await;
+    assert_eq!(win["result"]["recorded"], true, "{win}");
+    assert_eq!(win["result"]["applied"], true, "{win}");
+    assert_eq!(win["result"]["status"], "approved", "{win}");
+
+    // The double-submit (same expectedRevision) loses with the typed
+    // conflict code.
+    rpc_send(
+        &mut ws,
+        json!({"id":5,"method":"plan.respond",
+               "params":{"planId":row["planId"],"expectedRevision":1,"decision":"approve"}}),
+    )
+    .await;
+    let loser = read_reply(&mut ws, 5).await;
+    assert_eq!(loser["error"]["code"], -32009, "{loser}");
+
+    // The row is durably settled.
+    rpc_send(
+        &mut ws,
+        json!({"id":6,"method":"plan.list","params":{"sessionId":sid}}),
+    )
+    .await;
+    let reply = read_reply(&mut ws, 6).await;
+    let settled = &reply["result"]["plans"][0];
+    assert_eq!(settled["status"], "approved", "{reply}");
+    assert!(settled["appliedAt"].is_u64(), "{reply}");
+    assert_eq!(settled["decision"]["decision"], "approve", "{reply}");
+
+    // Exactly one decision reached the agent, and the turn completed.
+    wait_for_message(&mut ws, 7, &sid, "plan:approved").await;
+    let msgs = {
+        rpc_send(
+            &mut ws,
+            json!({"id":8,"method":"session.messages",
+                   "params":{"sessionId":sid,"limit":100}}),
+        )
+        .await;
+        read_reply(&mut ws, 8).await["result"]["messages"]
+            .as_array()
+            .cloned()
+            .unwrap()
+    };
+    assert_eq!(
+        msgs.iter()
+            .filter(|m| m["data"]["content"]
+                .as_str()
+                .is_some_and(|c| c.contains("plan:")))
+            .count(),
+        1,
+        "exactly one plan decision delivered: {msgs:?}"
+    );
+    let _ = store;
+}
+
+/// The decision intent is persisted BEFORE the native relay: a lost
+/// relay (mock) leaves the intent on file and reopens the row — and
+/// the ask stays answerable through the legacy path, which then
+/// settles the durable row too.
+#[tokio::test]
+async fn plan_intent_persists_before_relay_and_row_reopens_on_failure() {
+    let (_state, store, addr) = serve(test_config(None)).await;
+    let (mut ws, _) = ws_connect(&format!("ws://{addr}/ws")).await;
+
+    rpc_send(
+        &mut ws,
+        json!({"id":1,"method":"session.create","params":{"cwd":"/tmp"}}),
+    )
+    .await;
+    let sid = read_reply(&mut ws, 1).await["result"]["sessionId"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    rpc_send(
+        &mut ws,
+        json!({"id":2,"method":"turn.start",
+               "params":{"sessionId":sid,"prompt":"plan review planfail","detach":true}}),
+    )
+    .await;
+    let _ = read_reply(&mut ws, 2).await;
+    let row = wait_for_plan(&mut ws, 3, &sid).await;
+
+    rpc_send(
+        &mut ws,
+        json!({"id":4,"method":"plan.respond",
+               "params":{"planId":row["planId"],"expectedRevision":1,"decision":"approve"}}),
+    )
+    .await;
+    let failed = read_reply(&mut ws, 4).await;
+    assert_eq!(failed["error"]["code"], -32000, "{failed}");
+    assert!(
+        failed["error"]["message"]
+            .as_str()
+            .unwrap()
+            .contains("recorded but native relay failed"),
+        "{failed}"
+    );
+
+    // The row reopens with the intent kept: never a fake success.
+    rpc_send(
+        &mut ws,
+        json!({"id":5,"method":"plan.list","params":{"sessionId":sid}}),
+    )
+    .await;
+    let reply = read_reply(&mut ws, 5).await;
+    let reopened = &reply["result"]["plans"][0];
+    assert_eq!(reopened["status"], "awaiting_review", "{reply}");
+    assert!(reopened["decisionIntentAt"].is_u64(), "{reply}");
+    assert_eq!(reopened["decision"]["decision"], "approve", "{reply}");
+    assert!(reopened.get("appliedAt").is_none(), "{reply}");
+
+    // The ask is still answerable; the legacy path settles the row.
+    rpc_send(
+        &mut ws,
+        json!({"id":6,"method":"permission.respond",
+               "params":{"sessionId":sid,"requestId":row["requestId"],
+                         "response":{"behavior":"allow"}}}),
+    )
+    .await;
+    assert_eq!(read_reply(&mut ws, 6).await["result"], json!({}));
+    wait_for_message(&mut ws, 7, &sid, "plan:approved").await;
+    rpc_send(
+        &mut ws,
+        json!({"id":8,"method":"plan.list","params":{"sessionId":sid}}),
+    )
+    .await;
+    let reply = read_reply(&mut ws, 8).await;
+    assert_eq!(reply["result"]["plans"][0]["status"], "approved", "{reply}");
+    let _ = store;
+}
+
+/// Approval of an incomplete plan refuses (-32602), request_changes
+/// without feedback refuses, defer is non-terminal (the ask stays
+/// parked and a later approval still goes through).
+#[tokio::test]
+async fn plan_respond_refuses_incomplete_and_feedbackless_changes() {
+    let (_state, _store, addr) = serve(test_config(None)).await;
+    let (mut ws, _) = ws_connect(&format!("ws://{addr}/ws")).await;
+
+    rpc_send(
+        &mut ws,
+        json!({"id":1,"method":"session.create","params":{"cwd":"/tmp"}}),
+    )
+    .await;
+    let sid = read_reply(&mut ws, 1).await["result"]["sessionId"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    rpc_send(
+        &mut ws,
+        json!({"id":2,"method":"turn.start",
+               "params":{"sessionId":sid,"prompt":"plan review empty","detach":true}}),
+    )
+    .await;
+    let _ = read_reply(&mut ws, 2).await;
+    let row = wait_for_plan(&mut ws, 3, &sid).await;
+    assert_eq!(row["complete"], false, "{row}");
+
+    rpc_send(
+        &mut ws,
+        json!({"id":4,"method":"plan.respond",
+               "params":{"planId":row["planId"],"expectedRevision":1,"decision":"approve"}}),
+    )
+    .await;
+    assert_eq!(read_reply(&mut ws, 4).await["error"]["code"], -32602);
+
+    rpc_send(
+        &mut ws,
+        json!({"id":5,"method":"plan.respond",
+               "params":{"planId":row["planId"],"expectedRevision":1,
+                         "decision":"request_changes"}}),
+    )
+    .await;
+    assert_eq!(read_reply(&mut ws, 5).await["error"]["code"], -32602);
+
+    // Defer records without touching the native ask.
+    rpc_send(
+        &mut ws,
+        json!({"id":6,"method":"plan.respond",
+               "params":{"planId":row["planId"],"expectedRevision":1,"decision":"defer"}}),
+    )
+    .await;
+    let deferred = read_reply(&mut ws, 6).await;
+    assert_eq!(deferred["result"]["applied"], false, "{deferred}");
+    assert_eq!(deferred["result"]["status"], "deferred", "{deferred}");
+
+    // …and approval stays refused even from deferred — an incomplete
+    // plan can never be approved, only reworked or parked.
+    rpc_send(
+        &mut ws,
+        json!({"id":7,"method":"plan.respond",
+               "params":{"planId":row["planId"],"expectedRevision":1,"decision":"approve"}}),
+    )
+    .await;
+    assert_eq!(read_reply(&mut ws, 7).await["error"]["code"], -32602);
+
+    // The parked ask is still answerable through the legacy path; a
+    // deny WITH feedback lands in the durable row as changes_requested
+    // (a feedbackless deny declines the durable claim by design — the
+    // gate demands feedback for changes_requested).
+    rpc_send(
+        &mut ws,
+        json!({"id":8,"method":"permission.respond",
+               "params":{"sessionId":sid,"requestId":row["requestId"],
+                         "response":{"behavior":"deny","interrupt":false,
+                                     "message":"needs work"}}}),
+    )
+    .await;
+    assert_eq!(read_reply(&mut ws, 8).await["result"], json!({}));
+    wait_for_message(&mut ws, 9, &sid, "plan:changes_requested:needs work").await;
+    rpc_send(
+        &mut ws,
+        json!({"id":10,"method":"plan.list","params":{"sessionId":sid}}),
+    )
+    .await;
+    let reply = read_reply(&mut ws, 10).await;
+    assert_eq!(
+        reply["result"]["plans"][0]["status"], "changes_requested",
+        "{reply}"
+    );
+}
+
+/// A re-ask while a review is open chains onto the same planId as
+/// revision+1 (old revision superseded); a decision on the stale
+/// revision conflicts (-32009) and never reaches the agent.
+#[tokio::test]
+async fn plan_reask_bumps_revision_and_stale_decision_conflicts() {
+    let (_state, _store, addr) = serve(test_config(None)).await;
+    let (mut ws, _) = ws_connect(&format!("ws://{addr}/ws")).await;
+
+    rpc_send(
+        &mut ws,
+        json!({"id":1,"method":"session.create","params":{"cwd":"/tmp"}}),
+    )
+    .await;
+    let sid = read_reply(&mut ws, 1).await["result"]["sessionId"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    rpc_send(
+        &mut ws,
+        json!({"id":2,"method":"turn.start",
+               "params":{"sessionId":sid,"prompt":"plan review","detach":true}}),
+    )
+    .await;
+    let _ = read_reply(&mut ws, 2).await;
+    let rev1 = wait_for_plan(&mut ws, 3, &sid).await;
+
+    rpc_send(
+        &mut ws,
+        json!({"id":4,"method":"plan.respond",
+               "params":{"planId":rev1["planId"],"expectedRevision":1,
+                         "decision":"request_changes","feedback":"more detail"}}),
+    )
+    .await;
+    let changes = read_reply(&mut ws, 4).await;
+    assert_eq!(
+        changes["result"]["status"], "changes_requested",
+        "{changes}"
+    );
+    wait_for_message(&mut ws, 5, &sid, "plan:changes_requested:more detail").await;
+
+    // The agent re-asks: same planId, revision 2, rev1 superseded. The
+    // previous turn's collector may still hold the busy flag for a
+    // beat — retry the detached start until it lands.
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+    let started = loop {
+        rpc_send(
+            &mut ws,
+            json!({"id":6,"method":"turn.start",
+                   "params":{"sessionId":sid,"prompt":"plan review","detach":true}}),
+        )
+        .await;
+        let reply = read_reply(&mut ws, 6).await;
+        if reply["result"]["turnId"].is_string() {
+            break reply;
+        }
+        assert_eq!(reply["error"]["code"], -32006, "unexpected: {reply}");
+        assert!(
+            std::time::Instant::now() < deadline,
+            "turn never started: {reply}"
+        );
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+    };
+    let _ = started;
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+    let rev2 = loop {
+        rpc_send(
+            &mut ws,
+            json!({"id":7,"method":"plan.list","params":{"sessionId":sid}}),
+        )
+        .await;
+        let reply = read_reply(&mut ws, 7).await;
+        let plans = reply["result"]["plans"]
+            .as_array()
+            .cloned()
+            .unwrap_or_default();
+        if let Some(row) = plans.iter().find(|p| p["revision"] == 2) {
+            assert_eq!(row["planId"], rev1["planId"], "chains onto the plan");
+            break row.clone();
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "rev2 never appeared: {reply}"
+        );
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+    };
+    rpc_send(
+        &mut ws,
+        json!({"id":8,"method":"plan.list","params":{"sessionId":sid}}),
+    )
+    .await;
+    let reply = read_reply(&mut ws, 8).await;
+    assert_eq!(
+        reply["result"]["plans"][0]["status"], "superseded",
+        "{reply}"
+    );
+    assert_eq!(reply["result"]["plans"][0]["supersededBy"], 2, "{reply}");
+
+    // A decision on the stale revision conflicts and does NOT answer
+    // the live ask (rev2 stays open, no transcript echo).
+    rpc_send(
+        &mut ws,
+        json!({"id":9,"method":"plan.respond",
+               "params":{"planId":rev1["planId"],"expectedRevision":1,"decision":"approve"}}),
+    )
+    .await;
+    let stale = read_reply(&mut ws, 9).await;
+    assert_eq!(stale["error"]["code"], -32009, "{stale}");
+    tokio::time::sleep(std::time::Duration::from_millis(150)).await;
+    rpc_send(
+        &mut ws,
+        json!({"id":10,"method":"plan.list","params":{"sessionId":sid}}),
+    )
+    .await;
+    let reply = read_reply(&mut ws, 10).await;
+    let rev2_status = reply["result"]["plans"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|p| p["revision"] == 2)
+        .map(|p| p["status"].clone())
+        .unwrap();
+    assert_eq!(rev2_status, "awaiting_review", "{reply}");
+
+    // Approving the CURRENT revision is what unblocks the agent.
+    rpc_send(
+        &mut ws,
+        json!({"id":11,"method":"plan.respond",
+               "params":{"planId":rev2["planId"],"expectedRevision":2,"decision":"approve"}}),
+    )
+    .await;
+    assert_eq!(read_reply(&mut ws, 11).await["result"]["applied"], true);
+    wait_for_message(&mut ws, 12, &sid, "plan:approved").await;
+}
+
+/// The legacy permission.respond path lands its decision in the
+/// durable plan row too — a deny carries its message as the recorded
+/// changes_requested feedback and reaches the agent verbatim.
+#[tokio::test]
+async fn permission_respond_records_plan_decision_durably() {
+    let (_state, _store, addr) = serve(test_config(None)).await;
+    let (mut ws, _) = ws_connect(&format!("ws://{addr}/ws")).await;
+
+    rpc_send(
+        &mut ws,
+        json!({"id":1,"method":"session.create","params":{"cwd":"/tmp"}}),
+    )
+    .await;
+    let sid = read_reply(&mut ws, 1).await["result"]["sessionId"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    rpc_send(
+        &mut ws,
+        json!({"id":2,"method":"turn.start",
+               "params":{"sessionId":sid,"prompt":"plan review","detach":true}}),
+    )
+    .await;
+    let _ = read_reply(&mut ws, 2).await;
+    let row = wait_for_plan(&mut ws, 3, &sid).await;
+
+    rpc_send(
+        &mut ws,
+        json!({"id":4,"method":"permission.respond",
+               "params":{"sessionId":sid,"requestId":row["requestId"],
+                         "response":{"behavior":"deny","interrupt":false,
+                                     "message":"need a rollback step"}}}),
+    )
+    .await;
+    assert_eq!(read_reply(&mut ws, 4).await["result"], json!({}));
+
+    wait_for_message(
+        &mut ws,
+        5,
+        &sid,
+        "plan:changes_requested:need a rollback step",
+    )
+    .await;
+    rpc_send(
+        &mut ws,
+        json!({"id":6,"method":"plan.list","params":{"sessionId":sid}}),
+    )
+    .await;
+    let reply = read_reply(&mut ws, 6).await;
+    let settled = &reply["result"]["plans"][0];
+    assert_eq!(settled["status"], "changes_requested", "{reply}");
+    assert_eq!(
+        settled["decision"]["decision"], "request_changes",
+        "{reply}"
+    );
+    assert_eq!(
+        settled["decision"]["feedback"], "need a rollback step",
+        "{reply}"
+    );
+    assert!(settled["appliedAt"].is_u64(), "{reply}");
+}
+
+/// Recording CLI-lifecycle runner: canned outputs keyed by program,
+/// spawn errors on demand — no processes, no network (the repo's
+/// integration-test rule). parking_lot locks per repo convention.
+struct MockCliRunner {
+    outputs: parking_lot::Mutex<std::collections::HashMap<String, String>>,
+    spawn_errors: parking_lot::Mutex<Vec<String>>,
+    seen: parking_lot::Mutex<Vec<(String, Vec<String>)>>,
+}
+impl MockCliRunner {
+    fn new() -> std::sync::Arc<Self> {
+        let mut outputs = std::collections::HashMap::new();
+        outputs.insert("claude".to_string(), "2.1.100 (Claude Code)\n".to_string());
+        outputs.insert("npm".to_string(), "3.0.0\n".to_string());
+        outputs.insert("qwen".to_string(), "0.24.6\n".to_string());
+        std::sync::Arc::new(Self {
+            outputs: parking_lot::Mutex::new(outputs),
+            spawn_errors: parking_lot::Mutex::new(Vec::new()),
+            seen: parking_lot::Mutex::new(Vec::new()),
+        })
+    }
+}
+#[async_trait::async_trait]
+impl damon_core::cli_lifecycle::CommandRunner for MockCliRunner {
+    async fn run(
+        &self,
+        program: &str,
+        args: &[String],
+        _limit: std::time::Duration,
+        _cancel: &tokio_util::sync::CancellationToken,
+        on_line: std::sync::Arc<dyn for<'a> Fn(&'a str) + Send + Sync>,
+    ) -> anyhow::Result<damon_core::cli_lifecycle::RunOutcome> {
+        self.seen.lock().push((program.to_string(), args.to_vec()));
+        if self.spawn_errors.lock().iter().any(|p| p == program) {
+            anyhow::bail!("cannot spawn `{program}`");
+        }
+        let stdout = self
+            .outputs
+            .lock()
+            .get(program)
+            .cloned()
+            .unwrap_or_default();
+        for line in stdout.lines() {
+            on_line(line);
+        }
+        Ok(damon_core::cli_lifecycle::RunOutcome {
+            success: !stdout.is_empty(),
+            stdout,
+            timed_out: false,
+        })
+    }
+}
+
+/// backend.versions probes through the INJECTED runner (no processes,
+/// no network): installed/version/latest/updateAvailable/updateKind per
+/// backend, latest only where an npm package is verified, unknown
+/// backends refused.
+#[tokio::test]
+async fn backend_versions_probe_via_injected_runner() {
+    let mock = MockCliRunner::new();
+    let (state, _store, addr) = serve(test_config(None)).await;
+    let _ = state.cli_runner.set(mock.clone());
+    let (mut ws, _) = ws_connect(&format!("ws://{addr}/ws")).await;
+
+    rpc_send(
+        &mut ws,
+        json!({"id":1,"method":"backend.versions","params":{"backend":"claude"}}),
+    )
+    .await;
+    let reply = read_reply(&mut ws, 1).await;
+    let rows = reply["result"]["versions"].as_array().unwrap();
+    assert_eq!(rows.len(), 1, "{reply}");
+    assert_eq!(rows[0]["backend"], "claude", "{reply}");
+    assert_eq!(rows[0]["installed"], true, "{reply}");
+    assert_eq!(rows[0]["version"], "2.1.100 (Claude Code)", "{reply}");
+    assert_eq!(
+        rows[0]["latest"], "3.0.0",
+        "{reply} — npm view through the mock"
+    );
+    assert_eq!(rows[0]["updateAvailable"], true, "{reply}");
+    assert_eq!(rows[0]["updateKind"], "npm", "{reply}");
+
+    // Manual/unknown kinds: droid probes locally with NO latest probe
+    // (no verified package); zcode is probe-only unknown.
+    mock.spawn_errors.lock().push("zcode".to_string());
+    rpc_send(
+        &mut ws,
+        json!({"id":2,"method":"backend.versions","params":{}}),
+    )
+    .await;
+    let reply = read_reply(&mut ws, 2).await;
+    let rows = reply["result"]["versions"].as_array().unwrap();
+    assert_eq!(rows.len(), 9, "the whole catalog: {reply}");
+    let droid = rows.iter().find(|r| r["backend"] == "droid").unwrap();
+    assert_eq!(droid["updateKind"], "manual", "{reply}");
+    assert!(
+        droid["latest"].is_null(),
+        "no package → no latest probe: {reply}"
+    );
+    let zcode = rows.iter().find(|r| r["backend"] == "zcode").unwrap();
+    assert_eq!(zcode["installed"], false, "{reply}");
+    assert_eq!(zcode["updateKind"], "unknown", "{reply}");
+
+    rpc_send(
+        &mut ws,
+        json!({"id":3,"method":"backend.versions","params":{"backend":"ghost"}}),
+    )
+    .await;
+    assert_eq!(read_reply(&mut ws, 3).await["error"]["code"], -32602);
+}
+
+/// backend.update_plan is side-effect-free and shows the exact argv the
+/// run executes; unknown-kind plans refuse with blockers.
+#[tokio::test]
+async fn backend_update_plan_shows_argv_and_blockers() {
+    let mock = MockCliRunner::new();
+    let (state, _store, addr) = serve(test_config(None)).await;
+    let _ = state.cli_runner.set(mock.clone());
+    let (mut ws, _) = ws_connect(&format!("ws://{addr}/ws")).await;
+
+    rpc_send(
+        &mut ws,
+        json!({"id":1,"method":"backend.update_plan","params":{"backend":"qwen"}}),
+    )
+    .await;
+    let plan = read_reply(&mut ws, 1).await["result"].clone();
+    assert_eq!(plan["kind"], "npm", "{plan}");
+    assert_eq!(plan["canRun"], true, "{plan}");
+    assert_eq!(plan["command"][0], "npm", "{plan}");
+    assert!(
+        plan["command"]
+            .as_array()
+            .unwrap()
+            .contains(&json!("@qwen-code/qwen-code@latest")),
+        "{plan}"
+    );
+    let joined: Vec<String> = plan["command"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|c| c.as_str().unwrap().to_string())
+        .collect();
+    assert_eq!(plan["manualCommand"], json!(joined.join(" ")), "{plan}");
+
+    rpc_send(
+        &mut ws,
+        json!({"id":2,"method":"backend.update_plan","params":{"backend":"zcode"}}),
+    )
+    .await;
+    let plan = read_reply(&mut ws, 2).await["result"].clone();
+    assert_eq!(plan["kind"], "unknown", "{plan}");
+    assert_eq!(plan["canRun"], false, "{plan}");
+    assert!(!plan["blockers"].as_array().unwrap().is_empty(), "{plan}");
+
+    rpc_send(
+        &mut ws,
+        json!({"id":3,"method":"backend.update_plan","params":{"backend":"ghost"}}),
+    )
+    .await;
+    assert_eq!(read_reply(&mut ws, 3).await["error"]["code"], -32602);
+}
+
+/// backend.update runs the plan's exact argv (asserted through the
+/// mock's record), streams progress lines as backend.update_progress
+/// events on the requesting connection, and reports the freshly probed
+/// version. Update on an unknown-kind backend refuses before any run.
+#[tokio::test]
+async fn backend_update_runs_plan_argv_and_streams_progress() {
+    let mock = MockCliRunner::new();
+    let (state, _store, addr) = serve(test_config(None)).await;
+    let _ = state.cli_runner.set(mock.clone());
+    let (mut ws, _) = ws_connect(&format!("ws://{addr}/ws")).await;
+
+    // Unknown kind: refused with the blocker, nothing runs.
+    let seen_before = mock.seen.lock().len();
+    rpc_send(
+        &mut ws,
+        json!({"id":1,"method":"backend.update","params":{"backend":"zcode"}}),
+    )
+    .await;
+    assert_eq!(read_reply(&mut ws, 1).await["error"]["code"], -32602);
+    assert_eq!(mock.seen.lock().len(), seen_before, "nothing spawned");
+
+    rpc_send(
+        &mut ws,
+        json!({"id":2,"method":"backend.update",
+               "params":{"backend":"qwen","creationId":"upd-1"}}),
+    )
+    .await;
+    // Frames arrive interleaved: progress events, then the reply.
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+    let mut progress_seen = false;
+    let reply = loop {
+        let v = read_json(&mut ws).await;
+        if v["event"] == "backend.update_progress" && v["creationId"] == "upd-1" {
+            progress_seen = true;
+            continue;
+        }
+        if v.get("id").and_then(|i| i.as_u64()) == Some(2) {
+            break v;
+        }
+        assert!(std::time::Instant::now() < deadline, "stuck: {v}");
+    };
+    assert!(progress_seen, "progress events must stream: {reply}");
+    assert_eq!(reply["result"]["ok"], true, "{reply}");
+    assert_eq!(reply["result"]["creationId"], "upd-1", "{reply}");
+    assert_eq!(
+        reply["result"]["version"], "0.24.6",
+        "{reply} — post-update probe"
+    );
+
+    // The run used the plan's argv: npm install -g … @qwen-code/qwen-code@latest.
+    {
+        let seen = mock.seen.lock();
+        let run = seen
+            .iter()
+            .rev()
+            .find(|(p, _)| p == "npm")
+            .expect("npm run recorded");
+        assert!(
+            run.1.contains(&"@qwen-code/qwen-code@latest".to_string()),
+            "{run:?}"
+        );
+        assert!(run.1.contains(&"-g".to_string()), "{run:?}");
+    }
+
+    // Cancel on a finished run reports false (no live run holds it).
+    rpc_send(
+        &mut ws,
+        json!({"id":3,"method":"backend.update_cancel","params":{"creationId":"upd-1"}}),
+    )
+    .await;
+    assert_eq!(read_reply(&mut ws, 3).await["result"]["cancelled"], false);
+}
+
+/// The device.* surface over the wire: the pairing key mints on first
+/// ask and is stable until spent, a paired device lists as pending,
+/// approve flips it, rename works, and revoke (double-as deny) removes
+/// the row — a revoked device approves to false forever.
+#[tokio::test]
+async fn device_management_flow_round_trips() {
+    let (_state, store, addr) = serve(test_config(None)).await;
+    let (mut ws, _) = ws_connect(&format!("ws://{addr}/ws")).await;
+
+    // Key mints once and stays until spent.
+    rpc_send(
+        &mut ws,
+        json!({"id":1,"method":"device.pairing_key","params":{}}),
+    )
+    .await;
+    let key1 = read_reply(&mut ws, 1).await["result"]["key"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    rpc_send(
+        &mut ws,
+        json!({"id":2,"method":"device.pairing_key","params":{}}),
+    )
+    .await;
+    let key2 = read_reply(&mut ws, 2).await["result"]["key"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    assert_eq!(key1, key2, "stable until spent");
+
+    // Pair a device through the store side the HTTP handler uses (the
+    // HTTP /v1/pair flow itself is covered in tests/api.rs).
+    let hash = damon_core::cli_lifecycle::hash_device_token("device-secret");
+    let device_id = store.create_device("pixel", &hash).await.unwrap();
+    let _ = store.consume_pairing_key(&key1).await.unwrap();
+
+    rpc_send(&mut ws, json!({"id":3,"method":"device.list","params":{}})).await;
+    let reply = read_reply(&mut ws, 3).await;
+    let devices = reply["result"]["devices"].as_array().unwrap();
+    assert_eq!(devices.len(), 1, "{reply}");
+    assert_eq!(devices[0]["status"], "pending", "{reply}");
+    assert_eq!(devices[0]["name"], "pixel", "{reply}");
+    assert!(devices[0].get("approvedAt").is_none(), "{reply}");
+    assert!(
+        devices[0].get("tokenHash").is_none(),
+        "hash never leaves the store: {reply}"
+    );
+
+    rpc_send(
+        &mut ws,
+        json!({"id":4,"method":"device.approve","params":{"deviceId":device_id}}),
+    )
+    .await;
+    assert_eq!(read_reply(&mut ws, 4).await["result"]["approved"], true);
+
+    // approve is a pending-only transition — twice reads false.
+    rpc_send(
+        &mut ws,
+        json!({"id":5,"method":"device.approve","params":{"deviceId":device_id}}),
+    )
+    .await;
+    assert_eq!(read_reply(&mut ws, 5).await["result"]["approved"], false);
+
+    rpc_send(
+        &mut ws,
+        json!({"id":6,"method":"device.rename","params":{"deviceId":device_id,"name":"pixel 2"}}),
+    )
+    .await;
+    assert_eq!(read_reply(&mut ws, 6).await["result"]["renamed"], true);
+    rpc_send(
+        &mut ws,
+        json!({"id":7,"method":"device.rename","params":{"deviceId":device_id,"name":"  "}}),
+    )
+    .await;
+    assert_eq!(read_reply(&mut ws, 7).await["result"]["renamed"], false);
+
+    rpc_send(&mut ws, json!({"id":8,"method":"device.list","params":{}})).await;
+    let reply = read_reply(&mut ws, 8).await;
+    let devices = reply["result"]["devices"].as_array().unwrap();
+    assert_eq!(devices[0]["status"], "approved", "{reply}");
+    assert_eq!(devices[0]["name"], "pixel 2", "{reply}");
+    assert!(devices[0]["approvedAt"].is_string(), "{reply}");
+
+    // Revoke (deny) — the row goes; approving a revoked device is false.
+    rpc_send(
+        &mut ws,
+        json!({"id":9,"method":"device.revoke","params":{"deviceId":device_id}}),
+    )
+    .await;
+    assert_eq!(read_reply(&mut ws, 9).await["result"]["revoked"], true);
+    rpc_send(&mut ws, json!({"id":10,"method":"device.list","params":{}})).await;
+    assert!(
+        read_reply(&mut ws, 10).await["result"]["devices"]
+            .as_array()
+            .unwrap()
+            .is_empty()
+    );
+    rpc_send(
+        &mut ws,
+        json!({"id":11,"method":"device.approve","params":{"deviceId":device_id}}),
+    )
+    .await;
+    assert_eq!(read_reply(&mut ws, 11).await["result"]["approved"], false);
+    // The device token hash can no longer mint: store-level check.
+    assert!(!store.device_token_ok(&hash).await.unwrap());
+}
+
+/// session.rescan: single-flight (an in-flight scanId is returned with
+/// alreadyRunning instead of starting a second sweep), progress events
+/// stream on the requesting connection, and the reply carries the
+/// ScanReport.
+#[tokio::test]
+async fn session_rescan_single_flight_and_progress() {
+    let (state, _store, addr) = serve(test_config(None)).await;
+    // Scanner isolation: ONLY the mock — the machine's real CLIs (and
+    // their real history files) must never enter a test's sweep.
+    state
+        .sessions
+        .set_clients(std::collections::HashMap::from([(
+            "mock".to_string(),
+            common::mock_client(),
+        )]));
+    let (mut ws, _) = ws_connect(&format!("ws://{addr}/ws")).await;
+
+    // Simulate a scan already in flight.
+    *state.history_scan.lock() = Some("scan-in-flight".to_string());
+    rpc_send(
+        &mut ws,
+        json!({"id":1,"method":"session.rescan","params":{}}),
+    )
+    .await;
+    let busy = read_reply(&mut ws, 1).await;
+    assert_eq!(busy["result"]["alreadyRunning"], true, "{busy}");
+    assert_eq!(busy["result"]["scanId"], "scan-in-flight", "{busy}");
+
+    // Free the slot → the call runs and reports.
+    *state.history_scan.lock() = None;
+    rpc_send(
+        &mut ws,
+        json!({"id":2,"method":"session.rescan","params":{}}),
+    )
+    .await;
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+    let mut saw_progress = false;
+    let reply = loop {
+        let v = read_json(&mut ws).await;
+        if v["event"] == "history.scan_progress" {
+            saw_progress = true;
+            continue;
+        }
+        if v.get("id").and_then(|i| i.as_u64()) == Some(2) {
+            break v;
+        }
+        assert!(std::time::Instant::now() < deadline, "stuck: {v}");
+    };
+    assert!(saw_progress, "progress events must stream: {reply}");
+    assert_eq!(reply["result"]["alreadyRunning"], false, "{reply}");
+    let report = &reply["result"]["report"];
+    assert!(report["scanned"].is_u64(), "{reply}");
+    assert!(report["skippedBackends"].is_array(), "{reply}");
+    // The slot is released — a follow-up rescan runs again.
+    rpc_send(
+        &mut ws,
+        json!({"id":3,"method":"session.rescan","params":{}}),
+    )
+    .await;
+    let again = read_reply(&mut ws, 3).await;
+    assert_eq!(again["result"]["alreadyRunning"], false, "{again}");
 }

@@ -172,6 +172,12 @@ impl SessionManager {
         mgr
     }
 
+    /// Replace the registered backend clients (tests isolate the
+    /// scanner from the machine's real CLIs this way).
+    pub fn set_clients(&self, clients: HashMap<ProviderId, Arc<dyn AgentClient>>) {
+        *self.clients.write() = clients;
+    }
+
     pub fn new(
         clients: HashMap<ProviderId, Arc<dyn AgentClient>>,
         default_provider: Option<String>,

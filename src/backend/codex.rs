@@ -5,10 +5,17 @@
 //! - stdio JSONL, JSON-RPC 2.0 WITHOUT the `"jsonrpc"` header on the wire.
 //! - Handshake: `initialize` request → response, then `initialized`
 //!   notification. Requests before it are rejected.
-//! - `thread/start` → `{thread: {id}}`; `thread/resume` reattaches.
+//! - `thread/start` {cwd, model?, approvalPolicy?, sandbox?, config?} →
+//!   `{thread: {id}}`; `thread/resume` reattaches. `sandbox` is a
+//!   kebab-case `SandboxMode` string ("read-only" | "workspace-write" |
+//!   "danger-full-access"); `config` is a free-form config.toml override
+//!   object — MCP servers ride in under `mcp_servers.<name>`.
 //! - `turn/start` {threadId, input:[{type:"text",text}]} → streams
 //!   `turn/started`, `item/started`, `item/completed`,
-//!   `item/agentMessage/delta`, `turn/completed` notifications.
+//!   `item/agentMessage/delta`, `turn/completed` notifications. It also
+//!   accepts overrides that hold "for this turn and subsequent turns":
+//!   `model`, `approvalPolicy`, and `sandboxPolicy` — the struct-shaped
+//!   `{"type": "readOnly" | "workspaceWrite" | "dangerFullAccess"}`.
 //! - `turn/steer` appends input to the in-flight turn; `turn/interrupt`
 //!   cancels it.
 //! - Approvals arrive as server→client requests:
@@ -50,17 +57,7 @@ impl CodexClient {
     pub fn new(resolved: ResolvedBackend) -> Self {
         Self {
             resolved,
-            caps: Capabilities {
-                streaming: true,
-                session_persistence: true,
-                session_listing: true,
-                dynamic_modes: true,
-                mcp_servers: false,
-                reasoning_stream: true,
-                steer: true,
-                rewind: false,
-                subagent_events: false,
-            },
+            caps: codex_capabilities(),
         }
     }
 }
@@ -93,14 +90,10 @@ impl AgentClient for CodexClient {
         let _ = probe.close().await;
         Ok(ProviderCatalog {
             models,
-            modes: ["default", "plan", "full-access"]
-                .iter()
-                .map(|m| ModeDef {
-                    id: m.to_string(),
-                    name: m.to_string(),
-                    description: None,
-                })
-                .collect(),
+            // Damon-side modes: each id maps to an approvalPolicy +
+            // sandbox/sandboxPolicy pair applied on thread/start and
+            // every turn/start (codex has no native mode entity).
+            modes: codex_catalog_modes(),
             default_mode: Some("default".to_string()),
         })
     }
@@ -154,6 +147,7 @@ impl AgentClient for CodexClient {
                         .map(String::from),
                     cwd: t["cwd"].as_str().map(PathBuf::from),
                     modified_at: t["updatedAt"].as_u64().or_else(|| t["updated_at"].as_u64()),
+                    size: None,
                 })
             })
             .collect())
@@ -183,6 +177,13 @@ pub struct CodexSession {
     /// Last-seen `thread/tokenUsage/updated` payload — newer app-servers
     /// report usage only there, not on `turn/completed`.
     last_usage: parking_lot::Mutex<Option<Usage>>,
+    /// Active mode id (SessionConfig.mode / `set_mode`) — applied as
+    /// approvalPolicy + sandbox on `thread/start` and as approvalPolicy +
+    /// sandboxPolicy on every subsequent `turn/start`.
+    mode: Mutex<Option<String>>,
+    /// Model override from `set_model` — sent as `model` on every
+    /// subsequent `turn/start`.
+    pending_model: Mutex<Option<String>>,
 }
 
 impl CodexSession {
@@ -194,17 +195,7 @@ impl CodexSession {
         let (events, _) = broadcast::channel(512);
         let session = Arc::new(Self {
             transport: transport.clone(),
-            caps: Capabilities {
-                streaming: true,
-                session_persistence: true,
-                session_listing: true,
-                dynamic_modes: true,
-                mcp_servers: false,
-                reasoning_stream: true,
-                steer: true,
-                rewind: false,
-                subagent_events: false,
-            },
+            caps: codex_capabilities(),
             events,
             next_id: AtomicU64::new(1),
             thread_id: Mutex::new(None),
@@ -212,6 +203,8 @@ impl CodexSession {
             pending_asks: Mutex::new(HashMap::new()),
             open_items: Mutex::new(HashMap::new()),
             last_usage: parking_lot::Mutex::new(None),
+            mode: Mutex::new(None),
+            pending_model: Mutex::new(None),
         });
 
         // Frame dispatch task: routes responses/notifications, and fails
@@ -277,13 +270,17 @@ impl CodexSession {
 
         // Start the thread unless we're resuming (attach_thread does it).
         if session.thread_id.lock().await.is_none() {
-            let mut params = json!({});
-            if let Some(model) = &config.model {
-                params["model"] = json!(model);
+            // Seed the mode state so every turn/start re-applies it;
+            // unknown ids defer to codex's own defaults.
+            if let Some(mode) = config.mode.as_deref().filter(|m| codex_mode(m).is_some()) {
+                *session.mode.lock().await = Some(mode.to_string());
             }
-            params["cwd"] = json!(config.cwd.to_string_lossy());
             let result = session
-                .request("thread/start", params, INIT_TIMEOUT)
+                .request(
+                    "thread/start",
+                    codex_thread_start_params(&config),
+                    INIT_TIMEOUT,
+                )
                 .await
                 .context("codex thread/start failed")?;
             let tid = result["thread"]["id"]
@@ -681,6 +678,7 @@ impl CodexSession {
             detail: Some(detail),
             actions,
             suggestions: vec![],
+            questions: Vec::new(),
         };
         self.pending_asks.lock().await.insert(
             ask_id.clone(),
@@ -711,6 +709,151 @@ impl CodexSession {
         });
     }
 }
+
+/// Capability flags advertised to Damon. Every `true` is backed by
+/// implemented wire support covered by a unit test; rewind stays off —
+/// Damon has no rewind RPC consumer.
+fn codex_capabilities() -> Capabilities {
+    Capabilities {
+        streaming: true,
+        session_persistence: true,
+        session_listing: true,
+        // Damon-side modes translated to approvalPolicy +
+        // sandbox/sandboxPolicy on thread/start and turn/start.
+        dynamic_modes: true,
+        // thread/start `config` carries config.toml overrides; servers
+        // land under mcp_servers.<name> exactly as `codex mcp add`
+        // would write them.
+        mcp_servers: true,
+        reasoning_stream: true,
+        steer: true,
+        rewind: false,
+        subagent_events: false,
+        tool_allowlist: false,
+    }
+}
+
+/// Translate normalized MCP servers into the free-form `config` override
+/// carried by `thread/start` — same keys as config.toml, so servers land
+/// under `mcp_servers.<name> = {command, args, env}` exactly as
+/// `codex mcp add <name> -- <cmd…>` writes them. Empty args/env are
+/// dropped (codex defaults them); `None` means send no `config` key.
+fn codex_mcp_config(mcp_servers: &HashMap<String, McpServerConfig>) -> Option<Value> {
+    if mcp_servers.is_empty() {
+        return None;
+    }
+    let servers: serde_json::Map<String, Value> = mcp_servers
+        .iter()
+        .map(|(name, cfg)| {
+            let mut entry = serde_json::Map::new();
+            entry.insert("command".into(), json!(cfg.command));
+            if !cfg.args.is_empty() {
+                entry.insert("args".into(), json!(cfg.args));
+            }
+            if !cfg.env.is_empty() {
+                entry.insert("env".into(), json!(cfg.env));
+            }
+            (name.clone(), Value::Object(entry))
+        })
+        .collect();
+    Some(json!({"mcp_servers": Value::Object(servers)}))
+}
+
+/// Resolve a Damon mode id to its codex wire forms: the `approvalPolicy`
+/// plus the sandbox in both spellings — `thread/start` takes the
+/// kebab-case `SandboxMode` string, `turn/start` the struct-shaped
+/// `SandboxPolicy` with a camelCase type tag. Unknown ids → `None`
+/// (callers leave the params untouched).
+fn codex_mode(mode: &str) -> Option<(&'static str, &'static str, Value)> {
+    Some(match mode {
+        // Default: ask when needed, writes confined to the workspace.
+        "default" => (
+            "on-request",
+            "workspace-write",
+            json!({"type": "workspaceWrite"}),
+        ),
+        // Read-only: still ask, but the sandbox denies writes outright.
+        "read-only" => ("on-request", "read-only", json!({"type": "readOnly"})),
+        // Full access: no approvals, no sandbox.
+        "full-access" => (
+            "never",
+            "danger-full-access",
+            json!({"type": "dangerFullAccess"}),
+        ),
+        _ => return None,
+    })
+}
+
+/// The Damon-facing mode catalog. Codex has no native mode list — ids
+/// resolve through [`codex_mode`] to the approval/sandbox pair applied
+/// on `thread/start` and every `turn/start`.
+fn codex_catalog_modes() -> Vec<ModeDef> {
+    [
+        (
+            "default",
+            "Default",
+            "Ask for approvals; writes confined to the workspace",
+        ),
+        (
+            "read-only",
+            "Read-only",
+            "Ask for approvals; the sandbox denies file writes",
+        ),
+        ("full-access", "Full access", "No approvals, no sandbox"),
+    ]
+    .into_iter()
+    .map(|(id, name, description)| ModeDef {
+        id: id.to_string(),
+        name: name.to_string(),
+        description: Some(description.to_string()),
+    })
+    .collect()
+}
+
+/// Build `thread/start` params: cwd plus any SessionConfig overrides —
+/// model, MCP servers (via the `config` object) and, when a mode is set
+/// before the first turn, its approvalPolicy + sandbox.
+fn codex_thread_start_params(config: &SessionConfig) -> Value {
+    let mut params = json!({});
+    if let Some(model) = &config.model {
+        params["model"] = json!(model);
+    }
+    params["cwd"] = json!(config.cwd.to_string_lossy());
+    if let Some(overrides) = codex_mcp_config(&config.mcp_servers) {
+        params["config"] = overrides;
+    }
+    if let Some(mode) = config.mode.as_deref()
+        && let Some((approval, sandbox, _)) = codex_mode(mode)
+    {
+        params["approvalPolicy"] = json!(approval);
+        params["sandbox"] = json!(sandbox);
+    }
+    params
+}
+
+/// Build `turn/start` params, re-applying the session's model and mode
+/// state. Codex persists each override "for this turn and subsequent
+/// turns" thread-side, but re-sending keeps Damon's state authoritative
+/// across switches and thread resumes.
+fn codex_turn_params(
+    thread_id: &str,
+    input: Vec<Value>,
+    model: Option<&str>,
+    mode: Option<&str>,
+) -> Value {
+    let mut params = json!({"threadId": thread_id, "input": input});
+    if let Some(model) = model {
+        params["model"] = json!(model);
+    }
+    if let Some(mode) = mode
+        && let Some((approval, _, policy)) = codex_mode(mode)
+    {
+        params["approvalPolicy"] = json!(approval);
+        params["sandboxPolicy"] = policy;
+    }
+    params
+}
+
 /// Map a `turn/completed` usage block into the normalized [`Usage`].
 ///
 /// Codex reports cumulative token accounting under
@@ -857,10 +1000,12 @@ impl AgentSession for CodexSession {
                 })
                 .collect(),
         };
+        let model = self.pending_model.lock().await.clone();
+        let mode = self.mode.lock().await.clone();
         let result = self
             .request(
                 "turn/start",
-                json!({"threadId": thread_id, "input": input}),
+                codex_turn_params(&thread_id, input, model.as_deref(), mode.as_deref()),
                 REQUEST_TIMEOUT,
             )
             .await?;
@@ -937,6 +1082,29 @@ impl AgentSession for CodexSession {
             metadata: Value::Null,
         })
     }
+
+    /// Modes are client-side state: validated against the catalog,
+    /// stored, then applied on every subsequent `turn/start` — and on
+    /// `thread/start` when carried in via SessionConfig before the
+    /// first turn.
+    async fn set_mode(&self, mode: &str) -> Result<()> {
+        if codex_mode(mode).is_none() {
+            bail!("unknown codex mode: {mode}");
+        }
+        *self.mode.lock().await = Some(mode.to_string());
+        self.emit(StreamEvent::new(StreamEventKind::ModeChanged {
+            mode: Some(mode.to_string()),
+        }));
+        Ok(())
+    }
+
+    async fn set_model(&self, model: &str) -> Result<()> {
+        *self.pending_model.lock().await = Some(model.to_string());
+        self.emit(StreamEvent::new(StreamEventKind::ModelChanged {
+            model: model.to_string(),
+        }));
+        Ok(())
+    }
 }
 
 #[cfg(test)]
@@ -997,6 +1165,7 @@ mod tests {
             action_id: None,
             updated_input: None,
             answer: Some("use the staging cluster".to_string()),
+            answers: None,
         };
         let result = codex_approval_result(PermissionKind::Question, &response);
         assert_eq!(result["decision"], json!("accept"));
@@ -1011,6 +1180,7 @@ mod tests {
             action_id: Some("acceptForSession".to_string()),
             updated_input: None,
             answer: Some("stray text".to_string()),
+            answers: None,
         };
         let result = codex_approval_result(PermissionKind::Tool, &response);
         assert_eq!(result, json!({"decision": "acceptForSession"}));
@@ -1035,5 +1205,152 @@ mod tests {
             PermissionResponse::Allow { answer, .. } => assert_eq!(answer, None),
             other => panic!("expected allow, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn mcp_config_translates_servers_to_toml_shape() {
+        let mut env = HashMap::new();
+        env.insert("API_KEY".to_string(), "sk-1".to_string());
+        let mut servers = HashMap::new();
+        servers.insert(
+            "context7".to_string(),
+            McpServerConfig {
+                command: "npx".to_string(),
+                args: vec!["-y".to_string(), "@upstash/context7-mcp".to_string()],
+                env,
+            },
+        );
+        let config = codex_mcp_config(&servers).expect("config expected");
+        let server = &config["mcp_servers"]["context7"];
+        assert_eq!(server["command"], json!("npx"));
+        assert_eq!(server["args"], json!(["-y", "@upstash/context7-mcp"]));
+        assert_eq!(server["env"], json!({"API_KEY": "sk-1"}));
+    }
+
+    #[test]
+    fn mcp_config_drops_empty_args_and_env() {
+        let mut servers = HashMap::new();
+        servers.insert(
+            "bare".to_string(),
+            McpServerConfig {
+                command: "uvx".to_string(),
+                ..Default::default()
+            },
+        );
+        let config = codex_mcp_config(&servers).expect("config expected");
+        assert_eq!(config["mcp_servers"]["bare"], json!({"command": "uvx"}));
+    }
+
+    #[test]
+    fn mcp_config_without_servers_sends_no_config_key() {
+        assert!(codex_mcp_config(&HashMap::new()).is_none());
+    }
+
+    #[test]
+    fn modes_map_to_approval_policy_and_sandbox_forms() {
+        // thread/start takes the kebab-case SandboxMode string; turn/start
+        // takes the struct-shaped SandboxPolicy.
+        assert_eq!(
+            codex_mode("default"),
+            Some((
+                "on-request",
+                "workspace-write",
+                json!({"type": "workspaceWrite"})
+            ))
+        );
+        assert_eq!(
+            codex_mode("read-only"),
+            Some(("on-request", "read-only", json!({"type": "readOnly"})))
+        );
+        assert_eq!(
+            codex_mode("full-access"),
+            Some((
+                "never",
+                "danger-full-access",
+                json!({"type": "dangerFullAccess"})
+            ))
+        );
+        // Not in the catalog → no override, codex defaults apply.
+        assert!(codex_mode("plan").is_none());
+    }
+
+    #[test]
+    fn mode_switch_mid_session_changes_turn_overrides() {
+        let before = codex_turn_params("th1", vec![], None, Some("default"));
+        assert_eq!(before["approvalPolicy"], json!("on-request"));
+        assert_eq!(before["sandboxPolicy"], json!({"type": "workspaceWrite"}));
+
+        // set_mode("full-access") then the next turn/start:
+        let after = codex_turn_params("th1", vec![], None, Some("full-access"));
+        assert_eq!(after["approvalPolicy"], json!("never"));
+        assert_eq!(after["sandboxPolicy"], json!({"type": "dangerFullAccess"}));
+    }
+
+    #[test]
+    fn pending_model_override_applies_at_turn_start() {
+        let params = codex_turn_params(
+            "th1",
+            vec![json!({"type": "text", "text": "hi"})],
+            Some("gpt-5.2"),
+            None,
+        );
+        assert_eq!(params["threadId"], json!("th1"));
+        assert_eq!(params["model"], json!("gpt-5.2"));
+        assert_eq!(params["input"], json!([{"type": "text", "text": "hi"}]));
+
+        // Nothing pending → none of the override keys appear.
+        let plain = codex_turn_params("th1", vec![], None, None);
+        assert!(plain.get("model").is_none());
+        assert!(plain.get("approvalPolicy").is_none());
+        assert!(plain.get("sandboxPolicy").is_none());
+    }
+
+    #[test]
+    fn thread_start_params_carry_model_mcp_and_mode() {
+        let mut servers = HashMap::new();
+        servers.insert(
+            "fs".to_string(),
+            McpServerConfig {
+                command: "npx".to_string(),
+                args: vec![
+                    "-y".to_string(),
+                    "@modelcontextprotocol/server-fs".to_string(),
+                ],
+                env: HashMap::new(),
+            },
+        );
+        let config = SessionConfig {
+            cwd: PathBuf::from("/tmp/proj"),
+            model: Some("gpt-5.2".to_string()),
+            mode: Some("read-only".to_string()),
+            mcp_servers: servers,
+            ..Default::default()
+        };
+        let params = codex_thread_start_params(&config);
+        assert_eq!(params["cwd"], json!("/tmp/proj"));
+        assert_eq!(params["model"], json!("gpt-5.2"));
+        assert_eq!(params["approvalPolicy"], json!("on-request"));
+        assert_eq!(params["sandbox"], json!("read-only"));
+        assert_eq!(
+            params["config"]["mcp_servers"]["fs"],
+            json!({"command": "npx", "args": ["-y", "@modelcontextprotocol/server-fs"]})
+        );
+    }
+
+    #[test]
+    fn catalog_lists_three_modes_all_resolving_to_wire_forms() {
+        let modes = codex_catalog_modes();
+        let ids: Vec<&str> = modes.iter().map(|m| m.id.as_str()).collect();
+        assert_eq!(ids, vec!["default", "read-only", "full-access"]);
+        assert!(modes.iter().all(|m| codex_mode(&m.id).is_some()));
+    }
+
+    #[test]
+    fn capabilities_advertise_only_tested_wire_support() {
+        let caps = codex_capabilities();
+        assert!(caps.dynamic_modes);
+        assert!(caps.mcp_servers);
+        // Damon has no rewind RPC consumer — the flag stays off.
+        assert!(!caps.rewind);
     }
 }

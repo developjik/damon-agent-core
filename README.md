@@ -114,16 +114,22 @@ damon-slack    --app-token xapp-… --bot-token xoxb-…
 
 Each chat maps to its own agent session, replies stream as rendered markdown, and a prompt arriving mid-turn is queued (bounded) instead of rejected. Tool-permission requests arrive as native buttons on Telegram, Discord, and Slack (Socket Mode delivers the presses — enable Interactivity with Socket Mode in the app config); a plain `allow`/`deny`/`always` reply works everywhere, and files sent to any channel ride along as prompt attachments (Discord CDN URLs are fetched at prompt time like Slack's). `!cwd <dir>` and `!agent <backend>` steer a conversation's project and backend, alongside `!new`/`!fork`/`!delete`/`!cancel`/`!usage`. Cross-surface pickup: `!sessions` lists recent sessions from every surface, `!resume <id|title>` continues one in this chat (auto-watched), and `!watch`/`!unwatch <id|title>` follow a session so completions and permission asks ping the chat — and `allow`/`deny` answers work there too — even when the turn runs on the web UI or CLI. A new channel implements `damon_core::channel::ChannelApi` (`ready`/`recv`/`send`/`send_permission`/`send_media`) and hands it to `Bridge` — session mapping, event demux, and the permission flow are already there.
 
+## Missions (staged)
+
+`damon mission create <flow.json> && damon mission start <flow-id>` runs a staged agent workflow: `input → agent → human → output` nodes over condition-routed edges (`key=value` branches read each step's `key=value` output lines; a condition-less edge fires only when nothing else matched). Agent nodes run as real damon turns on per-node sessions — searchable like any transcript — with bounded parallelism and per-step retries before an honest `failed`. Read-only stages carry `allowedTools` onto the launch line and are REFUSED on backends that cannot enforce it (claude yes; never downgraded). Human gates park the run at `waiting_human`: answer in the web UI's Missions drawer (approve / feedback / exclude) or `damon mission respond`. Every transition persists to SQLite before it fans out, so a daemon restart converges unfinished runs to `interrupted` — nothing is faked as still-running. Staged scope: no `foreach`, no channel-based approval, no editing a live mission.
+
 ## Remote access
 
 - **Tailscale** (recommended): attach at `ws://<tailscale-ip>:9470/ws` — WireGuard E2E, no daemon changes.
 - **Direct TLS**: set `tls_cert`/`tls_key` to serve `wss`. Non-loopback binds refuse to start without `auth_token`.
 - **Self-hosted relay**: run `damon-relay` on a public host and add `[relay]` — the daemon dials out, so no inbound port. X25519 key exchange + `sha256(auth_token ‖ pubkey)` proof → AES-256-GCM; the relay sees only ciphertext.
 - **Web UI anywhere**: the relay itself serves the bundled UI at its root — open `http(s)://your-relay-host/` on any phone or laptop, enter the daemon name and auth token, and the page runs the E2E handshake back through the relay. No VPN, no port forwarding, no app; plain `ws://` hosting works because the browser does its own end-to-end crypto.
+- **Per-device pairing**: instead of handing every device the master `auth_token`, reveal a one-time pairing key in the settings drawer (`device.pairing_key`), let the device spend it at `POST /v1/pair`, and approve the pending request from any trusted surface. The device gets its own token (stored SHA-256-hashed daemon-side, revocable per device) that mints WS tickets; revoking kills the credential immediately. Direct-reach devices pair from the web UI's "pair this device" form; relay-mode devices keep the master-token login.
 
 ## Docs
 
 - **[Project homepage](https://developjik.github.io/damon-agent-core/)** — what Damon is, at a glance
+- [docs/features.md](docs/features.md) ([ko](docs/features.ko.md); [browser version](docs/features.ko.html)) — feature guide with diagrams, written for non-developers
 - [docs/protocol-v2.md](docs/protocol-v2.md) — wire protocol (methods, events, types)
 - [docs/install.md](docs/install.md) ([ko](docs/install.ko.md)) — install paths, service registration
 - [docs/integration.md](docs/integration.md) ([ko](docs/integration.ko.md)) — agent wiring, minimal clients

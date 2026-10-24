@@ -237,7 +237,11 @@ export class DamonClient {
 
   /** Answer a permission_requested event. `response` is a
    *  PermissionResponse: {behavior:"allow", action_id?, updated_input?}
-   *  or {behavior:"deny", action_id?, message?, interrupt?}. */
+   *  or {behavior:"deny", action_id?, message?, interrupt?}. For
+   *  kind:"question" asks (ev.questions present), submit picks via an
+   *  answers map {question → label | [labels]}; an allow without
+   *  answers skips. Fails with rpc.code -32008 (ASK_NOT_FOUND) when the
+   *  card is already settled; a transport error leaves it answerable. */
   async respondPermission(sessionId, requestId, response) {
     return this.#call("permission.respond", { sessionId, requestId, response });
   }

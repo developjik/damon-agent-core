@@ -316,6 +316,95 @@ async fn bridge_permission_reply_allows_tool() {
     }
 }
 
+/// A bridge wired to a fresh daemon + a recording MockChannel — the
+/// common setup of the question-card tests.
+async fn bridge_with_channel() -> (Arc<MockChannel>, Arc<Bridge>) {
+    let cfg = test_config();
+    let shared: damon_core::config::SharedConfig = Arc::new(parking_lot::RwLock::new(cfg));
+    let store = Store::in_memory().await.unwrap();
+    let state = AppState::new(shared, store).await;
+    state
+        .sessions
+        .insert_client("mock".into(), common::mock_client());
+    let url = serve_app(state).await;
+
+    let client = damon_core::client::DamonClient::connect(&url, None)
+        .await
+        .unwrap();
+    let ch = Arc::new(MockChannel {
+        sent: Mutex::new(vec![]),
+    });
+    let bridge = Bridge::new(ch.clone(), client);
+    bridge.client().hello().await.unwrap();
+    bridge.spawn_event_router().await;
+    (ch, bridge)
+}
+
+/// A single-question card: the "❓" prompt lists the options, a text
+/// reply that names an option resolves into the canonical answers map,
+/// and the mock echoes what it received.
+#[tokio::test]
+async fn bridge_question_option_reply_answers_the_card() {
+    let (ch, bridge) = bridge_with_channel().await;
+    bridge
+        .handle_message("42".into(), None, None, "question card".into(), Vec::new())
+        .await;
+    wait_for_sent(&ch.sent, "❓").await;
+    wait_for_sent(&ch.sent, "a) Postgres").await;
+
+    bridge
+        .handle_message("42".into(), None, None, "Postgres".into(), Vec::new())
+        .await;
+    wait_for_sent(&ch.sent, "✅ answered").await;
+    wait_for_sent(&ch.sent, "answered: {\"Which database?\":\"Postgres\"}").await;
+}
+
+/// A bare letter picks the option by position.
+#[tokio::test]
+async fn bridge_question_letter_reply_picks_the_option() {
+    let (ch, bridge) = bridge_with_channel().await;
+    bridge
+        .handle_message("42".into(), None, None, "question card".into(), Vec::new())
+        .await;
+    wait_for_sent(&ch.sent, "❓").await;
+
+    bridge
+        .handle_message("42".into(), None, None, "b".into(), Vec::new())
+        .await;
+    wait_for_sent(&ch.sent, "✅ answered").await;
+    wait_for_sent(&ch.sent, "answered: {\"Which database?\":\"SQLite\"}").await;
+}
+
+/// A multi-question batch refuses inline answers — the hint points at
+/// the web UI, and !skip dismisses the card (an allow without answers).
+#[tokio::test]
+async fn bridge_multi_question_card_answers_via_skip_only() {
+    let (ch, bridge) = bridge_with_channel().await;
+    bridge
+        .handle_message(
+            "42".into(),
+            None,
+            None,
+            "question card multi".into(),
+            Vec::new(),
+        )
+        .await;
+    wait_for_sent(&ch.sent, "❓").await;
+    wait_for_sent(&ch.sent, "(2 questions)").await;
+
+    // A multi-question batch refuses inline answers…
+    bridge
+        .handle_message("42".into(), None, None, "Postgres".into(), Vec::new())
+        .await;
+    wait_for_sent(&ch.sent, "answer in the web UI").await;
+    // …and !skip dismisses the card (an allow without answers).
+    bridge
+        .handle_message("42".into(), None, None, "!skip".into(), Vec::new())
+        .await;
+    wait_for_sent(&ch.sent, "⏭ skipped").await;
+    wait_for_sent(&ch.sent, "answered: none").await;
+}
+
 // --- Discord extraction -------------------------------------------------------
 
 #[test]
@@ -1490,4 +1579,215 @@ async fn long_reply_is_flushed_in_fence_safe_chunks() {
         assert!(c.len() <= 3500, "oversized chunk: {}", c.len());
     }
     assert_eq!(reassemble(&chunks), full);
+}
+
+/// The !grant loop-closer from a chat surface: !grant <dir> widens the
+/// daemon-side file jail (a file.read of a file outside the session
+/// cwd succeeds through the bridge's own client), !grants lists it,
+/// and !ungrant re-confines. Validation stays server-side — a bad
+/// path gets the refusal text, never a grant.
+#[tokio::test]
+async fn bridge_grant_command_widens_and_revokes_the_jail() {
+    let cfg = test_config();
+    let shared: damon_core::config::SharedConfig = Arc::new(parking_lot::RwLock::new(cfg));
+    let store = Store::in_memory().await.unwrap();
+    let state = AppState::new(shared, store.clone()).await;
+    state
+        .sessions
+        .insert_client("mock".into(), common::mock_client());
+    let url = serve_app(state).await;
+
+    let client = damon_core::client::DamonClient::connect(&url, None)
+        .await
+        .unwrap();
+    let ch = Arc::new(MockChannel {
+        sent: Mutex::new(vec![]),
+    });
+    let bridge = Bridge::new(ch.clone(), client);
+    bridge.client().hello().await.unwrap();
+    bridge.spawn_event_router().await;
+
+    let base = std::env::temp_dir().join(format!("damon-chgrant-{}", uuid::Uuid::new_v4()));
+    let jail = base.join("jail");
+    let outside = base.join("outside");
+    std::fs::create_dir_all(&jail).unwrap();
+    std::fs::create_dir_all(&outside).unwrap();
+    std::fs::write(outside.join("secret.txt"), "granted").unwrap();
+
+    // A session confined to jail/ — the outside file is unreadable.
+    let created = bridge
+        .client()
+        .request("session.create", json!({ "cwd": jail }))
+        .await
+        .unwrap();
+    let sid = created["sessionId"].as_str().unwrap().to_string();
+    let outside_file = outside.join("secret.txt");
+    assert!(
+        bridge
+            .client()
+            .request(
+                "file.read",
+                json!({ "sessionId": sid, "path": outside_file })
+            )
+            .await
+            .is_err(),
+        "pre-grant read must be denied"
+    );
+
+    // !grant — the channel surface grants globally.
+    bridge
+        .handle_message(
+            "chat-g".into(),
+            None,
+            None,
+            format!("!grant {}", outside.display()),
+            Vec::new(),
+        )
+        .await;
+    wait_for_sent(&ch.sent, "granted ").await;
+
+    // The jail is genuinely wider now.
+    let read = bridge
+        .client()
+        .request(
+            "file.read",
+            json!({ "sessionId": sid, "path": outside_file }),
+        )
+        .await
+        .unwrap_or_else(|e| panic!("post-grant read failed: {e:#}"));
+    assert_eq!(
+        read["content"].as_str().unwrap(),
+        base64::Engine::encode(&base64::engine::general_purpose::STANDARD, b"granted"),
+        "{read}"
+    );
+
+    // !grants lists the canonical root.
+    bridge
+        .handle_message("chat-g".into(), None, None, "!grants".into(), Vec::new())
+        .await;
+    wait_for_sent(&ch.sent, "granted roots:").await;
+
+    // !ungrant re-confines.
+    bridge
+        .handle_message(
+            "chat-g".into(),
+            None,
+            None,
+            format!("!ungrant {}", outside.display()),
+            Vec::new(),
+        )
+        .await;
+    wait_for_sent(&ch.sent, "revoked ").await;
+    assert!(
+        bridge
+            .client()
+            .request(
+                "file.read",
+                json!({ "sessionId": sid, "path": outside_file })
+            )
+            .await
+            .is_err(),
+        "post-revoke read must be denied again"
+    );
+
+    // A bad path is refused by the daemon's validation, not granted.
+    bridge
+        .handle_message(
+            "chat-g".into(),
+            None,
+            None,
+            "!grant relative/dir".into(),
+            Vec::new(),
+        )
+        .await;
+    wait_for_sent(&ch.sent, "grant failed:").await;
+
+    let _ = std::fs::remove_dir_all(&base);
+}
+
+/// The plan card path: a plan ask renders the plan (truncated) in the
+/// chat, and the plain "allow" reply routes through the permission
+/// gate — which lands the decision in the durable plan_reviews row and
+/// reaches the agent verbatim.
+#[tokio::test]
+async fn bridge_plan_card_renders_plan_and_allow_settles_the_row() {
+    let cfg = test_config();
+    let shared: damon_core::config::SharedConfig = Arc::new(parking_lot::RwLock::new(cfg));
+    let store = Store::in_memory().await.unwrap();
+    let state = AppState::new(shared, store.clone()).await;
+    state
+        .sessions
+        .insert_client("mock".into(), common::mock_client());
+    let url = serve_app(state).await;
+
+    let client = damon_core::client::DamonClient::connect(&url, None)
+        .await
+        .unwrap();
+    let ch = Arc::new(MockChannel {
+        sent: Mutex::new(vec![]),
+    });
+    let bridge = Bridge::new(ch.clone(), client);
+    bridge.client().hello().await.unwrap();
+    bridge.spawn_event_router().await;
+
+    bridge
+        .handle_message(
+            "chat-plan".into(),
+            None,
+            None,
+            "plan review".into(),
+            Vec::new(),
+        )
+        .await;
+    // The card shows the plan itself, not just a tool title.
+    wait_for_sent(&ch.sent, "🧭").await;
+    wait_for_sent(&ch.sent, "survey the repo").await;
+
+    // "allow" rides the permission gate → durable row approved.
+    bridge
+        .handle_message("chat-plan".into(), None, None, "allow".into(), Vec::new())
+        .await;
+    wait_for_sent(&ch.sent, "✅").await;
+
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(15);
+    let found = loop {
+        let mut hit = None;
+        for s in store
+            .list_sessions_paged(u32::MAX, 0, SessionFilter::default())
+            .await
+            .unwrap_or_default()
+        {
+            for r in store.plan_reviews(&s.id).await.unwrap_or_default() {
+                if r.status == "approved" {
+                    hit = Some((s.id.clone(), r));
+                    break;
+                }
+            }
+            if hit.is_some() {
+                break;
+            }
+        }
+        if let Some(f) = hit {
+            break f;
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "plan row never approved"
+        );
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+    };
+    let (sid, row) = found;
+    assert_eq!(
+        row.decision.as_ref().map(|d| d["decision"].as_str()),
+        Some(Some("approve"))
+    );
+    assert!(row.applied_at.is_some(), "native ack settled the row");
+    // The agent got exactly the approved answer.
+    let msgs = store.messages_paged(&sid, u32::MAX, 0).await.unwrap();
+    assert!(
+        msgs.iter().any(|m| m.data["content"]
+            .as_str()
+            .is_some_and(|c| c == "plan:approved")),
+        "{msgs:?}"
+    );
 }

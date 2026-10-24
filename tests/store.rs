@@ -1,4 +1,4 @@
-use damon_core::store::{SearchFilter, SessionFilter, Store};
+use damon_core::store::{PlanSubmit, SearchFilter, SessionFilter, Store};
 use serde_json::json;
 
 fn temp_db(name: &str) -> std::path::PathBuf {
@@ -1500,7 +1500,10 @@ async fn v3_migration_reindexes_array_content_rows() {
         c.query_row("PRAGMA user_version", [], |r| r.get(0))
             .unwrap()
     };
-    assert_eq!(v, 3, "migration must stamp user_version");
+    assert_eq!(
+        v, 9,
+        "migrations stamp user_version through the current one"
+    );
 }
 
 /// Trailing `term*` is an FTS5 prefix query: `zebr*` matches both
@@ -1598,4 +1601,770 @@ async fn pinned_and_archived_survive_retention() {
         .await
         .unwrap();
     assert_eq!(removed, vec!["pinned".to_string()]);
+}
+
+/// The trigram tokenizer makes CJK substring search work: a query
+/// token matches inside a longer Korean/Chinese run. Under unicode61
+/// the whole run indexed as ONE token, so `damon search "커밋"` could
+/// never find "커밋 메시지" — the defect this fixes.
+#[tokio::test]
+async fn search_matches_cjk_substrings_via_trigram_tokenizer() {
+    let store = Store::in_memory().await.unwrap();
+    store.create_session("s", "/tmp", None).await.unwrap();
+    store
+        .append("s", "user", &json!({"content": "커밋 메시지를 남겼다"}))
+        .await
+        .unwrap();
+    store
+        .append("s", "user", &json!({"content": "提交了新的代码"}))
+        .await
+        .unwrap();
+    store
+        .append("s", "user", &json!({"content": "fix: handle timeout"}))
+        .await
+        .unwrap();
+
+    // Sub-3-char queries take the LIKE fallback (see the next test).
+    let hits = store
+        .search_filtered("커밋", 10, Default::default())
+        .await
+        .unwrap();
+    assert_eq!(hits.len(), 1, "Korean substring must match: {hits:?}");
+    let hits = store
+        .search_filtered("提交", 10, Default::default())
+        .await
+        .unwrap();
+    assert_eq!(hits.len(), 1, "Chinese substring must match: {hits:?}");
+
+    // A 3+ char CJK query inside a longer unspaced run must match on
+    // the FTS5 path itself — the case unicode61 failed hardest: the
+    // whole run indexed as one token, so nothing shorter matched.
+    let hits = store
+        .search_filtered("提交了新", 10, Default::default())
+        .await
+        .unwrap();
+    assert_eq!(
+        hits.len(),
+        1,
+        "trigram windows must substring-match: {hits:?}"
+    );
+    let hits = store
+        .search_filtered("메시지를", 10, Default::default())
+        .await
+        .unwrap();
+    assert_eq!(hits.len(), 1, "{hits:?}");
+}
+
+/// Terms shorter than the trigram minimum (3 chars) fall back to
+/// exact-substring LIKE conjuncts with AND semantics; quoted phrases
+/// of 3+ chars stay on the FTS5 path and AND with them.
+#[tokio::test]
+async fn search_short_tokens_fall_back_to_like_with_and_semantics() {
+    let store = Store::in_memory().await.unwrap();
+    store.create_session("s", "/tmp", None).await.unwrap();
+    store
+        .append("s", "user", &json!({"content": "ab inside cd marker"}))
+        .await
+        .unwrap();
+    store
+        .append("s", "user", &json!({"content": "ab alone"}))
+        .await
+        .unwrap();
+    store
+        .append("s", "user", &json!({"content": "cd alone"}))
+        .await
+        .unwrap();
+
+    // Both short tokens must match — AND, not OR: only the row with
+    // both survives.
+    let hits = store
+        .search_filtered("ab cd", 10, Default::default())
+        .await
+        .unwrap();
+    assert_eq!(hits.len(), 1, "{hits:?}");
+    assert_eq!(hits[0].0, "s");
+
+    // A quoted phrase (3+ chars) stays on the FTS5 path and ANDs with
+    // the short token.
+    let hits = store
+        .search_filtered("\"cd marker\" ab", 10, Default::default())
+        .await
+        .unwrap();
+    assert_eq!(hits.len(), 1, "{hits:?}");
+    // …and still works on its own (trigram phrase = substring match).
+    let hits = store
+        .search_filtered("\"cd marker\"", 10, Default::default())
+        .await
+        .unwrap();
+    assert_eq!(hits.len(), 1, "{hits:?}");
+    let hits = store
+        .search_filtered("\"marker cd\"", 10, Default::default())
+        .await
+        .unwrap();
+    assert!(
+        hits.is_empty(),
+        "non-substring phrase matches nothing: {hits:?}"
+    );
+}
+
+/// The v4 migration re-tokenizes messages_fts to trigram and rebuilds
+/// the index, making pre-existing CJK rows searchable, then stamps
+/// user_version 4.
+#[tokio::test]
+async fn v4_migration_rebuilds_fts_with_trigram_tokenizer() {
+    let path = temp_db("fts-v4");
+
+    // Hand-build a pre-v4 database: the unicode61 table with CJK rows
+    // already indexed the old way (mirrors the v3 test's legacy schema).
+    {
+        let c = rusqlite::Connection::open(&path).unwrap();
+        c.execute_batch(
+            "CREATE TABLE sessions (
+                 id TEXT PRIMARY KEY,
+                 created_at TEXT NOT NULL DEFAULT (datetime('now')),
+                 last_active_at TEXT,
+                 cwd TEXT NOT NULL DEFAULT '',
+                 model TEXT,
+                 agent TEXT,
+                 agent_session TEXT,
+                 compacted_through INTEGER NOT NULL DEFAULT 0,
+                 summary TEXT,
+                 title TEXT,
+                 tags TEXT NOT NULL DEFAULT '[]'
+             );
+             CREATE TABLE messages (
+                 id INTEGER PRIMARY KEY AUTOINCREMENT,
+                 session_id TEXT NOT NULL REFERENCES sessions(id),
+                 role TEXT NOT NULL,
+                 data TEXT NOT NULL,
+                 ts INTEGER NOT NULL DEFAULT 0
+             );
+             CREATE VIRTUAL TABLE messages_fts USING fts5(
+                 content, session_id UNINDEXED, message_id UNINDEXED);
+             PRAGMA user_version = 3;
+             INSERT INTO sessions (id, cwd) VALUES ('s', '/w');
+             INSERT INTO messages (session_id, role, data)
+             VALUES ('s', 'user', '{\"content\":\"커밋 메시지를 남겼다\"}');
+             INSERT INTO messages (session_id, role, data)
+             VALUES ('s', 'user', '{\"content\":\"提交了新的代码\"}');
+             INSERT INTO messages_fts (content, session_id, message_id)
+             VALUES ('커밋 메시지를 남겼다', 's', 1);
+             INSERT INTO messages_fts (content, session_id, message_id)
+             VALUES ('提交了新的代码', 's', 2);",
+        )
+        .unwrap();
+        // Sanity: the unicode61 index cannot substring-match CJK —
+        // each spaced run is a single token, so "메시지" matches
+        // nothing ("메시지를" is a different token).
+        let n: i64 = c
+            .query_row(
+                "SELECT COUNT(*) FROM messages_fts WHERE messages_fts MATCH '메시지'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(n, 0, "pre-migration defect must be reproducible");
+    }
+
+    // Open runs the v4 migration over the legacy rows.
+    let store = Store::open(&path).await.unwrap();
+    let hits = store
+        .search_filtered("메시지", 10, SearchFilter::default())
+        .await
+        .unwrap();
+    assert_eq!(hits.len(), 1, "rebuilt trigram index must match: {hits:?}");
+    // Short-token LIKE fallback finds them too.
+    let hits = store
+        .search_filtered("커밋", 10, SearchFilter::default())
+        .await
+        .unwrap();
+    assert_eq!(hits.len(), 1, "{hits:?}");
+    let hits = store
+        .search_filtered("提交", 10, SearchFilter::default())
+        .await
+        .unwrap();
+    assert_eq!(hits.len(), 1, "{hits:?}");
+
+    let v: i64 = {
+        let c = rusqlite::Connection::open(&path).unwrap();
+        c.query_row("PRAGMA user_version", [], |r| r.get(0))
+            .unwrap()
+    };
+    assert_eq!(
+        v, 9,
+        "migrations stamp user_version through the current one"
+    );
+    let _ = std::fs::remove_file(&path);
+}
+
+/// usage_aggregate groups per (day, backend, model) — two backends ×
+/// two models give four groups — and sums a window total across them.
+#[tokio::test]
+async fn usage_aggregate_groups_by_day_backend_and_model() {
+    let path = temp_db("usage-aggregate");
+    let store = Store::open(&path).await.unwrap();
+    store
+        .create_session("a", "/tmp", Some("claude"))
+        .await
+        .unwrap();
+    store
+        .create_session("b", "/tmp", Some("codex"))
+        .await
+        .unwrap();
+    // record_usage stores per-session cumulative-to-delta costs, so
+    // each session's cumulative costs rise monotonically and the
+    // groups hold the per-turn deltas.
+    store
+        .record_usage("a", "opus", 10, 100, 0.10)
+        .await
+        .unwrap();
+    store
+        .record_usage("a", "sonnet", 20, 100, 0.30)
+        .await
+        .unwrap();
+    store
+        .record_usage("b", "opus", 30, 100, 0.50)
+        .await
+        .unwrap();
+    store
+        .record_usage("b", "sonnet", 40, 100, 0.90)
+        .await
+        .unwrap();
+    let today: String = {
+        let c = rusqlite::Connection::open(&path).unwrap();
+        c.query_row("SELECT date('now')", [], |r| r.get(0)).unwrap()
+    };
+
+    let agg = store.usage_aggregate(7, 0).await.unwrap();
+    assert_eq!(agg.rows.len(), 4, "2 backends × 2 models: {:?}", agg.rows);
+    // Ordered by date, then backend, then model.
+    assert_eq!(agg.rows[0].date, today);
+    assert_eq!(agg.rows[0].backend, "claude");
+    assert_eq!(agg.rows[0].model, "opus");
+    assert_eq!(agg.rows[0].turns, 1);
+    assert_eq!(agg.rows[0].context_used, 10);
+    assert!((agg.rows[0].cost_usd - 0.10).abs() < 1e-9);
+    assert_eq!(agg.rows[1].model, "sonnet");
+    assert!((agg.rows[1].cost_usd - 0.20).abs() < 1e-9);
+    assert_eq!(agg.rows[2].backend, "codex");
+    assert!((agg.rows[2].cost_usd - 0.50).abs() < 1e-9);
+    assert_eq!(agg.rows[3].backend, "codex");
+    assert_eq!(agg.rows[3].model, "sonnet");
+    assert!((agg.rows[3].cost_usd - 0.40).abs() < 1e-9);
+
+    assert_eq!(agg.turns, 4, "window total turns");
+    assert_eq!(agg.context_used, 100, "window total context");
+    assert!((agg.cost_usd - 1.20).abs() < 1e-9, "window total cost");
+
+    let _ = std::fs::remove_file(&path);
+}
+
+/// tz_offset_minutes moves UTC stamps across the local-day boundary:
+/// a 01:00 UTC row reads as today in UTC but yesterday at UTC-3,
+/// while a 12:00 UTC row stays on today — the buckets follow the
+/// caller's calendar, and the window total is unaffected.
+#[tokio::test]
+async fn usage_aggregate_tz_offset_shifts_day_buckets() {
+    let path = temp_db("usage-tz");
+    let store = Store::open(&path).await.unwrap();
+    store
+        .create_session("s", "/tmp", Some("claude"))
+        .await
+        .unwrap();
+    store.record_usage("s", "m", 10, 100, 0.10).await.unwrap();
+    // Cumulative 0.30 → stored delta 0.20 (record_usage semantics).
+    store.record_usage("s", "m", 20, 100, 0.30).await.unwrap();
+    {
+        let c = rusqlite::Connection::open(&path).unwrap();
+        c.execute(
+            "UPDATE usage SET created_at = strftime('%Y-%m-%d', 'now') || ' 01:00:00'
+             WHERE context_used = 10",
+            [],
+        )
+        .unwrap();
+        c.execute(
+            "UPDATE usage SET created_at = strftime('%Y-%m-%d', 'now') || ' 12:00:00'
+             WHERE context_used = 20",
+            [],
+        )
+        .unwrap();
+    }
+
+    // UTC buckets: both rows are today — one group.
+    let utc = store.usage_aggregate(7, 0).await.unwrap();
+    assert_eq!(utc.rows.len(), 1, "{:?}", utc.rows);
+    assert_eq!(utc.rows[0].turns, 2);
+
+    // UTC-3: 01:00 UTC is 22:00 yesterday, 12:00 UTC stays today —
+    // the group splits by local day.
+    let shifted = store.usage_aggregate(7, -180).await.unwrap();
+    assert_eq!(
+        shifted.rows.len(),
+        2,
+        "one group per local day: {:?}",
+        shifted.rows
+    );
+    {
+        let c = rusqlite::Connection::open(&path).unwrap();
+        let yesterday: String = c
+            .query_row("SELECT date('now', '-180 minutes', '-1 day')", [], |r| {
+                r.get(0)
+            })
+            .unwrap();
+        let today: String = c
+            .query_row("SELECT date('now', '-180 minutes')", [], |r| r.get(0))
+            .unwrap();
+        // Ordered by date: yesterday's 01:00-UTC row first.
+        assert_eq!(shifted.rows[0].date, yesterday);
+        assert_eq!(shifted.rows[0].turns, 1);
+        assert!((shifted.rows[0].cost_usd - 0.10).abs() < 1e-9);
+        assert_eq!(shifted.rows[1].date, today);
+        assert_eq!(shifted.rows[1].turns, 1);
+        assert!((shifted.rows[1].cost_usd - 0.20).abs() < 1e-9);
+    }
+    // Bucketing never changes the window total.
+    assert_eq!(shifted.turns, 2);
+    assert!((shifted.cost_usd - 0.30).abs() < 1e-9);
+
+    let _ = std::fs::remove_file(&path);
+}
+
+/// usage_clear deletes every usage row and nothing else.
+#[tokio::test]
+async fn usage_clear_empties_usage_rows_only() {
+    let path = temp_db("usage-clear");
+    let store = Store::open(&path).await.unwrap();
+    store
+        .create_session("s", "/tmp", Some("claude"))
+        .await
+        .unwrap();
+    store
+        .append("s", "user", &json!({"content": "kept"}))
+        .await
+        .unwrap();
+    store.record_usage("s", "m", 10, 100, 0.5).await.unwrap();
+    assert_eq!(store.usage_aggregate(7, 0).await.unwrap().turns, 1);
+
+    store.usage_clear().await.unwrap();
+    let agg = store.usage_aggregate(7, 0).await.unwrap();
+    assert!(agg.rows.is_empty(), "rows must be gone: {:?}", agg.rows);
+    assert_eq!(agg.turns, 0);
+
+    // Sessions and messages are untouched.
+    assert_eq!(store.messages_paged("s", 10, 0).await.unwrap().len(), 1);
+    let sessions: i64 = {
+        let c = rusqlite::Connection::open(&path).unwrap();
+        c.query_row("SELECT COUNT(*) FROM sessions", [], |r| r.get(0))
+            .unwrap()
+    };
+    assert_eq!(sessions, 1);
+
+    let _ = std::fs::remove_file(&path);
+}
+
+/// Granted roots persist across reopen (the v5 table, global and
+/// project-scoped rows), duplicates are idempotent, and revoke removes
+/// exactly one (scope, root) pair — the other scope's grant survives.
+#[tokio::test]
+async fn grant_roots_persist_across_reopen_and_revoke_by_scope() {
+    let path = temp_db("grants");
+    let root_a = std::env::temp_dir().join(format!("damon-grant-a-{}", uuid::Uuid::new_v4()));
+    let root_b = std::env::temp_dir().join(format!("damon-grant-b-{}", uuid::Uuid::new_v4()));
+    std::fs::create_dir_all(&root_a).unwrap();
+    std::fs::create_dir_all(&root_b).unwrap();
+
+    {
+        let store = Store::open(&path).await.unwrap();
+        store
+            .create_project("p1", "P1", "/tmp/p1", "{}")
+            .await
+            .unwrap();
+        store
+            .grant_root(None, root_a.to_string_lossy().into_owned())
+            .await
+            .unwrap();
+        // Duplicate grant: idempotent, still one row.
+        store
+            .grant_root(None, root_a.to_string_lossy().into_owned())
+            .await
+            .unwrap();
+        store
+            .grant_root(Some("p1".into()), root_b.to_string_lossy().into_owned())
+            .await
+            .unwrap();
+        // Effective set for the project: its grant + the global one.
+        let eff = store.granted_roots(Some("p1".into())).await.unwrap();
+        assert_eq!(eff.len(), 2, "{eff:?}");
+        let globals = store.granted_roots(None).await.unwrap();
+        assert_eq!(globals.len(), 1, "{globals:?}");
+        assert_eq!(globals[0].root, root_a.to_string_lossy());
+        assert_eq!(globals[0].project_id, None);
+    }
+
+    // Reopen — grants survive, no re-migration.
+    let store = Store::open(&path).await.unwrap();
+    let eff = store.granted_roots(Some("p1".into())).await.unwrap();
+    assert_eq!(eff.len(), 2, "grants survive reopen: {eff:?}");
+    assert!(eff.iter().any(|g| g.project_id.is_none()));
+    assert!(eff.iter().any(|g| g.project_id.as_deref() == Some("p1")));
+
+    // Revoking the global leaves the project grant, and vice versa.
+    assert!(
+        store
+            .revoke_root(None, root_a.to_string_lossy().into_owned())
+            .await
+            .unwrap()
+    );
+    assert!(
+        !store
+            .revoke_root(None, root_a.to_string_lossy().into_owned())
+            .await
+            .unwrap()
+    );
+    assert_eq!(
+        store.granted_roots(Some("p1".into())).await.unwrap().len(),
+        1
+    );
+    assert!(
+        store
+            .revoke_root(Some("p1".into()), root_b.to_string_lossy().into_owned())
+            .await
+            .unwrap()
+    );
+    assert!(
+        store
+            .granted_roots(Some("p1".into()))
+            .await
+            .unwrap()
+            .is_empty()
+    );
+
+    let _ = std::fs::remove_dir_all(&root_a);
+    let _ = std::fs::remove_dir_all(&root_b);
+    let _ = std::fs::remove_file(&path);
+}
+
+/// A re-asked plan chains onto the same planId as revision+1 while the
+/// previous review is still open, supersedes it, and a decided review
+/// starts a fresh chain.
+#[tokio::test]
+async fn plan_revisions_chain_while_open_and_restart_when_decided() {
+    let store = Store::in_memory().await.unwrap();
+    let first = store
+        .record_plan("s", "req-1", "ExitPlanMode", "draft one", true)
+        .await
+        .unwrap();
+    assert_eq!(first.revision, 1);
+    assert_eq!(first.status, "awaiting_review");
+
+    // Re-ask while open → same planId, revision 2, rev 1 superseded.
+    let second = store
+        .record_plan("s", "req-2", "ExitPlanMode", "draft two", true)
+        .await
+        .unwrap();
+    assert_eq!(second.plan_id, first.plan_id);
+    assert_eq!(second.revision, 2);
+    let rev1 = store.plan_row(&first.plan_id, 1).await.unwrap().unwrap();
+    assert_eq!(rev1.status, "superseded");
+    assert_eq!(rev1.superseded_by, Some(2));
+    // Content hash distinguishes the revisions' text.
+    assert_ne!(rev1.content_hash, second.content_hash);
+
+    // Decide revision 2 (terminal) → the next ask starts a NEW chain.
+    store
+        .submit_plan_decision(&second.plan_id, 2, "approve", None)
+        .await
+        .unwrap();
+    store
+        .settle_plan(&second.plan_id, 2, "approve")
+        .await
+        .unwrap();
+    let third = store
+        .record_plan("s", "req-3", "ExitPlanMode", "another plan", true)
+        .await
+        .unwrap();
+    assert_ne!(third.plan_id, first.plan_id);
+    assert_eq!(third.revision, 1);
+}
+
+/// The CAS gate: two submitters with the same expectedRevision —
+/// exactly one claims, the other conflicts with the current row; a
+/// decided review conflicts too.
+#[tokio::test]
+async fn plan_decision_claims_once_then_conflicts() {
+    let store = Store::in_memory().await.unwrap();
+    let row = store
+        .record_plan("s", "req-1", "ExitPlanMode", "the plan", true)
+        .await
+        .unwrap();
+
+    let win = store
+        .submit_plan_decision(&row.plan_id, 1, "approve", None)
+        .await
+        .unwrap();
+    let PlanSubmit::Claimed { previous, .. } = win else {
+        panic!("first submit must claim: {win:?}");
+    };
+    assert_eq!(previous, "awaiting_review");
+
+    // Double-click / second surface: conflict with the live row.
+    let loser = store
+        .submit_plan_decision(&row.plan_id, 1, "approve", None)
+        .await
+        .unwrap();
+    let PlanSubmit::Conflict(current) = loser else {
+        panic!("second submit must conflict: {loser:?}");
+    };
+    assert_eq!(current.status, "submitting");
+
+    // Ack settles the winner; anything further conflicts.
+    store.settle_plan(&row.plan_id, 1, "approve").await.unwrap();
+    let late = store
+        .submit_plan_decision(&row.plan_id, 1, "request_changes", Some("late"))
+        .await
+        .unwrap();
+    assert!(matches!(late, PlanSubmit::Conflict(_)));
+
+    // An unknown revision is a typed NotFound, not a conflict.
+    assert!(matches!(
+        store
+            .submit_plan_decision(&row.plan_id, 99, "approve", None)
+            .await
+            .unwrap(),
+        PlanSubmit::NotFound
+    ));
+}
+
+/// Approval of an incomplete plan is refused, request_changes demands
+/// non-empty feedback, and defer is allowed even on an incomplete plan
+/// (nothing natively approved).
+#[tokio::test]
+async fn plan_submit_refuses_incomplete_approvals_and_empty_feedback() {
+    let store = Store::in_memory().await.unwrap();
+    let row = store
+        .record_plan("s", "req-1", "ExitPlanMode", "", false)
+        .await
+        .unwrap();
+    assert!(!row.complete);
+
+    assert!(matches!(
+        store
+            .submit_plan_decision(&row.plan_id, 1, "approve", None)
+            .await
+            .unwrap(),
+        PlanSubmit::Incomplete
+    ));
+    assert!(matches!(
+        store
+            .submit_plan_decision(&row.plan_id, 1, "request_changes", Some("  "))
+            .await
+            .unwrap(),
+        PlanSubmit::FeedbackRequired
+    ));
+    assert!(matches!(
+        store
+            .submit_plan_decision(&row.plan_id, 1, "request_changes", None)
+            .await
+            .unwrap(),
+        PlanSubmit::FeedbackRequired
+    ));
+
+    // Defer on an incomplete plan is fine — nothing was approved.
+    assert!(matches!(
+        store
+            .submit_plan_decision(&row.plan_id, 1, "defer", None)
+            .await
+            .unwrap(),
+        PlanSubmit::Claimed { .. }
+    ));
+}
+
+/// A failed native relay keeps the decision intent on file and reopens
+/// the row — an approval never reads as delivered when the write was
+/// lost. The intent (decision + feedback) survives the revert.
+#[tokio::test]
+async fn plan_relay_failure_keeps_intent_and_reopens_row() {
+    let store = Store::in_memory().await.unwrap();
+    let row = store
+        .record_plan("s", "req-1", "ExitPlanMode", "the plan", true)
+        .await
+        .unwrap();
+
+    let claimed = store
+        .submit_plan_decision(
+            &row.plan_id,
+            1,
+            "request_changes",
+            Some("add a rollback step"),
+        )
+        .await
+        .unwrap();
+    let PlanSubmit::Claimed { previous, .. } = claimed else {
+        panic!("must claim: {claimed:?}");
+    };
+    assert_eq!(previous, "awaiting_review");
+
+    // The intent is durably recorded in the submitting state.
+    let mid = store.plan_row(&row.plan_id, 1).await.unwrap().unwrap();
+    assert_eq!(mid.status, "submitting");
+    assert!(mid.decision_intent_at.is_some());
+    assert_eq!(
+        mid.decision.as_ref().map(|d| d["decision"].as_str()),
+        Some(Some("request_changes"))
+    );
+    assert_eq!(
+        mid.decision.as_ref().map(|d| d["feedback"].as_str()),
+        Some(Some("add a rollback step"))
+    );
+    assert_eq!(mid.applied_at, None);
+
+    // The write was lost: revert reopens the row, the intent stays.
+    store.revert_plan(&row.plan_id, 1, &previous).await.unwrap();
+    let reverted = store.plan_row(&row.plan_id, 1).await.unwrap().unwrap();
+    assert_eq!(reverted.status, "awaiting_review");
+    assert!(reverted.decision_intent_at.is_some());
+    assert_eq!(reverted.applied_at, None);
+    assert!(reverted.decision.is_some());
+
+    // A deferred claim that never got a native write can still be
+    // answered later — deferred is non-terminal.
+    store
+        .submit_plan_decision(&row.plan_id, 1, "defer", None)
+        .await
+        .unwrap();
+    store.settle_plan(&row.plan_id, 1, "defer").await.unwrap();
+    let deferred = store.plan_row(&row.plan_id, 1).await.unwrap().unwrap();
+    assert_eq!(deferred.status, "deferred");
+    let later = store
+        .submit_plan_decision(&row.plan_id, 1, "approve", None)
+        .await
+        .unwrap();
+    assert!(matches!(later, PlanSubmit::Claimed { .. }));
+}
+
+/// Turn end expires the session's still-open reviews (ghost plans must
+/// not stay answerable), and deleting the session removes every row.
+#[tokio::test]
+async fn plan_rows_expire_on_turn_end_and_delete_with_the_session() {
+    let path = temp_db("plan-lifecycle");
+    let store = Store::open(&path).await.unwrap();
+    store.create_session("s", "/tmp", None).await.unwrap();
+    store
+        .record_plan("s", "req-1", "ExitPlanMode", "p1", true)
+        .await
+        .unwrap();
+    store
+        .record_plan("s", "req-2", "ExitPlanMode", "p2", true)
+        .await
+        .unwrap();
+    // rev2 open (awaiting_review), rev1 superseded.
+
+    assert_eq!(store.expire_open_plans("s").await.unwrap(), 1);
+    let rows = store.plan_reviews("s").await.unwrap();
+    assert_eq!(rows[0].status, "superseded", "already-closed stays");
+    assert_eq!(rows[1].status, "expired");
+
+    store.delete_session("s").await.unwrap();
+    assert!(store.plan_reviews("s").await.unwrap().is_empty());
+    let _ = std::fs::remove_file(&path);
+}
+
+/// The pairing key is single-use with rotation in one locked step: the
+/// same key mints until spent, a wrong key spends nothing, the spend
+/// rotates a DIFFERENT fresh key, and neither the spent key nor any
+/// replay works again.
+#[tokio::test]
+async fn pairing_key_spends_once_and_rotates() {
+    let store = Store::in_memory().await.unwrap();
+
+    let key = store.pairing_key_ensure().await.unwrap();
+    assert_eq!(
+        store.pairing_key_ensure().await.unwrap(),
+        key,
+        "stable until spent"
+    );
+
+    // Wrong key: nothing spent, the real key survives.
+    assert_eq!(store.consume_pairing_key("WRONG").await.unwrap(), None);
+    assert_eq!(store.pairing_key_ensure().await.unwrap(), key);
+
+    // Correct key: spent, fresh one rotated in, old key dead.
+    let fresh = store
+        .consume_pairing_key(&format!("  {key}  "))
+        .await
+        .unwrap()
+        .expect("correct key spends");
+    assert_ne!(fresh, key);
+    assert_eq!(
+        store.pairing_key_ensure().await.unwrap(),
+        fresh,
+        "the rotated key is active"
+    );
+    assert_eq!(
+        store.consume_pairing_key(&key).await.unwrap(),
+        None,
+        "replay dead"
+    );
+
+    // The fresh key spends too — every key is exactly one pairing.
+    assert!(store.consume_pairing_key(&fresh).await.unwrap().is_some());
+}
+
+/// Device rows: pending mints nothing, approval unlocks the token
+/// hash, revoke kills it immediately, rename validates, and the
+/// last-seen write is throttled to once per minute.
+#[tokio::test]
+async fn device_rows_gate_on_approval_and_revoke_immediately() {
+    let store = Store::in_memory().await.unwrap();
+    let hash = damon_core::cli_lifecycle::hash_device_token("device-secret");
+    let id = store.create_device("pixel", &hash).await.unwrap();
+
+    let rows = store.devices().await.unwrap();
+    assert_eq!(rows.len(), 1);
+    assert_eq!(rows[0].status, "pending");
+    assert_eq!(rows[0].name, "pixel");
+    assert_eq!(rows[0].approved_at, None);
+
+    // Pending: the token mints nothing.
+    assert!(!store.device_token_ok(&hash).await.unwrap());
+
+    // Approve: the hash unlocks.
+    assert!(store.approve_device(&id).await.unwrap());
+    assert!(store.device_token_ok(&hash).await.unwrap());
+    assert!(
+        !store.approve_device(&id).await.unwrap(),
+        "approve is pending-only"
+    );
+
+    // A DIFFERENT token never matches (hash discipline).
+    assert!(
+        !store
+            .device_token_ok(&damon_core::cli_lifecycle::hash_device_token("other"))
+            .await
+            .unwrap()
+    );
+
+    // Rename: blank refused, real name sticks.
+    assert!(!store.rename_device(&id, "   ").await.unwrap());
+    assert!(store.rename_device(&id, "pixel pro").await.unwrap());
+    assert_eq!(store.devices().await.unwrap()[0].name, "pixel pro");
+
+    // Throttled last-seen: the first touch writes, a second touch
+    // within the minute is a no-op.
+    store.touch_device(&hash).await.unwrap();
+    let seen = store.devices().await.unwrap()[0].last_seen.clone();
+    assert!(seen.is_some());
+    store.touch_device(&hash).await.unwrap();
+    assert_eq!(store.devices().await.unwrap()[0].last_seen, seen);
+
+    // Revoke: the row (and its hash) is gone — dead immediately.
+    assert!(store.revoke_device(&id).await.unwrap());
+    assert!(!store.device_token_ok(&hash).await.unwrap());
+    assert!(store.devices().await.unwrap().is_empty());
+    assert!(!store.revoke_device(&id).await.unwrap());
+
+    // Unnamed devices get a readable fallback label.
+    let id = store.create_device("  ", &hash).await.unwrap();
+    assert_eq!(store.devices().await.unwrap()[0].name, "unnamed device");
+    assert!(store.revoke_device(&id).await.unwrap());
 }

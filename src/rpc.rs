@@ -18,6 +18,7 @@ use std::net::SocketAddr;
 use std::sync::Arc;
 
 use anyhow::{Context, Result, bail};
+use async_trait::async_trait;
 use axum::extract::ws::{Message, WebSocket, WebSocketUpgrade};
 use axum::extract::{ConnectInfo, Query, State};
 use axum::http::StatusCode;
@@ -54,7 +55,23 @@ pub async fn ws_handler(
     {
         return Err(StatusCode::UNAUTHORIZED);
     }
-    Ok(ws.on_upgrade(move |sock| run_connection(state, sock)))
+    // Remote-control badge: count non-loopback peers for hello — a
+    // phone or second machine holding a direct /ws connection. The
+    // counter decrements when THIS connection's run loop returns.
+    let remote = !peer.ip().is_loopback();
+    if remote {
+        state
+            .remote_ws
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    }
+    Ok(ws.on_upgrade(move |sock| async move {
+        run_connection(state.clone(), sock).await;
+        if remote {
+            state
+                .remote_ws
+                .fetch_sub(1, std::sync::atomic::Ordering::Relaxed);
+        }
+    }))
 }
 
 /// Global bound on concurrent prompt turns — every other resource in
@@ -98,6 +115,20 @@ pub mod error_code {
     /// A worktree operation failed — `error.data.kind` carries the
     /// machine taxonomy (`pr_not_found`, `branch_exists`, …).
     pub const WORKTREE_FAILED: i64 = -32007;
+    /// No pending permission/question ask for the given `requestId` —
+    /// it was already answered, settled by the agent, or never existed.
+    /// Retrying is pointless; a *delivery* failure (ask still pending)
+    /// surfaces as `INTERNAL_ERROR` instead.
+    pub const ASK_NOT_FOUND: i64 = -32008;
+    /// Plan-review conflict: another surface claimed the decision
+    /// first, or the call targeted a stale revision / closed plan.
+    /// The current row comes back in the message; refetch via
+    /// `plan.list` before deciding again.
+    pub const PLAN_CONFLICT: i64 = -32009;
+    /// MCP setEnabled CAS reject — the entry changed since the
+    /// caller's inventory snapshot (external edit). Refetch via
+    /// `mcp.inventory` and retry.
+    pub const MCP_CONFLICT: i64 = -32010;
 }
 
 /// An error carrying a typed JSON-RPC code to the wire. Produced via
@@ -166,6 +197,11 @@ fn error_payload(e: &anyhow::Error) -> (i64, String, Option<Value>) {
             Some(json!({"kind": w.kind})),
         );
     }
+    if e.chain()
+        .any(|c| c.downcast_ref::<crate::backend::AskNotFound>().is_some())
+    {
+        return (error_code::ASK_NOT_FOUND, e.to_string(), None);
+    }
     (error_code::INTERNAL_ERROR, e.to_string(), None)
 }
 
@@ -191,6 +227,9 @@ fn replay_event(row: &crate::store::StoredMessage) -> Option<Value> {
         "assistant" => TimelineItem::AssistantMessage { text: text()? },
         "reasoning" => TimelineItem::Reasoning { text: text()? },
         "tool" => TimelineItem::ToolCall(serde_json::from_value(row.data.clone()).ok()?),
+        "todo" => TimelineItem::Todo {
+            items: serde_json::from_value(row.data["items"].clone()).ok()?,
+        },
         "compaction" => TimelineItem::Compaction { summary: text()? },
         // A failed turn's durable marker — the live wire carries the
         // TurnFailed event; replay re-raises it for late subscribers.
@@ -349,6 +388,9 @@ async fn run_connection(state: Arc<AppState>, socket: WebSocket) {
             "daemon": "damond",
             "version": env!("CARGO_PKG_VERSION"),
             "permissionTimeoutSecs": state.config.read().permission_timeout_secs,
+            "remoteClients": state
+                .remote_ws
+                .load(std::sync::atomic::Ordering::Relaxed),
         }
     }));
 
@@ -404,6 +446,9 @@ pub async fn handle_socket(
             "daemon": "damond",
             "version": env!("CARGO_PKG_VERSION"),
             "permissionTimeoutSecs": state.config.read().permission_timeout_secs,
+            "remoteClients": state
+                .remote_ws
+                .load(std::sync::atomic::Ordering::Relaxed),
         }
     }));
 
@@ -505,6 +550,9 @@ async fn dispatch(
             "version": env!("CARGO_PKG_VERSION"),
             "backends": state.sessions.available_backends(),
             "methods": rpc_methods(),
+            "remoteClients": state
+                .remote_ws
+                .load(std::sync::atomic::Ordering::Relaxed),
         })),
 
         "backend.list" => {
@@ -517,6 +565,367 @@ async fn dispatch(
                 }));
             }
             Ok(json!({"backends": out}))
+        }
+
+        // CLI lifecycle: version probes run ONLY here (explicit
+        // request — never scheduled; `npm view` is a network call and
+        // every probe spawns a process). Local and latest probes run
+        // concurrently per backend, all backends in parallel; the
+        // response stays under the frame budget (nine small rows).
+        "backend.versions" => {
+            let only = params["backend"].as_str();
+            let runner: std::sync::Arc<dyn crate::cli_lifecycle::CommandRunner> = state
+                .cli_runner
+                .get()
+                .cloned()
+                .unwrap_or_else(|| std::sync::Arc::new(crate::cli_lifecycle::RealRunner));
+            let resolved =
+                crate::backend::registry::resolve_backends(&state.config.read().backends);
+            let targets: Vec<_> = resolved
+                .iter()
+                .filter(|b| only.is_none_or(|o| b.id == o))
+                .collect();
+            if targets.is_empty() {
+                return Err(RpcError::error(
+                    error_code::INVALID_PARAMS,
+                    format!("unknown backend {}", only.unwrap_or_default()),
+                ));
+            }
+            let probes = targets.iter().map(|b| {
+                let runner = runner.clone();
+                async move {
+                    let ((installed, version), latest) = tokio::join!(
+                        crate::cli_lifecycle::probe_local_version(runner.as_ref(), &b.command),
+                        async {
+                            match crate::cli_lifecycle::update_kind(&b.id) {
+                                crate::cli_lifecycle::UpdateKind::Npm(package) => {
+                                    crate::cli_lifecycle::probe_latest_version(
+                                        runner.as_ref(),
+                                        package,
+                                    )
+                                    .await
+                                }
+                                // No verified package — no latest probe.
+                                _ => None,
+                            }
+                        }
+                    );
+                    (b, installed, version, latest)
+                }
+            });
+            let results = futures::future::join_all(probes).await;
+            let versions: Vec<Value> = results
+                .into_iter()
+                .map(|(b, installed, version, latest)| {
+                    json!({
+                        "backend": b.id,
+                        "installed": installed,
+                        "version": version,
+                        "latest": latest,
+                        "updateAvailable": crate::cli_lifecycle::update_available(
+                            version.as_deref(), latest.as_deref()),
+                        "updateKind": match crate::cli_lifecycle::update_kind(&b.id) {
+                            crate::cli_lifecycle::UpdateKind::Npm(_) => "npm",
+                            crate::cli_lifecycle::UpdateKind::Manual(_) => "manual",
+                            crate::cli_lifecycle::UpdateKind::Unknown => "unknown",
+                        },
+                    })
+                })
+                .collect();
+            Ok(json!({"versions": versions}))
+        }
+
+        "backend.update_plan" => {
+            let backend = req_str(&params, "backend")?;
+            let runner: std::sync::Arc<dyn crate::cli_lifecycle::CommandRunner> = state
+                .cli_runner
+                .get()
+                .cloned()
+                .unwrap_or_else(|| std::sync::Arc::new(crate::cli_lifecycle::RealRunner));
+            let resolved =
+                crate::backend::registry::resolve_backends(&state.config.read().backends);
+            let entry = resolved.iter().find(|b| b.id == backend).ok_or_else(|| {
+                RpcError::error(
+                    error_code::INVALID_PARAMS,
+                    format!("unknown backend {backend}"),
+                )
+            })?;
+            // Pure construction over one cheap probe (the action label).
+            let (installed, _version) =
+                crate::cli_lifecycle::probe_local_version(runner.as_ref(), &entry.command).await;
+            let plan = crate::cli_lifecycle::build_plan(backend, installed);
+            Ok(json!({
+                "backend": plan.backend,
+                "action": plan.action,
+                "kind": plan.kind,
+                "command": plan.command,
+                "manualCommand": plan.manual_command,
+                "canRun": plan.can_run,
+                "blockers": plan.blockers,
+                "platform": plan.platform,
+            }))
+        }
+
+        "backend.update" => {
+            let backend = req_str(&params, "backend")?;
+            let runner: std::sync::Arc<dyn crate::cli_lifecycle::CommandRunner> = state
+                .cli_runner
+                .get()
+                .cloned()
+                .unwrap_or_else(|| std::sync::Arc::new(crate::cli_lifecycle::RealRunner));
+            let resolved =
+                crate::backend::registry::resolve_backends(&state.config.read().backends);
+            let entry = resolved.iter().find(|b| b.id == backend).ok_or_else(|| {
+                RpcError::error(
+                    error_code::INVALID_PARAMS,
+                    format!("unknown backend {backend}"),
+                )
+            })?;
+            // The plan IS the run: same argv the plan preview showed.
+            let plan = crate::cli_lifecycle::build_plan(backend, true);
+            if !plan.can_run {
+                return Err(RpcError::error(
+                    error_code::INVALID_PARAMS,
+                    plan.blockers.join("; "),
+                ));
+            }
+            let creation_id = params["creationId"]
+                .as_str()
+                .map(String::from)
+                .unwrap_or_else(|| uuid::Uuid::new_v4().to_string());
+            let cancel = state.cli_updates.register(&creation_id);
+            // Progress frames ride the requesting connection — the
+            // surface that clicked update is the one showing the log
+            // (the worktree.create precedent). Per-line cap keeps a
+            // minified npm progress bar from flooding the socket.
+            let pconn = conn.clone();
+            let cid = creation_id.clone();
+            let on_line: std::sync::Arc<dyn for<'a> Fn(&'a str) + Send + Sync> =
+                std::sync::Arc::new(move |line: &str| {
+                    pconn.send(json!({
+                    "event": "backend.update_progress",
+                    "creationId": cid,
+                        "data": {"phase": "line", "line": line},
+                    }));
+                });
+            let (program, args) = (plan.command[0].clone(), plan.command[1..].to_vec());
+            let outcome = runner
+                .run(
+                    &program,
+                    &args,
+                    crate::cli_lifecycle::INSTALL_TIMEOUT,
+                    &cancel,
+                    on_line.clone(),
+                )
+                .await;
+            state.cli_updates.finish(&creation_id);
+            let out = outcome.map_err(|e| {
+                RpcError::error(
+                    error_code::INTERNAL_ERROR,
+                    format!("cannot run the update command: {e:#}"),
+                )
+            })?;
+            if out.timed_out {
+                conn.send(json!({
+                    "event": "backend.update_progress", "creationId": creation_id,
+                    "data": {"phase": "finished", "exitOk": false},
+                }));
+                return Err(RpcError::error(
+                    error_code::INTERNAL_ERROR,
+                    format!(
+                        "update timed out after {}s — check the network and retry",
+                        crate::cli_lifecycle::INSTALL_TIMEOUT.as_secs()
+                    ),
+                ));
+            }
+            if !out.success {
+                conn.send(json!({
+                    "event": "backend.update_progress", "creationId": creation_id,
+                    "data": {"phase": "finished", "exitOk": false},
+                }));
+                return Err(RpcError::error(
+                    error_code::INTERNAL_ERROR,
+                    format!(
+                        "update failed. output tail: {}",
+                        crate::cli_lifecycle::tail_chars(
+                            &out.stdout,
+                            crate::cli_lifecycle::ERROR_TAIL_CHARS
+                        )
+                    ),
+                ));
+            }
+            // Fresh local version after the update.
+            let (_installed, version) =
+                crate::cli_lifecycle::probe_local_version(runner.as_ref(), &entry.command).await;
+            conn.send(json!({
+                "event": "backend.update_progress", "creationId": creation_id,
+                "data": {"phase": "finished", "exitOk": true},
+            }));
+            Ok(json!({
+                "creationId": creation_id,
+                "ok": true,
+                "version": version,
+            }))
+        }
+
+        "backend.update_cancel" => {
+            let id = req_str(&params, "creationId")?;
+            Ok(json!({
+                "cancelled": state.cli_updates.cancel(id)
+            }))
+        }
+
+        // MCP inventory: read-only — every backend's NATIVE config,
+        // REDACTED (env keys yes / values never; URLs lose userinfo,
+        // query and fragment; stdio shows the program and an arg
+        // count). A broken config file is reported per source and the
+        // rest of the inventory continues.
+        "mcp.inventory" => {
+            let (entries, sources) = crate::mcp_inventory::inventory().await?;
+            Ok(json!({
+                "entries": entries.iter().map(|e| e.to_json()).collect::<Vec<_>>(),
+                "sources": sources
+                    .iter()
+                    .map(|s| {
+                        json!({
+                            "backend": s.backend, "source": s.source,
+                            "format": s.format, "error": s.error,
+                        })
+                    })
+                    .collect::<Vec<_>>(),
+            }))
+        }
+
+        // MCP probe: explicit request ONLY (never scheduled, never
+        // auto-run — stated in the docs). Real handshake against the
+        // configured server: stdio spawn in its own process group
+        // (25s cap) or HTTP POST (12s cap); tool NAMES only, capped
+        // at 40. The server's command/args/env never reach the wire.
+        "mcp.probe" => {
+            let backend = req_str(&params, "backend")?;
+            let name = req_str(&params, "name")?;
+            let runner: std::sync::Arc<dyn crate::mcp_inventory::ProbeRunner> = state
+                .mcp_probe
+                .get()
+                .cloned()
+                .unwrap_or_else(|| std::sync::Arc::new(crate::mcp_inventory::RealProbeRunner));
+            let result = crate::mcp_inventory::probe(runner.as_ref(), backend, name).await?;
+            let mut out = json!({
+                "backend": backend, "name": name,
+                "result": result.status,
+                "tools": result.tools,
+                "elapsedMs": result.elapsed_ms,
+            });
+            if let Some(n) = &result.server_name {
+                out["serverName"] = json!(n);
+            }
+            if let Some(p) = &result.protocol_version {
+                out["protocolVersion"] = json!(p);
+            }
+            if let Some(e) = &result.error {
+                out["error"] = json!(e);
+            }
+            Ok(out)
+        }
+
+        // Claude-only toggle: claude's own per-project switch in
+        // ~/.claude.json, CAS'd on the entry version (external edits
+        // reject -32010), parse-fail never writes, same-path writes
+        // serialized, atomic replace. Every other backend is readonly
+        // with the reason.
+        "mcp.setEnabled" => {
+            let backend = req_str(&params, "backend")?;
+            let name = req_str(&params, "name")?;
+            let enabled = params["enabled"].as_bool().ok_or_else(|| {
+                RpcError::error(error_code::INVALID_PARAMS, "enabled must be a boolean")
+            })?;
+            let expected_version = req_str(&params, "expectedVersion")?;
+            let cwd = params["cwd"]
+                .as_str()
+                .map(std::path::PathBuf::from)
+                .unwrap_or_else(|| std::env::current_dir().unwrap_or_else(|_| ".".into()));
+            if backend != "claude" {
+                return Err(RpcError::error(
+                    error_code::INVALID_PARAMS,
+                    crate::mcp_inventory::readonly_reason(backend)
+                        .unwrap_or_else(|| "no verified config toggle".to_string()),
+                ));
+            }
+            let (name_owned, version_owned) = (name.to_string(), expected_version.to_string());
+            let outcome = tokio::task::spawn_blocking(move || {
+                crate::mcp_inventory::set_enabled_blocking(
+                    &name_owned,
+                    enabled,
+                    &version_owned,
+                    &cwd,
+                )
+            })
+            .await
+            .context("mcp setEnabled join failed")?;
+            match outcome {
+                Ok(()) => Ok(json!({"set": true})),
+                Err(crate::mcp_inventory::SetEnabledError::Conflict) => Err(RpcError::error(
+                    error_code::MCP_CONFLICT,
+                    "server changed since the inventory snapshot — refetch mcp.inventory",
+                )),
+                Err(e) => Err(RpcError::error(
+                    error_code::INVALID_PARAMS,
+                    format!("{e:#}"),
+                )),
+            }
+        }
+
+        // Web device pairing — the desktop side. The pairing key is
+        // shown here (master-authenticated), the DEVICE spends it at
+        // POST /v1/pair, and approval here is what lets its token mint
+        // tickets. Bots must not run installs or approve devices.
+        "device.pairing_key" => {
+            let key = state.store.pairing_key_ensure().await?;
+            Ok(json!({"key": key}))
+        }
+
+        "device.list" => {
+            let rows = state.store.devices().await?;
+            let devices: Vec<Value> = rows
+                .into_iter()
+                .map(|d| {
+                    let mut v = json!({
+                        "deviceId": d.id,
+                        "name": d.name,
+                        "status": d.status,
+                        "createdAt": d.created_at,
+                    });
+                    if let Some(a) = d.approved_at {
+                        v["approvedAt"] = json!(a);
+                    }
+                    if let Some(l) = d.last_seen {
+                        v["lastSeen"] = json!(l);
+                    }
+                    v
+                })
+                .collect();
+            Ok(json!({"devices": devices}))
+        }
+
+        "device.approve" => {
+            let id = req_str(&params, "deviceId")?;
+            let approved = state.store.approve_device(id).await?;
+            Ok(json!({"approved": approved}))
+        }
+
+        "device.rename" => {
+            let id = req_str(&params, "deviceId")?;
+            let name = req_str(&params, "name")?;
+            let renamed = state.store.rename_device(id, name).await?;
+            Ok(json!({"renamed": renamed}))
+        }
+
+        "device.revoke" => {
+            let id = req_str(&params, "deviceId")?;
+            // Deny and revoke are the same act: the row (and with it
+            // the token hash) is gone immediately.
+            let revoked = state.store.revoke_device(id).await?;
+            Ok(json!({"revoked": revoked}))
         }
 
         "project.create" => {
@@ -870,6 +1279,10 @@ async fn dispatch(
                 None => None,
             };
             check_cwd_allowed(state, &cfg.cwd)?;
+            // Effective granted roots (global + the project's) ride
+            // the launch line for backends with a native widening flag
+            // (claude --add-dir) and pre-warm the file jail.
+            cfg.granted_roots = effective_grants(state, project.clone()).await?;
             let ms = state
                 .sessions
                 .create(backend.as_deref(), cfg.clone())
@@ -943,17 +1356,13 @@ async fn dispatch(
                     .map(std::path::PathBuf::from)
                     .unwrap_or_else(|| std::path::PathBuf::from("."));
                 check_cwd_allowed(state, &cwd)?;
-                let ms = state
-                    .sessions
-                    .resume(
-                        &id,
-                        &handle,
-                        SessionConfig {
-                            cwd,
-                            ..Default::default()
-                        },
-                    )
-                    .await?;
+                let mut cfg = SessionConfig {
+                    cwd,
+                    ..Default::default()
+                };
+                cfg.granted_roots =
+                    effective_grants(state, state.store.session_project(&id).await?).await?;
+                let ms = state.sessions.resume(&id, &handle, cfg).await?;
                 let replayed = conn.subscribe(state, &ms).await;
                 return Ok(json!({"sessionId": id, "backend": ms.provider, "replayed": replayed}));
             }
@@ -1123,6 +1532,46 @@ async fn dispatch(
             Ok(json!({"closed": true}))
         }
 
+        // History scan: single-flight globally — a second call while
+        // one runs gets the in-flight scanId (and no progress events;
+        // the running caller owns the pipeline view). Progress frames
+        // ride the requesting connection (worktree precedent).
+        "session.rescan" => {
+            let scan_id = {
+                let mut slot = state.history_scan.lock();
+                match slot.as_ref() {
+                    Some(in_flight) => {
+                        return Ok(json!({
+                            "scanId": in_flight,
+                            "alreadyRunning": true,
+                        }));
+                    }
+                    None => {
+                        let id = uuid::Uuid::new_v4().to_string();
+                        *slot = Some(id.clone());
+                        id
+                    }
+                }
+            };
+            let pconn = conn.clone();
+            let sid = scan_id.clone();
+            let progress = move |payload: serde_json::Value| {
+                pconn.send(json!({
+                    "event": "history.scan_progress",
+                    "scanId": sid,
+                    "data": payload,
+                }));
+            };
+            let report = crate::history_scan::scan_history(state, &scan_id, &progress).await;
+            *state.history_scan.lock() = None;
+            let report = report?;
+            Ok(json!({
+                "scanId": scan_id,
+                "alreadyRunning": false,
+                "report": report.to_json(),
+            }))
+        }
+
         "session.set_tags" => {
             let id = req_str(&params, "sessionId")?;
             let tags: Vec<String> =
@@ -1241,6 +1690,294 @@ async fn dispatch(
             Ok(json!({"results": results}))
         }
 
+        "usage.summary" => {
+            // days/tzOffsetMinutes default to 7/0 — a week of UTC-day
+            // buckets, matching session.usage's daily rollup.
+            let days = params["days"].as_u64().unwrap_or(7).max(1) as u32;
+            let tz_offset_minutes = params["tzOffsetMinutes"].as_i64().unwrap_or(0) as i32;
+            let agg = state.store.usage_aggregate(days, tz_offset_minutes).await?;
+            let rows: Vec<Value> = agg
+                .rows
+                .into_iter()
+                .map(|r| {
+                    json!({
+                        "date": r.date, "backend": r.backend, "model": r.model,
+                        "turns": r.turns, "contextUsed": r.context_used,
+                        "contextSize": r.context_size, "costUsd": r.cost_usd,
+                    })
+                })
+                .collect();
+            Ok(json!({
+                "days": days,
+                "rows": rows,
+                "total": {
+                    "turns": agg.turns, "contextUsed": agg.context_used,
+                    "contextSize": agg.context_size, "costUsd": agg.cost_usd,
+                },
+            }))
+        }
+
+        "usage.clear" => {
+            state.store.usage_clear().await?;
+            Ok(json!({"cleared": true}))
+        }
+
+        "mission.create" => {
+            // Validate first: an unparseable/unrunnable definition never
+            // reaches the store. Re-creating the same flow_id inserts
+            // the next version — drafts and runs stay isolated.
+            let flow_id = params["flowId"]
+                .as_str()
+                .map(String::from)
+                .unwrap_or_else(|| uuid::Uuid::new_v4().to_string());
+            let name = params["name"].as_str().unwrap_or(&flow_id).to_string();
+            let def = crate::mission::parse_definition(&params["definition"])?;
+            crate::mission::validate_definition(&def)?;
+            let version = state
+                .store
+                .create_mission_flow(&flow_id, &name, &params["definition"].to_string())
+                .await?;
+            Ok(json!({"flowId": flow_id, "version": version}))
+        }
+
+        "mission.start" => {
+            let flow_id = req_str(&params, "flowId")?;
+            let (version, _name, definition) = state
+                .store
+                .latest_mission_flow(flow_id)
+                .await?
+                .ok_or_else(|| {
+                    RpcError::error(
+                        error_code::INVALID_PARAMS,
+                        format!("unknown flow {flow_id}"),
+                    )
+                })?;
+            let def: Value = serde_json::from_str(&definition).map_err(|_| {
+                RpcError::error(error_code::INTERNAL_ERROR, "stored flow corrupted")
+            })?;
+            let def = crate::mission::parse_definition(&def)?;
+            crate::mission::validate_definition(&def)?;
+            // Read-only enforcement BEFORE any run exists: a backend
+            // that cannot enforce a tool allowlist refuses the stage —
+            // damon never downgrades a read-only stage to full access.
+            let clients = state.sessions.clients();
+            for n in &def.nodes {
+                if let crate::mission::MissionNodeKind::Agent = n.kind {
+                    let backend = n.backend.as_deref().unwrap_or_default();
+                    let caps = clients
+                        .iter()
+                        .find(|(id, _)| *id == backend)
+                        .map(|(_, c)| c.capabilities().clone());
+                    match caps {
+                        Some(caps) if !n.read_only || caps.tool_allowlist => {}
+                        Some(_) => {
+                            return Err(RpcError::error(
+                                error_code::NOT_SUPPORTED,
+                                format!(
+                                    "backend {backend} cannot enforce a tool allowlist — read-only agent node {} refused",
+                                    n.id
+                                ),
+                            ));
+                        }
+                        None => {
+                            return Err(RpcError::error(
+                                error_code::BACKEND_UNAVAILABLE,
+                                format!(
+                                    "backend {backend} not registered — agent node {} refused",
+                                    n.id
+                                ),
+                            ));
+                        }
+                    }
+                }
+            }
+            let run_id = uuid::Uuid::new_v4().to_string();
+            let (events, _) = tokio::sync::broadcast::channel(64);
+            let (cmd_tx, cmd_rx) = mpsc::channel::<crate::mission::MissionCommand>(16);
+            let cancel = CancellationToken::new();
+            // Register the run as live BEFORE its store rows exist: the
+            // boot recovery sweep must never see this process's
+            // in-flight work as a crash orphan.
+            state
+                .missions
+                .register(&run_id, events.clone(), cancel.clone(), cmd_tx);
+            state
+                .store
+                .create_mission_run(&run_id, flow_id, version, &definition)
+                .await?;
+            for n in &def.nodes {
+                state.store.insert_mission_task(&run_id, &n.id).await?;
+            }
+            let runner: Arc<dyn crate::mission::MissionAgentRunner> = Arc::new(MissionTurnRunner {
+                state: state.clone(),
+            });
+            let scheduler = crate::mission::MissionScheduler::new(
+                run_id.clone(),
+                def,
+                state.store.clone(),
+                runner,
+                events.clone(),
+                cmd_rx,
+                cancel.clone(),
+            );
+            tokio::spawn(async move {
+                if let Err(e) = scheduler.run().await {
+                    tracing::error!(error = %e, "mission scheduler crashed");
+                }
+            });
+            Ok(json!({"runId": run_id, "version": version}))
+        }
+
+        "mission.cancel" => {
+            let run_id = req_str(&params, "runId")?;
+            let cancelled = state.missions.cancel(run_id);
+            Ok(json!({"runId": run_id, "cancelled": cancelled}))
+        }
+
+        "mission.respond" => {
+            let run_id = req_str(&params, "runId")?;
+            let node_id = req_str(&params, "nodeId")?;
+            let decision = req_str(&params, "decision")?;
+            if !matches!(decision, "approve" | "feedback" | "exclude") {
+                return Err(RpcError::error(
+                    error_code::INVALID_PARAMS,
+                    "decision must be approve | feedback | exclude",
+                ));
+            }
+            let feedback = params["feedback"].as_str();
+            if decision == "feedback" && feedback.map(str::trim).unwrap_or_default().is_empty() {
+                return Err(RpcError::error(
+                    error_code::INVALID_PARAMS,
+                    "decision feedback requires non-empty feedback",
+                ));
+            }
+            // The store CAS is the one-winner gate: two answers race on
+            // `status = 'pending'`, exactly one UPDATE lands.
+            let won = state
+                .store
+                .resolve_mission_inbox(run_id, node_id, decision, feedback)
+                .await?;
+            if !won {
+                return Err(RpcError::error(
+                    error_code::INVALID_PARAMS,
+                    "inbox item is not pending — another answer won",
+                ));
+            }
+            let live = state.missions.send_command(
+                run_id,
+                crate::mission::MissionCommand::Respond {
+                    node_id: node_id.to_string(),
+                    decision: decision.to_string(),
+                    feedback: feedback.map(String::from),
+                },
+            );
+            Ok(json!({"accepted": true, "live": live}))
+        }
+
+        "mission.list" => {
+            let runs = state.store.mission_runs_list().await?;
+            let mut out = Vec::new();
+            for (run_id, flow_id, version, interrupted, ended, cancelled, created_at) in runs {
+                let tasks = state.store.mission_tasks(&run_id).await?;
+                out.push(json!({
+                    "runId": run_id,
+                    "flowId": flow_id,
+                    "version": version,
+                    "status": crate::mission::derive_run_status(&tasks, interrupted, ended, cancelled),
+                    "interrupted": interrupted,
+                    "ended": ended,
+                    "createdAt": created_at,
+                    "tasks": tasks.iter().map(|t| json!({
+                        "nodeId": t.0, "status": t.1, "attempt": t.2,
+                    })).collect::<Vec<_>>(),
+                }));
+            }
+            Ok(json!({"runs": out}))
+        }
+
+        "mission.get" => {
+            let run_id = req_str(&params, "runId")?;
+            let (snapshot, flow_id, version, interrupted, ended, cancelled) =
+                state.store.mission_run(run_id).await?.ok_or_else(|| {
+                    RpcError::error(error_code::INVALID_PARAMS, format!("unknown run {run_id}"))
+                })?;
+            let tasks = state.store.mission_tasks(run_id).await?;
+            let inbox = state.store.mission_inbox_for_run(run_id).await?;
+            let definition: Value = serde_json::from_str(&snapshot).unwrap_or(Value::Null);
+            Ok(json!({
+                "runId": run_id,
+                "flowId": flow_id,
+                "version": version,
+                "interrupted": interrupted,
+                "ended": ended,
+                "status": crate::mission::derive_run_status(&tasks, interrupted, ended, cancelled),
+                "definition": definition,
+                "tasks": tasks.iter().map(|t| {
+                    let mut v = json!({
+                        "nodeId": t.0, "status": t.1, "attempt": t.2,
+                    });
+                    if let Some(o) = &t.3
+                        && let Ok(o) = serde_json::from_str::<Value>(o)
+                    {
+                        v["output"] = o;
+                    }
+                    if let Some(e) = &t.4 {
+                        v["error"] = json!(e);
+                    }
+                    v
+                }).collect::<Vec<_>>(),
+                "inbox": inbox.iter().map(|i| json!({
+                    "nodeId": i.0, "status": i.1, "decision": i.2, "feedback": i.3,
+                })).collect::<Vec<_>>(),
+            }))
+        }
+
+        "mission.watch" => {
+            let run_id = req_str(&params, "runId")?;
+            let events = state.missions.events_sender(run_id).ok_or_else(|| {
+                RpcError::error(
+                    error_code::SESSION_NOT_LIVE,
+                    "run is not live — it finished, was cancelled, or the daemon restarted (mission.get reads the persisted state)",
+                )
+            })?;
+            let mut subs = conn.subscriptions.lock().await;
+            let key = format!("mission:{run_id}");
+            if subs.contains_key(&key) {
+                return Ok(json!({"runId": run_id, "subscribed": true}));
+            }
+            let mut rx = events.subscribe();
+            let tx = conn.tx.clone();
+            let rid = run_id.to_string();
+            subs.insert(
+                key,
+                tokio::spawn(async move {
+                    loop {
+                        match rx.recv().await {
+                            Ok(ev) => {
+                                let frame =
+                                    json!({"event": "mission.progress", "runId": rid, "data": ev});
+                                if tx
+                                    .try_send(Message::Text(frame.to_string().into()))
+                                    .is_err()
+                                {
+                                    continue;
+                                }
+                            }
+                            Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => continue,
+                            Err(tokio::sync::broadcast::error::RecvError::Closed) => break,
+                        }
+                    }
+                }),
+            );
+            Ok(json!({"runId": run_id, "subscribed": true}))
+        }
+
+        "mission.unwatch" => {
+            let run_id = req_str(&params, "runId")?;
+            let removed = conn.unsubscribe(&format!("mission:{run_id}")).await;
+            Ok(json!({"runId": run_id, "subscribed": !removed}))
+        }
+
         "turn.start" => {
             let id = req_str(&params, "sessionId")?;
             let ms = state.sessions.get(id).await.ok_or_else(|| {
@@ -1314,9 +2051,50 @@ async fn dispatch(
                 .map_err(|_| {
                 RpcError::error(error_code::INVALID_PARAMS, "response required")
             })?;
-            ms.session
+            // Plan asks land their decision in the durable review row
+            // too — intent BEFORE the native write (the "lost pipe"
+            // record), settled on ack, reverted on failure. The gate's
+            // winner owns the record: if plan.respond claimed it
+            // first, this legacy call proceeds natively without
+            // touching the row (the backend's one-shot ask dedups the
+            // double delivery anyway). Legacy semantics are untouched
+            // for non-plan asks and for plans with no open row.
+            let mut plan_claim: Option<(String, i64, String, String)> = None;
+            if let Ok(Some(row)) = state.store.open_plan_for_request(request_id).await {
+                let (decision, feedback) = match &response {
+                    PermissionResponse::Allow { .. } => ("approve", None),
+                    PermissionResponse::Deny { message, .. } => {
+                        ("request_changes", message.clone())
+                    }
+                };
+                if let Ok(crate::store::PlanSubmit::Claimed { previous, .. }) = state
+                    .store
+                    .submit_plan_decision(&row.plan_id, row.revision, decision, feedback.as_deref())
+                    .await
+                {
+                    plan_claim = Some((
+                        row.plan_id.clone(),
+                        row.revision,
+                        decision.to_string(),
+                        previous,
+                    ));
+                }
+            }
+            let delivered = ms
+                .session
                 .respond_to_permission(request_id, response.clone())
-                .await?;
+                .await;
+            if let Some((pid, rev, decision, previous)) = plan_claim {
+                match &delivered {
+                    Ok(()) => {
+                        let _ = state.store.settle_plan(&pid, rev, &decision).await;
+                    }
+                    Err(_) => {
+                        let _ = state.store.revert_plan(&pid, rev, &previous).await;
+                    }
+                }
+            }
+            delivered?;
             // A deny with `interrupt` kills the whole turn, not just
             // this call — backends only apply the flag to the pending
             // ask, so the daemon drives the follow-up interrupt here.
@@ -1332,6 +2110,136 @@ async fn dispatch(
                 tracing::warn!(error = %e, session = %id, "post-deny interrupt failed");
             }
             Ok(json!({}))
+        }
+
+        "plan.list" => {
+            let id = req_str(&params, "sessionId")?;
+            let rows = state.store.plan_reviews(id).await?;
+            let plans: Vec<Value> = rows.into_iter().map(plan_row_json).collect();
+            Ok(json!({"plans": plans}))
+        }
+
+        "plan.respond" => {
+            let plan_id = req_str(&params, "planId")?;
+            let expected_revision = params["expectedRevision"].as_i64().ok_or_else(|| {
+                RpcError::error(
+                    error_code::INVALID_PARAMS,
+                    "expectedRevision must be a number",
+                )
+            })?;
+            let decision = req_str(&params, "decision")?;
+            if !matches!(decision, "approve" | "request_changes" | "defer") {
+                return Err(RpcError::error(
+                    error_code::INVALID_PARAMS,
+                    "decision must be approve | request_changes | defer",
+                ));
+            }
+            let feedback = params["feedback"].as_str();
+            match state
+                .store
+                .submit_plan_decision(plan_id, expected_revision, decision, feedback)
+                .await?
+            {
+                crate::store::PlanSubmit::FeedbackRequired => Err(RpcError::error(
+                    error_code::INVALID_PARAMS,
+                    "request_changes requires non-empty feedback",
+                )),
+                crate::store::PlanSubmit::Incomplete => Err(RpcError::error(
+                    error_code::INVALID_PARAMS,
+                    "plan content is not reviewable — approval refused",
+                )),
+                crate::store::PlanSubmit::NotFound => Err(RpcError::error(
+                    error_code::INVALID_PARAMS,
+                    format!("no plan review {plan_id} revision {expected_revision}"),
+                )),
+                crate::store::PlanSubmit::Conflict(row) => Err(RpcError::error(
+                    error_code::PLAN_CONFLICT,
+                    format!(
+                        "plan decision conflict — revision {} is {} (expected revision {}); refetch via plan.list",
+                        row.revision, row.status, expected_revision
+                    ),
+                )),
+                crate::store::PlanSubmit::Claimed {
+                    session_id,
+                    request_id,
+                    previous,
+                } => {
+                    // Deferred is non-terminal and never touches the
+                    // native ask: the agent's wait stays parked and a
+                    // later plan.respond can still decide it.
+                    if decision == "defer" {
+                        state
+                            .store
+                            .settle_plan(plan_id, expected_revision, decision)
+                            .await?;
+                        return Ok(json!({
+                            "recorded": true, "status": "deferred", "applied": false,
+                            "planId": plan_id, "revision": expected_revision,
+                        }));
+                    }
+                    let ms = state.sessions.get(&session_id).await;
+                    let Some(ms) = ms else {
+                        // The ask died with the session — the intent
+                        // stays recorded, the row returns to its
+                        // pre-claim state.
+                        let _ = state
+                            .store
+                            .revert_plan(plan_id, expected_revision, &previous)
+                            .await;
+                        return Err(RpcError::error(
+                            error_code::SESSION_NOT_LIVE,
+                            "session not live — the plan ask died with it",
+                        ));
+                    };
+                    let response = if decision == "approve" {
+                        PermissionResponse::Allow {
+                            action_id: None,
+                            updated_input: None,
+                            answer: None,
+                            answers: None,
+                        }
+                    } else {
+                        PermissionResponse::Deny {
+                            action_id: None,
+                            // The feedback IS the message the agent
+                            // sees for its next revision.
+                            message: Some(feedback.unwrap_or_default().to_string()),
+                            interrupt: false,
+                        }
+                    };
+                    match ms
+                        .session
+                        .respond_to_permission(&request_id, response)
+                        .await
+                    {
+                        Ok(()) => {
+                            state
+                                .store
+                                .settle_plan(plan_id, expected_revision, decision)
+                                .await?;
+                            Ok(json!({
+                                "recorded": true,
+                                "status": if decision == "approve" { "approved" } else { "changes_requested" },
+                                "applied": true,
+                                "planId": plan_id, "revision": expected_revision,
+                            }))
+                        }
+                        Err(e) => {
+                            // Relay lost: the intent stays on file, the
+                            // row reopens, and the caller sees the
+                            // failure instead of a fake success.
+                            let _ = state
+                                .store
+                                .revert_plan(plan_id, expected_revision, &previous)
+                                .await;
+                            Err(RpcError::error(
+                                error_code::INTERNAL_ERROR,
+                                format!("plan decision recorded but native relay failed: {e:#}"),
+                            ))
+                        }
+                    }
+                }
+            }
         }
 
         "session.set_model" => {
@@ -1662,8 +2570,7 @@ async fn dispatch(
         "file.read" => {
             let id = req_str(&params, "sessionId")?;
             let path = req_str(&params, "path")?;
-            let cwd = stored_cwd(state, id).await?;
-            let full = resolve_jailed(&cwd, path)?;
+            let full = resolve_session_path(state, id, path).await?;
             let meta = tokio::fs::metadata(&full)
                 .await
                 .map_err(|e| RpcError::error(error_code::INVALID_PARAMS, format!("{path}: {e}")))?;
@@ -1694,8 +2601,7 @@ async fn dispatch(
             let id = req_str(&params, "sessionId")?;
             let path = req_str(&params, "path")?;
             let content = req_str(&params, "content")?;
-            let cwd = stored_cwd(state, id).await?;
-            let full = resolve_jailed(&cwd, path)?;
+            let full = resolve_session_path(state, id, path).await?;
             let bytes = base64::engine::general_purpose::STANDARD
                 .decode(content.as_bytes())
                 .map_err(|e| {
@@ -1720,8 +2626,7 @@ async fn dispatch(
         "file.list" => {
             let id = req_str(&params, "sessionId")?;
             let path = params["path"].as_str().unwrap_or(".");
-            let cwd = stored_cwd(state, id).await?;
-            let full = resolve_jailed(&cwd, path)?;
+            let full = resolve_session_path(state, id, path).await?;
             let meta = tokio::fs::metadata(&full)
                 .await
                 .map_err(|e| RpcError::error(error_code::INVALID_PARAMS, format!("{path}: {e}")))?;
@@ -1751,6 +2656,69 @@ async fn dispatch(
                 }));
             }
             Ok(json!({"entries": out, "path": path}))
+        }
+
+        // Granted roots: the loop-closer for a headless agent that hit
+        // an out-of-workspace denial. The user grants an extra
+        // directory; it persists, widens the file jail for sessions in
+        // scope, and rides the next backend launch as --add-dir
+        // (claude). Grants are explicit user actions and deliberately
+        // bypass allowed_dirs — that gate bounds which cwds sessions
+        // may SPAWN in, not what an explicitly granted session may
+        // read. No grant → nothing changes.
+        "file.grant" => {
+            let project = match params["projectId"].as_str() {
+                Some(pid) => {
+                    if state.store.get_project(pid).await?.is_none() {
+                        return Err(RpcError::error(
+                            error_code::INVALID_PARAMS,
+                            format!("unknown project {pid}"),
+                        ));
+                    }
+                    Some(pid.to_string())
+                }
+                None => None,
+            };
+            let root = canon_grant(req_str(&params, "path")?)?;
+            let root_str = root.to_string_lossy().into_owned();
+            // Duplicates are idempotent — re-granting confirms.
+            state
+                .store
+                .grant_root(project.clone(), root_str.clone())
+                .await?;
+            let mut out = json!({"granted": true, "root": root_str});
+            if let Some(pid) = project {
+                out["projectId"] = json!(pid);
+            }
+            Ok(out)
+        }
+
+        "file.grants" => {
+            let project = params["projectId"].as_str().map(String::from);
+            let rows = state.store.granted_roots(project).await?;
+            let grants: Vec<Value> = rows
+                .into_iter()
+                .map(|g| {
+                    let mut v = json!({"root": g.root, "createdAt": g.created_at});
+                    if let Some(pid) = g.project_id {
+                        v["projectId"] = json!(pid);
+                    }
+                    v
+                })
+                .collect();
+            Ok(json!({"grants": grants}))
+        }
+
+        "file.ungrant" => {
+            let project = params["projectId"].as_str().map(String::from);
+            // Loose canonicalization: a grant whose directory was
+            // deleted must stay revocable.
+            let root = canon_grant_loose(req_str(&params, "path")?)?;
+            let revoked = state
+                .store
+                .revoke_root(project, root.to_string_lossy().into_owned())
+                .await?;
+            Ok(json!({"revoked": revoked}))
         }
 
         "file.index" => {
@@ -1976,7 +2944,47 @@ fn session_config(params: &Value) -> Result<SessionConfig> {
         model: params["model"].as_str().map(String::from),
         mode: params["mode"].as_str().map(String::from),
         mcp_servers: mcp,
+        granted_roots: Vec::new(),
+        allowed_tools: params["allowedTools"]
+            .as_array()
+            .map(|a| {
+                a.iter()
+                    .filter_map(|t| t.as_str().map(String::from))
+                    .collect()
+            })
+            .unwrap_or_default(),
     })
+}
+
+/// Flatten a durable plan-review row for the wire — camelCase, absent
+/// Option fields omitted.
+fn plan_row_json(r: crate::store::PlanRow) -> Value {
+    let mut v = json!({
+        "planId": r.plan_id,
+        "sessionId": r.session_id,
+        "requestId": r.request_id,
+        "revision": r.revision,
+        "title": r.title,
+        "content": r.content,
+        "contentHash": r.content_hash,
+        "complete": r.complete,
+        "status": r.status,
+        "createdAt": r.created_at,
+        "updatedAt": r.updated_at,
+    });
+    if let Some(d) = r.decision {
+        v["decision"] = d;
+    }
+    if let Some(t) = r.decision_intent_at {
+        v["decisionIntentAt"] = json!(t);
+    }
+    if let Some(t) = r.applied_at {
+        v["appliedAt"] = json!(t);
+    }
+    if let Some(s) = r.superseded_by {
+        v["supersededBy"] = json!(s);
+    }
+    v
 }
 
 /// Best-effort canonical form for allowlist matching: absolute, with
@@ -2126,8 +3134,15 @@ fn lexical_abs(p: &std::path::Path) -> std::path::PathBuf {
 /// for a not-yet-existing target (writes), the deepest existing
 /// ancestor canonicalizes and the missing tail is re-appended — so a
 /// symlinked cwd still admits new files, and every escape (`..`,
-/// symlink hop, absolute elsewhere) fails closed.
-fn resolve_jailed(cwd: &std::path::Path, user_path: &str) -> Result<std::path::PathBuf> {
+/// symlink hop, absolute elsewhere) fails closed. `extra_jails` are
+/// additional admissible roots (canonical granted roots) — a resolved
+/// path inside any of them passes; an empty slice is the historical
+/// cwd-only jail.
+fn resolve_jailed(
+    cwd: &std::path::Path,
+    user_path: &str,
+    extra_jails: &[std::path::PathBuf],
+) -> Result<std::path::PathBuf> {
     let joined = {
         let p = std::path::Path::new(user_path);
         if p.is_absolute() {
@@ -2172,13 +3187,86 @@ fn resolve_jailed(cwd: &std::path::Path, user_path: &str) -> Result<std::path::P
         }
     };
     let jail = cwd.canonicalize().unwrap_or_else(|_| lexical_abs(cwd));
-    if !resolved.starts_with(&jail) {
+    if !resolved.starts_with(&jail) && !extra_jails.iter().any(|root| resolved.starts_with(root)) {
         return Err(RpcError::error(
             error_code::INVALID_PARAMS,
             format!("{user_path} escapes the session cwd"),
         ));
     }
     Ok(resolved)
+}
+
+/// The file.* jail for one stored session: the session cwd plus every
+/// granted root effective for its scope (global + the session
+/// project's). With no grants the resolution is byte-identical to the
+/// cwd-only jail.
+async fn resolve_session_path(
+    state: &Arc<AppState>,
+    id: &str,
+    user_path: &str,
+) -> Result<std::path::PathBuf> {
+    let cwd = stored_cwd(state, id).await?;
+    let project = state.store.session_project(id).await?;
+    let extra_jails = effective_grants(state, project).await?;
+    resolve_jailed(&cwd, user_path, &extra_jails)
+}
+
+/// Effective granted roots for a scope — global grants plus the
+/// project's — as canonical paths. One list feeds both the file jail
+/// (`resolve_session_path`) and the backend launch line
+/// (`--add-dir`).
+async fn effective_grants(
+    state: &Arc<AppState>,
+    project_id: Option<String>,
+) -> Result<Vec<std::path::PathBuf>> {
+    Ok(state
+        .store
+        .granted_roots(project_id)
+        .await?
+        .into_iter()
+        .map(|g| std::path::PathBuf::from(g.root))
+        .collect())
+}
+
+/// Validate + canonicalize a grant candidate, fail-closed: absolute,
+/// must exist, must be a directory; symlinks and `..` resolve through
+/// canonicalize (a grant to a not-yet-existing path is refused —
+/// unlike `canon_cwd`, which tolerates pre-authorized future
+/// workspaces). The canonical form is what gets stored, so jail
+/// checks and revocations match exactly.
+fn canon_grant(user: &str) -> Result<std::path::PathBuf> {
+    let p = std::path::Path::new(user);
+    if !p.is_absolute() {
+        return Err(RpcError::error(
+            error_code::INVALID_PARAMS,
+            format!("grant path must be absolute: {user}"),
+        ));
+    }
+    let canonical = p
+        .canonicalize()
+        .map_err(|e| RpcError::error(error_code::INVALID_PARAMS, format!("{user}: {e}")))?;
+    if !canonical.is_dir() {
+        return Err(RpcError::error(
+            error_code::INVALID_PARAMS,
+            format!("not a directory: {user}"),
+        ));
+    }
+    Ok(canonical)
+}
+
+/// Best-effort canonical form for revocation matching: absolute with
+/// symlinks resolved when the target still exists (a grant whose
+/// directory was deleted must stay revocable). lexical_abs folds a
+/// vanished tail so the stored form still matches in the common case.
+fn canon_grant_loose(user: &str) -> Result<std::path::PathBuf> {
+    let p = std::path::Path::new(user);
+    if !p.is_absolute() {
+        return Err(RpcError::error(
+            error_code::INVALID_PARAMS,
+            format!("grant path must be absolute: {user}"),
+        ));
+    }
+    Ok(canon_cwd(p))
 }
 
 fn check_cwd_allowed(state: &AppState, cwd: &std::path::Path) -> Result<()> {
@@ -2221,19 +3309,105 @@ async fn reattach(state: &Arc<AppState>, conn: &Arc<Conn>, id: &str) -> Result<V
         native_handle: native,
         metadata: Value::Null,
     };
-    let ms = state
-        .sessions
-        .resume(
-            id,
-            &handle,
-            SessionConfig {
-                cwd,
-                ..Default::default()
-            },
-        )
-        .await?;
+    let mut cfg = SessionConfig {
+        cwd,
+        ..Default::default()
+    };
+    // Granted roots re-widen on every relaunch: a grant made while a
+    // session was down still reaches the backend's sandbox.
+    cfg.granted_roots = effective_grants(state, state.store.session_project(id).await?).await?;
+    let ms = state.sessions.resume(id, &handle, cfg).await?;
     let replayed = conn.subscribe(state, &ms).await;
     Ok(json!({"sessionId": id, "backend": ms.provider, "replayed": replayed}))
+}
+
+// ---------------------------------------------------------------------------
+// Mission DAG runner — rpc-side agent executor + dispatch arms
+// ---------------------------------------------------------------------------
+
+/// Executes one mission agent node as a real damon turn on a per-node
+/// session (the transcript lands in the store, so `damon search` covers
+/// mission turns like any other). The scheduler owns convergence; this
+/// only drives one turn and returns its parsed key=value output.
+struct MissionTurnRunner {
+    state: Arc<AppState>,
+}
+
+#[async_trait]
+impl crate::mission::MissionAgentRunner for MissionTurnRunner {
+    async fn run_agent_node(
+        &self,
+        req: crate::mission::MissionAgentRequest,
+    ) -> std::result::Result<Value, String> {
+        let cfg = SessionConfig {
+            cwd: req
+                .cwd
+                .clone()
+                .unwrap_or_else(|| std::env::current_dir().unwrap_or_else(|_| ".".into())),
+            // Read-only stages carry their allowlist onto the launch
+            // line (claude: --allowedTools); mission start already
+            // refused nodes on backends that cannot enforce it.
+            allowed_tools: if req.read_only {
+                req.allowed_tools.clone()
+            } else {
+                Vec::new()
+            },
+            ..SessionConfig::default()
+        };
+        let cwd = cfg.cwd.clone();
+        let ms = self
+            .state
+            .sessions
+            .create(Some(&req.backend), cfg)
+            .await
+            .map_err(|e| format!("agent node session create failed: {e}"))?;
+        // Persist the session row so the turn's transcript is
+        // searchable from the store like every other session.
+        let _ = self
+            .state
+            .store
+            .create_session(&ms.id, &cwd.to_string_lossy(), Some(&ms.provider))
+            .await;
+        // A sink connection: turn events are fanned out through the
+        // session's broadcast channel; nobody is watching this one.
+        let (tx, mut rx) = mpsc::channel::<Message>(256);
+        tokio::spawn(async move { while rx.recv().await.is_some() {} });
+        let conn = Arc::new(Conn {
+            tx,
+            subscriptions: Mutex::new(HashMap::new()),
+            owned_turns: Mutex::new(HashMap::new()),
+            closed: std::sync::atomic::AtomicBool::new(false),
+            log_follow: Mutex::new(None),
+        });
+        let result = run_turn(
+            &self.state,
+            &conn,
+            &ms,
+            json!({"prompt": req.prompt}),
+            false,
+            Some(req.cancel.clone()),
+        )
+        .await;
+        if let Err(e) = result {
+            return Err(format!("agent turn failed: {e}"));
+        }
+        // The turn's final assistant message is the node output.
+        let msgs = self
+            .state
+            .store
+            .messages_paged(&ms.id, u32::MAX, 0)
+            .await
+            .map_err(|e| format!("agent transcript read failed: {e}"))?;
+        let text = msgs.iter().rev().find_map(|m| {
+            if m.role != "assistant" {
+                return None;
+            }
+            crate::mission::assistant_text(&m.data)
+        });
+        Ok(crate::mission::parse_agent_output(
+            text.as_deref().unwrap_or_default(),
+        ))
+    }
 }
 
 /// Drive one turn. Blocking (default): forward events to the
@@ -2352,6 +3526,7 @@ async fn drive_turn(
     let mut assistant = String::new();
     let mut reasoning = String::new();
     let mut tools: HashMap<String, ToolCall> = HashMap::new();
+    let mut todo: Option<Vec<TaskItem>> = None;
     let mut compactions: Vec<String> = Vec::new();
     let mut failure: Option<String> = None;
     let mut usage = None;
@@ -2361,6 +3536,32 @@ async fn drive_turn(
         loop {
             match events.recv().await {
                 Ok(ev) => match &ev.kind {
+                    // A plan ask gets a durable review row immediately:
+                    // the live oneshot stays the transport, the row is
+                    // the multi-surface fact-source (revisions chain
+                    // while the previous review is still open).
+                    StreamEventKind::PermissionRequested(ask)
+                        if matches!(ask.kind, PermissionKind::Plan) =>
+                    {
+                        let plan = ask
+                            .input
+                            .as_ref()
+                            .and_then(|i| i["plan"].as_str())
+                            .unwrap_or("");
+                        if let Err(e) = state
+                            .store
+                            .record_plan(
+                                &ms.id,
+                                &ask.id,
+                                ask.name.as_str(),
+                                plan,
+                                !plan.trim().is_empty(),
+                            )
+                            .await
+                        {
+                            tracing::warn!(error = %e, "plan review record failed");
+                        }
+                    }
                     StreamEventKind::Timeline(TimelineItem::AssistantMessage { text }) => {
                         assistant.push_str(text);
                     }
@@ -2369,6 +3570,11 @@ async fn drive_turn(
                     }
                     StreamEventKind::Timeline(TimelineItem::ToolCall(t)) => {
                         tools.insert(t.call_id.clone(), t.clone());
+                    }
+                    // Backends re-send the whole list on every update —
+                    // keep the latest snapshot, drop the stale ones.
+                    StreamEventKind::Timeline(TimelineItem::Todo { items }) => {
+                        todo = Some(items.clone());
                     }
                     StreamEventKind::Timeline(TimelineItem::Compaction { summary }) => {
                         compactions.push(summary.clone());
@@ -2448,6 +3654,16 @@ async fn drive_turn(
         };
         let _ = state.store.append(&ms.id, "tool", &v).await;
     }
+    // The turn's ending task list rides along too — a session reopened
+    // from history shows what the agent set out to do, not a live-only
+    // card that evaporated with the turn. Snapshots only: one row with
+    // the final state, never one per intermediate update.
+    if let Some(items) = &todo {
+        let _ = state
+            .store
+            .append(&ms.id, "todo", &json!({"items": items}))
+            .await;
+    }
     // Compaction boundaries and the failure reason are part of the
     // durable transcript — a client that missed the live stream (or a
     // reconnecting one) reads them from session.messages/replay
@@ -2477,6 +3693,13 @@ async fn drive_turn(
             .await;
     }
     let _ = state.store.touch(&ms.id).await;
+    // The turn is over: any still-open plan review's native ask died
+    // with it — expire the rows so no surface answers a ghost plan.
+    // A settle/claim that raced the turn end is expired with its
+    // decision intent preserved, matching the other open statuses.
+    if let Err(e) = state.store.expire_open_plans(&ms.id).await {
+        tracing::warn!(error = %e, session = %ms.id, "plan expiry failed");
+    }
 
     // Refresh the persisted resume token if the backend reported one.
     // Read it from the live session rather than the create-time
@@ -2560,6 +3783,18 @@ pub fn rpc_methods() -> Vec<Value> {
     vec![
         json!({"name": "hello", "result": {"protocol": "number", "backends": "array", "methods": "array"}}),
         json!({"name": "backend.list", "result": {"backends": "array"}}),
+        json!({"name": "backend.versions", "params": {"backend": "string? — one backend, else all"}, "result": {"versions": "array of {backend, installed, version?, latest?, updateAvailable, updateKind: 'npm'|'manual'|'unknown'} — latest only where an npm package is verified; probes run on this call only, never scheduled"}}),
+        json!({"name": "backend.update_plan", "params": {"backend": "string"}, "result": "{backend, action: 'install'|'update', kind: 'npm'|'manual'|'unknown', command: string[], manualCommand: string, canRun: bool, blockers: string[], platform} — the exact argv backend.update runs plus the copy-paste fallback; no side effects"}),
+        json!({"name": "backend.update", "params": {"backend": "string", "creationId": "string? — echoes back; matches backend.update_progress events and targets backend.update_cancel"}, "result": {"creationId": "string", "ok": "boolean", "version": "string? — freshly probed after the update"}, "errors": "-32602 updateKind unknown (no verified channel — see blockers in backend.update_plan); -32000 update failed or timed out (the failure tail rides the message)"}),
+        json!({"name": "backend.update_cancel", "params": {"creationId": "string"}, "result": {"cancelled": "boolean — false when no live run holds the id"}}),
+        json!({"name": "device.pairing_key", "params": {}, "result": {"key": "string — the one-time pairing key (minted on first ask); the next device to POST /v1/pair {pairingKey, name} spends it and it rotates"}}),
+        json!({"name": "device.list", "params": {}, "result": {"devices": "array of {deviceId, name, status: 'pending'|'approved', createdAt, approvedAt?, lastSeen?} — lastSeen updates at most once a minute"}}),
+        json!({"name": "device.approve", "params": {"deviceId": "string"}, "result": {"approved": "boolean — false when unknown or already approved"}}),
+        json!({"name": "device.rename", "params": {"deviceId": "string", "name": "string"}, "result": {"renamed": "boolean — false when unknown or the name is blank"}}),
+        json!({"name": "device.revoke", "params": {"deviceId": "string"}, "result": {"revoked": "boolean — the row goes with the token hash, so the credential dies immediately; doubles as deny for pending requests"}}),
+        json!({"name": "mcp.inventory", "params": {}, "result": {"entries": "array of {backend, name, transport, command?, url?, envKeys?, source, format, version, enabled?, readonlyReason?} — REDACTED: env values never leave the file, URLs lose userinfo/query, stdio shows the program and an arg count", "sources": "array of {backend, source, format, error?} — one per config file; a broken file reports its error and the inventory continues"}}),
+        json!({"name": "mcp.probe", "params": {"backend": "string", "name": "string"}, "result": "{backend, name, result: 'connected'|'needs_auth'|'failed'|'unsupported', tools: string[] — names only, ≤40, serverName?, protocolVersion?, elapsedMs, error?} — REAL handshake, explicit request only (never scheduled); stdio 25s cap, HTTP 12s cap; the server's command/args/env never reach the wire"}),
+        json!({"name": "mcp.setEnabled", "params": {"backend": "string — claude only this round", "name": "string", "enabled": "boolean", "expectedVersion": "string — CAS from mcp.inventory", "cwd": "string? — project scope for the toggle, default the daemon cwd"}, "result": {"set": "boolean"}, "errors": "-32010 the entry changed since the snapshot (external edit); -32602 readonly backend (reason in the message) or parse-failed config (never written)"}),
         json!({"name": "session.create", "params": {"backend": "string?", "cwd": "string?", "model": "string?", "mode": "string?", "mcpServers": "object?", "projectId": "string? — scopes the session: root becomes the cwd default, project defaults fill unset params"}, "result": {"sessionId": "string", "backend": "string", "replayed": "number — replay-tagged session.event frames sent for missed history"}}),
         json!({"name": "session.resume", "params": {"sessionId": "string — or", "handle": "{provider, native_handle}", "cwd": "string?", "title": "string?"}, "result": {"sessionId": "string", "backend": "string", "replayed": "number"}}),
         json!({"name": "session.list", "params": {"limit": "number?", "offset": "number?", "backend": "string?", "cwd": "string?", "tag": "string?", "projectId": "string?"}, "result": {"sessions": "array of {sessionId, createdAt, backend, title, cwd, tags}"}}),
@@ -2567,9 +3802,18 @@ pub fn rpc_methods() -> Vec<Value> {
         json!({"name": "session.export", "params": {"sessionId": "string"}, "result": {"session": "{sessionId, createdAt, backend, title, tags, cwd}", "messages": "array of {id, role, ts, data}", "usage": "{contextUsed, contextSize, costUsd, turns}"}}),
         json!({"name": "session.import", "params": {"backend": "string", "cwd": "string?"}, "result": {"sessions": "array"}}),
         json!({"name": "session.delete", "params": {"sessionId": "string"}, "result": {"deleted": "boolean"}}),
+        json!({"name": "session.rescan", "params": {}, "result": {"scanId": "string", "alreadyRunning": "boolean — true when a scan is in flight; its progress events go to the caller that started it", "report": "{scanned, reparsed, reused, archived, tombstoned, skippedBackends[]} — the finished sweep's summary; imported sessions appear in session.list and their handles resume like any native session"}, "errors": "best-effort: a failing backend is skipped (skippedBackends), never an abort; -32000 on store failure"}),
         json!({"name": "session.close", "params": {"sessionId": "string"}, "result": {"closed": "boolean — kills the live backend process, keeps the row/history; frees a max_sessions slot"}}),
         json!({"name": "session.restart", "params": {"sessionId": "string"}, "result": {"sessionId": "string", "backend": "string", "replayed": "number — kills the live backend (refuses with -32006 mid-turn) and reattaches through the persisted handle"}}),
         json!({"name": "session.status", "params": {}, "result": {"sessions": "array of {sessionId, backend, busy, idleSecs} — live backend sessions only"}}),
+        json!({"name": "mission.create", "params": {"flowId?": "string — defaults to a fresh uuid", "name?": "string", "definition": "{nodes: [{id, kind: input|agent|human|output, title?, prompt?, value?, backend?, cwd?, readOnly?, allowedTools?, artifact?}], edges: [{from, to, condition? — key=value | key!=value, and over or, missing key ⇒ false; absent = default edge taken only when nothing else matched}], settings?: {concurrency? default 4, retries? default 0}}"}, "result": {"flowId": "string", "version": "number — re-creating a flowId inserts the next version; runs keep their snapshot"}, "errors": "-32602 invalid definition (unknown node kind, missing prompt/backend/value, root rule)"}),
+        json!({"name": "mission.start", "params": {"flowId": "string"}, "result": {"runId": "string", "version": "number"}, "errors": "-32602 unknown flow; -32003 backend not registered; -32002 read-only agent node refused — the backend cannot enforce a tool allowlist (never downgraded)"}),
+        json!({"name": "mission.cancel", "params": {"runId": "string"}, "result": {"runId": "string", "cancelled": "boolean — false when the run is not live"}, "errors": ""}),
+        json!({"name": "mission.respond", "params": {"runId": "string", "nodeId": "string", "decision": "approve | feedback | exclude", "feedback?": "string — required non-empty for feedback"}, "result": {"accepted": "boolean", "live": "boolean — false when the run finished between the CAS and the command"}, "errors": "-32602 not pending (another answer won the CAS) | bad decision | empty feedback"}),
+        json!({"name": "mission.list", "params": {}, "result": {"runs": "[{runId, flowId, version, status: running|succeeded|failed|interrupted, interrupted, ended, createdAt, tasks: [{nodeId, status, attempt}]}] — status always derived from task states, never stored"}}),
+        json!({"name": "mission.get", "params": {"runId": "string"}, "result": "{runId, flowId, version, status, interrupted, ended, definition, tasks: [{nodeId, status, attempt, output?, error?}], inbox: [{nodeId, status, decision?, feedback?}]}", "errors": "-32602 unknown run"}),
+        json!({"name": "mission.watch", "params": {"runId": "string — must be live"}, "result": {"runId": "string", "subscribed": "boolean — streams {event: mission.progress, runId, data} frames until mission.unwatch"}, "errors": "-32001 run is not live (finished, cancelled, or daemon restarted — mission.get reads the persisted state)"}),
+        json!({"name": "mission.unwatch", "params": {"runId": "string"}, "result": {"runId": "string", "subscribed": "boolean"}}),
         json!({"name": "session.watch", "params": {"sessionId": "string — must be live"}, "result": {"sessionId": "string", "subscribed": "boolean", "replayed": "number — subscribes this connection to the session's events without touching it; the cross-surface notification path"}}),
         json!({"name": "session.unwatch", "params": {"sessionId": "string"}, "result": {"sessionId": "string", "subscribed": "boolean — false when this connection was subscribed and now is not"}}),
         json!({"name": "session.set_pinned", "params": {"sessionId": "string", "pinned": "boolean"}, "result": {"updated": "boolean — pinned rows float to the top of session.list and survive the retention sweep"}}),
@@ -2579,10 +3823,14 @@ pub fn rpc_methods() -> Vec<Value> {
         json!({"name": "session.fork", "params": {"sessionId": "string", "upto": "number?"}, "result": {"sessionId": "string — copies messages, tags, usage history, and the backend resume handle; title suffixed \" (fork)\""}}),
         json!({"name": "session.usage", "params": {"sessionId": "string?", "daily": "boolean? — global view only", "days": "number? — daily window in days, default 7"}, "result": {"daily": "array of {date, turns, costUsd, contextUsed} when daily, else per-session/per-model totals"}}),
         json!({"name": "session.search", "params": {"query": "string", "limit": "number?", "sessionId": "string?", "backend": "string?", "cwd": "string?", "projectId": "string?", "since": "string? — RFC3339 or YYYY-MM-DD", "until": "string?"}, "result": {"results": "array of {sessionId, messageId, snippet}"}}),
+        json!({"name": "usage.summary", "params": {"days": "number? — window in local days, today inclusive, default 7", "tzOffsetMinutes": "number? — caller's UTC offset shifting the day buckets, default 0 (UTC)"}, "result": {"days": "number", "rows": "array of {date, backend, model, turns, contextUsed, contextSize, costUsd} — one per local day × backend × model; context columns sum the per-turn snapshots", "total": "{turns, contextUsed, contextSize, costUsd}"}}),
+        json!({"name": "usage.clear", "params": {}, "result": {"cleared": "boolean — every usage row deleted; sessions and messages untouched"}}),
         json!({"name": "turn.start", "params": {"sessionId": "string", "prompt": "string|array", "timeoutSecs": "number?", "detach": "boolean? — true resolves immediately {turnId, detached:true} and the turn outlives the connection (not cancelled on disconnect); turn.cancel/timeoutSecs still apply"}, "result": {"turnId": "string", "stopReason": "string", "usage": "object?"}}),
         json!({"name": "turn.steer", "params": {"sessionId": "string", "prompt": "string|array"}, "result": {"result": "string"}}),
         json!({"name": "turn.cancel", "params": {"sessionId": "string"}, "result": {"cancelled": "boolean"}}),
-        json!({"name": "permission.respond", "params": {"sessionId": "string", "requestId": "string", "response": "object"}, "result": {}}),
+        json!({"name": "permission.respond", "params": {"sessionId": "string", "requestId": "string", "response": "{behavior: allow|deny, action_id?, updated_input?, answer?, answers?{question → label|[labels]}} — for kind:question asks an answers map submits picks, an allow without answers skips"}, "result": {}, "errors": "-32008 requestId is not a pending ask (answered, withdrawn, or turn ended); delivery failures leave it answerable"}),
+        json!({"name": "plan.list", "params": {"sessionId": "string"}, "result": {"plans": "array of {planId, sessionId, requestId, revision, title, content, contentHash, complete, status, decision?, decisionIntentAt?, appliedAt?, createdAt, updatedAt, supersededBy?} — every revision, chain-ordered"}}),
+        json!({"name": "plan.respond", "params": {"planId": "string", "expectedRevision": "number — CAS: the call claims or conflicts", "decision": "string — approve | request_changes | defer", "feedback": "string? — required non-empty for request_changes; rides the deny as the agent's revision guidance"}, "result": {"recorded": "boolean", "status": "string — approved | changes_requested | deferred", "applied": "boolean — false for defer (the native ask stays parked); true after a delivered native answer", "planId": "string", "revision": "number"}, "errors": "-32009 another surface claimed the decision, or the call targeted a stale revision / closed plan (also: superseded, expired); -32602 approval of an incomplete plan or request_changes without feedback"}),
         json!({"name": "session.set_model", "params": {"sessionId": "string", "model": "string"}, "result": {}}),
         json!({"name": "session.set_mode", "params": {"sessionId": "string", "mode": "string"}, "result": {}}),
         json!({"name": "catalog.models", "params": {"backend": "string"}, "result": {"models": "array", "modes": "array"}}),
@@ -2611,6 +3859,9 @@ pub fn rpc_methods() -> Vec<Value> {
         json!({"name": "file.write", "params": {"sessionId": "string", "path": "string", "content": "string — base64"}, "result": {"written": "number", "path": "string"}}),
         json!({"name": "file.list", "params": {"sessionId": "string", "path": "string? — default ."}, "result": {"entries": "array of {name, dir, bytes}", "path": "string"}}),
         json!({"name": "file.index", "params": {"sessionId": "string?", "cwd": "string? — gated by allowed_dirs like session.create"}, "result": {"entries": "array of {rel, isDir} — root-relative gitignore-aware walk (node_modules/target pruned, hidden skipped, symlinks not followed)", "truncated": "boolean — the walk stopped at the 10 000-entry / 512 KiB bound"}}),
+        json!({"name": "file.grant", "params": {"projectId": "string? — scope; omitted grants globally", "path": "string — absolute, must exist and be a directory; symlinks/.. resolve to the canonical form"}, "result": {"granted": "boolean", "root": "string — the canonical stored form", "projectId": "string? — echo when scoped"}}),
+        json!({"name": "file.grants", "params": {"projectId": "string? — effective grants for this scope (project + global); omitted lists globals only"}, "result": {"grants": "array of {root, projectId?, createdAt}"}}),
+        json!({"name": "file.ungrant", "params": {"projectId": "string? — scope to revoke from", "path": "string — absolute; matched against the stored canonical root"}, "result": {"revoked": "boolean — false when no such grant"}}),
         json!({"name": "channel.get_state", "params": {"convId": "string", "key": "string"}, "result": {"value": "string?"}}),
         json!({"name": "channel.set_state", "params": {"convId": "string", "key": "string", "value": "string"}, "result": {"set": "boolean"}}),
         json!({"name": "channel.delete_state", "params": {"convId": "string", "key": "string"}, "result": {"deleted": "boolean"}}),
@@ -2746,7 +3997,118 @@ fn parse_time_bound(input: &str) -> Result<i64> {
 
 #[cfg(test)]
 mod tests {
-    use super::parse_time_bound;
+    use super::{parse_time_bound, rpc_methods};
+
+    /// Every RPC method name `dispatch` routes — the advertised wire
+    /// surface. `rpc_surface_stays_in_sync_with_dispatch` pins this
+    /// table to the dispatcher's actual match arms and to the
+    /// hand-written schema in `rpc_methods()` (hello /
+    /// `--print-rpc-schema`), so a new method cannot land half-wired.
+    const RPC_METHODS: &[&str] = &[
+        "hello",
+        "backend.list",
+        "backend.versions",
+        "backend.update_plan",
+        "backend.update",
+        "backend.update_cancel",
+        "device.pairing_key",
+        "device.list",
+        "device.approve",
+        "device.rename",
+        "device.revoke",
+        "project.create",
+        "project.list",
+        "project.get",
+        "project.set_defaults",
+        "project.delete",
+        "worktree.create",
+        "worktree.cancel",
+        "worktree.remove",
+        "worktree.list",
+        "worktree.resolve_pr",
+        "worktree.merged",
+        "session.create",
+        "session.resume",
+        "session.restart",
+        "session.list",
+        "session.status",
+        "mission.create",
+        "mission.start",
+        "mission.cancel",
+        "mission.respond",
+        "mission.list",
+        "mission.get",
+        "mission.watch",
+        "mission.unwatch",
+        "session.watch",
+        "session.unwatch",
+        "session.messages",
+        "session.export",
+        "session.import",
+        "session.delete",
+        "session.rescan",
+        "session.close",
+        "session.set_tags",
+        "session.set_pinned",
+        "session.set_archived",
+        "session.rename",
+        "session.fork",
+        "session.usage",
+        "session.search",
+        "usage.summary",
+        "usage.clear",
+        "turn.start",
+        "turn.steer",
+        "turn.cancel",
+        "permission.respond",
+        "plan.list",
+        "plan.respond",
+        "session.set_model",
+        "session.set_mode",
+        "catalog.models",
+        "catalog.commands",
+        "skills.targets",
+        "skills.installed",
+        "skills.repos",
+        "skills.install",
+        "skills.uninstall",
+        "skills.restore",
+        "skills.setTargets",
+        "skills.importLocal",
+        "skills.deleteLocal",
+        "skills.addRepo",
+        "skills.removeRepo",
+        "skills.activity",
+        "skills.discover",
+        "skills.search",
+        "skills.popular",
+        "skills.updates",
+        "skills.content",
+        "skills.remoteContent",
+        "logs.tail",
+        "logs.follow",
+        "file.read",
+        "file.write",
+        "file.list",
+        "file.index",
+        "file.grant",
+        "file.grants",
+        "file.ungrant",
+        "mcp.inventory",
+        "mcp.probe",
+        "mcp.setEnabled",
+        "channel.get_state",
+        "channel.set_state",
+        "channel.delete_state",
+        "prompt.add",
+        "prompt.recent",
+        "prompts.list",
+        "prompts.create",
+        "prompts.update",
+        "prompts.get",
+        "prompts.delete",
+        "prompts.move",
+    ];
 
     /// Known instants: date-only midnight UTC, RFC3339 with Z, the
     /// space separator SQLite writes, fractional seconds, explicit
@@ -2795,5 +4157,49 @@ mod tests {
         ] {
             assert!(parse_time_bound(bad).is_err(), "accepted {bad:?}");
         }
+    }
+
+    /// The RPC surface stays in lockstep, both directions, against the
+    /// actual dispatcher source: (1) every match arm in `dispatch` is
+    /// listed in `RPC_METHODS` and vice versa, and (2) the
+    /// hand-written schema in `rpc_methods()` (hello /
+    /// `--print-rpc-schema`) names exactly the callable set — push-only
+    /// entries like `worktree.progress` carry a `kind` field and are
+    /// excluded there. Adding a method without updating the table, or
+    /// advertising one the daemon does not route, fails here.
+    #[test]
+    fn rpc_surface_stays_in_sync_with_dispatch() {
+        // Match arms sit at exactly 8 spaces inside `match method {`;
+        // nested string-literal matches are indented deeper, so the
+        // fixed indent keeps the extraction to dispatch's own arms.
+        let src = include_str!("rpc.rs");
+        let start = src
+            .find("    match method {")
+            .expect("dispatch match not found");
+        let tail = &src[start..];
+        let end = tail
+            .find("        other => Err(")
+            .expect("dispatch fallback not found");
+        let mut routed: Vec<String> = tail[..end]
+            .lines()
+            .filter_map(|line| {
+                line.strip_prefix("        \"")?
+                    .split_once("\" =>")
+                    .map(|(name, _)| name.to_string())
+            })
+            .collect();
+        routed.sort();
+
+        let mut listed: Vec<String> = RPC_METHODS.iter().map(|s| s.to_string()).collect();
+        listed.sort();
+        assert_eq!(routed, listed, "dispatch arms and RPC_METHODS diverged");
+
+        let mut advertised: Vec<String> = rpc_methods()
+            .into_iter()
+            .filter(|m| m.get("kind").is_none())
+            .filter_map(|m| m["name"].as_str().map(str::to_string))
+            .collect();
+        advertised.sort();
+        assert_eq!(advertised, listed, "rpc_methods() and RPC_METHODS diverged");
     }
 }

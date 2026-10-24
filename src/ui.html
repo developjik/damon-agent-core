@@ -294,6 +294,44 @@
   .msg.flash, .thought.flash, .toolcard.flash { animation: flashHi 1.9s ease-out; }
   @keyframes flashHi { 0%, 55% { box-shadow: 0 0 0 2px var(--accent), 0 8px 32px rgba(0,0,0,.45); } }
 
+  /* ---- in-transcript find bar (Ctrl/Cmd+F) ---- */
+  #findBar {
+    flex: none; display: flex; align-items: center; gap: 7px;
+    padding: 7px 12px; background: var(--panel); border-bottom: 1px solid var(--border);
+  }
+  #findBar[hidden] { display: none; }
+  #findInput {
+    flex: 1; min-width: 0; background: var(--bg2); border: 1px solid var(--border2);
+    border-radius: 8px; color: var(--fg); padding: 5px 10px; font: inherit; font-size: 13px;
+  }
+  #findInput:focus { outline: none; border-color: var(--accent); box-shadow: 0 0 0 3px var(--accent-dim); }
+  #findCount {
+    flex: none; min-width: 46px; text-align: center; font-size: 11.5px;
+    color: var(--muted); font-variant-numeric: tabular-nums;
+  }
+  #findBar button {
+    flex: none; width: 26px; height: 26px; cursor: pointer; font-size: 13px; line-height: 1;
+    background: none; border: 1px solid var(--border2); color: var(--muted); border-radius: 7px;
+  }
+  #findBar button:hover { color: var(--fg); border-color: var(--accent); }
+  mark.fmark { background: var(--warn); color: var(--bg); border-radius: 2px; padding: 0 1px; }
+  mark.fmark.active { background: var(--accent); color: var(--bg); outline: 2px solid var(--accent); }
+
+  /* ---- long-message collapse ---- */
+  .msg.assistant.folded { max-height: 480px; overflow: hidden; }
+  .msg.assistant .foldFade {
+    position: absolute; left: 0; right: 0; bottom: 0; height: 64px; pointer-events: none;
+    background: linear-gradient(transparent, var(--panel) 82%);
+  }
+  .msg.assistant .foldBtn {
+    position: absolute; left: 50%; transform: translateX(-50%); bottom: 10px;
+    font-size: 12px; font-weight: 600; cursor: pointer;
+    padding: 3px 14px; border-radius: 12px;
+    color: var(--accent); background: var(--accent-dim);
+    border: 1px solid color-mix(in srgb, var(--accent) 30%, transparent);
+  }
+  .msg.assistant .foldBtn:hover { filter: brightness(1.15); }
+
   /* ---- tool call cards ---- */
   .toolcard {
     max-width: min(76%, 720px); margin: 0 0 10px; border-radius: 10px;
@@ -476,6 +514,32 @@
     padding: 1px 7px; border-radius: 10px; margin-right: 7px; vertical-align: 1px;
   }
   .kindChip:empty { display: none; }
+  #permQuestions { margin-bottom: 11px; display: grid; gap: 10px; }
+  #permQuestions:empty { display: none; }
+  .qBlock {
+    background: var(--code-bg); border: 1px solid var(--border);
+    border-radius: 8px; padding: 8px 10px;
+  }
+  .qChip {
+    font-size: 10px; font-weight: 700; text-transform: uppercase; letter-spacing: .06em;
+    color: var(--accent); background: color-mix(in srgb, var(--accent) 12%, transparent);
+    border: 1px solid color-mix(in srgb, var(--accent) 35%, transparent);
+    padding: 1px 7px; border-radius: 10px; margin-right: 6px; vertical-align: 1px;
+  }
+  .qText { font-weight: 600; font-size: 12.5px; margin: 2px 0 7px; }
+  .qOpts { display: flex; gap: 6px; flex-wrap: wrap; }
+  .qOpt {
+    padding: 5px 11px; border-radius: 8px; border: 1px solid var(--border);
+    background: var(--panel2); color: var(--fg); cursor: pointer; font-size: 12px;
+  }
+  .qOpt:hover { border-color: var(--accent); }
+  .qOpt.on { background: var(--accent); border-color: var(--accent); color: #fff; }
+  .qOther {
+    margin-top: 7px; width: 100%; box-sizing: border-box; padding: 6px 9px;
+    border-radius: 8px; border: 1px solid var(--border); background: var(--panel2);
+    color: var(--fg); font-size: 12px;
+  }
+  #permBtns button:disabled { opacity: .45; cursor: not-allowed; }
   #permInput {
     color: var(--muted); font: 11.5px/1.5 var(--mono);
     white-space: pre-wrap; word-wrap: break-word; max-height: 130px; overflow-y: auto;
@@ -492,6 +556,16 @@
   #permBtns button.allow:hover { filter: brightness(1.1); }
   #permBtns button.reject { background: none; color: var(--err); border-color: var(--err); }
   #permBtns button.reject:hover { background: color-mix(in srgb, var(--err) 10%, transparent); }
+  .planMeta {
+    font-size: 10.5px; font-weight: 700; text-transform: uppercase;
+    letter-spacing: .06em; color: var(--muted); margin-bottom: 6px;
+  }
+  .planBody {
+    margin: 0 0 9px; max-height: 220px; overflow-y: auto;
+    font: 11.5px/1.55 var(--mono); white-space: pre-wrap; word-wrap: break-word;
+    color: var(--fg); background: var(--code-bg); border: 1px solid var(--border);
+    border-radius: 8px; padding: 9px 11px;
+  }
 
   /* ---- typing indicator ---- */
   #typing {
@@ -753,6 +827,46 @@
   .statDot.st-crashed { background: var(--err); box-shadow: 0 0 0 3px color-mix(in srgb, var(--err) 18%, transparent); }
   .statName { font-weight: 550; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
   .statMeta { margin-left: auto; flex: none; color: var(--faint); font-size: 10.5px; }
+  .verUpdate {
+    margin-left: 8px; flex: none; cursor: pointer; font-size: 10.5px;
+    border: 1px solid var(--border); background: var(--panel); color: var(--fg);
+    border-radius: 6px; padding: 2px 8px;
+  }
+  .verUpdate:hover { border-color: var(--accent); color: var(--accent); }
+  .verUpdate:disabled { opacity: .45; cursor: default; }
+  #cliUpdateLog {
+    display: none; max-height: 140px; overflow-y: auto; margin-top: 6px;
+    font: 10.5px/1.5 var(--mono); color: var(--muted);
+    background: var(--code-bg); border: 1px solid var(--border);
+    border-radius: 8px; padding: 7px 9px; white-space: pre-wrap; word-wrap: break-word;
+  }
+  #cliUpdateLog:empty { display: none; }
+  .grantRow { display: flex; align-items: center; gap: 8px; padding: 4px 0; font-size: 12px; }
+  .grantPath {
+    font: 11px var(--mono); color: var(--fg);
+    overflow: hidden; text-overflow: ellipsis; white-space: nowrap; direction: rtl;
+  }
+  .grantRevoke {
+    margin-left: auto; flex: none; cursor: pointer;
+    border: 1px solid var(--border); background: var(--panel); color: var(--muted);
+    width: 22px; height: 22px; border-radius: 6px; font-size: 11px;
+    display: grid; place-items: center;
+  }
+  .grantRevoke:hover { color: var(--err); border-color: var(--err); }
+  .grantForm { display: flex; gap: 7px; margin-top: 8px; }
+  .grantForm input {
+    flex: 1; min-width: 0; font: 11.5px var(--mono);
+    background: var(--panel); border: 1px solid var(--border); border-radius: 7px;
+    color: var(--fg); padding: 6px 9px;
+  }
+  .grantForm input:focus { outline: none; border-color: var(--border2); }
+  .grantForm button {
+    flex: none; cursor: pointer; font-size: 11.5px;
+    border: 1px solid var(--border); background: var(--panel); color: var(--fg);
+    border-radius: 7px; padding: 5px 11px;
+  }
+  .grantForm button:hover { border-color: var(--border2); }
+  .grantForm button:disabled { opacity: .5; cursor: default; }
   .setToggle {
     display: flex; align-items: center; gap: 9px;
     font-size: 12.5px; cursor: pointer; padding: 2px 0;
@@ -820,6 +934,75 @@
   }
   #wtClose:hover { color: var(--fg); border-color: var(--border2); }
   #wtBody { flex: 1; min-height: 0; overflow-y: auto; padding: 12px 16px 16px; }
+
+  /* ---- missions drawer (mirrors the worktree panel) ---- */
+  #miBackdrop {
+    display: none; position: fixed; inset: 0; z-index: 26;
+    background: rgba(0,0,0,.5); border: 0; padding: 0; cursor: pointer;
+    backdrop-filter: blur(2px);
+  }
+  body.mi-open #miBackdrop { display: block; }
+  #miPanel {
+    display: none; position: fixed; z-index: 27;
+    left: 50%; top: 50%; transform: translate(-50%, -50%);
+    width: min(680px, 94vw); height: min(560px, 88vh);
+    background: var(--bg2); border: 1px solid var(--border); border-radius: 12px;
+    flex-direction: column; overflow: hidden;
+    box-shadow: 0 18px 60px rgba(0,0,0,.5);
+  }
+  body.mi-open #miPanel { display: flex; }
+  #miClose {
+    margin-left: auto; border: 1px solid var(--border); background: var(--panel);
+    color: var(--muted); width: 26px; height: 26px; border-radius: 7px;
+    cursor: pointer; font-size: 12px; display: grid; place-items: center;
+  }
+  #miClose:hover { color: var(--fg); border-color: var(--border2); }
+  #miBody { flex: 1; min-height: 0; overflow-y: auto; padding: 12px 16px 16px; }
+  .miRun {
+    padding: 9px 10px; border: 1px solid var(--border); border-radius: 9px;
+    margin-bottom: 8px; cursor: pointer;
+  }
+  .miRun:hover { border-color: var(--border2); }
+  .miRunHead { display: flex; align-items: center; gap: 8px; font-size: 12.5px; }
+  .miRunHead .miFlow { font-weight: 600; }
+  .miRunHead .miWhen { margin-left: auto; color: var(--faint); font-size: 11px; }
+  .miChips { display: flex; flex-wrap: wrap; gap: 4px; margin-top: 7px; }
+  .miChip {
+    font-size: 10.5px; padding: 2px 7px; border-radius: 999px;
+    border: 1px solid var(--border); color: var(--muted);
+    display: inline-flex; align-items: center; gap: 4px;
+  }
+  .miChip.s-succeeded { color: var(--ok, #3fb950); border-color: currentColor; }
+  .miChip.s-failed, .miChip.s-excluded { color: var(--err, #f85149); border-color: currentColor; }
+  .miChip.s-running { color: var(--accent); border-color: currentColor; }
+  .miChip.s-waiting_human { color: var(--warn, #d29922); border-color: currentColor; }
+  .miChip.s-interrupted { color: var(--warn, #d29922); border-color: currentColor; }
+  .miStatus { font-size: 11px; padding: 2px 8px; border-radius: 999px; border: 1px solid currentColor; }
+  .miStatus.s-running { color: var(--accent); }
+  .miStatus.s-succeeded { color: var(--ok, #3fb950); }
+  .miStatus.s-failed, .miStatus.s-interrupted { color: var(--err, #f85149); }
+  .miStatus.s-cancelled { color: var(--muted); }
+  .miInbox {
+    margin-top: 10px; padding: 9px 10px; border-radius: 9px;
+    border: 1px solid var(--warn, #d29922); background: rgba(210,153,34,.06);
+  }
+  .miInbox h3 { font-size: 12px; margin: 0 0 6px; color: var(--warn, #d29922); }
+  .miInbox .miQ { font-size: 12px; margin-bottom: 8px; }
+  .miActs { display: flex; gap: 6px; }
+  .miActs input {
+    flex: 1; min-width: 0; background: var(--panel); border: 1px solid var(--border);
+    color: var(--fg); border-radius: 7px; padding: 6px 8px; font: 12px/1.3 inherit;
+  }
+  .miActs button {
+    border: 1px solid var(--border); background: var(--panel); color: var(--fg);
+    border-radius: 7px; padding: 6px 10px; font-size: 11.5px; cursor: pointer;
+  }
+  .miActs button:hover { border-color: var(--border2); }
+  .miActs button.miApprove { color: var(--ok, #3fb950); }
+  .miActs button.miExclude { color: var(--err, #f85149); }
+  .miDetail { font-size: 11.5px; color: var(--muted); margin: 4px 0 0 18px; white-space: pre-wrap; word-break: break-word; }
+  .miEmpty { color: var(--faint); font-size: 12px; padding: 20px 0; text-align: center; }
+  .miBack { display: inline-flex; align-items: center; gap: 5px; font-size: 11.5px; color: var(--accent); background: none; border: 0; cursor: pointer; padding: 0 0 8px; }
   .wtField { display: flex; align-items: center; gap: 8px; margin-bottom: 8px; }
   .wtLabel { width: 84px; flex: none; font-size: 11.5px; color: var(--muted); }
   .wtInput {
@@ -891,6 +1074,87 @@
 </style>
 </head>
 <body>
+<script>
+// ---------- crash watchdog ----------
+// Installed before anything else can throw. A pre-render failure renders a
+// plain-DOM crash card (error summary + copy report); after boot completes
+// (window.__damonBootOk()), errors only bump a small non-blocking toast
+// badge — never a full-screen takeover.
+(function() {
+  "use strict";
+  var booted = false, count = 0, last = null, card = null, badge = null, detail = null;
+  window.__damonBootOk = function() { booted = true; };
+  function summarize(err) {
+    if (err === null || err === undefined) return "unknown error";
+    if (err.stack) return String(err.stack).split("\n").slice(0, 8).join("\n");
+    return String(err.message || err.reason || err);
+  }
+  function copyReport() {
+    var text = "damon ui crash report\n" + new Date().toISOString() +
+      "\nurl: " + location.href + "\nbooted: " + booted + "\nerrors: " + count +
+      "\nlast:\n" + (last || "n/a");
+    if (navigator.clipboard && window.isSecureContext)
+      navigator.clipboard.writeText(text).catch(function() {});
+    else {
+      var ta = document.createElement("textarea");
+      ta.value = text;
+      ta.style.cssText = "position:fixed;opacity:0";
+      document.body.appendChild(ta);
+      ta.select();
+      try { document.execCommand("copy"); } catch (e) { /* best effort */ }
+      ta.remove();
+    }
+  }
+  function crashCard(err) {
+    if (card || !document.body) return;
+    card = document.createElement("div");
+    card.setAttribute("role", "alert");
+    card.style.cssText = "position:fixed;left:50%;transform:translateX(-50%);bottom:16px;" +
+      "width:min(720px,92vw);z-index:9999;background:var(--danger-bg);color:var(--danger-fg);" +
+      "border:1px solid var(--err);border-radius:10px;padding:14px 16px;" +
+      "font:12px/1.5 ui-monospace,Menlo,Consolas,monospace;white-space:pre-wrap;word-break:break-word;";
+    card.textContent = "damon ui failed to start\n\n" + summarize(err);
+    var btn = document.createElement("button");
+    btn.type = "button";
+    btn.textContent = "copy report";
+    btn.style.cssText = "margin-top:10px;font:inherit;padding:3px 12px;border-radius:7px;" +
+      "cursor:pointer;border:1px solid currentColor;background:none;color:inherit;";
+    btn.onclick = copyReport;
+    card.appendChild(btn);
+    document.body.appendChild(card);
+  }
+  function toastBadge(err) {
+    count++;
+    last = summarize(err);
+    if (!badge) {
+      badge = document.createElement("button");
+      badge.type = "button";
+      badge.style.cssText = "position:fixed;right:14px;bottom:14px;z-index:9998;cursor:pointer;" +
+        "font:600 11px/1.4 -apple-system,'Segoe UI',Roboto,sans-serif;padding:4px 10px;" +
+        "border-radius:12px;background:var(--danger-bg);color:var(--danger-fg);" +
+        "border:1px solid var(--err);display:none;";
+      badge.onclick = function() {
+        if (detail) { detail.remove(); detail = null; return; }
+        detail = document.createElement("div");
+        detail.style.cssText = "position:fixed;right:14px;bottom:44px;z-index:9998;max-width:460px;" +
+          "max-height:40vh;overflow:auto;background:var(--bg2);color:var(--fg);" +
+          "border:1px solid var(--err);border-radius:10px;padding:10px 12px;" +
+          "font:11px/1.5 ui-monospace,Menlo,Consolas,monospace;white-space:pre-wrap;";
+        detail.textContent = last || "";
+        document.body.appendChild(detail);
+      };
+      document.body.appendChild(badge);
+    }
+    badge.textContent = "⚠ " + count;
+    badge.title = last;
+    badge.style.display = "block";
+    if (detail) detail.textContent = last;
+  }
+  function onError(err) { if (!booted) crashCard(err); else toastBadge(err); }
+  window.addEventListener("error", function(ev) { onError(ev.error || ev.message); });
+  window.addEventListener("unhandledrejection", function(ev) { onError(ev.reason); });
+})();
+</script>
   <button id="backdrop" aria-label="Close menu" tabindex="-1"></button>
   <aside id="sidebar">
     <div id="brand">
@@ -906,6 +1170,7 @@
     <button id="importBtn" title="Import a session the agent made outside damon">⇩ Import</button>
     <button id="skillsBtn" title="Skills hub — install agent skills and manage prompts">✦ Skills</button>
     <button id="wtBtn" title="Worktrees — one PR, one isolated agent workspace">⑂ Worktrees</button>
+    <button id="miBtn" title="Missions — staged agent workflows with human gates">◐ Missions</button>
     <input id="search" type="search" placeholder="search history…" title="Full-text search over all sessions (Ctrl/Cmd+K)">
     <div id="sessions"></div>
   </aside>
@@ -925,6 +1190,13 @@
       </div>
     </header>
     <div id="banner"></div>
+    <div id="findBar" hidden>
+      <input id="findInput" type="text" placeholder="find in transcript…" aria-label="Find in transcript">
+      <span id="findCount" role="status" aria-live="polite"></span>
+      <button id="findPrev" type="button" title="Previous match (Shift+Enter)" aria-label="Previous match">↑</button>
+      <button id="findNext" type="button" title="Next match (Enter)" aria-label="Next match">↓</button>
+      <button id="findClose" type="button" title="Close (Escape)" aria-label="Close find bar">✕</button>
+    </div>
     <div id="log" role="log" aria-live="polite"></div>
     <div id="empty">
       <div class="hero">d</div>
@@ -935,6 +1207,7 @@
     <button id="jumpBtn" aria-label="Jump to latest message" title="Jump to latest">↓</button>
     <div id="perm">
       <div id="permTitle"><span id="permKind" class="kindChip"></span><span id="permName"></span></div>
+      <div id="permQuestions"></div>
       <div id="permInput"></div>
       <div id="permBtns"></div>
     </div>
@@ -1009,6 +1282,14 @@
     </div>
     <div id="wtBody"></div>
   </div>
+  <button id="miBackdrop" aria-label="Close missions panel" tabindex="-1"></button>
+  <div id="miPanel" role="dialog" aria-modal="true" aria-label="Mission runs" inert>
+    <div class="skHead">
+      <h2>◐ Missions</h2>
+      <button id="miClose" aria-label="Close">✕</button>
+    </div>
+    <div id="miBody"></div>
+  </div>
   <aside id="setPanel" role="dialog" aria-modal="true" aria-label="Settings and status" inert>
     <div class="setHead">
       <h2>settings</h2>
@@ -1017,6 +1298,10 @@
     <div id="setBody">
       <section>
         <div class="panelHead">daemon</div>
+        <div class="setRow" id="remoteBadge" style="display:none">
+          <span class="k">remote control</span>
+          <span class="v off">active — a non-local device is connected</span>
+        </div>
         <div class="setRow"><span class="k">agent</span><span class="v" id="dmAgent">—</span></div>
         <div class="setRow"><span class="k">version</span><span class="v" id="dmVersion">—</span></div>
         <div class="setRow"><span class="k">origin</span><span class="v" id="dmUrl">—</span></div>
@@ -1027,12 +1312,52 @@
         <div id="setStatusList"></div>
       </section>
       <section>
+        <div class="panelHead">cli versions</div>
+        <div id="cliVersionList"></div>
+        <div id="cliUpdateLog"></div>
+        <div class="setHint">Probed when this drawer opens and on refresh — never
+          scheduled. Update runs the exact command shown in the confirm step
+          and streams its output above.</div>
+      </section>
+      <section>
+        <div class="panelHead">paired devices</div>
+        <div class="setRow"><span class="k">pairing key</span><span class="v" style="display:flex;gap:6px;align-items:center">
+          <span id="pairKeyVal" style="font-family:var(--mono)">····</span>
+          <button type="button" id="pairKeyBtn" class="verUpdate">show</button>
+        </span></div>
+        <div class="setHint">One-time key: the next device to pair spends it and a
+          fresh key rotates in. Shown here only — never auto-generated on a
+          timer.</div>
+        <div id="deviceList"></div>
+        <div class="panelHead" style="margin-top:10px">pair this device</div>
+        <div class="grantForm">
+          <input type="text" id="pairName" placeholder="device name (e.g. pixel)"
+                 autocomplete="off" aria-label="Device name">
+          <button type="button" id="pairSelf">pair</button>
+        </div>
+        <div class="setHint" id="pairSelfHint">Pairs THIS browser against the daemon it
+          can reach directly (same origin). Devices on the relay keep the relay
+          login.</div>
+      </section>
+      <section>
         <div class="panelHead">notifications</div>
         <label class="setToggle">
           <input type="checkbox" id="notifyToggle">
           <span>Desktop notifications</span>
         </label>
         <div class="setHint" id="notifyHint"></div>
+      </section>
+      <section>
+        <div class="panelHead">granted roots</div>
+        <div id="grantList"></div>
+        <form class="grantForm" id="grantForm">
+          <input type="text" id="grantPath" placeholder="/absolute/directory"
+                 autocomplete="off" spellcheck="false" aria-label="Directory to grant">
+          <button type="submit" id="grantAdd">grant</button>
+        </form>
+        <div class="setHint">Extra directories file tools may reach beyond a
+          session's cwd (claude also gets them as --add-dir on its next launch).
+          Grants here are global — every session.</div>
       </section>
     </div>
   </aside>
@@ -1495,6 +1820,26 @@ function wsUrl(ticket) {
   return proto + "//" + location.host + "/ws" + (ticket ? "?ticket=" + encodeURIComponent(ticket) : "");
 }
 async function fetchTicket() {
+  // A paired device mints tickets with its OWN token — the master
+  // token stays out of the picture entirely (per-device revocable).
+  const deviceToken = localStorage.getItem("damon_device_token");
+  if (deviceToken && !token) {
+    const r = await fetch("/v1/ws_ticket", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ deviceToken }),
+    });
+    if (!r.ok) {
+      // Revoked/expired device token: drop it and fall through to the
+      // normal auth path (fail closed, then re-ask).
+      localStorage.removeItem("damon_device_token");
+      localStorage.removeItem("damon_device_name");
+      throw new Error("device token rejected: HTTP " + r.status);
+    }
+    const j = await r.json();
+    if (!j.ticket) throw new Error("ticket response malformed");
+    return j.ticket;
+  }
   const r = await fetch("/v1/ws_ticket", {
     method: "POST",
     headers: { "Authorization": "Bearer " + token }
@@ -1580,6 +1925,7 @@ async function connect() {
     if (v.id !== undefined) onResponse(v);
     else if (v.event === "session.event") onSessionEvent(v);
     else if (v.event === "worktree.progress") onWorktreeProgress(v);
+    else if (v.event === "backend.update_progress") onCliUpdateProgress(v);
     else if (v.hello) daemonInfo = Object.assign(daemonInfo || {}, v.hello);
   };
   ws.onclose = (ev) => {
@@ -2032,10 +2378,7 @@ function onTimeline(sid, ev) {
         todoEl.innerHTML = "<summary>tasks</summary><div class=\"thoughtBody\"></div>";
         log.appendChild(todoEl);
       }
-      todoEl.querySelector(".thoughtBody").textContent = items.map(it => {
-        const mark = it.status === "completed" ? "☑" : it.status === "in_progress" ? "◐" : "☐";
-        return mark + " " + it.content;
-      }).join("\n");
+      todoEl.querySelector(".thoughtBody").textContent = todoLines(items);
       stickScroll();
       break;
     }
@@ -2150,41 +2493,200 @@ function onSessionEvent(v) {
 
 // ---------- permission card ----------
 // ev is the flattened PermissionRequest: {id, kind, name, title?, input?,
-// detail?, actions[]}. Actions are the buttons the agent offered; each
-// maps to a permission.respond with its own behavior + action_id.
+// detail?, actions[], questions?}. Tool asks render the agent's offered
+// actions as buttons; question cards (kind: "question") render the
+// structured questions — options to pick, a free-text fallback, and
+// Answer/Skip/Decline. A failed respond leaves the card up: the ask is
+// still pending and can be retried.
 function showPermission(sid, ev) {
   permSession = sid;
   pendingAsk = { sid, ev };
+  const isQuestion = ev.kind === "question" &&
+    Array.isArray(ev.questions) && ev.questions.length > 0;
   $("permKind").textContent = ev.kind || "";
-  $("permName").textContent = "Allow " + (ev.title || ev.name || "?");
-  $("permInput").textContent =
-    ev.input !== undefined && ev.input !== null ? JSON.stringify(ev.input, null, 2) : "";
-  const btns = $("permBtns");
-  btns.textContent = "";
-  const acts = Array.isArray(ev.actions) && ev.actions.length
-    ? ev.actions
-    : [{ id: "allow", label: "Allow", behavior: "allow" },
-       { id: "deny", label: "Deny", behavior: "deny" }];
-  for (const a of acts) {
+  $("permName").textContent = isQuestion
+    ? (ev.title || ev.name || "Question")
+    : "Allow " + (ev.title || ev.name || "?");
+  $("permInput").textContent = "";
+  const qWrap = $("permQuestions");
+  qWrap.textContent = "";
+
+  const respond = (response) => {
+    request("permission.respond",
+            { sessionId: sid, requestId: ev.id, response })
+      .then(() => clearAsk())
+      .catch(e => errBubble("permission.respond failed: " + e.message));
+  };
+  const mkBtn = (label, cls, fn) => {
     const b = document.createElement("button");
-    b.textContent = a.label || a.id;
-    b.className = a.behavior === "allow" ? "allow" : "reject";
-    b.onclick = () => {
-      const response = a.behavior === "deny"
-        ? { behavior: "deny", action_id: a.id, interrupt: false }
-        : { behavior: "allow", action_id: a.id };
-      request("permission.respond",
-              { sessionId: sid, requestId: ev.id, response })
-        .catch(e => errBubble("permission.respond failed: " + e.message));
-      clearAsk();
+    b.textContent = label;
+    b.className = cls;
+    b.onclick = fn;
+    $("permBtns").appendChild(b);
+    return b;
+  };
+  // The plain tool-actions rendering — also the fallback when a plan
+  // ask has no durable row (backend without the gate) or plan.list
+  // could not be fetched.
+  const renderToolActions = () => {
+    $("permInput").textContent =
+      ev.input !== undefined && ev.input !== null ? JSON.stringify(ev.input, null, 2) : "";
+    const acts = Array.isArray(ev.actions) && ev.actions.length
+      ? ev.actions
+      : [{ id: "allow", label: "Allow", behavior: "allow" },
+         { id: "deny", label: "Deny", behavior: "deny" }];
+    for (const a of acts) {
+      mkBtn(a.label || a.id, a.behavior === "allow" ? "allow" : "reject", () => {
+        respond(a.behavior === "deny"
+          ? { behavior: "deny", action_id: a.id, interrupt: false }
+          : { behavior: "allow", action_id: a.id });
+      });
+    }
+  };
+
+  if (isQuestion) {
+    // One pick-state per question: selected labels + typed override.
+    const picks = ev.questions.map(() => ({ sel: new Set(), text: "" }));
+    const complete = () => ev.questions.every((q, qi) => {
+      const p = picks[qi];
+      return p.text || p.sel.size > 0;
+    });
+    ev.questions.forEach((q, qi) => {
+      const block = document.createElement("div");
+      block.className = "qBlock";
+      if (q.header) {
+        const chip = document.createElement("span");
+        chip.className = "qChip";
+        chip.textContent = q.header;
+        block.appendChild(chip);
+      }
+      const qt = document.createElement("div");
+      qt.className = "qText";
+      qt.textContent = q.question;
+      block.appendChild(qt);
+      const st = picks[qi];
+      const opts = Array.isArray(q.options) ? q.options : [];
+      if (opts.length) {
+        const row = document.createElement("div");
+        row.className = "qOpts";
+        opts.forEach(o => {
+          const b = document.createElement("button");
+          b.type = "button";
+          b.className = "qOpt";
+          b.textContent = o.label;
+          if (o.description) b.title = o.description;
+          b.onclick = () => {
+            if (q.multiSelect) {
+              st.sel.has(o.label) ? st.sel.delete(o.label) : st.sel.add(o.label);
+              b.classList.toggle("on", st.sel.has(o.label));
+            } else {
+              st.sel = new Set([o.label]);
+              row.querySelectorAll(".qOpt").forEach(x => x.classList.toggle("on", x === b));
+            }
+            st.text = "";
+            other.value = "";
+            refresh();
+          };
+          row.appendChild(b);
+        });
+        block.appendChild(row);
+      }
+      const other = document.createElement("input");
+      other.type = "text";
+      other.className = "qOther";
+      other.placeholder = opts.length ? "Other…" : "Type your answer…";
+      other.oninput = () => {
+        st.text = other.value;
+        if (other.value && !q.multiSelect) {
+          st.sel = new Set();
+          block.querySelectorAll(".qOpt").forEach(x => x.classList.remove("on"));
+        }
+        refresh();
+      };
+      block.appendChild(other);
+      qWrap.appendChild(block);
+    });
+    const answerBtn = mkBtn("Answer", "allow", () => {
+      const answers = {};
+      ev.questions.forEach((q, qi) => {
+        const p = picks[qi];
+        if (p.text) { answers[q.question] = p.text; return; }
+        const v = [...p.sel];
+        if (v.length) answers[q.question] = q.multiSelect ? v : v[0];
+      });
+      respond({ behavior: "allow", answers });
+    });
+    const refresh = () => { answerBtn.disabled = !complete(); };
+    refresh();
+    mkBtn("Skip", "", () => respond({ behavior: "allow" }));
+    mkBtn("Decline", "reject", () => respond({ behavior: "deny", interrupt: false }));
+  } else if (ev.kind === "plan") {
+    // Plan approval dock: the durable plan_reviews row carries the
+    // planId + revision the CAS gate needs; the live ask's id links
+    // the two. Approve / request-changes / defer go through
+    // plan.respond (the typed gate), never the bare permission path.
+    $("permName").textContent = ev.title || ev.name || "Plan ready for review";
+    const respondPlan = (decision, feedback) =>
+      request("plan.respond", Object.assign(
+        { planId: row.planId, expectedRevision: row.revision, decision },
+        feedback !== undefined ? { feedback } : {}))
+        .then(() => clearAsk())
+        .catch(e => {
+          errBubble("plan.respond failed: " + e.message);
+          // A conflict means another surface decided first — the card
+          // is stale; close it.
+          if (e && e.code === -32009) clearAsk();
+        });
+    let row = null;
+    const dock = () => {
+      const head = document.createElement("div");
+      head.className = "planMeta";
+      head.textContent = "revision " + row.revision +
+        (row.complete ? "" : " · incomplete — approval disabled") +
+        (row.status !== "awaiting_review" ? " · " + row.status : "");
+      qWrap.appendChild(head);
+      const body = document.createElement("pre");
+      body.className = "planBody";
+      body.textContent = row.content || "(no plan text)";
+      qWrap.appendChild(body);
+      const fb = document.createElement("input");
+      fb.type = "text"; fb.className = "qOther";
+      fb.placeholder = "Feedback — required to request changes";
+      qWrap.appendChild(fb);
+      const approve = mkBtn("Approve", "allow", () => {
+        approve.disabled = true;
+        respondPlan("approve");
+      });
+      if (!row.complete || row.status !== "awaiting_review") approve.disabled = true;
+      mkBtn("Request changes", "reject", () => {
+        const feedback = fb.value.trim();
+        if (!feedback) { fb.focus(); return; }
+        respondPlan("request_changes", feedback);
+      });
+      mkBtn("Defer", "", () => respondPlan("defer"));
+      const first = $("permBtns").querySelector("button");
+      if (first) first.focus();
     };
-    btns.appendChild(b);
+    request("plan.list", { sessionId: sid })
+      .then(res => {
+        const plans = res.plans || [];
+        row = plans.find(p => p.requestId === ev.id);
+        if (!row || row.status === "superseded" || row.status === "expired") {
+          renderToolActions();
+          return;
+        }
+        dock();
+      })
+      .catch(() => renderToolActions());
+  } else {
+    renderToolActions();
   }
   $("perm").classList.add("show");
   // Hidden tab: desktop notification (title = tool title) or title flash.
   attention(ev.title || ev.name || "permission requested",
-    "damon — allow this tool?", "damon — permission?");
-  const first = btns.querySelector("button");
+    isQuestion ? "damon — a question needs an answer" : "damon — allow this tool?",
+    "damon — permission?");
+  const first = $("permBtns").querySelector("button");
   if (first) first.focus();
 }
 
@@ -2606,8 +3108,10 @@ async function loadMessages(sid, focusMessageId) {
       if (page.length < 200) break;
     }
     for (const m of msgs) renderStored(m);
+    applyCollapse();
     stickScroll(true);
     syncEmpty();
+    refreshFind(); // no-op while the find bar is closed
     if (focusMessageId !== undefined && !focusStoredMessage(focusMessageId))
       // Rows at or before the compaction cutoff never come back from
       // session.messages — say so instead of silently landing at the top.
@@ -2633,6 +3137,14 @@ function msgText(m) {
   if (Array.isArray(d.content))
     return d.content.map(p => (p && (p.text || p.content)) || "").join("\n");
   return "";
+}
+// One line per task item with its status mark — shared by the live
+// event card and the persisted-row card so both render identically.
+function todoLines(items) {
+  return (Array.isArray(items) ? items : []).map(it => {
+    const mark = it.status === "completed" ? "☑" : it.status === "in_progress" ? "◐" : "☐";
+    return mark + " " + (it.content || "");
+  }).join("\n");
 }
 function renderStored(m) {
   const d = m.data || m;
@@ -2723,6 +3235,20 @@ function renderStored(m) {
       el.className = "thought";
       el.innerHTML = "<summary>context compacted</summary><div class=\"thoughtBody\"></div>";
       el.querySelector(".thoughtBody").textContent = text;
+      log.appendChild(el);
+      anchor = el;
+      break;
+    }
+    case "todo": {
+      // Final task-list snapshot persisted by the turn — same card as
+      // the live event, so history and stream render identically.
+      const t = todoLines(d.items);
+      if (!t.trim()) break;
+      const el = document.createElement("details");
+      el.className = "thought";
+      el.open = true;
+      el.innerHTML = "<summary>tasks</summary><div class=\"thoughtBody\"></div>";
+      el.querySelector(".thoughtBody").textContent = t;
       log.appendChild(el);
       anchor = el;
       break;
@@ -2954,6 +3480,9 @@ function renderDaemonInfo() {
   const info = daemonInfo || {};
   $("dmAgent").textContent = info.daemon || "—";
   $("dmVersion").textContent = info.version || "—";
+  // Remote-control badge: hello carries the live non-loopback /ws count.
+  const remote = Number(info.remoteClients || 0);
+  $("remoteBadge").style.display = remote > 0 ? "" : "none";
   const served = location.protocol === "http:" || location.protocol === "https:";
   $("dmUrl").textContent = connMode === "relay"
     ? relayName + " @ " + relayUrl + (served ? " (page: " + location.host + ")" : "")
@@ -2999,6 +3528,271 @@ function renderAgentStatus() {
     box.appendChild(row);
   }
 }
+
+// ---------- CLI versions (settings drawer) ----------
+// One probe per drawer open / explicit refresh — never scheduled (each
+// refresh spawns a `--version` per backend plus npm registry reads).
+// The update button resolves a plan first, confirms with the exact
+// command, then streams backend.update_progress lines into the log.
+async function renderCliVersions() {
+  const box = $("cliVersionList");
+  let versions;
+  try {
+    versions = (await request("backend.versions", {})).versions || [];
+  } catch {
+    return; // socket down — the banner already says so
+  }
+  box.textContent = "";
+  for (const v of versions) {
+    const row = document.createElement("div");
+    row.className = "statRow";
+    const dot = document.createElement("span");
+    dot.className = "statDot " + (v.installed ? "st-ok" : "");
+    row.appendChild(dot);
+    const name = document.createElement("span");
+    name.className = "statName";
+    name.textContent = v.backend;
+    row.appendChild(name);
+    const meta = document.createElement("span");
+    meta.className = "statMeta";
+    if (!v.installed) {
+      meta.textContent = "not installed";
+    } else if (v.updateAvailable) {
+      meta.textContent = `${v.version || "version unknown"} → ${v.latest || "?"}`;
+      meta.style.color = "var(--warn)";
+    } else {
+      meta.textContent = v.version || "version unknown";
+    }
+    meta.title = v.updateAvailable
+      ? "update available"
+      : v.latest ? "up to date" : "";
+    row.appendChild(meta);
+    if (v.installed && v.updateKind !== "unknown") {
+      const btn = document.createElement("button");
+      btn.type = "button";
+      btn.className = "verUpdate";
+      btn.textContent = "update";
+      btn.title = v.updateKind === "npm"
+        ? "npm install -g <package>@latest"
+        : "official installer";
+      btn.onclick = () => runCliUpdate(v.backend, btn);
+      row.appendChild(btn);
+    }
+    box.appendChild(row);
+  }
+}
+
+// One CLI update at a time on this surface — the log area is shared.
+let cliUpdateBusy = false;
+
+async function runCliUpdate(backend, btn) {
+  if (cliUpdateBusy) return;
+  const log = $("cliUpdateLog");
+  try {
+    const plan = await request("backend.update_plan", { backend });
+    if (!plan.canRun) {
+      errBubble(plan.blockers.join(" ") || "no update path for " + backend);
+      return;
+    }
+    // The confirm shows the EXACT argv the run executes — the plan and
+    // the run share one argv construction, so they can never drift.
+    if (!confirm(`Update ${backend}?\n\n${plan.manualCommand}`)) return;
+    cliUpdateBusy = true;
+    btn.disabled = true;
+    log.textContent = `$ ${plan.manualCommand}\n`;
+    const res = await request("backend.update", { backend });
+    log.textContent += `✓ done${res.version ? ` — now ${res.version}` : ""}\n`;
+  } catch (e) {
+    log.textContent += `✗ ${e.message || e}\n`;
+  } finally {
+    cliUpdateBusy = false;
+    btn.disabled = false;
+    renderCliVersions(); // fresh probe shows the new version
+  }
+}
+
+function onCliUpdateProgress(v) {
+  // Streamed installer lines — scope to the creationId in flight on
+  // this connection (the server only sends this connection's runs).
+  const line = v.data && v.data.line;
+  if (line) $("cliUpdateLog").textContent += line + "\n";
+}
+
+// ---------- paired devices (settings drawer) ----------
+// Desktop-side management: reveal the one-time pairing key, approve or
+// deny pending requests, rename/revoke devices. The DEVICE side pairs
+// via POST /v1/pair against a directly-reachable daemon origin.
+async function renderDevices() {
+  const box = $("deviceList");
+  let devices;
+  try {
+    devices = (await request("device.list", {})).devices || [];
+  } catch {
+    return;
+  }
+  box.textContent = "";
+  if (!devices.length) {
+    const d = document.createElement("div");
+    d.className = "setHint";
+    d.textContent = "no devices paired";
+    box.appendChild(d);
+    return;
+  }
+  for (const dev of devices) {
+    const row = document.createElement("div");
+    row.className = "statRow";
+    const dot = document.createElement("span");
+    dot.className = "statDot " + (dev.status === "approved" ? "st-ok" : "st-cooling");
+    row.appendChild(dot);
+    const name = document.createElement("span");
+    name.className = "statName";
+    name.textContent = dev.name;
+    row.appendChild(name);
+    const meta = document.createElement("span");
+    meta.className = "statMeta";
+    meta.textContent = dev.status === "pending"
+      ? "waiting for approval"
+      : "seen " + (dev.lastSeen || "never");
+    meta.title = dev.status === "pending" ? "deviceId: " + dev.deviceId : "";
+    row.appendChild(meta);
+    const act = (label, cls, fn) => {
+      const b = document.createElement("button");
+      b.type = "button";
+      b.className = "verUpdate" + (cls ? " " + cls : "");
+      b.textContent = label;
+      b.onclick = async () => {
+        b.disabled = true;
+        try { await fn(); } catch (e) { errBubble(String(e.message || e)); }
+        renderDevices();
+      };
+      row.appendChild(b);
+      return b;
+    };
+    if (dev.status === "pending") {
+      act("approve", "", () =>
+        request("device.approve", { deviceId: dev.deviceId }));
+      act("deny", "reject", () =>
+        request("device.revoke", { deviceId: dev.deviceId }));
+    } else {
+      act("rename", "", async () => {
+        const name = prompt("Device name", dev.name);
+        if (name && name.trim()) {
+          await request("device.rename", { deviceId: dev.deviceId, name: name.trim() });
+        }
+      });
+      act("revoke", "reject", () =>
+        request("device.revoke", { deviceId: dev.deviceId }));
+    }
+    box.appendChild(row);
+  }
+}
+
+async function revealPairingKey(btn) {
+  if (btn.dataset.revealed) {
+    $("pairKeyVal").textContent = "····";
+    delete btn.dataset.revealed;
+    btn.textContent = "show";
+    return;
+  }
+  try {
+    const key = (await request("device.pairing_key", {})).key;
+    $("pairKeyVal").textContent = key;
+    btn.dataset.revealed = "1";
+    btn.textContent = "hide";
+    try { navigator.clipboard.writeText(key); } catch { /* clipboard is a nicety */ }
+  } catch (e) {
+    errBubble(String(e.message || e));
+  }
+}
+
+// Pair THIS browser: spends the key against a directly-reachable daemon
+// origin (same origin — the drawer's daemon), stores the device token,
+// and re-dials. Relay-mode devices keep the relay login (the E2E
+// handshake proves the master token; device tokens are a direct-HTTP
+// surface today — documented cut).
+async function pairThisDevice() {
+  const key = prompt("Pairing key (shown in this drawer on the desktop)");
+  if (!key || !key.trim()) return;
+  const name = ($("pairName").value || "").trim() || navigator.platform || "this browser";
+  const r = await fetch("/v1/pair", {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ pairingKey: key.trim(), name }),
+  });
+  if (!r.ok) {
+    errBubble("pairing refused (" + r.status + ") — check the key");
+    return;
+  }
+  const j = await r.json();
+  localStorage.setItem("damon_device_token", j.token);
+  localStorage.setItem("damon_device_name", j.deviceId);
+  $("pairName").value = "";
+  errBubble("paired — waiting for approval on the desktop");
+  if (connMode !== "relay" && !token) connect(); // re-dial with the device token once approved
+}
+
+$("pairKeyBtn").onclick = (e) => revealPairingKey(e.target);
+$("pairSelf").onclick = () => pairThisDevice();
+
+// ---------- granted roots (settings drawer) ----------
+// The effective global grants: extra directories file.* may reach
+// beyond a session's cwd. The daemon validates + canonicalizes, so the
+// list always shows the stored canonical form.
+async function renderGrants() {
+  const box = $("grantList");
+  let grants;
+  try {
+    grants = (await request("file.grants", {})).grants || [];
+  } catch {
+    return; // socket down — the banner already says so
+  }
+  box.textContent = "";
+  if (!grants.length) {
+    const d = document.createElement("div");
+    d.className = "setHint";
+    d.textContent = "no grants — sessions are confined to their cwd";
+    box.appendChild(d);
+    return;
+  }
+  for (const g of grants) {
+    const row = document.createElement("div");
+    row.className = "grantRow";
+    const path = document.createElement("span");
+    path.className = "grantPath";
+    path.textContent = g.root;
+    path.title = g.root + (g.projectId ? " (project " + g.projectId + ")" : " (global)");
+    row.appendChild(path);
+    if (!g.projectId) { // scope rows come from their own surface; only globals revoke here
+      const revoke = document.createElement("button");
+      revoke.type = "button";
+      revoke.className = "grantRevoke";
+      revoke.textContent = "✕";
+      revoke.setAttribute("aria-label", "Revoke " + g.root);
+      revoke.onclick = async () => {
+        revoke.disabled = true;
+        try { await request("file.ungrant", { path: g.root }); } catch { /* re-render shows the truth */ }
+        renderGrants();
+      };
+      row.appendChild(revoke);
+    }
+    box.appendChild(row);
+  }
+}
+$("grantForm").addEventListener("submit", async e => {
+  e.preventDefault();
+  const input = $("grantPath"), add = $("grantAdd");
+  const path = input.value.trim();
+  if (!path) return;
+  add.disabled = true;
+  try {
+    await request("file.grant", { path });
+    input.value = "";
+  } catch (err) {
+    input.title = String(err && err.message || err);
+  }
+  add.disabled = false;
+  renderGrants();
+});
 function openSettings() {
   settingsOpener = document.activeElement instanceof Element ? document.activeElement : null;
   document.body.classList.add("settings-open");
@@ -3007,11 +3801,18 @@ function openSettings() {
   $("notifyToggle").checked = notifyOn;
   updateNotifyHint();
   renderDaemonInfo();
+  renderGrants();
+  renderCliVersions();
+  renderDevices();
   refreshAgents(); // its hook re-renders the agent rows
   clearInterval(settingsTimer);
   settingsTimer = setInterval(() => {
     renderDaemonInfo();
+    renderGrants();
     refreshAgents();
+    // CLI versions deliberately NOT on the timer: every refresh spawns
+    // nine `--version` processes plus npm registry reads. Explicit
+    // requests only (the Refresh button).
   }, 10000);
   $("setClose").focus();
 }
@@ -3736,6 +4537,172 @@ document.addEventListener("keydown", e => {
   if (e.key === "Escape" && document.body.classList.contains("wt-open")) closeWorktrees();
 });
 
+// ---------- missions drawer ----------
+// Flat runs list + per-run node chips + the human inbox. Deliberately
+// read-mostly: create/edit stays a CLI/wire concern this round (staged
+// scope — see docs/protocol-v2.md "mission").
+const missions = {
+  runs: [],
+  openRun: null,   // runId when the detail view is showing
+  detail: null,    // mission.get payload
+  timer: null,
+};
+
+function openMissions() {
+  document.body.classList.add("mi-open");
+  $("miPanel").inert = false;
+  missions.openRun = null;
+  refreshMissions();
+  missions.timer = setInterval(() => {
+    if (missions.openRun) refreshMissionDetail(missions.openRun);
+    else refreshMissions();
+  }, 3000);
+}
+function closeMissions() {
+  document.body.classList.remove("mi-open");
+  $("miPanel").inert = true;
+  if (missions.timer) { clearInterval(missions.timer); missions.timer = null; }
+}
+$("miBtn").onclick = openMissions;
+$("miClose").onclick = closeMissions;
+$("miBackdrop").onclick = closeMissions;
+document.addEventListener("keydown", e => {
+  if (e.key === "Escape" && document.body.classList.contains("mi-open")) closeMissions();
+});
+
+function miStatusChip(status) {
+  const chip = el("span", "miStatus s-" + status);
+  chip.textContent = status;
+  return chip;
+}
+
+function miChips(tasks) {
+  const wrap = el("div", "miChips");
+  (tasks || []).forEach(t => {
+    const chip = el("span", "miChip s-" + t.status);
+    chip.textContent = t.nodeId + " · " + t.status + (t.attempt > 1 ? " ×" + t.attempt : "");
+    chip.title = "attempt " + (t.attempt || 1);
+    wrap.appendChild(chip);
+  });
+  return wrap;
+}
+
+function refreshMissions() {
+  request("mission.list", {})
+    .then(r => { missions.runs = r.runs || []; if (!missions.openRun) renderMissionList(); })
+    .catch(() => { missions.runs = []; if (!missions.openRun) renderMissionList(); });
+}
+
+function refreshMissionDetail(runId) {
+  request("mission.get", { runId })
+    .then(r => { missions.detail = r; if (missions.openRun === runId) renderMissionDetail(); })
+    .catch(err => { if (missions.openRun === runId) { missions.detail = { error: err.message || String(err) }; renderMissionDetail(); } });
+}
+
+function renderMissionList() {
+  const body = $("miBody");
+  body.textContent = "";
+  if (!missions.runs.length) {
+    const empty = el("div", "miEmpty");
+    empty.textContent = "No mission runs yet — create a flow with `damon mission create` and start it.";
+    body.appendChild(empty);
+    return;
+  }
+  missions.runs.forEach(run => {
+    const row = el("div", "miRun");
+    row.onclick = () => { missions.openRun = run.runId; refreshMissionDetail(run.runId); };
+    const head = el("div", "miRunHead");
+    const flow = el("span", "miFlow");
+    flow.textContent = run.flowId + " v" + run.version;
+    head.appendChild(flow);
+    head.appendChild(miStatusChip(run.status));
+    const when = el("span", "miWhen");
+    when.textContent = (run.createdAt || "").replace("T", " ");
+    head.appendChild(when);
+    row.appendChild(head);
+    row.appendChild(miChips(run.tasks));
+    body.appendChild(row);
+  });
+}
+
+function renderMissionDetail() {
+  const body = $("miBody");
+  body.textContent = "";
+  const back = el("button", "miBack");
+  back.textContent = "← all runs";
+  back.onclick = () => { missions.openRun = null; missions.detail = null; renderMissionList(); };
+  body.appendChild(back);
+
+  const d = missions.detail;
+  if (!d || d.error) {
+    const empty = el("div", "miEmpty");
+    empty.textContent = d && d.error ? "Run unavailable: " + d.error : "…";
+    body.appendChild(empty);
+    return;
+  }
+  const head = el("div", "miRunHead");
+  const flow = el("span", "miFlow");
+  flow.textContent = d.flowId + " v" + d.version;
+  head.appendChild(flow);
+  head.appendChild(miStatusChip(d.status));
+  body.appendChild(head);
+  body.appendChild(miChips(d.tasks));
+
+  // Terminal agent outputs, small and inline.
+  (d.tasks || []).forEach(t => {
+    if (t.output !== undefined && t.output !== null) {
+      const pre = el("div", "miDetail");
+      pre.textContent = t.nodeId + " → " + JSON.stringify(t.output);
+      body.appendChild(pre);
+    }
+    if (t.error) {
+      const pre = el("div", "miDetail");
+      pre.style.color = "var(--err, #f85149)";
+      pre.textContent = t.nodeId + " ✗ " + t.error;
+      body.appendChild(pre);
+    }
+  });
+
+  // The human inbox: approve / feedback / exclude — one answer wins.
+  (d.inbox || []).filter(i => i.status === "pending").forEach(item => {
+    const box = el("div", "miInbox");
+    const h = el("h3");
+    h.textContent = "Awaiting you · " + item.nodeId;
+    box.appendChild(h);
+    const q = el("div", "miQ");
+    q.textContent = "approve to continue · feedback to re-ask with notes · exclude to drop the branch (downstream cancels)";
+    box.appendChild(q);
+    const acts = el("div", "miActs");
+    const input = el("input");
+    input.type = "text";
+    input.placeholder = "feedback…";
+    acts.appendChild(input);
+    const approve = el("button", "miApprove");
+    approve.textContent = "Approve";
+    approve.onclick = () => respondMission(d.runId, item.nodeId, "approve", null);
+    acts.appendChild(approve);
+    const feedback = el("button");
+    feedback.textContent = "Send feedback";
+    feedback.onclick = () => {
+      const text = input.value.trim();
+      if (text) respondMission(d.runId, item.nodeId, "feedback", text);
+    };
+    acts.appendChild(feedback);
+    const exclude = el("button", "miExclude");
+    exclude.textContent = "Exclude branch";
+    exclude.onclick = () => respondMission(d.runId, item.nodeId, "exclude", null);
+    acts.appendChild(exclude);
+    box.appendChild(acts);
+    body.appendChild(box);
+  });
+}
+
+function respondMission(runId, nodeId, decision, feedback) {
+  request("mission.respond", { runId, nodeId, decision, feedback: feedback || undefined })
+    .then(() => refreshMissionDetail(runId))
+    .catch(err => { onError((err && err.message) || String(err)); });
+}
+
 function wtErrText(e) {
   const kind = e && e.rpc && e.rpc.data && e.rpc.data.kind;
   return (kind ? kind + ": " : "") + ((e && e.message) || String(e));
@@ -4379,11 +5346,233 @@ document.addEventListener("keydown", e => {
     e.preventDefault();
     $("search").focus();
     $("search").select();
+  } else if ((e.metaKey || e.ctrlKey) && e.key.toLowerCase() === "f") {
+    e.preventDefault();
+    openFind();
+  } else if (e.key === "Escape" && !$("findBar").hidden) {
+    // An open find bar owns Escape first (its input stops propagation;
+    // this catches Escape pressed while focus moved into the transcript).
+    e.preventDefault();
+    closeFind();
   } else if (e.key === "Escape") {
     closeDrawer();
     closeSettings();
   }
 });
+
+// ---------- long-message collapse ----------
+// Finished assistant bubbles taller than FOLD_HEIGHT render collapsed
+// (max-height + fade + "Show more"). The live streaming row is never
+// folded; manual (or find-driven) expansions persist per message id for
+// the page session — loadMessages re-renders rows from scratch, so the
+// Set is keyed by data-message-id (raw-text fallback for id-less rows).
+const FOLD_HEIGHT = 480;
+const expandedMsgs = new Set();
+function foldKey(m) {
+  if (m.dataset.messageId) return "id:" + m.dataset.messageId;
+  const raw = m.dataset.raw || m.textContent || "";
+  return "raw:" + raw.length + ":" + raw.slice(0, 60);
+}
+function applyCollapse() {
+  for (const m of log.querySelectorAll(".msg.assistant")) {
+    if (m.classList.contains("streaming") || m.classList.contains("folded") ||
+        m.classList.contains("unfolded")) continue;
+    if (m === streamEl || (streamBody && m.contains(streamBody))) continue;
+    if (expandedMsgs.has(foldKey(m))) { m.classList.add("unfolded"); continue; }
+    if (m.scrollHeight > FOLD_HEIGHT) foldMsg(m);
+  }
+}
+function foldMsg(m) {
+  m.classList.add("folded");
+  const fade = document.createElement("div");
+  fade.className = "foldFade";
+  const btn = document.createElement("button");
+  btn.type = "button";
+  btn.className = "foldBtn";
+  btn.textContent = "Show more";
+  btn.title = "더 보기";
+  btn.setAttribute("aria-label", "Show more of this message");
+  btn.onclick = () => expandMsg(m);
+  m.appendChild(fade);
+  m.appendChild(btn);
+}
+function expandMsg(m) {
+  if (!m.classList.contains("folded")) return;
+  m.classList.remove("folded");
+  m.classList.add("unfolded"); // re-render keeps it open via expandedMsgs
+  expandedMsgs.add(foldKey(m));
+  const b = m.querySelector(".foldBtn");
+  if (b) b.remove();
+  const f = m.querySelector(".foldFade");
+  if (f) f.remove();
+}
+
+// ==== damon-find pure module (extracted by npm/findbar.test.mjs) ====
+// Text-node collection + match planning + mark highlighting, kept free of
+// TreeWalker/querySelector so the stub-DOM tests can drive it directly.
+const FIND_SKIP = { SCRIPT: 1, STYLE: 1, TEXTAREA: 1, BUTTON: 1, MARK: 1, NOSCRIPT: 1 };
+function findMatches(nodes, query) {
+  const q = String(query).toLowerCase();
+  if (!q) return [];
+  // Matches live in the concatenated text (case-insensitive, non-
+  // overlapping); each hit maps onto one or more node-local ranges.
+  const hay = nodes.map(n => n.nodeValue).join("").toLowerCase();
+  const hits = [];
+  let i = hay.indexOf(q);
+  while (i !== -1) { hits.push([i, i + q.length]); i = hay.indexOf(q, i + q.length); }
+  const out = [];
+  let off = 0;
+  for (const n of nodes) {
+    const s = off, e = off + n.nodeValue.length;
+    for (const [hs, he] of hits) {
+      if (he <= s || hs >= e) continue;
+      out.push({ node: n, start: Math.max(hs - s, 0), end: Math.min(he, e) - s });
+    }
+    off = e;
+  }
+  return out;
+}
+function clearHighlights(root, doc) {
+  (function walk(parent) {
+    for (let i = parent.childNodes.length - 1; i >= 0; i--) {
+      const c = parent.childNodes[i];
+      if (c.nodeType !== 1) continue;
+      // Token match: the active mark's className is "fmark active".
+      if (String(c.className || "").split(/\s+/).includes("fmark")) {
+        let text = "";
+        for (const g of c.childNodes) if (g.nodeType === 3) text += g.nodeValue;
+        // replaceChild, not childNodes.splice — a real browser's
+        // childNodes is a live NodeList with no array methods.
+        parent.replaceChild(doc.createTextNode(text), c);
+      } else walk(c);
+    }
+  })(root);
+}
+function applyHighlights(root, query, doc) {
+  clearHighlights(root, doc);
+  const nodes = [];
+  (function walk(parent) {
+    for (let i = 0; i < parent.childNodes.length; i++) {
+      const c = parent.childNodes[i];
+      if (c.nodeType === 3) { if (c.nodeValue) nodes.push({ node: c, parent }); }
+      else if (c.nodeType === 1 && !FIND_SKIP[c.tagName] && !c.hidden) walk(c);
+    }
+  })(root);
+  const plan = findMatches(nodes.map(r => r.node), query);
+  if (!plan.length) return [];
+  const byNode = new Map();
+  for (const p of plan) {
+    if (!byNode.has(p.node)) byNode.set(p.node, []);
+    byNode.get(p.node).push(p);
+  }
+  const marks = [];
+  // Node references come from the pre-mutation snapshot above, so each
+  // rec.node stays valid however many siblings were already split —
+  // forward order keeps `marks` in document order.
+  for (const rec of nodes) {
+    const ranges = byNode.get(rec.node);
+    if (!ranges) continue;
+    const pieces = [];
+    let pos = 0;
+    for (const r of ranges) {
+      if (r.start > pos) pieces.push(doc.createTextNode(rec.node.nodeValue.slice(pos, r.start)));
+      const mk = doc.createElement("mark");
+      mk.className = "fmark";
+      mk.appendChild(doc.createTextNode(rec.node.nodeValue.slice(r.start, r.end)));
+      pieces.push(mk);
+      marks.push(mk);
+      pos = r.end;
+    }
+    if (pos < rec.node.nodeValue.length)
+      pieces.push(doc.createTextNode(rec.node.nodeValue.slice(pos)));
+    // Standard DOM mutation only — replaceChild for the first piece, then
+    // insertBefore(nextSibling) chains the rest into place. A real
+    // browser's childNodes is a live NodeList with no array methods.
+    rec.parent.replaceChild(pieces[0], rec.node);
+    let prev = pieces[0];
+    for (let p = 1; p < pieces.length; p++) {
+      rec.parent.insertBefore(pieces[p], prev.nextSibling);
+      prev = pieces[p];
+    }
+  }
+  return marks; // document order
+}
+// ==== end damon-find pure module ====
+
+// ---------- in-transcript find bar ----------
+// Ctrl/Cmd+F opens the bar; Ctrl/Cmd+K stays on session search. Matches
+// highlight in place, Enter/Shift+Enter cycle, collapsed long messages
+// and closed <details> rows containing a match auto-expand, Escape or ✕
+// closes and restores focus.
+let findMarks = [], findActive = -1, findPrevFocus = null;
+function openFind() {
+  const bar = $("findBar");
+  if (bar.hidden) {
+    bar.hidden = false;
+    findPrevFocus = document.activeElement;
+    $("findInput").focus();
+    $("findInput").select();
+  }
+}
+function closeFind() {
+  $("findBar").hidden = true;
+  clearHighlights(log, document);
+  findMarks = [];
+  findActive = -1;
+  $("findCount").textContent = "";
+  const back = findPrevFocus && findPrevFocus.isConnected ? findPrevFocus : input;
+  findPrevFocus = null;
+  back.focus();
+}
+function runFind(keepIndex) {
+  const q = $("findInput").value;
+  findMarks = applyHighlights(log, q, document);
+  findActive = -1;
+  // A match inside a collapsed long message or a closed details row must
+  // be visible — expand before the first scroll.
+  for (const m of findMarks) {
+    const folded = m.closest(".msg.folded");
+    if (folded) expandMsg(folded);
+    const det = m.closest("details");
+    if (det && !det.open) det.open = true;
+  }
+  if (!findMarks.length) {
+    $("findCount").textContent = q ? "0/0" : "";
+    return;
+  }
+  const target = keepIndex ? Math.min(keepIndex, findMarks.length - 1) : 0;
+  stepFind(target - findActive); // lands on `target` via wrap-around mod
+}
+function stepFind(dir) {
+  if (!findMarks.length) return;
+  if (findActive >= 0) findMarks[findActive].classList.remove("active");
+  findActive = ((findActive + dir) % findMarks.length + findMarks.length) % findMarks.length;
+  const m = findMarks[findActive];
+  m.classList.add("active");
+  $("findCount").textContent = (findActive + 1) + "/" + findMarks.length;
+  m.scrollIntoView({ block: "center" });
+}
+function refreshFind() {
+  // The transcript re-rendered underneath an open bar (session switch,
+  // turn completed) — re-plan so marks track the new DOM.
+  if ($("findBar").hidden) return;
+  runFind(findActive >= 0 ? findActive : 0);
+}
+$("findInput").addEventListener("input", () => runFind());
+$("findInput").addEventListener("keydown", e => {
+  if (e.key === "Enter") {
+    e.preventDefault();
+    stepFind(e.shiftKey ? -1 : 1);
+  } else if (e.key === "Escape") {
+    e.preventDefault();
+    e.stopPropagation(); // must not also close drawers
+    closeFind();
+  }
+});
+$("findNext").onclick = () => stepFind(1);
+$("findPrev").onclick = () => stepFind(-1);
+$("findClose").onclick = closeFind;
+
 // A closed tab mid-turn kills the connection and cancels the turn —
 // warn while an agent is working.
 window.addEventListener("beforeunload", e => {
@@ -4565,7 +5754,8 @@ if (location.protocol === "http:" || location.protocol === "https:") {
 setConn("pending", "connecting");
 syncEmpty();
 const demoParam = new URLSearchParams(location.search).get("pickerDemo") === "1" ||
-  new URLSearchParams(location.search).get("revealDemo") === "1";
+  new URLSearchParams(location.search).get("revealDemo") === "1" ||
+  new URLSearchParams(location.search).get("findDemo") === "1";
 if (demoParam) {
   // No daemon in demo mode — skip connect so the auth overlay never
   // covers the demo; the stubbed/synthetic events are the whole show.
@@ -4726,6 +5916,40 @@ if (new URLSearchParams(location.search).get("revealDemo") === "1") {
   };
   drip();
 }
+
+// ---------- find demo (?findDemo=1) ----------
+// Smoke hook: a synthetic transcript with long collapsible assistant
+// messages — "needle" recurs across rows, some inside collapsed ones —
+// so find/highlight/expand-on-match is exercisable without a daemon.
+// Works from file:// like the other demos (connect() is skipped above).
+if (new URLSearchParams(location.search).get("findDemo") === "1") {
+  activeSession = "demo";
+  sysline("find demo — press Ctrl/Cmd+F and search \"needle\"; tall rows start collapsed");
+  const para = (i, tag) =>
+    "Paragraph " + i + " — " + tag + " filler text that only exists to give this " +
+    "assistant bubble enough height to trip the long-message collapse. It talks " +
+    "about the rendering pipeline, the find bar, and row folding in general terms.";
+  const rows = [
+    { text: Array.from({ length: 30 }, (_, i) =>
+        i === 12 ? "Paragraph 12 — the first needle hides in this row, deep inside a collapsed bubble." : para(i, "plain")
+      ).join("\n\n") },
+    { user: "short question without the target word" },
+    { text: "A short answer that still mentions needle once, but never folds because it is tiny." },
+    { text: Array.from({ length: 30 }, (_, i) =>
+        i % 6 === 3 ? "Paragraph " + i + " — another needle lands here, row " + i + "." : para(i, "needle-free")
+      ).join("\n\n") },
+    { text: Array.from({ length: 26 }, (_, i) => para(i, "quiet")).join("\n\n") },
+  ];
+  for (const r of rows) {
+    if (r.user) bubble("user", esc(r.user), r.user);
+    else bubble("assistant", mdLite(r.text), r.text);
+  }
+  applyCollapse();
+}
+
+// Boot finished: the main script evaluated and every handler above is
+// wired — from here the watchdog downgrades errors to the toast badge.
+window.__damonBootOk();
 </script>
 </body>
 </html>

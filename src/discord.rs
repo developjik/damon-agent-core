@@ -353,7 +353,13 @@ pub fn incoming_from_message(d: &Value, bot_id: &str) -> Option<Incoming> {
 /// malformed payloads.
 pub fn incoming_from_interaction(d: &Value) -> Option<Incoming> {
     let word = d["data"]["custom_id"].as_str()?.strip_prefix("perm:")?;
-    if !matches!(word, "allow" | "deny" | "always") {
+    // allow/deny/always for tool approvals — plus question-option
+    // labels, which the question lane resolves into answers. Guarded
+    // to the same shape question_option_buttons emits; anything else
+    // is not a permission callback.
+    if !matches!(word, "allow" | "deny" | "always")
+        && (word.is_empty() || word.len() > 48 || word.contains('\n'))
+    {
         return None;
     }
     let sender_id = d["member"]["user"]["id"]
@@ -657,12 +663,17 @@ impl ChannelApi for DiscordChannel {
         thread_id: Option<&str>,
         title: &str,
         actions: &[Value],
+        questions: &[Value],
     ) -> anyhow::Result<()> {
         // Discord threads are channels — thread_id is already folded
         // into chat_id by the bridge's conversation keying.
         let _ = thread_id;
-        let text = crate::channel::permission_prompt_text(title, actions);
-        let buttons: Vec<(String, String, u8)> = crate::channel::permission_choices(actions)
+        let text = if questions.is_empty() {
+            crate::channel::permission_prompt_text(title, actions)
+        } else {
+            crate::channel::question_prompt_text(title, questions)
+        };
+        let mut buttons: Vec<(String, String, u8)> = crate::channel::permission_choices(actions)
             .into_iter()
             .map(|c| {
                 // 3 success for the allow variants, 4 danger for deny.
@@ -670,6 +681,13 @@ impl ChannelApi for DiscordChannel {
                 (c.label, format!("perm:{}", c.word), style)
             })
             .collect();
+        // Question cards: one neutral button per option — a press
+        // echoes the label back through the text path as the answer.
+        buttons.extend(
+            crate::channel::question_option_buttons(questions)
+                .into_iter()
+                .map(|(label, word)| (label, word, 2u8)),
+        );
         self.api.send_button_message(chat_id, &text, &buttons).await
     }
 
@@ -772,9 +790,19 @@ mod tests {
         let menu =
             json!({"channel_id": "C1", "data": {"custom_id": "menu:x"}, "user": {"id": "U1"}});
         assert!(incoming_from_interaction(&menu).is_none());
-        let bad =
-            json!({"channel_id": "C1", "data": {"custom_id": "perm:reboot"}, "user": {"id": "U1"}});
+        // Unknown words pass through as question-option answers —
+        // bounded to the shape question_option_buttons emits. Oversized
+        // or multiline payloads are not presses.
+        let bad = json!({"channel_id": "C1",
+                         "data": {"custom_id": format!("perm:{}", "x".repeat(49))},
+                         "user": {"id": "U1"}});
         assert!(incoming_from_interaction(&bad).is_none());
+        let bad = json!({"channel_id": "C1",
+                         "data": {"custom_id": "perm:two\nlines"},
+                         "user": {"id": "U1"}});
+        assert!(incoming_from_interaction(&bad).is_none());
+        let option = json!({"channel_id": "C1", "data": {"custom_id": "perm:Postgres"}, "user": {"id": "U1"}});
+        assert_eq!(incoming_from_interaction(&option).unwrap().text, "Postgres");
         assert!(incoming_from_interaction(&json!({"data": {"custom_id": "perm:allow"}})).is_none());
     }
 

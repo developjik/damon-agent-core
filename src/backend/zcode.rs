@@ -25,18 +25,40 @@
 //!   `permission.requested/resolved`, `userInput.requested/resolved`,
 //!   `checkpoint.created`.
 //! - Interrupt: `session/stop`.
+//! - Listing: `session/list {workspace?{workspacePath, workspaceKey},
+//!   sessionIds?, includeArchived?, limit?}` → `{sessions:[{sessionId,
+//!   title, mode, status, sessionKind, createdAt, updatedAt, workspace}]}`.
+//!   The workspace filter is an exact-directory match (the CLI's
+//!   --resume-by-cwd semantics) — verified live: cwd filter returned this
+//!   repo's sessions, its parent dir returned none. `updatedAt` is epoch
+//!   milliseconds.
+//! - Modes: `session/setMode {sessionId, mode}` — the protocol enum is
+//!   `plan|build|edit|yolo|auto` (live-verified: a bogus mode answers
+//!   -32602 listing exactly those). Fresh sessions default to `build`.
+//! - Model: `session/setModel {sessionId, model:{providerId, modelId,
+//!   options?}}` — providerId is REQUIRED. The runtime resolves against
+//!   its provider registry, which a bare `app-server --stdio` starts
+//!   with EMPTY (the CLI pushes `provider/updateAccountConfig` from its
+//!   own login state); until then every well-formed setModel answers
+//!   -32603 "Provider Registry 中不存在 Model". Registered providerIds
+//!   in this install: zai, bigmodel, custom.
+//! - MCP: `session/create` (and `mcp/list`, which also takes them for
+//!   status checks) accept `mcpServers: [{name, command, args, env:
+//!   [{name, value}], timeoutMs?/isolation?/protocolVersion?}]` for
+//!   stdio (or `{name, type:"http"|"sse", url, headers}`); verified live
+//!   via `mcp/list` statuses keyed by server name with transport stdio.
 //!
 //! One process = one conversation. The persistence handle is the
 //! `sess_…` id.
 
 use std::collections::HashMap;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::sync::Weak;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
 
-use anyhow::{Context, Result, bail};
+use anyhow::{Context, Result};
 use async_trait::async_trait;
 use serde_json::{Value, json};
 use tokio::sync::{Mutex, broadcast};
@@ -58,17 +80,7 @@ impl ZcodeClient {
     pub fn new(resolved: ResolvedBackend) -> Self {
         Self {
             resolved,
-            caps: Capabilities {
-                streaming: true,
-                session_persistence: true,
-                session_listing: false,
-                dynamic_modes: false,
-                mcp_servers: false,
-                reasoning_stream: true,
-                steer: false,
-                rewind: false,
-                subagent_events: false,
-            },
+            caps: capabilities(),
         }
     }
 }
@@ -88,9 +100,17 @@ impl AgentClient for ZcodeClient {
     }
 
     async fn fetch_catalog(&self, _cwd: Option<&Path>) -> Result<ProviderCatalog> {
-        // Model selection rides session/create's `model` field; thought
-        // levels switch per-session. No cold listing wire.
-        Ok(ProviderCatalog::default())
+        // Model selection rides session/create's `model` field (and
+        // session/setModel at runtime); there is no model-listing wire
+        // method and the provider registry starts empty without the
+        // CLI's account-config push — so models stay unlisted while
+        // explicit selection still works, matching qwen's convention.
+        // Modes are the live-verified protocol enum.
+        Ok(ProviderCatalog {
+            models: vec![],
+            modes: zcode_modes(),
+            default_mode: Some("build".to_string()),
+        })
     }
 
     async fn create_session(&self, config: SessionConfig) -> Result<Arc<dyn AgentSession>> {
@@ -107,8 +127,205 @@ impl AgentClient for ZcodeClient {
                 as Arc<dyn AgentSession>,
         )
     }
+
+    /// `session/list` against a throwaway app-server process. No
+    /// session/create is needed — the method answers from the store
+    /// right after boot, so this spawns the transport alone and keeps
+    /// a side answerer for any server→client request that shows up.
+    /// Any failure degrades to an empty list (the caller treats
+    /// listing as best-effort, matching the codex backend).
+    async fn list_importable_sessions(&self, cwd: &Path) -> Result<Vec<ImportableSession>> {
+        let env: HashMap<String, String> = self.resolved.env.iter().cloned().collect();
+        let Ok(transport) =
+            NdjsonTransport::spawn(&self.resolved.command, &self.resolved.args, &env, cwd).await
+        else {
+            return Ok(vec![]);
+        };
+        // Answer-and-forget loop: silence toward a server→client
+        // request would wedge the exchange.
+        let answerer = {
+            let transport = transport.clone();
+            let mut rx = transport.subscribe();
+            tokio::spawn(async move {
+                loop {
+                    match rx.recv().await {
+                        Ok(f) if f.get("method").is_some() && f.get("id").is_some() => {
+                            let _ = transport
+                                .send(json!({"id": f["id"].clone(), "result": {}}))
+                                .await;
+                        }
+                        Ok(_) => {}
+                        Err(broadcast::error::RecvError::Closed) => break,
+                        Err(broadcast::error::RecvError::Lagged(_)) => continue,
+                    }
+                }
+            })
+        };
+        let result = request_roundtrip(
+            &transport,
+            "1",
+            json!({"id": 1, "method": "session/list", "params": list_params(cwd)}),
+            CONTROL_TIMEOUT,
+        )
+        .await;
+        answerer.abort();
+        transport.shutdown().await;
+        let Ok(v) = result else { return Ok(vec![]) };
+        let Some(items) = v["sessions"].as_array() else {
+            return Ok(vec![]);
+        };
+        Ok(items.iter().filter_map(map_session_item).collect())
+    }
 }
 
+/// Capability set, shared by the client and every session it spawns.
+/// rewind stays false: checkpoints live CLI-side and damon has no
+/// rewind consumer. subagent_events stays false: zcode has no push
+/// notification family for subagents — `session/subagents` is a pull
+/// request over store-backed sessions only (a freshly created live
+/// session answers -32004 "Session not found", verified live), so
+/// there is nothing to stream.
+fn capabilities() -> Capabilities {
+    Capabilities {
+        streaming: true,
+        session_persistence: true,
+        session_listing: true,
+        dynamic_modes: true,
+        mcp_servers: true,
+        reasoning_stream: true,
+        steer: false,
+        rewind: false,
+        subagent_events: false,
+        tool_allowlist: false,
+    }
+}
+
+/// The mode enum the protocol accepts — live-verified: `session/setMode`
+/// with a bogus mode answers -32602 "expected one of
+/// "plan"|"build"|"edit"|"yolo"|"auto"". `build` is the live default
+/// (fresh sessions report `settings.mode.current: "build"`); the CLI's
+/// `--mode yolo` headless default does not apply to the app-server wire.
+fn zcode_modes() -> Vec<ModeDef> {
+    [
+        ("plan", Some("plan before executing a task")),
+        ("build", Some("default mode")),
+        ("edit", None),
+        ("yolo", None),
+        ("auto", None),
+    ]
+    .into_iter()
+    .map(|(id, description)| ModeDef {
+        id: id.to_string(),
+        name: id.to_string(),
+        description: description.map(String::from),
+    })
+    .collect()
+}
+
+/// `session/list` params scoped to one workspace directory — the
+/// server's exact-directory match mirrors the CLI's --resume-by-cwd
+/// (parent dirs do NOT match; verified live). `workspaceKey` is
+/// schema-required whenever `workspace` is present; matching rides
+/// `workspacePath` alone.
+fn list_params(cwd: &Path) -> Value {
+    json!({
+        "workspace": {
+            "workspacePath": cwd.to_string_lossy(),
+            "workspaceKey": workspace_key(cwd),
+        }
+    })
+}
+
+fn workspace_key(cwd: &Path) -> String {
+    format!(
+        "damon-{}",
+        cwd.file_name()
+            .map(|s| s.to_string_lossy().to_string())
+            .unwrap_or_else(|| "ws".to_string())
+    )
+}
+
+/// session/list item → ImportableSession. `title` is "" on sessions
+/// that never got one (verified live) — surfaced as None. `updatedAt`
+/// is epoch milliseconds.
+fn map_session_item(item: &Value) -> Option<ImportableSession> {
+    let id = item["sessionId"].as_str()?;
+    Some(ImportableSession {
+        handle: PersistenceHandle {
+            provider: "zcode".to_string(),
+            native_handle: id.to_string(),
+            metadata: item.clone(),
+        },
+        title: item["title"]
+            .as_str()
+            .filter(|t| !t.is_empty())
+            .map(String::from),
+        cwd: item["workspace"]["workspacePath"]
+            .as_str()
+            .map(PathBuf::from),
+        modified_at: item["updatedAt"].as_u64().map(|ms| ms / 1000),
+        size: None,
+    })
+}
+
+/// Damon's MCP map → the protocol's `mcpServers` array (stdio shape:
+/// `{name, command, args, env: [{name, value}]}`; env is an array of
+/// pairs on the wire, key-sorted here for deterministic frames).
+/// Servers with no command are unrepresentable and skipped; `None`
+/// when nothing remains, so create frames stay minimal.
+fn mcp_servers_param(servers: &HashMap<String, McpServerConfig>) -> Option<Value> {
+    let mut names: Vec<&String> = servers.keys().collect();
+    names.sort();
+    let list: Vec<Value> = names
+        .iter()
+        .filter_map(|name| {
+            let s = servers.get(*name)?;
+            if s.command.is_empty() {
+                return None;
+            }
+            let mut env: Vec<&String> = s.env.keys().collect();
+            env.sort();
+            let env_pairs: Vec<Value> = env
+                .iter()
+                .map(|k| json!({"name": k, "value": s.env[*k]}))
+                .collect();
+            json!({
+                "name": name,
+                "command": s.command,
+                "args": s.args,
+                "env": env_pairs,
+            })
+            .into()
+        })
+        .collect();
+    (!list.is_empty()).then_some(Value::Array(list))
+}
+
+/// "provider/model" → (provider, model); a bare id defaults to the
+/// `zai` provider (this install's account provider; the registry also
+/// knows `bigmodel` and `custom`).
+fn split_model(model: &str) -> (String, String) {
+    model
+        .split_once('/')
+        .map(|(p, m)| (p.to_string(), m.to_string()))
+        .unwrap_or_else(|| ("zai".to_string(), model.to_string()))
+}
+
+fn set_mode_params(session_id: &str, mode: &str) -> Value {
+    json!({"sessionId": session_id, "mode": mode})
+}
+
+/// `model` carries `providerId` + `modelId` (providerId is required —
+/// a bare `{modelId}` answers -32602, verified live).
+fn set_model_params(session_id: &str, model: &str) -> Value {
+    let (provider_id, model_id) = split_model(model);
+    json!({
+        "sessionId": session_id,
+        "model": {"providerId": provider_id, "modelId": model_id},
+    })
+}
+
+#[derive(Clone)]
 struct PendingAsk {
     /// The JSON-RPC id of the server→client interaction request.
     rpc_id: Value,
@@ -141,17 +358,7 @@ impl ZcodeSession {
         let (events, _) = broadcast::channel(512);
         let session = Arc::new(Self {
             transport: transport.clone(),
-            caps: Capabilities {
-                streaming: true,
-                session_persistence: true,
-                session_listing: false,
-                dynamic_modes: false,
-                mcp_servers: false,
-                reasoning_stream: true,
-                steer: false,
-                rewind: false,
-                subagent_events: false,
-            },
+            caps: capabilities(),
             events,
             next_id: AtomicU64::new(1),
             session_id: Mutex::new(None),
@@ -199,14 +406,7 @@ impl ZcodeSession {
 
         // Create (or resume) the session before returning. workspaceKey
         // is the caller-chosen slug; the path is authoritative.
-        let key = format!(
-            "damon-{}",
-            config
-                .cwd
-                .file_name()
-                .map(|s| s.to_string_lossy().to_string())
-                .unwrap_or_else(|| "ws".to_string())
-        );
+        let key = workspace_key(&config.cwd);
         let mut params = json!({
             "workspace": {
                 "workspacePath": config.cwd.to_string_lossy(),
@@ -214,7 +414,17 @@ impl ZcodeSession {
             }
         });
         if let Some(model) = &config.model {
-            params["model"] = json!({"modelId": model});
+            // Create-time model must carry providerId + modelId (the
+            // schema rejects a bare modelId). Note: the runtime's
+            // provider registry starts empty in a bare app-server run —
+            // until the CLI's account-config push equivalent exists,
+            // this fails the whole create rather than degrading, so it
+            // stays opt-in via config.model.
+            let (provider_id, model_id) = split_model(model);
+            params["model"] = json!({"providerId": provider_id, "modelId": model_id});
+        }
+        if let Some(mcp_servers) = mcp_servers_param(&config.mcp_servers) {
+            params["mcpServers"] = mcp_servers;
         }
         let method = if let Some(id) = resume {
             params = json!({"sessionId": id});
@@ -346,6 +556,7 @@ impl ZcodeSession {
                     detail: Some(map_tool_input(&name, &input)),
                     actions,
                     suggestions: vec![],
+                    questions: Vec::new(),
                 };
                 self.register_ask(ask, rpc_id, option_responses, false)
                     .await;
@@ -359,6 +570,7 @@ impl ZcodeSession {
                     .to_string();
                 let mut option_responses = HashMap::new();
                 let mut actions = vec![];
+                let mut options = vec![];
                 if let Some(opts) = p["options"].as_array() {
                     for o in opts {
                         let oid = o["optionId"]
@@ -376,13 +588,23 @@ impl ZcodeSession {
                             o.get("response").cloned().unwrap_or(Value::Null),
                         );
                         actions.push(PermissionAction {
-                            id: oid,
-                            label,
+                            id: oid.clone(),
+                            label: label.clone(),
                             behavior: PermissionBehavior::Allow,
                             variant: None,
                         });
+                        options.push(QuestionOption {
+                            label,
+                            description: o["description"].as_str().map(String::from),
+                        });
                     }
                 }
+                let questions = vec![QuestionField {
+                    question: question.clone(),
+                    header: None,
+                    options,
+                    multi_select: false,
+                }];
                 let ask = PermissionRequest {
                     id: uuid::Uuid::new_v4().to_string(),
                     kind: PermissionKind::Question,
@@ -392,6 +614,7 @@ impl ZcodeSession {
                     detail: None,
                     actions,
                     suggestions: vec![],
+                    questions,
                 };
                 self.register_ask(ask, rpc_id, option_responses, true).await;
             }
@@ -650,14 +873,34 @@ impl AgentSession for ZcodeSession {
         request_id: &str,
         response: PermissionResponse,
     ) -> Result<()> {
-        let Some(ask) = self.pending_asks.lock().await.remove(request_id) else {
-            bail!("no pending permission {request_id}");
+        // Peek, don't remove: a failed send leaves the ask pending and
+        // answerable; an unknown id is a typed AskNotFound.
+        let ask = {
+            let asks = self.pending_asks.lock().await;
+            asks.get(request_id)
+                .cloned()
+                .ok_or_else(|| anyhow::Error::new(AskNotFound(request_id.to_string())))?
         };
         let result = match &response {
             PermissionResponse::Allow {
-                action_id, answer, ..
+                action_id,
+                answer,
+                answers,
+                ..
             } => {
-                let chosen = action_id.clone().or_else(|| answer.clone());
+                // A structured `answers` map resolves by question text —
+                // matched against the option labels first so a picked
+                // option carries its verbatim response payload.
+                let from_answers = answers.as_ref().and_then(|a| match a {
+                    Value::Object(map) => map.values().find_map(|v| match v {
+                        Value::String(s) => Some(s.clone()),
+                        Value::Array(arr) => arr.iter().find_map(|x| x.as_str()).map(String::from),
+                        _ => None,
+                    }),
+                    Value::String(s) => Some(s.clone()),
+                    _ => None,
+                });
+                let chosen = action_id.clone().or(answer.clone()).or(from_answers);
                 match chosen
                     .as_deref()
                     .and_then(|id| ask.option_responses.get(id))
@@ -679,8 +922,48 @@ impl AgentSession for ZcodeSession {
         self.transport
             .send(json!({"id": ask.rpc_id, "result": result}))
             .await?;
+        self.pending_asks.lock().await.remove(request_id);
         self.emit(StreamEvent::new(StreamEventKind::PermissionResolved {
             request_id: request_id.to_string(),
+        }));
+        Ok(())
+    }
+
+    /// Runtime mode switch — `session/setMode {sessionId, mode}`, one
+    /// of the protocol enum ids (plan|build|edit|yolo|auto). Accepted
+    /// live on a real session; the server echoes a `state.updated`
+    /// notification carrying the new mode.
+    async fn set_mode(&self, mode: &str) -> Result<()> {
+        let sid = self.session_id.lock().await.clone().unwrap_or_default();
+        self.request(
+            "session/setMode",
+            set_mode_params(&sid, mode),
+            CONTROL_TIMEOUT,
+        )
+        .await?;
+        self.emit(StreamEvent::new(StreamEventKind::ModeChanged {
+            mode: Some(mode.to_string()),
+        }));
+        Ok(())
+    }
+
+    /// Runtime model switch — `session/setModel {sessionId,
+    /// model:{providerId, modelId}}`. The frame is protocol-correct,
+    /// but resolution runs against the runtime's provider registry,
+    /// which a bare `app-server --stdio` leaves empty until the
+    /// CLI's `provider/updateAccountConfig` push (damon cannot
+    /// fabricate that payload); until then a well-formed switch
+    /// answers -32603 and no ModelChanged is emitted.
+    async fn set_model(&self, model: &str) -> Result<()> {
+        let sid = self.session_id.lock().await.clone().unwrap_or_default();
+        self.request(
+            "session/setModel",
+            set_model_params(&sid, model),
+            CONTROL_TIMEOUT,
+        )
+        .await?;
+        self.emit(StreamEvent::new(StreamEventKind::ModelChanged {
+            model: model.to_string(),
         }));
         Ok(())
     }
@@ -725,5 +1008,75 @@ mod tests {
                 || label.to_lowercase().contains("reject");
             assert_eq!(deny, label != "Allow once", "{label}");
         }
+    }
+
+    /// Verified live: session/list answers post-boot, setMode/setModel
+    /// accept real frames, mcp/list keys statuses by server name —
+    /// all three affordances are advertised.
+    #[test]
+    fn capability_flags_advertised() {
+        let c = capabilities();
+        assert!(c.session_listing);
+        assert!(c.dynamic_modes);
+        assert!(c.mcp_servers);
+        assert!(!c.rewind);
+        assert!(!c.subagent_events);
+    }
+
+    /// The catalog is the protocol's own enum — a bogus `session/setMode`
+    /// answered -32602 listing exactly plan|build|edit|yolo|auto, and a
+    /// fresh session reports `settings.mode.current: "build"`.
+    #[test]
+    fn mode_catalog_matches_protocol_enum() {
+        let modes = zcode_modes();
+        assert_eq!(
+            modes.iter().map(|m| m.id.as_str()).collect::<Vec<_>>(),
+            ["plan", "build", "edit", "yolo", "auto"]
+        );
+        let cat = ProviderCatalog {
+            models: vec![],
+            modes: zcode_modes(),
+            default_mode: Some("build".to_string()),
+        };
+        assert_eq!(cat.default_mode.as_deref(), Some("build"));
+    }
+
+    /// Damon's MCP map → the wire's array-of-named-stdio-servers shape
+    /// (env as {name, value} pairs, deterministic ordering). Verified
+    /// live: the identical array came back keyed by name in mcp/list
+    /// statuses with transport stdio, and session/create accepted it.
+    /// (The archive capture of this test ends mid-scenario after the
+    /// empty-map assertion — restored exactly that far.)
+    #[test]
+    fn mcp_translation_shape() {
+        let mut servers = HashMap::new();
+        servers.insert(
+            "echo".to_string(),
+            McpServerConfig {
+                command: "/bin/echo".to_string(),
+                args: vec!["--hi".to_string()],
+                env: HashMap::from([("FOO".to_string(), "bar".to_string())]),
+            },
+        );
+        servers.insert(
+            "aaa".to_string(),
+            McpServerConfig {
+                command: "/bin/true".to_string(),
+                args: vec![],
+                env: HashMap::new(),
+            },
+        );
+        let v = mcp_servers_param(&servers).unwrap();
+        let list = v.as_array().unwrap();
+        assert_eq!(list.len(), 2);
+        assert_eq!(list[0]["name"], "aaa");
+        assert_eq!(list[1]["name"], "echo");
+        assert_eq!(list[1]["command"], "/bin/echo");
+        assert_eq!(list[1]["args"][0], "--hi");
+        assert_eq!(list[1]["env"][0]["name"], "FOO");
+        assert_eq!(list[1]["env"][0]["value"], "bar");
+
+        // No representable servers → no field at all.
+        assert!(mcp_servers_param(&HashMap::new()).is_none());
     }
 }

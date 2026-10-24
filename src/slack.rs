@@ -323,7 +323,9 @@ struct PermAction {
     chat_id: String,
     thread_id: Option<String>,
     sender_id: String,
-    word: &'static str,
+    /// The reply word ("allow"/"deny"/"always") or the pressed
+    /// question-option label.
+    word: String,
     /// The prompt message's ts — chat.update target for stripping the
     /// now-resolved buttons.
     ts: String,
@@ -340,7 +342,13 @@ fn perm_action(v: &Value) -> Option<PermAction> {
     let word = p["actions"][0]["action_id"]
         .as_str()?
         .strip_prefix("perm:")?;
-    if !matches!(word, "allow" | "deny" | "always") {
+    // allow/deny/always for tool approvals — plus question-option
+    // labels, which the question lane resolves into answers. Guarded
+    // to the same shape question_option_buttons emits; anything else
+    // is not a permission callback.
+    if !matches!(word, "allow" | "deny" | "always")
+        && (word.is_empty() || word.len() > 48 || word.contains('\n'))
+    {
         return None;
     }
     Some(PermAction {
@@ -348,10 +356,17 @@ fn perm_action(v: &Value) -> Option<PermAction> {
         thread_id: p["message"]["thread_ts"].as_str().map(String::from),
         sender_id: p["user"]["id"].as_str()?.to_string(),
         word: match word {
-            "allow" => "allow",
-            "deny" => "deny",
-            _ => "always",
-        },
+            "allow" | "deny" | "always" => {
+                // Keep the static form for the standard words.
+                match word {
+                    "deny" => "deny",
+                    "always" => "always",
+                    _ => "allow",
+                }
+            }
+            other => other,
+        }
+        .to_string(),
         ts: p["message"]["ts"].as_str()?.to_string(),
     })
 }
@@ -618,8 +633,9 @@ impl ChannelApi for SlackChannel {
         thread_id: Option<&str>,
         title: &str,
         actions: &[Value],
+        questions: &[Value],
     ) -> anyhow::Result<()> {
-        let elements: Vec<Value> = crate::channel::permission_choices(actions)
+        let mut elements: Vec<Value> = crate::channel::permission_choices(actions)
             .into_iter()
             .map(|c| {
                 let label = match c.word {
@@ -642,17 +658,30 @@ impl ChannelApi for SlackChannel {
                 btn
             })
             .collect();
+        // Question cards: one neutral button per option — a press
+        // echoes the label back through the text path as the answer.
+        elements.extend(
+            crate::channel::question_option_buttons(questions)
+                .into_iter()
+                .map(|(label, word)| {
+                    json!({
+                        "type": "button",
+                        "text": {"type": "plain_text", "text": format!("💬 {label}"), "emoji": true},
+                        "action_id": word,
+                    })
+                }),
+        );
         let blocks = vec![
             json!({"type": "section", "text": {"type": "mrkdwn", "text": escape_mrkdwn(title)}}),
             json!({"type": "actions", "elements": elements}),
         ];
+        let fallback = if questions.is_empty() {
+            crate::channel::permission_prompt_text(title, actions)
+        } else {
+            crate::channel::question_prompt_text(title, questions)
+        };
         self.api
-            .post_blocks(
-                chat_id,
-                thread_id,
-                &crate::channel::permission_prompt_text(title, actions),
-                blocks,
-            )
+            .post_blocks(chat_id, thread_id, &fallback, blocks)
             .await
     }
 
@@ -929,15 +958,33 @@ mod tests {
                         "message": {"ts": "1"}}
         });
         assert!(perm_action(&menu).is_none());
-        // Unknown word — only allow/deny/always synthesize.
+        // Unknown words pass through as question-option answers —
+        // bounded to the shape question_option_buttons emits. Oversized
+        // or multiline payloads are not presses.
         let bad = json!({
             "type": "interactive",
             "payload": {"type": "block_actions",
-                        "actions": [{"action_id": "perm:reboot"}],
+                        "actions": [{"action_id": format!("perm:{}", "x".repeat(49))}],
                         "user": {"id": "U1"}, "channel": {"id": "C1"},
                         "message": {"ts": "1"}}
         });
         assert!(perm_action(&bad).is_none());
+        let bad = json!({
+            "type": "interactive",
+            "payload": {"type": "block_actions",
+                        "actions": [{"action_id": "perm:two\nlines"}],
+                        "user": {"id": "U1"}, "channel": {"id": "C1"},
+                        "message": {"ts": "1"}}
+        });
+        assert!(perm_action(&bad).is_none());
+        let option = json!({
+            "type": "interactive",
+            "payload": {"type": "block_actions",
+                        "actions": [{"action_id": "perm:Postgres"}],
+                        "user": {"id": "U1"}, "channel": {"id": "C1"},
+                        "message": {"ts": "1"}}
+        });
+        assert_eq!(perm_action(&option).unwrap().word, "Postgres");
         // Other interactive flavors (view_submission, shortcuts).
         let view = json!({"type": "interactive", "payload": {"type": "view_submission"}});
         assert!(perm_action(&view).is_none());
@@ -991,6 +1038,7 @@ mod tests {
                 Some("1234.0001"),
                 "Bash <rm> & files",
                 actions.as_array().unwrap(),
+                &[],
             )
             .await
             .unwrap();

@@ -65,6 +65,22 @@ impl StreamJsonDialect for ClaudeDialect {
             args.push("--resume".to_string());
             args.push(id.to_string());
         }
+        // Granted roots widen claude's own sandbox: one --add-dir per
+        // effective grant (global + the session project's). Only this
+        // dialect has a native widening flag — other backends ignore
+        // config.granted_roots rather than fake it.
+        for dir in &config.granted_roots {
+            args.push("--add-dir".to_string());
+            args.push(dir.to_string_lossy().into_owned());
+        }
+        if !config.allowed_tools.is_empty() {
+            // Mission read-only stages: one comma-joined --allowedTools
+            // flag. Only this dialect can enforce the list at launch —
+            // mission start refuses such nodes elsewhere (capability
+            // tool_allowlist), so the flag always means what it says.
+            args.push("--allowedTools".to_string());
+            args.push(config.allowed_tools.join(","));
+        }
         if !config.mcp_servers.is_empty() {
             // Claude takes MCP servers as a JSON config flag.
             let servers: Value = config
@@ -217,10 +233,9 @@ impl StreamJsonDialect for ClaudeDialect {
             let Some(stem) = path.file_stem().and_then(|s| s.to_str()) else {
                 continue;
             };
-            let modified = entry
-                .metadata()
-                .await
-                .ok()
+            let meta = entry.metadata().await.ok();
+            let modified = meta
+                .as_ref()
                 .and_then(|m| m.modified().ok())
                 .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
                 .map(|d| d.as_secs());
@@ -233,6 +248,7 @@ impl StreamJsonDialect for ClaudeDialect {
                 title: transcript_title(&path).await,
                 cwd: Some(cwd.to_path_buf()),
                 modified_at: modified,
+                size: meta.as_ref().map(|m| m.len()),
             });
         }
         Ok(out)
@@ -249,6 +265,7 @@ impl StreamJsonDialect for ClaudeDialect {
             steer: true,
             rewind: false,
             subagent_events: true,
+            tool_allowlist: true,
         }
     }
 }
@@ -303,11 +320,36 @@ impl ClaudeDialect {
             "can_use_tool" => {
                 let tool = req["tool_name"].as_str().unwrap_or_default().to_string();
                 let input = req["input"].clone();
+                // AskUserQuestion rides can_use_tool as a question card:
+                // parse its native questions array into normalized fields.
+                let questions = parse_questions(
+                    input["questions"]
+                        .as_array()
+                        .map(Vec::as_slice)
+                        .unwrap_or(&[]),
+                );
+                let kind = if questions.is_empty() {
+                    // ExitPlanMode is claude's plan-approval ask: the
+                    // plan text rides input.plan, and the daemon gates
+                    // it through the durable plan-review row (see
+                    // PermissionKind::Plan).
+                    if tool == "ExitPlanMode" {
+                        PermissionKind::Plan
+                    } else {
+                        PermissionKind::Tool
+                    }
+                } else {
+                    PermissionKind::Question
+                };
                 let ask = PermissionRequest {
                     id: uuid::Uuid::new_v4().to_string(),
-                    kind: PermissionKind::Tool,
+                    kind,
                     name: tool.clone(),
-                    title: Some(format!("{tool} wants to run")),
+                    title: Some(if tool == "ExitPlanMode" {
+                        "Plan ready for review".to_string()
+                    } else {
+                        format!("{tool} wants to run")
+                    }),
                     input: Some(input.clone()),
                     detail: Some(map_tool_input(&tool, &input)),
                     actions: vec![
@@ -328,6 +370,7 @@ impl ClaudeDialect {
                         .as_array()
                         .cloned()
                         .unwrap_or_default(),
+                    questions,
                 };
                 session.register_ask(ask, request_id).await;
             }
@@ -408,6 +451,37 @@ mod tests {
         assert!(!c.rewind);
         assert!(c.mcp_servers);
         assert!(c.steer);
+    }
+
+    /// Granted roots ride the launch line as one --add-dir <root>
+    /// pair per effective grant, after resume and before MCP config.
+    #[test]
+    fn launch_args_carry_add_dir_per_granted_root() {
+        let d = ClaudeDialect::dialect();
+        let config = SessionConfig {
+            granted_roots: vec![
+                std::path::PathBuf::from("/tmp/extra-a"),
+                std::path::PathBuf::from("/tmp/extra-b"),
+            ],
+            ..Default::default()
+        };
+        let args = d.launch_args(&config, Some("native-1"));
+        let pairs: Vec<&str> = args
+            .windows(2)
+            .filter(|w| w[0] == "--add-dir")
+            .map(|w| w[1].as_str())
+            .collect();
+        assert_eq!(pairs, ["/tmp/extra-a", "/tmp/extra-b"], "{args:?}");
+        // Resume flag still present alongside.
+        assert!(
+            args.windows(2)
+                .any(|w| w[0] == "--resume" && w[1] == "native-1")
+        );
+
+        // No grants → no --add-dir (byte-identical to the old line).
+        let args = d.launch_args(&SessionConfig::default(), None);
+        assert!(!args.contains(&"--add-dir".to_string()), "{args:?}");
+        assert!(args.is_empty());
     }
 
     #[tokio::test]

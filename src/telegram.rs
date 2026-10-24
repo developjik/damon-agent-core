@@ -485,15 +485,18 @@ impl ChannelApi for TelegramChannel {
         thread_id: Option<&str>,
         title: &str,
         actions: &[Value],
+        questions: &[Value],
     ) -> anyhow::Result<()> {
         let id: i64 = chat_id
             .parse()
             .map_err(|_| anyhow::anyhow!("invalid telegram chat_id: {chat_id}"))?;
         let tid: Option<i64> = thread_id.and_then(|t| t.parse().ok());
-        let text = crate::channel::to_telegram_html(&crate::channel::permission_prompt_text(
-            title, actions,
-        ));
-        let buttons: Vec<(String, String)> = crate::channel::permission_choices(actions)
+        let text = crate::channel::to_telegram_html(&if questions.is_empty() {
+            crate::channel::permission_prompt_text(title, actions)
+        } else {
+            crate::channel::question_prompt_text(title, questions)
+        });
+        let mut buttons: Vec<(String, String)> = crate::channel::permission_choices(actions)
             .into_iter()
             .map(|c| {
                 // allow/deny get their affordance emoji; the scoped
@@ -506,6 +509,13 @@ impl ChannelApi for TelegramChannel {
                 (label, format!("perm:{}", c.word))
             })
             .collect();
+        // Question cards: one button per option — a press echoes the
+        // label back through the text path as the answer.
+        buttons.extend(
+            crate::channel::question_option_buttons(questions)
+                .into_iter()
+                .map(|(label, word)| (format!("💬 {label}"), word)),
+        );
         self.tg.send_buttons(id, &text, tid, &buttons).await
     }
 
@@ -607,7 +617,13 @@ struct PermCallback {
 fn perm_callback(u: &Value) -> Option<PermCallback> {
     let cq = &u["callback_query"];
     let word = cq["data"].as_str()?.strip_prefix("perm:")?;
-    if !matches!(word, "allow" | "deny" | "always") {
+    // allow/deny/always for tool approvals — plus question-option
+    // labels, which the question lane resolves into answers. Guarded
+    // to the same shape question_option_buttons emits; anything else
+    // is not a permission callback.
+    if !matches!(word, "allow" | "deny" | "always")
+        && (word.is_empty() || word.len() > 48 || word.contains('\n'))
+    {
         return None;
     }
     Some(PermCallback {
@@ -946,7 +962,7 @@ mod tests {
         .as_array()
         .unwrap()
         .clone();
-        ch.send_permission("42", None, "run command", &actions)
+        ch.send_permission("42", None, "run command", &actions, &[])
             .await
             .unwrap();
         let sent = tg.sent.lock();

@@ -23,7 +23,11 @@ a long `turn.start` never serializes the socket.
 
 Auth: `Authorization: Bearer <token>` header, or a single-use
 `?ticket=` from `POST /v1/ws_ticket` (query-string tokens are refused —
-they leak into logs). Loopback + no configured token → open.
+they leak into logs). Loopback + no configured token → open. The
+ticket endpoint also accepts an approved web device's own token in the
+body (`{"deviceToken": …}`) — the per-device revokable credential from
+pairing (see [Web devices](#web-devices)); the master bearer path is
+unchanged.
 
 ## Error codes
 
@@ -46,6 +50,8 @@ parsing messages:
 | `-32005` | response over the 1 MiB frame budget | page via `limit`/`offset` |
 | `-32006` | a turn is already running on the session | wait for `turn.*` events, or `turn.cancel` first |
 | `-32007` | worktree operation failed — `error.data.kind` carries the taxonomy | branch on `data.kind` (`pr_not_found`, `branch_exists`, …) |
+| `-32008` | no pending ask for that `requestId` (`ASK_NOT_FOUND`) — already answered, settled by the agent, or its turn ended | stop retrying that card |
+| `-32009` | plan-review conflict (`PLAN_CONFLICT`) — another surface claimed the decision, or the call targeted a stale revision / closed plan | refetch via `plan.list` and decide on the current revision |
 
 Pre-0.5.0 daemons answered every error with `-32000`; messages are
 unchanged, so string-matching clients keep working.
@@ -56,12 +62,17 @@ unchanged, so string-matching clients keep working.
 |---|---|---|
 | `hello` | — | `{protocol, daemon, version, backends[], methods[]}` |
 | `backend.list` | — | `{backends: [{id, available, capabilities}]}` |
+| `backend.versions` | `{backend?}` — one backend, else the whole catalog | `{versions: [{backend, installed, version?, latest?, updateAvailable, updateKind: "npm"\|"manual"\|"unknown"}]}` — `latest` only where an npm package is verified; probes run on this call only, never scheduled |
+| `backend.update_plan` | `{backend}` | `{backend, action: "install"\|"update", kind, command[], manualCommand, canRun, blockers[], platform}` — the exact argv `backend.update` runs plus the copy-paste fallback; no side effects |
+| `backend.update` | `{backend, creationId?}` | `{creationId, ok: true, version?}` — runs the plan (npm global install or the CLI's official installer); progress streams to the requesting connection as `{"event":"backend.update_progress","creationId","data":{phase, line?, exitOk?}}` with per-line caps; `-32602` when the backend has no verified channel (see the plan's blockers), `-32000` on failure or the 420s timeout (output tail rides the message) |
+| `backend.update_cancel` | `{creationId}` | `{cancelled: bool}` — false when no live run holds the id |
 | `session.create` | `{backend?, cwd?, model?, mode?, mcpServers?, projectId?}` — the project scopes the session: its root becomes the cwd default and its defaults fill unset params (explicit always wins) | `{sessionId, backend, replayed}` |
 | `session.resume` | `{sessionId}` — or `{handle:{provider,native_handle}, cwd?, title?}` to import a native session | `{sessionId, backend, replayed}` |
 | `session.messages` | `{sessionId, limit?, offset?}` | `{messages: [{id, session_id, role, ts, data}]}` |
 | `session.export` | `{sessionId}` | `{session: {sessionId, createdAt, backend, title, tags, cwd}, messages: [{id, role, ts, data}], usage: {contextUsed, contextSize, costUsd, turns}}` |
 | `session.import` | `{backend, cwd?}` | `{sessions: [ImportableSession]}` |
 | `session.delete` | `{sessionId}` | `{deleted: bool}` |
+| `session.rescan` | `{}` | `{scanId, alreadyRunning, report: {scanned, reparsed, reused, archived, tombstoned, skippedBackends[]}}` — sweeps every backend's native session storage and creates damon bookmark rows for sessions the daemon has never seen; single-flight (a second call while one runs returns the in-flight `scanId`); progress streams to the requesting connection as `{"event":"history.scan_progress","scanId","data":{stage, …}}`; see [The history scanner](#the-history-scanner) |
 | `session.close` | `{sessionId}` | `{closed: bool}` — kills the live backend process, keeps the row/history; frees a `max_sessions` slot; idempotent |
 | `session.restart` | `{sessionId}` | `{sessionId, backend, replayed}` — kills the live backend (mid-turn refuses `-32006`) and reattaches through the persisted handle |
 | `session.status` | `{}` | `{sessions: [{sessionId, backend, busy, idleSecs}]}` — live backend sessions only |
@@ -75,10 +86,22 @@ unchanged, so string-matching clients keep working.
 | `session.usage` | `{sessionId?}` — or `{daily: true, days?}` for the global day rollup (default 7 days) | per-session `{sessionId, contextUsed, contextSize, costUsd, turns}`, per-model `{sessions: [...]}`, or `{daily: [{date, turns, costUsd, contextUsed}]}` |
 | `session.list` | `{limit?, offset?, backend?, cwd?, tag?, includeArchived?}` | `{sessions: [{sessionId, createdAt, backend, title, cwd, tags, pinned, archived}]}` — pinned first; archived hidden unless requested |
 | `session.search` | `{query, limit?, sessionId?, backend?, cwd?, since?, until?}` | `{results: [{sessionId, messageId, snippet}]}` |
+| `usage.summary` | `{days?, tzOffsetMinutes?}` — the last `days` local days (default 7, today inclusive); `tzOffsetMinutes` shifts the UTC stamps into the caller's calendar (default 0 = UTC) | `{days, rows: [{date, backend, model, turns, contextUsed, contextSize, costUsd}], total: {turns, contextUsed, contextSize, costUsd}}` — one row per local day × backend × model; context columns sum the per-turn snapshots, cost sums the per-turn deltas; days with no rows are absent |
+| `usage.clear` | `{}` | `{cleared: true}` — deletes every usage row; sessions and messages are untouched |
+| `mission.create` | `{flowId?, name?, definition}` — `flowId` defaults to a fresh uuid; re-creating a `flowId` inserts the next version (runs keep the snapshot they started with) | `{flowId, version}` — `-32602` for an invalid definition (unknown node kind, agent node without prompt/backend, read-only without `allowedTools`, root rule, unparseable condition) |
+| `mission.start` | `{flowId}` — starts the LATEST version | `{runId, version}` — `-32602` unknown flow; `-32003` backend not registered; `-32002` read-only agent node refused: the backend cannot enforce a tool allowlist and damon never downgrades a read-only stage |
+| `mission.cancel` | `{runId}` | `{runId, cancelled}` — `false` when no live scheduler holds the id |
+| `mission.respond` | `{runId, nodeId, decision, feedback?}` — `decision` is `approve \| feedback \| exclude`; `feedback` requires non-empty text | `{accepted: true, live}` — the store CAS is the one-winner gate: `-32602` when the inbox item is not pending (another answer won) |
+| `mission.list` | `{}` | `{runs: [{runId, flowId, version, status, interrupted, ended, createdAt, tasks: [{nodeId, status, attempt}]}]}` — status is always derived from the task states (running / succeeded / failed / interrupted / cancelled), never stored |
+| `mission.get` | `{runId}` | `{runId, flowId, version, status, interrupted, ended, definition, tasks: [{nodeId, status, attempt, output?, error?}], inbox: [{nodeId, status, decision?, feedback?}]}` — `-32602` unknown run |
+| `mission.watch` | `{runId}` — must be live | `{runId, subscribed}` — streams `{"event":"mission.progress","runId","data":{node, status, attempt}}` frames |
+| `mission.unwatch` | `{runId}` | `{runId, subscribed}` |
 | `turn.start` | `{sessionId, prompt, timeoutSecs?, detach?}` | `{turnId, stopReason, usage?}` — or `{turnId, detached: true}` immediately when `detach` is true |
 | `turn.steer` | `{sessionId, prompt, expectedTurn?}` | `{result}` |
 | `turn.cancel` | `{sessionId}` | `{cancelled: true}` |
-| `permission.respond` | `{sessionId, requestId, response}` | `{}` |
+| `permission.respond` | `{sessionId, requestId, response}` — for `kind: question` asks, an `answers` map (`{question → label | [labels]}`) submits picks; an allow without answers skips | `{}` — unknown `requestId` fails with `-32008`; a *delivery* failure leaves the ask answerable; on `kind: plan` asks the decision also lands in the durable plan-review row |
+| `plan.list` | `{sessionId}` | `{plans: [{planId, sessionId, requestId, revision, title, content, contentHash, complete, status, decision?, decisionIntentAt?, appliedAt?, createdAt, updatedAt, supersededBy?}]}` — every revision of every plan, chain-ordered |
+| `plan.respond` | `{planId, expectedRevision, decision, feedback?}` — `decision` is `approve` \| `request_changes` \| `defer`; feedback is required non-empty for request_changes | `{recorded: true, status, applied, planId, revision}` — CAS claim against `expectedRevision`: `-32009` on a lost race or a stale/closed revision; approval of an incomplete plan and feedback-less request_changes refuse `-32602`; `defer` records non-terminally without touching the live ask |
 | `session.set_model` | `{sessionId, model}` | `{}` |
 | `session.set_mode` | `{sessionId, mode}` | `{}` |
 | `catalog.models` | `{backend}` | `{models[], modes[], commands[]}` |
@@ -89,9 +112,17 @@ unchanged, so string-matching clients keep working.
 | `file.write` | `{sessionId, path, content: base64}` | `{written, path}` — jailed to the session cwd; 1 MiB decoded cap |
 | `file.list` | `{sessionId, path? — default "."}` | `{entries: [{name, dir, bytes}], path}` — jailed to the session cwd, 1000 entries |
 | `file.index` | `{sessionId?, cwd?}` — the composer's `@path` picker: one gitignore-aware walk of the root | `{entries: [{rel, isDir}], truncated}` — `node_modules`/`target` pruned, hidden entries skipped, symlinks never followed; bounded at 10 000 entries / 512 KiB with `truncated: true` on an early stop |
+| `file.grant` | `{projectId?, path}` — `path` absolute, must exist and be a directory; symlinks/`..` resolve to the canonical form | `{granted: true, root, projectId?}` — persists an extra directory the file jail admits (duplicate grants are idempotent); claude sessions pick it up as `--add-dir` on their next launch |
+| `file.grants` | `{projectId?}` — effective grants for the scope (project + global); omitted lists globals only | `{grants: [{root, projectId?, createdAt}]}` |
+| `file.ungrant` | `{projectId?, path}` — matched against the stored canonical root | `{revoked: bool}` — false when no such grant |
 | `channel.get_state` | `{convId, key}` | `{value: string?}` |
 | `channel.set_state` | `{convId, key, value}` | `{set: true}` |
 | `channel.delete_state` | `{convId, key}` | `{deleted: true}` |
+| `device.pairing_key` | `{}` | `{key: string}` — the one-time pairing key (8 unambiguous chars), minted on first ask; the next `POST /v1/pair` spends it and a fresh key rotates in, under one lock |
+| `device.list` | `{}` | `{devices: [{deviceId, name, status: "pending"\|"approved", createdAt, approvedAt?, lastSeen?}]}` — lastSeen updates at most once a minute (throttled); the token hash never leaves the store |
+| `device.approve` | `{deviceId}` | `{approved: bool}` — only from pending; false when unknown or already approved |
+| `device.rename` | `{deviceId, name}` | `{renamed: bool}` — blank names refuse |
+| `device.revoke` | `{deviceId}` | `{revoked: bool}` — the row goes with the token hash, so the credential dies immediately; doubles as deny for pending requests |
 | `prompt.add` | `{text, sessionId?, cwd?}` — one sent prompt, trimmed and capped at 300 chars | `{recorded: true}` — upsert: a resend bumps the count and moves the row to newest; the newest 200 per cwd survive |
 | `prompt.recent` | `{limit? — default 50, max 200, sessionId?, cwd?}` | `{prompts: [{text, count}]}` — newest first, per cwd |
 | `skills.targets` | `{}` | `{targets: [{id, label, path, available}]}` — the agent CLIs' skill directories the hub can sync into; `available` means the engine home exists (the hub never creates one) |
@@ -129,6 +160,9 @@ unchanged, so string-matching clients keep working.
 | `worktree.list` | `{repo? \| projectId?}` | `{repo, worktrees: [{path, branch?, head, isMain, locked, lockReason?, prunable, projectId?}], registered: [{projectId, name, path, parentId?, meta}]}` — git's porcelain view joined with damon's rows |
 | `worktree.resolve_pr` | `{repo, input, branch?}` — `input` is `1842`, `#1842`, or a GitHub PR URL; details come from `gh pr view` (3s deadline) | `{number, repo: "owner/repo", title?, state?, author?, degraded, suggestedBranch, suggestedPath, branchConflict, dirConflict}` — `degraded` means gh was missing/hung; number and slug are still confirmed |
 | `worktree.merged` | `{repo, branch, base? — default HEAD}` | `{merged: bool}` — ancestry check; squash merges report false |
+| `mcp.inventory` | `{}` | `{entries: [{backend, name, transport, command?, url?, envKeys?, source, format, version, enabled?, readonlyReason?}], sources: [{backend, source, format, error?}]}` — every backend's NATIVE MCP config, REDACTED (env values never leave the file; URLs lose userinfo/query; stdio shows the program + an arg count); a broken config file reports its error per source and the inventory continues |
+| `mcp.probe` | `{backend, name}` | `{backend, name, result: "connected"\|"needs_auth"\|"failed"\|"unsupported", tools: string[] (names, ≤40), serverName?, protocolVersion?, elapsedMs, error?}` — REAL handshake (stdio: own process group, 25s cap; HTTP: 12s cap); explicit request only, never scheduled; the server's command/args/env never reach the wire |
+| `mcp.setEnabled` | `{backend, name, enabled, expectedVersion, cwd?}` — claude only | `{set: true}` — flips claude's own per-project toggle in ~/.claude.json, CAS'd on the inventory `version` (external edits reject `-32010`); parse-failed configs are never written; readonly backends refuse `-32602` with the reason |
 
 `worktree.create` errors are `-32007` with `data.kind`:
 `not_a_repo`, `invalid_branch`, `branch_not_found`, `branch_exists`,
@@ -145,7 +179,145 @@ stage, so a long fetch is not silent.
 parser raw: quoted spans are phrases, `AND`/`OR`/`NOT` pass through,
 and a **trailing `*` on a term makes it a prefix query** — `error*`
 matches `error`/`errors`/`erroring` (a bare `*` is nothing
-searchable).
+searchable). The index uses the `trigram` tokenizer, so a match is a
+substring match — including inside CJK runs (`커밋` finds
+`커밋 메시지`), which the previous unicode61 index could not do.
+Terms shorter than 3 characters (the trigram minimum) would be
+silently dropped by MATCH, so they take an exact-substring LIKE path
+instead: short terms are mandatory AND conjuncts (an `OR` touching
+one narrows to AND), a NOT-operand exclusion is honored, and a query
+built only of them returns newest-first hits with a Rust-built
+snippet instead of ranked ones.
+
+### CLI lifecycle
+
+`backend.versions` probes every cataloged backend's `<bin> --version`
+(10s cap) and — where an npm package is verified — the registry's
+latest (`npm view`, 15s cap), concurrently. Probes run on explicit
+request only: never scheduled, never on connect. The npm map is
+verified against each CLI's own install docs (claude
+`@anthropic-ai/claude-code`, codex `@openai/codex`, omp
+`@oh-my-pi/pi-coding-agent`, pi `@earendil-works/pi-coding-agent`,
+qwen `@qwen-code/qwen-code`, opencode `opencode-ai`); backends
+without a verified npm distribution (droid, mimo — official
+installers; zcode — no verified channel) probe the installed version
+only and report `updateKind: "manual"` (official one-liner is the
+update path) or `"unknown"` (blockers only) rather than guessing a
+package.
+
+`backend.update` executes the plan `backend.update_plan` previewed —
+one argv construction serves both, so the confirm dialog can never
+drift from what runs. Updates NEVER run automatically or on a
+schedule; they are user-initiated, stream their output (per-line
+capped) to the requesting connection, and can be cancelled. `damond
+doctor` reuses the same 10s probe: detected backends report their
+version inline, degrading to "version unknown" on a timeout.
+
+### Web devices
+
+A phone on the LAN no longer needs the master `auth_token`. The
+desktop reveals a one-time pairing key (`device.pairing_key`, also in
+the settings drawer); the device spends it at `POST /v1/pair` with
+`{pairingKey, name}` — the key is consumed AND rotated in a single
+locked step, so a code opens exactly one pairing — and receives a
+device token plus a `pending` row (`{deviceId, token, status}`; the
+token is returned exactly once and stored SHA-256-hashed
+daemon-side). The device polls `POST /v1/pair/status`
+(`{deviceId, token}`) → `pending` / `approved` / `revoked` (a missing
+row reads revoked — fail closed). A trusted surface approves via
+`device.approve`; until then the device mints nothing.
+
+Once approved, the device exchanges its token at
+`POST /v1/ws_ticket` (`{"deviceToken": …}`) for the same single-use
+WS tickets the master token mints. `device.revoke` deletes the row —
+the credential is dead immediately, no grace period. Non-loopback
+binds still refuse to start without a resolvable master `auth_token`;
+relay-mode devices keep the master-token login (the E2E handshake
+proves the master secret — device tokens are a direct-reach surface).
+`hello` carries `remoteClients`, the live count of non-loopback `/ws`
+connections, so surfaces can show a "remote control active" badge.
+
+### The history scanner
+
+The daemon knows the sessions its CLIs created outside Damon:
+`session.rescan` walks every backend's own native session storage —
+through each backend's discovery, honoring env overrides
+(`CLAUDE_CONFIG_DIR`, `FACTORY_HOME_OVERRIDE`, …) — and creates damon
+bookmark rows (id, backend, native handle, cwd, title) for entries the
+daemon has never seen. Per the PersistenceHandle philosophy, the
+provider's session file stays the source of truth; the row is a
+bookmark, and resuming it works exactly like any native-session
+resume.
+
+Scope, stated precisely: the scan delivers **visibility and
+resumability** — discovered sessions appear in `session.list` (with
+derived titles and cwd) and their native handles resume like any
+native session. It does **not** extract transcript messages: Damon has
+no message-extraction path for native handles today (`session.import`
+is a listing call; a resume binds the handle and streams only new
+turns), so `session.search` indexes messages from damon-run turns
+only. Per-backend transcript extractors that feed scanned sessions
+into the search index are future work.
+
+The sweep is incremental: each discovered entry carries a stat
+signature (size, mtime) — unchanged signature, no work. Titles derived
+from transcript heads are noise-filtered (pasted `<file …>` envelopes,
+`[Image #N, WxH]` placeholders, `<command-name>` shells and their kin
+never name a session), and head reads are byte-capped at 1 MiB in
+16 KiB chunks — Codex embeds its full base_instructions prompt in the
+first line, so unbounded reads explode.
+
+Cadence: one boot scan (a few seconds after start) plus explicit
+`session.rescan`; `[history] scan_interval_secs` adds a timer (0, the
+default, = off) and `[history] enabled = false` turns the automatic
+sweeps off entirely. Single-flight globally — a second `session.rescan`
+while one runs returns the in-flight `scanId`; progress events ride the
+requesting connection.
+
+Failures are contained: a backend whose discovery fails is reported in
+`skippedBackends` and the rest of the scan proceeds. A native file that
+vanishes means the provider's truth is gone — its damon session is
+**archived** (hidden from `session.list`, history kept), never deleted.
+`session.delete` on a discovered session tombstones its native handle
+so no sweep re-imports it; resuming the same native handle clears the
+tombstone (the user's explicit new intent wins). The scanner never
+writes or deletes native files.
+
+### MCP inventory and probe
+
+Each agent CLI keeps its MCP config where its own docs say: claude in
+`~/.claude.json` (`mcpServers` plus per-project scopes under
+`projects[cwd]`, honoring `CLAUDE_CONFIG_DIR`), codex in
+`~/.codex/config.toml` (`[mcp_servers.*]`, honoring `CODEX_HOME`),
+qwen in `~/.qwen/settings.json`, opencode in
+`$XDG_CONFIG_HOME/opencode/opencode.json`, droid in
+`~/.factory/mcp.json`. `mcp.inventory` reads them all and reports, per
+entry, the transport, a REDACTED command/URL (env keys yes, values
+never; userinfo/query dropped; stdio shows the program plus an arg
+count), the source file, a content-hash `version`, and — where the
+backend tracks it — the enabled state. Sources that fail to parse are
+reported per file (`sources[].error`) and never abort the inventory.
+Backends without a verified config location report no source rather
+than a guessed path (omp/pi manage MCP through extensions; zcode and
+mimo are unverified).
+
+`mcp.probe {backend, name}` performs a REAL MCP handshake against the
+configured server — stdio spawns it in its own process group (killed
+on exit, 25s cap), HTTP POSTs streamable-HTTP (12s cap) — walking
+`initialize` → `notifications/initialized` → `tools/list` and
+returning tool NAMES (≤40) plus the server's name and protocol
+version. Probes are explicit-request only: never scheduled, never
+auto-run. The server's command, args, and environment never appear on
+the wire.
+
+`mcp.setEnabled` is claude-only: it flips the same per-project
+`disabledMcpServers` switch the claude TUI uses, guarded by the
+entry's content-hash `version` — an external edit since the inventory
+snapshot rejects with `-32010`. The config must parse (a broken file
+is never written), same-path writes are serialized, and the replace is
+atomic. Every other backend is read-only with the reason: agents own
+their config; Damon flips the CLI's documented switch, it never
+authors config.
 
 ### Projects
 
@@ -164,6 +336,18 @@ exists, a not-yet-existing write target resolves through its deepest
 existing ancestor, and lexical `..` folding covers the rest — so an
 escape fails closed with `-32602`. Combine with `allowed_dirs` to
 bound which cwds sessions may have in the first place.
+
+Granted roots widen that jail on purpose: `file.grant` persists an
+extra directory (absolute, existing, canonicalized — a grant to
+`/var` that resolves through a symlink to `/private/var` stores the
+latter, so jail checks and revocations match exactly) scoped to a
+project or global; `file.grants` lists what is effective for a scope
+and `file.ungrant` revokes it. Widening is immediate for `file.*`;
+backends with a native widening flag pick grants up on their next
+launch (claude gets one `--add-dir` per effective grant — backends
+without an equivalent are not faked). A grant is an explicit user
+action and is not bounded by `allowed_dirs`, which gates where
+sessions may spawn, not what an explicitly granted session may read.
 
 ### Composer support
 
@@ -245,6 +429,14 @@ to 7 and covers today plus the preceding days) groups usage rows by
 UTC day: `{date, turns, costUsd, contextUsed}` where cost sums the
 per-turn deltas and context is the day's latest snapshot. Days with
 no rows are absent from the array.
+
+`usage.summary` groups the same rows finer — per LOCAL day × backend
+× model, with `tzOffsetMinutes` shifting the UTC stamps into the
+caller's calendar so buckets match it. Each row carries turns,
+summed context snapshots, and summed cost deltas, plus a window
+`total`. `usage.clear` deletes every usage row (sessions and
+messages are untouched).
+
 `turn.start` resolves when the turn ends — events stream first, then
 the response. Disconnect cancels the turns that connection started.
 
@@ -267,13 +459,43 @@ A connection that first touches a session (`session.create`,
 `session.resume`, `turn.start`) receives everything it missed BEFORE
 live streaming starts, as `session.event` frames tagged
 `"replay": true`: persisted history from the store (user, assistant,
-reasoning, tool, compaction, and error rows as timeline events, newest
-last, capped at 200),
+reasoning, tool, todo, compaction, and error rows as timeline events,
+newest last, capped at 200),
 then the in-flight turn's journal. The `replayed` count in the
 create/resume result says how many frames were sent. Live frames carry
 no `replay` field. A turn that overflowed the daemon's in-flight
 journal is not replayed (the live remainder continues uninterrupted;
 the assembled result is still persisted at turn end).
+
+### The mission runner (staged)
+
+A resident DAG runner for staged agent workflows: `input → agent → human →
+output` nodes over condition-routed edges. SQLite is the truth — every
+transition persists before it fans out, run status derives from the task
+states, and a daemon restart converges unfinished runs to `interrupted +
+cancelled` (never faked as still-running).
+
+- **Conditions** — `key=value` / `key!=value` clauses read the upstream
+  outputs plus the flow settings (`and` binds over `or`, missing key ⇒
+  false); an edge without a condition is the default: it fires only when
+  no explicit sibling from the same source matched.
+- **Agent nodes** run as real damon turns on per-node sessions (one per
+  attempt), so transcripts land in the store and `session.search` covers
+  them. The node's final assistant message parses as `key=value` lines
+  into the downstream condition context.
+- **Read-only stages** carry `allowedTools` onto the launch line (claude:
+  `--allowedTools`); `mission.start` refuses a read-only node on any
+  backend whose capabilities say it cannot enforce the list.
+- **Human nodes** park the task at `waiting_human` and create an inbox
+  item; `mission.respond` resolves it (approve / feedback re-ask /
+  exclude — the branch terminates and downstream cancels).
+- **Failures** retry up to `settings.retries`, then the task `failed` —
+  never silently skipped. `settings.concurrency` bounds parallel agent
+  nodes (human nodes never occupy a slot).
+
+Staged limits, on purpose: no `foreach` nodes, no channel-based approval
+(a human answers in the UI drawer or over the wire), no mission editing
+after start (cancel and re-create instead).
 
 ## StreamEvent
 
@@ -292,17 +514,72 @@ the assembled result is still persisted at turn end).
   reports a context compaction or a `turn_failed` — they appear in
   `session.messages` (roles `compaction`/`error`, content in
   `data.content`) and in replay; live consumers see the corresponding
-  `timeline`/`turn_failed` events as they happen.
-- `permission_requested {id,kind,name,title?,input?,detail?,actions[]}`
+  `timeline`/`turn_failed` events as they happen. A turn's final
+  `todo` snapshot persists the same way (role `todo`, items in
+  `data.items`) — intermediate snapshots are live-only.
+- `permission_requested {id,kind,name,title?,input?,detail?,actions[],questions?}`
 - `permission_resolved {request_id}`
 - `attention_required {reason: finished|permission}`
 - `subagent {event}`
 
 `ToolCall.detail` is `{type: shell|read|edit|web|task|other, …}`.
-`PermissionResponse` is `{behavior:"allow",action_id?,updated_input?}`
+`PermissionResponse` is `{behavior:"allow",action_id?,updated_input?,answer?,answers?}`
 or `{behavior:"deny",action_id?,message?,interrupt}` — a deny with
 `interrupt: true` makes the daemon interrupt the whole turn right
 after delivering the denial, not just refuse the one call.
+
+`kind` is `tool`, `question`, or `plan`. A `question` ask carries a structured
+`questions` array — Claude Code's AskUserQuestion, opencode question
+batches, omp dialogs, codex input requests — of
+`{question, header?, options?: [{label, description?}], multiSelect?}`
+(empty `options` = free text). Surfaces render the options and answer
+through `permission.respond` with an `answers` map,
+`{question text → label | [labels] | typed string}` (a bare string
+answers a single-question card):
+
+- `Allow` **with** `answers` submits the user's picks to the agent.
+- `Allow` **without** `answers` skips/dismisses the card — the agent
+  learns nothing was chosen.
+- `Deny` refuses the ask; the agent continues without an answer.
+
+Delivery is retryable: the daemon removes a pending ask only after the
+answer reached the agent, so a failed respond (transport error, `-32000`)
+leaves the card up and the same `requestId` answerable. `-32008`
+(`ASK_NOT_FOUND`) means the card is genuinely gone — the ask was
+answered elsewhere, the agent withdrew it (`control_cancel_request`),
+or its turn ended (pending asks settle with a `permission_resolved`
+event before the turn's terminal event).
+
+### Plan review
+
+A `kind: plan` ask (claude's ExitPlanMode) carries the plan text in
+`input.plan`. The daemon records it as a durable review row, visible
+via `plan.list` and keyed by sessionId + planId + revision: a re-ask
+while the review is still open chains as revision+1 and supersedes
+the old revision. The live ask stays the transport; the row is the
+multi-surface fact-source, so a phone, a chat bot, and the desktop UI
+all see — and answer — the same artifact.
+
+Decisions go through `plan.respond` (`planId`, `expectedRevision`,
+`decision`, optional `feedback`): the expectedRevision CAS claim means
+two surfaces answering the same revision resolve to exactly one win
+plus a typed `-32009` for the loser, and a decision on a stale or
+closed revision never reaches the agent. The decision intent is
+persisted BEFORE the native relay: a lost pipe leaves the record and
+reopens the row (status back to `awaiting_review`, intent kept on
+file) instead of ever reporting a success that did not happen.
+`approve` delivers an allow to the live ask, `request_changes` a deny
+whose message is the feedback, and `defer` records non-terminally
+without touching the ask — the agent's wait stays parked and a later
+`plan.respond` can still decide it. Approving a plan whose content is
+not reviewable (`complete: false`) and a feedback-less
+request_changes refuse with `-32602`.
+
+When the turn ends, still-open reviews expire (the native ask died
+with the process — history must not pretend they are answerable;
+recorded intents survive). `permission.respond` on a plan ask lands
+its decision in the same durable row (a deny's `message` becomes the
+recorded feedback), so pre-gate clients keep working.
 
 ## Relay handshake
 

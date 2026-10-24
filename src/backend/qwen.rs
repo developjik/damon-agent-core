@@ -56,6 +56,11 @@ impl QwenDialect {
                 // failed turns; no cost or context window observed.
                 error_field_first: true,
                 usage_optional: true,
+                // qwen's subagent tool is literally "Task" with a
+                // `subagent_type` input (verified in the 0.24.6 bundle),
+                // identical to claude's — the shared parser's Task
+                // start/end tracking applies as-is.
+                subagent_from_task: true,
                 ..ClaudeQuirks::default()
             }),
         })
@@ -77,6 +82,23 @@ impl StreamJsonDialect for QwenDialect {
         if let Some(id) = resume {
             args.push("--resume".to_string());
             args.push(id.to_string());
+        }
+        if !config.mcp_servers.is_empty() {
+            // Same --mcp-config contract as claude (verified against
+            // qwen 0.24.6 --help): inline JSON with {"mcpServers": ...}.
+            let servers: Value = config
+                .mcp_servers
+                .iter()
+                .map(|(name, s)| {
+                    (
+                        name.clone(),
+                        json!({"command": s.command, "args": s.args, "env": s.env}),
+                    )
+                })
+                .collect::<serde_json::Map<String, Value>>()
+                .into();
+            args.push("--mcp-config".to_string());
+            args.push(json!({"mcpServers": servers}).to_string());
         }
         args
     }
@@ -237,10 +259,9 @@ impl StreamJsonDialect for QwenDialect {
             let Some(stem) = path.file_stem().and_then(|s| s.to_str()) else {
                 continue;
             };
-            let modified = entry
-                .metadata()
-                .await
-                .ok()
+            let meta = entry.metadata().await.ok();
+            let modified = meta
+                .as_ref()
                 .and_then(|m| m.modified().ok())
                 .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
                 .map(|d| d.as_secs());
@@ -253,6 +274,7 @@ impl StreamJsonDialect for QwenDialect {
                 title: transcript_title(&path).await,
                 cwd: Some(cwd.to_path_buf()),
                 modified_at: modified,
+                size: meta.as_ref().map(|m| m.len()),
             });
         }
         Ok(out)
@@ -264,11 +286,12 @@ impl StreamJsonDialect for QwenDialect {
             session_persistence: true,
             session_listing: true,
             dynamic_modes: true,
-            mcp_servers: false,
+            mcp_servers: true,
             reasoning_stream: true,
             steer: true,
             rewind: false,
-            subagent_events: false,
+            subagent_events: true,
+            tool_allowlist: false,
         }
     }
 }
@@ -310,6 +333,7 @@ impl QwenDialect {
                         .as_array()
                         .cloned()
                         .unwrap_or_default(),
+                    questions: Vec::new(),
                 };
                 session.register_ask(ask, request_id).await;
             }
@@ -425,6 +449,7 @@ mod tests {
     use super::*;
     use crate::backend::streamjson::tests::TestCtx;
     use crate::backend::types::StreamEventKind;
+    use std::collections::HashMap;
 
     #[test]
     fn capabilities_match_the_verified_wire() {
@@ -432,8 +457,133 @@ mod tests {
         // Permission relay, steering, streaming, resume verified live;
         // images are not (text-only stdin), so nothing is overstated.
         assert!(c.streaming && c.reasoning_stream && c.steer && c.session_persistence);
-        assert!(!c.mcp_servers);
-        assert!(!c.subagent_events);
+        // --mcp-config is documented for 0.24.6; the Task tool with a
+        // `subagent_type` input ships in the bundle.
+        assert!(c.mcp_servers);
+        assert!(c.subagent_events);
+    }
+
+    #[test]
+    fn launch_args_carry_mcp_config_json() {
+        let d = QwenDialect::dialect();
+        let mut config = SessionConfig::default();
+        config.mcp_servers.insert(
+            "fs".to_string(),
+            McpServerConfig {
+                command: "npx".to_string(),
+                args: vec![
+                    "-y".to_string(),
+                    "@modelcontextprotocol/server-fs".to_string(),
+                ],
+                env: HashMap::from([("NODE_ENV".to_string(), "production".to_string())]),
+            },
+        );
+        let args = d.launch_args(&config, None);
+        let i = args.iter().position(|a| a == "--mcp-config").unwrap();
+        let parsed: Value = serde_json::from_str(&args[i + 1]).unwrap();
+        let server = &parsed["mcpServers"]["fs"];
+        assert_eq!(server["command"], "npx");
+        assert_eq!(
+            server["args"],
+            json!(["-y", "@modelcontextprotocol/server-fs"])
+        );
+        assert_eq!(server["env"]["NODE_ENV"], "production");
+    }
+
+    #[test]
+    fn launch_args_omit_mcp_config_without_servers() {
+        let d = QwenDialect::dialect();
+        let args = d.launch_args(&SessionConfig::default(), None);
+        assert!(!args.contains(&"--mcp-config".to_string()));
+        assert!(args.is_empty());
+    }
+
+    /// qwen's subagent tool is named "Task" with a `subagent_type`
+    /// input — the same shape claude emits, so the shared parser's
+    /// start tracking must fire identically through the qwen dialect.
+    #[tokio::test]
+    async fn task_tool_use_raises_subagent_start() {
+        let t = TestCtx::new();
+        let ctx = t.as_ctx();
+        QwenDialect::dialect()
+            .on_frame(
+                &ctx,
+                &json!({
+                    "type":"assistant",
+                    "message":{"role":"assistant","content":[
+                        {"type":"tool_use","id":"task-1","name":"Task","input":{
+                            "subagent_type":"general-purpose",
+                            "description":"review the parser",
+                            "prompt":"look at streamjson.rs"
+                        }}
+                    ]}
+                }),
+            )
+            .await;
+        let events = t.events.lock().await;
+        assert_eq!(events.len(), 2);
+        assert!(matches!(
+            events[0].kind,
+            StreamEventKind::Timeline(TimelineItem::ToolCall(_))
+        ));
+        let StreamEventKind::Subagent { event } = &events[1].kind else {
+            panic!("expected subagent event, got {:?}", events[1].kind);
+        };
+        assert_eq!(event["type"], "subagent_lifecycle");
+        assert_eq!(event["id"], "task-1");
+        assert_eq!(event["name"], "general-purpose");
+        assert_eq!(event["description"], "review the parser");
+        assert_eq!(event["status"], "running");
+        assert_eq!(event["state"], "running");
+        // The subagent event stays inside its turn like omp's do.
+        assert_eq!(events[1].turn_id.as_deref(), Some("t1"));
+    }
+
+    /// The matching Task tool_result closes the loop with a terminal
+    /// subagent event repeating the remembered identity.
+    #[tokio::test]
+    async fn task_result_raises_terminal_subagent_event() {
+        let t = TestCtx::new();
+        let ctx = t.as_ctx();
+        let d = QwenDialect::dialect();
+        d.on_frame(
+            &ctx,
+            &json!({
+                "type":"assistant",
+                "message":{"content":[
+                    {"type":"tool_use","id":"task-9","name":"Task","input":{
+                        "subagent_type":"general-purpose","description":"find the bug"
+                    }}
+                ]}
+            }),
+        )
+        .await;
+        d.on_frame(
+            &ctx,
+            &json!({
+                "type":"user",
+                "message":{"content":[
+                    {"type":"tool_result","tool_use_id":"task-9","content":"found it","is_error":false}
+                ]}
+            }),
+        )
+        .await;
+        let events = t.events.lock().await;
+        // start pair (tool_call + subagent), then result pair
+        assert_eq!(events.len(), 4);
+        let StreamEventKind::Subagent { event } = &events[3].kind else {
+            panic!("expected subagent event, got {:?}", events[3].kind);
+        };
+        assert_eq!(event["id"], "task-9");
+        assert_eq!(event["name"], "general-purpose");
+        assert_eq!(event["description"], "find the bug");
+        assert_eq!(event["status"], "completed");
+        assert_eq!(event["state"], "completed");
+        // The tool_result's own timeline item is still there.
+        assert!(matches!(
+            events[2].kind,
+            StreamEventKind::Timeline(TimelineItem::ToolCall(_))
+        ));
     }
 
     #[test]
@@ -487,6 +637,7 @@ mod tests {
             detail: None,
             actions: vec![],
             suggestions: vec![],
+            questions: Vec::new(),
         };
         let f = d.permission_response_frame(
             &ask,
@@ -495,6 +646,7 @@ mod tests {
                 action_id: None,
                 updated_input: None,
                 answer: None,
+                answers: None,
             },
         );
         assert_eq!(f["response"]["subtype"], "success");

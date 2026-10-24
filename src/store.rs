@@ -110,6 +110,136 @@ pub struct SearchFilter {
     pub until_ms: Option<i64>,
 }
 
+/// One (local day, backend, model) group of `usage_aggregate`.
+#[derive(Debug, Clone)]
+pub struct UsageDayRow {
+    /// Local day, `YYYY-MM-DD` (UTC stamps shifted by the caller's
+    /// offset).
+    pub date: String,
+    /// Owning session's agent id ("" when unset).
+    pub backend: String,
+    pub model: String,
+    /// Usage rows in the group (one per reported turn).
+    pub turns: u64,
+    /// Sum of the per-turn context snapshots.
+    pub context_used: u64,
+    pub context_size: u64,
+    /// Sum of the per-turn cost deltas.
+    pub cost_usd: f64,
+}
+
+/// `usage_aggregate` result: grouped rows plus the window total.
+#[derive(Debug, Clone)]
+pub struct UsageAggregate {
+    /// Day/backend/model groups, ordered by date then backend then
+    /// model.
+    pub rows: Vec<UsageDayRow>,
+    pub turns: u64,
+    pub context_used: u64,
+    pub context_size: u64,
+    pub cost_usd: f64,
+}
+
+/// One granted root: an extra directory a user widened sessions to
+/// (upstream desktop-cc-gui's grant_root). Stored canonically
+/// (resolved, absolute) so jail comparisons are exact string compares.
+#[derive(Debug, Clone)]
+pub struct GrantedRoot {
+    /// Project scope; None = global (every session).
+    pub project_id: Option<String>,
+    /// Canonical directory.
+    pub root: String,
+    pub created_at: String,
+}
+
+/// One durable plan-review revision (the approval fact-source for
+/// `kind=plan` asks). Identity = session + planId + revision; a
+/// re-asked plan chains onto the same planId with revision+1.
+#[derive(Debug, Clone)]
+pub struct PlanRow {
+    pub plan_id: String,
+    pub session_id: String,
+    /// The live permission ask this revision answers.
+    pub request_id: String,
+    pub revision: i64,
+    pub title: String,
+    /// The verbatim plan text the user reviews.
+    pub content: String,
+    /// Non-cryptographic content fingerprint — detects text drift
+    /// between the record and a late submit.
+    pub content_hash: String,
+    /// false = no reviewable plan text: every approval refuses.
+    pub complete: bool,
+    /// awaiting_review | submitting | approved | changes_requested |
+    /// deferred | cancelled | expired | superseded.
+    pub status: String,
+    /// The recorded decision intent {decision, feedback?} — persisted
+    /// before the native relay, kept when the relay fails.
+    pub decision: Option<Value>,
+    pub decision_intent_at: Option<i64>,
+    /// When the native ack settled the decision; None = unconfirmed.
+    pub applied_at: Option<i64>,
+    pub created_at: i64,
+    pub updated_at: i64,
+    /// Revision that replaced this one (open rows only).
+    pub superseded_by: Option<i64>,
+}
+
+/// `submit_plan_decision` outcome: the CAS claim-or-conflict contract.
+#[derive(Debug)]
+pub enum PlanSubmit {
+    /// This caller owns the submission: the row is `submitting` and
+    /// the decision intent is durably recorded. Carries what the
+    /// native relay needs (the live ask's session and request ids)
+    /// and the pre-claim status for a revert.
+    Claimed {
+        session_id: String,
+        request_id: String,
+        previous: String,
+    },
+    /// Lost the race or answered a closed/stale row — the current row
+    /// is returned so the caller can present what actually happened.
+    Conflict(Box<PlanRow>),
+    /// No row for this planId + expectedRevision.
+    NotFound,
+    /// Approving a plan whose content is not reviewable.
+    Incomplete,
+    /// `request_changes` without non-empty feedback.
+    FeedbackRequired,
+}
+
+/// One paired web device: a remote surface with its own revokable
+/// credential. `pending` rows mint nothing — `approved_at` is what
+/// lets the device token through ws_ticket, and only a trusted surface
+/// sets it.
+#[derive(Debug, Clone)]
+pub struct DeviceRow {
+    pub id: String,
+    pub name: String,
+    /// pending | approved
+    pub status: String,
+    pub created_at: String,
+    pub approved_at: Option<String>,
+    /// Throttled: updated at most once a minute by ticket mints.
+    pub last_seen: Option<String>,
+}
+
+/// A sanitized search, split across two engines by term length.
+#[derive(Debug, PartialEq)]
+struct FtsQuery {
+    /// FTS5 MATCH expression — every term in it is >= 3 chars (the
+    /// trigram minimum). Empty when every term went to the LIKE path.
+    match_expr: String,
+    /// 1–2 char terms, applied as exact `%term%` substring conjuncts
+    /// over the indexed content. The trigram tokenizer only indexes
+    /// 3-char windows, so MATCH would silently drop these (an empty
+    /// result for e.g. `커밋`).
+    like_terms: Vec<String>,
+    /// Same, for terms under NOT: exclusion conjuncts
+    /// (`content NOT LIKE '%term%'`).
+    like_not_terms: Vec<String>,
+}
+
 /// The searchable text of one stored message, for the FTS index:
 /// `content` text (plain string, text parts of an array, or nested ACP
 /// `content` blocks) plus tool I/O — OpenAI-style `tool_calls` names
@@ -171,6 +301,108 @@ fn fts_text(role: &str, data: &Value) -> Option<String> {
     let text = parts.join("\n");
     (!text.trim().is_empty()).then_some(text)
 }
+
+/// Index every message that `messages_fts` is missing, using the
+/// current `fts_text` extractor. Shared by the v3 coverage migration
+/// and the v4 trigram rebuild (whose fresh table is missing
+/// everything).
+fn fts_reindex_missing(c: &rusqlite::Connection) -> rusqlite::Result<()> {
+    let missing: Vec<(i64, String, String, String)> = {
+        let mut stmt = c.prepare(
+            "SELECT id, session_id, role, data FROM messages
+             WHERE id NOT IN (SELECT message_id FROM messages_fts)",
+        )?;
+        let rows = stmt.query_map([], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)))?;
+        rows.collect::<Result<_, _>>()?
+    };
+    for (id, sid, role, data) in missing {
+        let Ok(v) = serde_json::from_str::<Value>(&data) else {
+            continue;
+        };
+        if let Some(text) = fts_text(&role, &v) {
+            c.execute(
+                "INSERT INTO messages_fts (content, session_id, message_id)
+                 VALUES (?1, ?2, ?3)",
+                rusqlite::params![text, sid, id],
+            )?;
+        }
+    }
+    Ok(())
+}
+
+/// Manual snippet for the pure-LIKE path — `snippet()` is an FTS5
+/// auxiliary function that requires a MATCH, which a pure-LIKE query
+/// has none of. Same output shape as the SQL one: the first matched
+/// term wrapped in char(1)/char(2) markers, `…` where text was cut,
+/// ±48 chars of context (the SQL version's 32-token window). Matching
+/// mirrors SQLite LIKE: ASCII-case-insensitive, exact otherwise. With
+/// no positive term (exclusion-only), the content head stands in.
+fn like_snippet(content: &str, terms: &[String]) -> String {
+    const WINDOW: usize = 48;
+    let bytes = content.as_bytes();
+    let mut hit: Option<(usize, usize)> = None; // (byte start, term len)
+    for t in terms {
+        if let Some(pos) = bytes
+            .windows(t.len())
+            .position(|w| w.eq_ignore_ascii_case(t.as_bytes()))
+            .filter(|&p| content.is_char_boundary(p))
+            && hit.is_none_or(|(s, _)| pos < s)
+        {
+            hit = Some((pos, t.len()));
+        }
+    }
+    let Some((start, tlen)) = hit else {
+        // No highlightable occurrence — emit the head so the caller
+        // still sees what matched.
+        let mut end = content.len().min(2 * WINDOW);
+        while end < content.len() && !content.is_char_boundary(end) {
+            end += 1;
+        }
+        return format!("{}…", &content[..end]);
+    };
+    let term_end = start + tlen;
+    let mut b = start.saturating_sub(WINDOW);
+    while b > 0 && !content.is_char_boundary(b) {
+        b -= 1;
+    }
+    let mut e = (term_end + WINDOW).min(content.len());
+    while e < content.len() && !content.is_char_boundary(e) {
+        e += 1;
+    }
+    let mut out = String::new();
+    if b > 0 {
+        out.push('…');
+    }
+    out.push_str(&content[b..start]);
+    out.push('\u{1}');
+    out.push_str(&content[start..term_end]);
+    out.push('\u{2}');
+    out.push_str(&content[term_end..e]);
+    if e < content.len() {
+        out.push('…');
+    }
+    out
+}
+
+/// Wall-clock unix ms for plan-review stamps.
+fn plan_now_ms() -> i64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_millis() as i64)
+        .unwrap_or(0)
+}
+
+/// Non-cryptographic content fingerprint for plan text — detects drift
+/// between revisions and between record and submit (SipHash via the
+/// standard library; no new dependency, per upstream).
+fn plan_content_hash(content: &str) -> String {
+    use std::hash::{Hash, Hasher};
+    let mut hasher = std::collections::hash_map::DefaultHasher::new();
+    content.len().hash(&mut hasher);
+    content.hash(&mut hasher);
+    format!("{:016x}", hasher.finish())
+}
+
 /// Force `mode` on `path`. Session transcripts and tool I/O must not be
 /// group/world-accessible regardless of the process umask (SQLite opens
 /// 0644 by default) — same threat model as the config file's 0600
@@ -212,6 +444,18 @@ fn now_ms() -> i64 {
 /// Per-cwd ceiling on `prompt_history` rows — the trim target in
 /// `record_prompt`, and the ceiling on `prompt.recent`'s limit.
 pub(crate) const PROMPT_HISTORY_CAP: i64 = 200;
+
+/// One persisted mission task transition (status plus optional payload
+/// and timestamp stamps).
+pub struct MissionTaskTransition {
+    pub status: String,
+    /// Current attempt number (written on every transition).
+    pub attempt: u32,
+    pub output: Option<String>,
+    pub error: Option<String>,
+    pub stamp_started: bool,
+    pub stamp_ended: bool,
+}
 
 impl Store {
     pub async fn open(path: &Path) -> anyhow::Result<Self> {
@@ -260,10 +504,18 @@ impl Store {
                  );
                  CREATE INDEX IF NOT EXISTS idx_messages_session
                      ON messages(session_id, id);
+                 -- trigram: the default unicode61 tokenizer folds a run
+                 -- of CJK characters into ONE token, so a substring
+                 -- query like 커밋 could never match 커밋 메시지.
+                 -- Trigram (SQLite >= 3.34; the bundled build ships
+                 -- 3.4x) indexes every 3-char window instead, making
+                 -- MATCH a substring search. Pre-existing tables are
+                 -- re-tokenized by the v4 migration below.
                  CREATE VIRTUAL TABLE IF NOT EXISTS messages_fts USING fts5(
                      content,
                      session_id UNINDEXED,
-                     message_id UNINDEXED
+                     message_id UNINDEXED,
+                     tokenize = 'trigram'
                  );
                 CREATE TABLE IF NOT EXISTS usage (
                     id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -310,7 +562,43 @@ impl Store {
                  CREATE INDEX IF NOT EXISTS idx_sessions_agent
                      ON sessions(agent, agent_session);
                  CREATE INDEX IF NOT EXISTS idx_usage_created
-                     ON usage(created_at);",
+                     ON usage(created_at);
+                 -- Granted roots (see the v5 migration): extra
+                 -- directories the user widened sessions to. NULL
+                 -- project_id = global (every session); a project row
+                 -- scopes the grant to that project's sessions. The
+                 -- FK cascades — grants die with their project.
+                 CREATE TABLE IF NOT EXISTS granted_roots (
+                     id INTEGER PRIMARY KEY AUTOINCREMENT,
+                     project_id TEXT REFERENCES projects(id) ON DELETE CASCADE,
+                     root TEXT NOT NULL,
+                     created_at TEXT NOT NULL DEFAULT (datetime('now')),
+                     UNIQUE(project_id, root)
+                 );
+                 -- Durable plan-review rows (see the v6 migration): the
+                 -- approval fact-source for kind=plan permission asks.
+                 CREATE TABLE IF NOT EXISTS plan_reviews (
+                     plan_id TEXT NOT NULL,
+                     session_id TEXT NOT NULL,
+                     request_id TEXT NOT NULL,
+                     revision INTEGER NOT NULL,
+                     title TEXT NOT NULL DEFAULT '',
+                     content TEXT NOT NULL DEFAULT '',
+                     content_hash TEXT NOT NULL DEFAULT '',
+                     complete INTEGER NOT NULL DEFAULT 0,
+                     status TEXT NOT NULL DEFAULT 'awaiting_review',
+                     decision TEXT,
+                     decision_intent_at INTEGER,
+                     applied_at INTEGER,
+                     created_at INTEGER NOT NULL,
+                     updated_at INTEGER NOT NULL,
+                     superseded_by INTEGER,
+                     PRIMARY KEY (plan_id, revision)
+                 );
+                 CREATE INDEX IF NOT EXISTS idx_plan_reviews_session
+                     ON plan_reviews(session_id, plan_id, revision);
+                 CREATE INDEX IF NOT EXISTS idx_plan_reviews_request
+                     ON plan_reviews(request_id);",
             )?;
             // Migrate pre-compaction databases. Check column existence
             // first — swallowing every ALTER error would hide real
@@ -541,28 +829,204 @@ impl Store {
             // NOT IN filter skips indexed rows), so a crash mid-run
             // just re-runs on next open.
             if v < 3 {
-                let missing: Vec<(i64, String, String, String)> = {
-                    let mut stmt = c.prepare(
-                        "SELECT id, session_id, role, data FROM messages
-                          WHERE id NOT IN (SELECT message_id FROM messages_fts)",
-                    )?;
-                    let rows =
-                        stmt.query_map([], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)))?;
-                    rows.collect::<Result<_, _>>()?
-                };
-                for (id, sid, role, data) in missing {
-                    let Ok(v) = serde_json::from_str::<Value>(&data) else {
-                        continue;
-                    };
-                    if let Some(text) = fts_text(&role, &v) {
-                        c.execute(
-                            "INSERT INTO messages_fts (content, session_id, message_id)
-                             VALUES (?1, ?2, ?3)",
-                            rusqlite::params![text, sid, id],
-                        )?;
-                    }
-                }
+                fts_reindex_missing(c)?;
                 c.execute_batch("PRAGMA user_version = 3;")?;
+            }
+            // CJK substring search (user_version 4): the default
+            // unicode61 tokenizer folds a whole run of CJK characters
+            // into ONE token, so a query like "커밋" never matched
+            // "커밋 메시지를 남겼다". The trigram tokenizer (SQLite
+            // >= 3.34; the bundled build ships 3.4x, so no dependency
+            // churn) indexes every 3-character window instead, making
+            // MATCH a substring search. The tokenizer is baked into
+            // the shadow index, and this is a plain-content FTS table
+            // (it stores its own copy of the text — `rebuild` re-reads
+            // that copy, it cannot re-tokenize it), so the table is
+            // dropped, recreated with trigram, and every message
+            // re-indexed through the current `fts_text` extractor.
+            // Crash-safe: DROP IF EXISTS + CREATE re-run cleanly, the
+            // reindex is idempotent, and user_version flips only at
+            // the end.
+            if v < 4 {
+                c.execute_batch(
+                    "DROP TABLE IF EXISTS messages_fts;
+                     CREATE VIRTUAL TABLE messages_fts USING fts5(
+                         content,
+                         session_id UNINDEXED,
+                         message_id UNINDEXED,
+                         tokenize = 'trigram'
+                     );",
+                )?;
+                fts_reindex_missing(c)?;
+                c.execute_batch("PRAGMA user_version = 4;")?;
+            }
+            // Granted roots (user_version 5): persisted extra
+            // directories a user granted to sessions (upstream
+            // desktop-cc-gui's grant_root). Scope: per-project, with
+            // NULL meaning global — every session. Projects carry the
+            // workspace root (upstream's "workspace" scope), but bot
+            // surfaces (chat channels) have no project context, so a
+            // global grant is the loop-closer there; the jail join
+            // stays one predicate: project_id IS NULL OR matches the
+            // session's project. FK cascades on project delete.
+            if v < 5 {
+                c.execute_batch(
+                    "CREATE TABLE IF NOT EXISTS granted_roots (
+                         id INTEGER PRIMARY KEY AUTOINCREMENT,
+                         project_id TEXT REFERENCES projects(id) ON DELETE CASCADE,
+                         root TEXT NOT NULL,
+                         created_at TEXT NOT NULL DEFAULT (datetime('now')),
+                         UNIQUE(project_id, root)
+                     );
+                     PRAGMA user_version = 5;",
+                )?;
+            }
+            // Plan reviews (user_version 6): the durable approval
+            // artifact for kind=plan asks (upstream desktop-cc-gui's
+            // plan_review). Identity = session + planId + revision;
+            // a re-ask while the previous revision is still open
+            // chains as revision+1 and supersedes it. Status machine:
+            // awaiting_review → submitting → approved |
+            // changes_requested | deferred (non-terminal); terminal
+            // cancelled | expired | superseded. The decision intent is
+            // persisted BEFORE the native relay write, so a lost pipe
+            // or crash leaves the record; `submitting` reverts on a
+            // failed relay and settles on an ack.
+            if v < 6 {
+                c.execute_batch(
+                    "CREATE TABLE IF NOT EXISTS plan_reviews (
+                         plan_id TEXT NOT NULL,
+                         session_id TEXT NOT NULL,
+                         request_id TEXT NOT NULL,
+                         revision INTEGER NOT NULL,
+                         title TEXT NOT NULL DEFAULT '',
+                         content TEXT NOT NULL DEFAULT '',
+                         content_hash TEXT NOT NULL DEFAULT '',
+                         complete INTEGER NOT NULL DEFAULT 0,
+                         status TEXT NOT NULL DEFAULT 'awaiting_review',
+                         decision TEXT,
+                         decision_intent_at INTEGER,
+                         applied_at INTEGER,
+                         created_at INTEGER NOT NULL,
+                         updated_at INTEGER NOT NULL,
+                         superseded_by INTEGER,
+                         PRIMARY KEY (plan_id, revision)
+                     );
+                     CREATE INDEX IF NOT EXISTS idx_plan_reviews_session
+                         ON plan_reviews(session_id, plan_id, revision);
+                     CREATE INDEX IF NOT EXISTS idx_plan_reviews_request
+                         ON plan_reviews(request_id);
+                     PRAGMA user_version = 6;",
+                )?;
+            }
+
+            // Web device pairing (user_version 7): per-device
+            // credentials for remote surfaces. A daemon-minted one-time
+            // pairing key (single row — exactly one active key, like
+            // upstream) is consumed+rotated in one locked step by the
+            // pair request, which creates the pending device row;
+            // `approved_at` (set only by a trusted surface) is what
+            // lets its token through ws_ticket. Tokens are stored
+            // SHA-256 hashed — the daemon never persists the usable
+            // secret, so a store leak cannot mint tickets.
+            if v < 7 {
+                c.execute_batch(
+                    "CREATE TABLE IF NOT EXISTS web_pairing (
+                         id INTEGER PRIMARY KEY CHECK (id = 1),
+                         key TEXT NOT NULL,
+                         created_at TEXT NOT NULL DEFAULT (datetime('now'))
+                     );
+                     CREATE TABLE IF NOT EXISTS web_devices (
+                         id TEXT PRIMARY KEY,
+                         name TEXT NOT NULL DEFAULT '',
+                         token_hash TEXT NOT NULL UNIQUE,
+                         status TEXT NOT NULL DEFAULT 'pending',
+                         created_at TEXT NOT NULL DEFAULT (datetime('now')),
+                         approved_at TEXT,
+                         last_seen TEXT
+                     );
+                     PRAGMA user_version = 7;",
+                )?;
+            }
+
+            // Native-history scanner state (user_version 8): the stat
+            // signature (size + mtime) per discovered native file keyed
+            // to the damon session it produced — unchanged signature
+            // skips the re-parse entirely. Tombstones record explicit
+            // deletes: a deleted session's native handle is never
+            // re-imported by a later sweep, and a resume that binds the
+            // same handle (the user's explicit new intent) clears it.
+            if v < 8 {
+                c.execute_batch(
+                    "CREATE TABLE IF NOT EXISTS scanned_native (
+                         backend TEXT NOT NULL,
+                         native_handle TEXT NOT NULL,
+                         size INTEGER,
+                         mtime_ms INTEGER,
+                         session_id TEXT NOT NULL,
+                         scanned_at TEXT NOT NULL DEFAULT (datetime('now')),
+                         PRIMARY KEY (backend, native_handle)
+                     );
+                     CREATE TABLE IF NOT EXISTS session_tombstones (
+                         backend TEXT NOT NULL,
+                         native_handle TEXT NOT NULL,
+                         created_at TEXT NOT NULL DEFAULT (datetime('now')),
+                         PRIMARY KEY (backend, native_handle)
+                     );
+                     PRAGMA user_version = 8;",
+                )?;
+            }
+
+            // Mission DAG runner (user_version 9): versioned flow
+            // definitions, runs with deep-cloned snapshots, per-node
+            // task instances, and the human inbox. Run status is always
+            // derived from task states — never a stale stored field.
+            if v < 9 {
+                c.execute_batch(
+                    "CREATE TABLE IF NOT EXISTS mission_flows (
+                         flow_id TEXT NOT NULL,
+                         version INTEGER NOT NULL,
+                         name TEXT NOT NULL DEFAULT '',
+                         definition TEXT NOT NULL,
+                         created_at TEXT NOT NULL DEFAULT (datetime('now')),
+                         PRIMARY KEY (flow_id, version)
+                     );
+                     CREATE TABLE IF NOT EXISTS mission_runs (
+                         run_id TEXT PRIMARY KEY,
+                         flow_id TEXT NOT NULL,
+                         version INTEGER NOT NULL,
+                         snapshot TEXT NOT NULL,
+                         interrupted INTEGER NOT NULL DEFAULT 0,
+                         created_at TEXT NOT NULL DEFAULT (datetime('now')),
+                         ended_at TEXT,
+                         cancelled INTEGER NOT NULL DEFAULT 0
+                     );
+                     CREATE TABLE IF NOT EXISTS mission_tasks (
+                         task_id TEXT PRIMARY KEY,
+                         run_id TEXT NOT NULL,
+                         node_id TEXT NOT NULL,
+                         status TEXT NOT NULL DEFAULT 'queued',
+                         attempt INTEGER NOT NULL DEFAULT 1,
+                         output TEXT,
+                         error TEXT,
+                         started_at TEXT,
+                         ended_at TEXT
+                     );
+                     CREATE INDEX IF NOT EXISTS idx_mission_tasks_run
+                         ON mission_tasks(run_id, node_id);
+                     CREATE TABLE IF NOT EXISTS mission_inbox (
+                         id INTEGER PRIMARY KEY AUTOINCREMENT,
+                         task_id TEXT NOT NULL,
+                         run_id TEXT NOT NULL,
+                         node_id TEXT NOT NULL,
+                         status TEXT NOT NULL DEFAULT 'pending',
+                         decision TEXT,
+                         feedback TEXT,
+                         created_at TEXT NOT NULL DEFAULT (datetime('now')),
+                         resolved_at TEXT
+                     );
+                     PRAGMA user_version = 9;",
+                )?;
             }
             Ok::<(), rusqlite::Error>(()).map_err(tokio_rusqlite::Error::from)
         })
@@ -602,7 +1066,8 @@ impl Store {
                  CREATE VIRTUAL TABLE messages_fts USING fts5(
                      content,
                      session_id UNINDEXED,
-                     message_id UNINDEXED
+                     message_id UNINDEXED,
+                     tokenize = 'trigram'
                 );
                 CREATE TABLE IF NOT EXISTS usage (
                     id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -642,7 +1107,105 @@ impl Store {
                 CREATE INDEX IF NOT EXISTS idx_sessions_agent
                     ON sessions(agent, agent_session);
                 CREATE INDEX IF NOT EXISTS idx_usage_created
-                    ON usage(created_at);",
+                    ON usage(created_at);
+                CREATE TABLE granted_roots (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    project_id TEXT REFERENCES projects(id) ON DELETE CASCADE,
+                    root TEXT NOT NULL,
+                    created_at TEXT NOT NULL DEFAULT (datetime('now')),
+                    UNIQUE(project_id, root)
+                );
+                CREATE TABLE plan_reviews (
+                    plan_id TEXT NOT NULL,
+                    session_id TEXT NOT NULL,
+                    request_id TEXT NOT NULL,
+                    revision INTEGER NOT NULL,
+                    title TEXT NOT NULL DEFAULT '',
+                    content TEXT NOT NULL DEFAULT '',
+                    content_hash TEXT NOT NULL DEFAULT '',
+                    complete INTEGER NOT NULL DEFAULT 0,
+                    status TEXT NOT NULL DEFAULT 'awaiting_review',
+                    decision TEXT,
+                    decision_intent_at INTEGER,
+                    applied_at INTEGER,
+                    created_at INTEGER NOT NULL,
+                    updated_at INTEGER NOT NULL,
+                    superseded_by INTEGER,
+                    PRIMARY KEY (plan_id, revision)
+                );
+                CREATE INDEX idx_plan_reviews_session
+                    ON plan_reviews(session_id, plan_id, revision);
+                CREATE INDEX idx_plan_reviews_request
+                    ON plan_reviews(request_id);
+                CREATE TABLE web_pairing (
+                    id INTEGER PRIMARY KEY CHECK (id = 1),
+                    key TEXT NOT NULL,
+                    created_at TEXT NOT NULL DEFAULT (datetime('now'))
+                );
+                CREATE TABLE scanned_native (
+                    backend TEXT NOT NULL,
+                    native_handle TEXT NOT NULL,
+                    size INTEGER,
+                    mtime_ms INTEGER,
+                    session_id TEXT NOT NULL,
+                    scanned_at TEXT NOT NULL DEFAULT (datetime('now')),
+                    PRIMARY KEY (backend, native_handle)
+                );
+                CREATE TABLE session_tombstones (
+                    backend TEXT NOT NULL,
+                    native_handle TEXT NOT NULL,
+                    created_at TEXT NOT NULL DEFAULT (datetime('now')),
+                    PRIMARY KEY (backend, native_handle)
+                );
+                CREATE TABLE web_devices (
+                    id TEXT PRIMARY KEY,
+                    name TEXT NOT NULL DEFAULT '',
+                    token_hash TEXT NOT NULL UNIQUE,
+                    status TEXT NOT NULL DEFAULT 'pending',
+                    created_at TEXT NOT NULL DEFAULT (datetime('now')),
+                    approved_at TEXT,
+                    last_seen TEXT
+                );
+                CREATE TABLE mission_flows (
+                    flow_id TEXT NOT NULL,
+                    version INTEGER NOT NULL,
+                    name TEXT NOT NULL DEFAULT '',
+                    definition TEXT NOT NULL,
+                    created_at TEXT NOT NULL DEFAULT (datetime('now')),
+                    PRIMARY KEY (flow_id, version)
+                );
+                CREATE TABLE mission_runs (
+                    run_id TEXT PRIMARY KEY,
+                    flow_id TEXT NOT NULL,
+                    version INTEGER NOT NULL,
+                    snapshot TEXT NOT NULL,
+                    interrupted INTEGER NOT NULL DEFAULT 0,
+                    created_at TEXT NOT NULL DEFAULT (datetime('now')),
+                    ended_at TEXT,
+                    cancelled INTEGER NOT NULL DEFAULT 0
+                );
+                CREATE TABLE mission_tasks (
+                    task_id TEXT PRIMARY KEY,
+                    run_id TEXT NOT NULL,
+                    node_id TEXT NOT NULL,
+                    status TEXT NOT NULL DEFAULT 'queued',
+                    attempt INTEGER NOT NULL DEFAULT 1,
+                    output TEXT,
+                    error TEXT,
+                    started_at TEXT,
+                    ended_at TEXT
+                );
+                CREATE TABLE mission_inbox (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    task_id TEXT NOT NULL,
+                    run_id TEXT NOT NULL,
+                    node_id TEXT NOT NULL,
+                    status TEXT NOT NULL DEFAULT 'pending',
+                    decision TEXT,
+                    feedback TEXT,
+                    created_at TEXT NOT NULL DEFAULT (datetime('now')),
+                    resolved_at TEXT
+                );",
             )
             .map_err(tokio_rusqlite::Error::from)
         })
@@ -684,6 +1247,9 @@ impl Store {
         let sid = id.to_string();
         let agent = agent.to_string();
         let agent_session = agent_session.to_string();
+        // Binding a native handle is the user's explicit new intent —
+        // a scanner tombstone for it dissolves.
+        let _ = self.clear_tombstone(&agent, &agent_session).await;
         self.conn
             .call(move |c| {
                 c.execute(
@@ -806,6 +1372,11 @@ impl Store {
     /// coarsest bound the old schema could express, so pre-migration
     /// history stays inside bounded queries instead of silently
     /// dropping out of them.
+    ///
+    /// Sub-trigram terms (see `fts5_query`) ride along as
+    /// exact-substring conjuncts; a query built only of them has no
+    /// MATCH, hence no rank — those hits come back newest-first
+    /// (message id order) with a Rust-built snippet.
     pub async fn search_filtered(
         &self,
         query: &str,
@@ -833,15 +1404,62 @@ impl Store {
                     ELSE messages.ts END)";
         self.conn
             .call(move |c| {
-                let mut sql = String::from(
-                    "SELECT messages_fts.session_id, messages_fts.message_id,
-                            snippet(messages_fts, 0, char(1), char(2), '…', 32)
+                // Hybrid queries keep the MATCH — snippet() and rank
+                // stay live. A pure-LIKE query has no MATCH, and
+                // snippet() is an FTS5 auxiliary function that
+                // requires one: the raw content comes back (the
+                // snippet is built in Rust, see `like_snippet`),
+                // ordered newest-first instead of by rank.
+                let fts = !query.match_expr.is_empty();
+                // Exact-substring patterns for the sub-trigram terms;
+                // ESCAPE keeps user %/_ literal, as on the FTS path.
+                let like_pat = |t: &String| {
+                    format!(
+                        "%{}%",
+                        t.replace('\\', "\\\\")
+                            .replace('%', "\\%")
+                            .replace('_', "\\_")
+                    )
+                };
+                let like_patterns: Vec<String> = query.like_terms.iter().map(like_pat).collect();
+                let not_like_patterns: Vec<String> =
+                    query.like_not_terms.iter().map(like_pat).collect();
+                let mut sql =
+                    String::from("SELECT messages_fts.session_id, messages_fts.message_id, ");
+                if fts {
+                    sql.push_str("snippet(messages_fts, 0, char(1), char(2), '…', 32)");
+                } else {
+                    sql.push_str("messages_fts.content");
+                }
+                sql.push_str(
+                    "
                      FROM messages_fts
                      JOIN sessions ON sessions.id = messages_fts.session_id
                      LEFT JOIN messages ON messages.id = messages_fts.message_id
-                     WHERE messages_fts MATCH ?1",
+                     WHERE ",
                 );
-                let mut idx = 2;
+                let mut binds: Vec<&dyn rusqlite::ToSql> = Vec::new();
+                if fts {
+                    sql.push_str("messages_fts MATCH ?1");
+                    binds.push(&query.match_expr);
+                } else {
+                    // No MATCH — the LIKE conjuncts below carry the
+                    // whole predicate; give WHERE a base to bind to.
+                    sql.push_str("1=1");
+                }
+                for p in &like_patterns {
+                    let n = binds.len() + 1;
+                    sql.push_str(&format!(" AND messages_fts.content LIKE ?{n} ESCAPE '\\'"));
+                    binds.push(p);
+                }
+                for p in &not_like_patterns {
+                    let n = binds.len() + 1;
+                    sql.push_str(&format!(
+                        " AND messages_fts.content NOT LIKE ?{n} ESCAPE '\\'"
+                    ));
+                    binds.push(p);
+                }
+                let mut idx = binds.len() + 1;
                 if filter.session_id.is_some() {
                     sql.push_str(&format!(" AND messages_fts.session_id = ?{idx}"));
                     idx += 1;
@@ -866,9 +1484,14 @@ impl Store {
                     sql.push_str(&format!(" AND {eff_ts} <= ?{idx}"));
                     idx += 1;
                 }
-                sql.push_str(&format!(" ORDER BY rank LIMIT ?{idx}"));
+                if fts {
+                    sql.push_str(&format!(" ORDER BY rank LIMIT ?{idx}"));
+                } else {
+                    sql.push_str(&format!(
+                        " ORDER BY messages_fts.message_id DESC LIMIT ?{idx}"
+                    ));
+                }
                 let mut stmt = c.prepare(&sql)?;
-                let mut binds: Vec<&dyn rusqlite::ToSql> = vec![&query];
                 if let Some(s) = &filter.session_id {
                     binds.push(s);
                 }
@@ -891,18 +1514,34 @@ impl Store {
                 binds.push(&lim);
                 let rows = stmt
                     .query_map(binds.as_slice(), |row| {
-                        Ok((row.get(0)?, row.get(1)?, row.get(2)?))
+                        Ok((
+                            row.get::<_, String>(0)?,
+                            row.get::<_, i64>(1)?,
+                            row.get::<_, String>(2)?,
+                        ))
                     })?
                     .collect::<Result<Vec<_>, _>>()?;
-                Ok::<Vec<_>, tokio_rusqlite::Error>(rows)
+                Ok::<Vec<_>, tokio_rusqlite::Error>(
+                    rows.into_iter()
+                        .map(|(session_id, message_id, text)| {
+                            let snippet = if fts {
+                                text
+                            } else {
+                                like_snippet(&text, &query.like_terms)
+                            };
+                            (session_id, message_id, snippet)
+                        })
+                        .collect(),
+                )
             })
             .await
             .map_err(Into::into)
     }
 
-    /// Build a safe FTS5 MATCH expression from user input.
+    /// Build a safe FTS5 MATCH expression from user input, splitting
+    /// out sub-trigram terms for a LIKE fallback.
     ///
-    /// Token rules:
+    /// Token rules (unchanged):
     /// - `"..."` spans (with `""` escapes) become FTS5 phrase tokens.
     /// - Bare `AND`, `OR`, `NOT` pass through as operators.
     /// - Everything else becomes a single-quoted phrase — `*`, `NEAR(...)`,
@@ -914,8 +1553,19 @@ impl Store {
     /// operator (`x NOT y`) — FTS5 has no unary NOT, so `x AND NOT y` is
     /// rewritten to the equivalent `x NOT y`, and a leading or operand-less
     /// NOT is dropped.
+    ///
+    /// The split: any term shorter than 3 characters — bare or quoted,
+    /// after stripping a trailing `*` — cannot survive the trigram
+    /// tokenizer (SQLite silently drops sub-3-char query tokens, so
+    /// `커밋` would match nothing). Such a term moves to
+    /// `like_terms`/`like_not_terms` instead, where it becomes an
+    /// exact-substring conjunct over the indexed content; every other
+    /// term stays on the FTS5 path, keeping snippet()/rank. Operators
+    /// never bind LIKE-path terms: short terms are mandatory
+    /// conjuncts, so an `OR` touching one narrows to AND (fewer hits,
+    /// never wrong ones) and a NOT-operand exclusion is honored.
     /// Returns `None` when nothing searchable remains.
-    fn fts5_query(input: &str) -> Option<String> {
+    fn fts5_query(input: &str) -> Option<FtsQuery> {
         enum Tok {
             Term(String),
             AndOr(&'static str),
@@ -965,6 +1615,11 @@ impl Store {
         // Sanitize: drop leading/trailing binary operators, collapse
         // consecutive ones, and keep NOT only as a binary exclusion
         // operator (a trailing NOT dies unconsumed).
+        let mut q = FtsQuery {
+            match_expr: String::new(),
+            like_terms: Vec::new(),
+            like_not_terms: Vec::new(),
+        };
         let mut out: Vec<String> = Vec::new();
         let mut pending_op: Option<&'static str> = None;
         let mut pending_not = false;
@@ -986,9 +1641,37 @@ impl Store {
                     }
                 }
                 Tok::Term(term) => {
-                    // FTS5's NOT is binary and already conjunctive — "x NOT
-                    // y" is "x and-not y" — while "x AND NOT y" does not
-                    // parse, so NOT replaces any pending AND/OR.
+                    // A trailing `*` makes the term an FTS5 prefix
+                    // query (`"tok"*` — prefix on the last token of
+                    // the phrase); quote-wrapping alone used to
+                    // swallow it, so `error*` searched the literal
+                    // token "error" and never matched "errors". A
+                    // bare `*` is nothing searchable — drop it.
+                    let (stem, prefix) = match term.strip_suffix('*') {
+                        Some(s) => (s.trim_end_matches('*'), true),
+                        None => (term.as_str(), false),
+                    };
+                    // Sub-trigram term: route to the LIKE conjuncts
+                    // (exclusion under NOT) instead of a MATCH that
+                    // would silently drop it. Its connecting operator
+                    // is dropped with it — short terms stay
+                    // conjunctive. The operator push is deferred
+                    // until a piece actually lands in `out`, so a
+                    // diverted or empty term can never strand a
+                    // dangling operator in the MATCH expression.
+                    if stem.chars().count() < 3 {
+                        if !stem.is_empty() {
+                            if pending_not {
+                                q.like_not_terms.push(stem.to_string());
+                                pending_not = false;
+                            } else {
+                                q.like_terms.push(stem.to_string());
+                            }
+                            pending_op = None;
+                        }
+                        continue;
+                    }
+                    let escaped = stem.replace('"', "\"\"");
                     if pending_not {
                         pending_op = None;
                         out.push("NOT".to_string());
@@ -996,27 +1679,19 @@ impl Store {
                     } else if let Some(op) = pending_op.take() {
                         out.push(op.to_string());
                     }
-                    // A trailing `*` makes the term an FTS5 prefix
-                    // query (`"tok"*` — prefix on the last token of
-                    // the phrase); quote-wrapping alone used to
-                    // swallow it, so `error*` searched the literal
-                    // token "error" and never matched "errors". A
-                    // bare `*` is nothing searchable — drop it.
-                    if let Some(stem) = term.strip_suffix('*') {
-                        let stem = stem.trim_end_matches('*');
-                        if !stem.is_empty() {
-                            out.push(format!("\"{}\"*", stem.replace('"', "\"\"")));
-                        }
+                    if prefix {
+                        out.push(format!("\"{escaped}\"*"));
                     } else {
-                        out.push(format!("\"{}\"", term.replace('"', "\"\"")));
+                        out.push(format!("\"{escaped}\""));
                     }
                 }
             }
         }
-        if out.is_empty() {
+        q.match_expr = out.join(" ");
+        if q.match_expr.is_empty() && q.like_terms.is_empty() && q.like_not_terms.is_empty() {
             None
         } else {
-            Some(out.join(" "))
+            Some(q)
         }
     }
 
@@ -1274,6 +1949,88 @@ impl Store {
             .map_err(Into::into)
     }
 
+    /// Usage rollup grouped per (LOCAL day, backend, model) over the
+    /// last `days` local days (today inclusive — 7 covers today plus
+    /// the six days before it; 0 clamps to today-only, same rule as
+    /// `daily_usage`), plus the window total. `tz_offset_minutes` is
+    /// the caller's UTC offset: the UTC `created_at` stamps are
+    /// shifted by it so buckets match the user's calendar (0 = UTC
+    /// buckets, the `daily_usage` behavior). `backend` is the owning
+    /// session's agent id ("" when unset). Turns count usage rows;
+    /// context columns sum the per-turn snapshots (each row is a fill
+    /// level, so sums grow with turn count — `daily_usage` reports
+    /// the day's latest snapshot instead); cost sums the per-turn
+    /// deltas. Days with no rows are absent — the client renders the
+    /// gaps.
+    pub async fn usage_aggregate(
+        &self,
+        days: u32,
+        tz_offset_minutes: i32,
+    ) -> anyhow::Result<UsageAggregate> {
+        // SQLite date modifiers: "+540 minutes" / "-420 minutes" shift
+        // a UTC stamp into the caller's wall clock; the cutoff date is
+        // computed in the same shifted clock so the window is `days`
+        // LOCAL days, not UTC ones.
+        let tz = format!("{tz_offset_minutes:+} minutes");
+        let cutoff = format!("-{} days", days.saturating_sub(1));
+        self.conn
+            .call(move |c| {
+                let mut stmt = c.prepare(
+                    "SELECT substr(datetime(u.created_at, ?1), 1, 10),
+                            COALESCE(s.agent, ''),
+                            u.model,
+                            COUNT(*), SUM(u.context_used), SUM(u.context_size), SUM(u.cost_usd)
+                     FROM usage u
+                     LEFT JOIN sessions s ON s.id = u.session_id
+                     WHERE date(u.created_at, ?1) >= date('now', ?1, ?2)
+                     GROUP BY substr(datetime(u.created_at, ?1), 1, 10),
+                              COALESCE(s.agent, ''), u.model
+                     ORDER BY 1, 2, 3",
+                )?;
+                let rows = stmt
+                    .query_map(rusqlite::params![tz, cutoff], |r| {
+                        Ok(UsageDayRow {
+                            date: r.get(0)?,
+                            backend: r.get(1)?,
+                            model: r.get(2)?,
+                            turns: r.get::<_, i64>(3)? as u64,
+                            context_used: r.get::<_, i64>(4)? as u64,
+                            context_size: r.get::<_, i64>(5)? as u64,
+                            cost_usd: r.get(6)?,
+                        })
+                    })?
+                    .collect::<Result<Vec<_>, _>>()?;
+                let mut agg = UsageAggregate {
+                    turns: 0,
+                    context_used: 0,
+                    context_size: 0,
+                    cost_usd: 0.0,
+                    rows,
+                };
+                for r in &agg.rows {
+                    agg.turns += r.turns;
+                    agg.context_used += r.context_used;
+                    agg.context_size += r.context_size;
+                    agg.cost_usd += r.cost_usd;
+                }
+                Ok::<_, tokio_rusqlite::Error>(agg)
+            })
+            .await
+            .map_err(Into::into)
+    }
+
+    /// Delete every usage row (context/cost history) — the store side
+    /// of `usage.clear`. Sessions, messages, and FTS are untouched.
+    pub async fn usage_clear(&self) -> anyhow::Result<()> {
+        self.conn
+            .call(move |c| {
+                c.execute("DELETE FROM usage", [])?;
+                Ok::<(), tokio_rusqlite::Error>(())
+            })
+            .await
+            .map_err(Into::into)
+    }
+
     /// Delete a session and all of its messages.
     pub async fn delete_session(&self, id: &str) -> anyhow::Result<()> {
         let id = id.to_string();
@@ -1295,6 +2052,40 @@ impl Store {
                     "DELETE FROM usage WHERE session_id = ?1",
                     rusqlite::params![id],
                 )?;
+                // Plan reviews are session lifecycle state as well —
+                // a deleted session leaves no ghost approvals behind.
+                tx.execute(
+                    "DELETE FROM plan_reviews WHERE session_id = ?1",
+                    rusqlite::params![id],
+                )?;
+                // Tombstone the native handle so the history sweep
+                // never re-imports what the user just deleted. The
+                // agent id + native handle are the sweep's identity.
+                {
+                    let handle: Option<(Option<String>, Option<String>)> = tx
+                        .query_row(
+                            "SELECT COALESCE(agent, ''), COALESCE(agent_session, '')
+                             FROM sessions WHERE id = ?1",
+                            rusqlite::params![id],
+                            |r| Ok((r.get(0)?, r.get(1)?)),
+                        )
+                        .optional()?;
+                    if let Some((Some(agent), Some(native))) = handle
+                        && !agent.is_empty()
+                        && !native.is_empty()
+                    {
+                        tx.execute(
+                            "INSERT OR IGNORE INTO session_tombstones
+                                 (backend, native_handle) VALUES (?1, ?2)",
+                            rusqlite::params![agent, native],
+                        )?;
+                        tx.execute(
+                            "DELETE FROM scanned_native
+                             WHERE backend = ?1 AND native_handle = ?2",
+                            rusqlite::params![agent, native],
+                        )?;
+                    }
+                }
                 tx.execute("DELETE FROM sessions WHERE id = ?1", rusqlite::params![id])?;
                 tx.commit()?;
                 Ok::<(), tokio_rusqlite::Error>(())
@@ -1671,6 +2462,1256 @@ impl Store {
         Ok(())
     }
 
+    /// The session's project scope (None = unbound) — the key that
+    /// selects a session's effective granted roots.
+    pub async fn session_project(&self, id: &str) -> anyhow::Result<Option<String>> {
+        let sid = id.to_string();
+        Ok(self
+            .conn
+            .call(move |c| {
+                Ok::<Option<String>, tokio_rusqlite::Error>(c.query_row(
+                    "SELECT project_id FROM sessions WHERE id = ?1",
+                    [&sid],
+                    |r| r.get(0),
+                )?)
+            })
+            .await?)
+    }
+
+    /// Persist one granted root. Idempotent per (project, root): a
+    /// duplicate is a no-op, not an error. `root` must already be the
+    /// canonical form (resolved, absolute) — validation lives at the
+    /// RPC door, the store just persists.
+    pub async fn grant_root(&self, project_id: Option<String>, root: String) -> anyhow::Result<()> {
+        self.conn
+            .call(move |c| {
+                let exists: bool = c
+                    .query_row(
+                        "SELECT 1 FROM granted_roots WHERE project_id IS ?1 AND root = ?2",
+                        rusqlite::params![project_id, root],
+                        |r| r.get::<_, i64>(0).map(|_| true),
+                    )
+                    .optional()?
+                    .unwrap_or(false);
+                if !exists {
+                    c.execute(
+                        "INSERT INTO granted_roots (project_id, root) VALUES (?1, ?2)",
+                        rusqlite::params![project_id, root],
+                    )?;
+                }
+                Ok::<(), tokio_rusqlite::Error>(())
+            })
+            .await
+            .map_err(Into::into)
+    }
+
+    /// Grants effective for a scope: the project's plus every global
+    /// one (`project_id = None` lists globals only). `root` is the
+    /// canonical stored form.
+    pub async fn granted_roots(
+        &self,
+        project_id: Option<String>,
+    ) -> anyhow::Result<Vec<GrantedRoot>> {
+        self.conn
+            .call(move |c| {
+                let mut stmt = c.prepare(
+                    "SELECT COALESCE(project_id, ''), root, created_at
+                     FROM granted_roots
+                     WHERE project_id IS NULL OR project_id = ?1
+                     ORDER BY project_id IS NOT NULL, root",
+                )?;
+                let rows = stmt
+                    .query_map(rusqlite::params![project_id], |r| {
+                        Ok(GrantedRoot {
+                            project_id: {
+                                let p: String = r.get(0)?;
+                                (!p.is_empty()).then_some(p)
+                            },
+                            root: r.get(1)?,
+                            created_at: r.get(2)?,
+                        })
+                    })?
+                    .collect::<Result<Vec<_>, _>>()?;
+                Ok::<_, tokio_rusqlite::Error>(rows)
+            })
+            .await
+            .map_err(Into::into)
+    }
+
+    /// Remove one grant (exact project scope + canonical root match).
+    /// Returns whether a row was removed.
+    pub async fn revoke_root(
+        &self,
+        project_id: Option<String>,
+        root: String,
+    ) -> anyhow::Result<bool> {
+        self.conn
+            .call(move |c| {
+                let n = c.execute(
+                    "DELETE FROM granted_roots WHERE project_id IS ?1 AND root = ?2",
+                    rusqlite::params![project_id, root],
+                )?;
+                Ok::<bool, tokio_rusqlite::Error>(n > 0)
+            })
+            .await
+            .map_err(Into::into)
+    }
+
+    /// Register a `kind=plan` ask as a durable review row. A re-ask
+    /// while the session's latest revision is still open (not decided,
+    /// not terminal) chains onto the same planId as revision+1 and
+    /// supersedes the open ones; otherwise a fresh planId starts at
+    /// revision 1. Returns the new revision's row.
+    pub async fn record_plan(
+        &self,
+        session_id: &str,
+        request_id: &str,
+        title: &str,
+        content: &str,
+        complete: bool,
+    ) -> anyhow::Result<PlanRow> {
+        let session_id = session_id.to_string();
+        let request_id = request_id.to_string();
+        let title = title.to_string();
+        let content = content.to_string();
+        self.conn
+            .call(move |c| {
+                let now = plan_now_ms();
+                let tx = c.transaction()?;
+                // The session's newest revision decides chaining.
+                let latest: Option<(String, i64, String)> = tx
+                    .query_row(
+                        "SELECT plan_id, revision, status FROM plan_reviews
+                         WHERE session_id = ?1
+                         ORDER BY created_at DESC, revision DESC LIMIT 1",
+                        rusqlite::params![session_id],
+                        |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+                    )
+                    .optional()?;
+                let (plan_id, revision) = match latest {
+                    // Still-open review: the same plan, revised.
+                    Some((pid, rev, status))
+                        if matches!(
+                            status.as_str(),
+                            "awaiting_review" | "changes_requested" | "deferred"
+                        ) =>
+                    {
+                        let next = rev + 1;
+                        tx.execute(
+                            "UPDATE plan_reviews
+                             SET status = 'superseded', superseded_by = ?1, updated_at = ?2
+                             WHERE plan_id = ?3
+                               AND status IN ('awaiting_review', 'submitting',
+                                              'deferred', 'changes_requested')",
+                            rusqlite::params![next, now, pid],
+                        )?;
+                        (pid, next)
+                    }
+                    // No open review — a new plan chain.
+                    _ => (uuid::Uuid::new_v4().to_string(), 1),
+                };
+                let hash = plan_content_hash(&content);
+                tx.execute(
+                    "INSERT INTO plan_reviews
+                         (plan_id, session_id, request_id, revision, title,
+                          content, content_hash, complete, status,
+                          created_at, updated_at)
+                     VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, 'awaiting_review', ?9, ?9)",
+                    rusqlite::params![
+                        plan_id,
+                        session_id,
+                        request_id,
+                        revision,
+                        title,
+                        content,
+                        hash,
+                        complete as i64,
+                        now
+                    ],
+                )?;
+                tx.commit()?;
+                Ok::<PlanRow, tokio_rusqlite::Error>(PlanRow {
+                    plan_id,
+                    session_id,
+                    request_id,
+                    revision,
+                    title,
+                    content,
+                    content_hash: hash,
+                    complete,
+                    status: "awaiting_review".to_string(),
+                    decision: None,
+                    decision_intent_at: None,
+                    applied_at: None,
+                    created_at: now,
+                    updated_at: now,
+                    superseded_by: None,
+                })
+            })
+            .await
+            .map_err(Into::into)
+    }
+
+    fn plan_row_columns() -> &'static str {
+        "plan_id, session_id, request_id, revision, title, content, content_hash,
+         complete, status, decision, decision_intent_at, applied_at,
+         created_at, updated_at, superseded_by"
+    }
+
+    fn map_plan_row(r: &rusqlite::Row<'_>) -> rusqlite::Result<PlanRow> {
+        let decision: Option<String> = r.get(9)?;
+        Ok(PlanRow {
+            plan_id: r.get(0)?,
+            session_id: r.get(1)?,
+            request_id: r.get(2)?,
+            revision: r.get(3)?,
+            title: r.get(4)?,
+            content: r.get(5)?,
+            content_hash: r.get(6)?,
+            complete: r.get::<_, i64>(7)? != 0,
+            status: r.get(8)?,
+            decision: decision.and_then(|raw| serde_json::from_str(&raw).ok()),
+            decision_intent_at: r.get(10)?,
+            applied_at: r.get(11)?,
+            created_at: r.get(12)?,
+            updated_at: r.get(13)?,
+            superseded_by: r.get(14)?,
+        })
+    }
+
+    /// One revision of a plan review.
+    pub async fn plan_row(&self, plan_id: &str, revision: i64) -> anyhow::Result<Option<PlanRow>> {
+        let (pid, rev) = (plan_id.to_string(), revision);
+        self.conn
+            .call(move |c| {
+                Ok::<Option<PlanRow>, tokio_rusqlite::Error>(
+                    c.query_row(
+                        &format!(
+                            "SELECT {} FROM plan_reviews
+                             WHERE plan_id = ?1 AND revision = ?2",
+                            Self::plan_row_columns()
+                        ),
+                        rusqlite::params![pid, rev],
+                        Self::map_plan_row,
+                    )
+                    .optional()?,
+                )
+            })
+            .await
+            .map_err(Into::into)
+    }
+
+    /// The still-open revision answering this live ask, if any — the
+    /// hook `permission.respond` uses to land a legacy decision in the
+    /// durable row.
+    pub async fn open_plan_for_request(&self, request_id: &str) -> anyhow::Result<Option<PlanRow>> {
+        let rid = request_id.to_string();
+        self.conn
+            .call(move |c| {
+                Ok::<Option<PlanRow>, tokio_rusqlite::Error>(
+                    c.query_row(
+                        &format!(
+                            "SELECT {} FROM plan_reviews
+                             WHERE request_id = ?1
+                               AND status IN ('awaiting_review', 'deferred')
+                             ORDER BY created_at DESC LIMIT 1",
+                            Self::plan_row_columns()
+                        ),
+                        rusqlite::params![rid],
+                        Self::map_plan_row,
+                    )
+                    .optional()?,
+                )
+            })
+            .await
+            .map_err(Into::into)
+    }
+
+    /// Every revision of every plan for a session, chain-ordered —
+    /// the review history `plan.list` serves.
+    pub async fn plan_reviews(&self, session_id: &str) -> anyhow::Result<Vec<PlanRow>> {
+        let sid = session_id.to_string();
+        self.conn
+            .call(move |c| {
+                let mut stmt = c.prepare(&format!(
+                    "SELECT {} FROM plan_reviews
+                     WHERE session_id = ?1
+                     ORDER BY plan_id, revision",
+                    Self::plan_row_columns()
+                ))?;
+                let rows = stmt
+                    .query_map(rusqlite::params![sid], Self::map_plan_row)?
+                    .collect::<Result<Vec<_>, _>>()?;
+                Ok::<_, tokio_rusqlite::Error>(rows)
+            })
+            .await
+            .map_err(Into::into)
+    }
+
+    /// CAS decision claim: expectedRevision + status-conditional update
+    /// inside one serialized connection call — "double-click, two
+    /// windows, retry" all resolve to claim-or-conflict. The decision
+    /// intent ({decision, feedback}) is persisted HERE, before any
+    /// native relay. Approving an incomplete plan and requesting
+    /// changes without feedback are refused outright.
+    pub async fn submit_plan_decision(
+        &self,
+        plan_id: &str,
+        expected_revision: i64,
+        decision: &str,
+        feedback: Option<&str>,
+    ) -> anyhow::Result<PlanSubmit> {
+        if decision == "request_changes" && feedback.map(str::trim).unwrap_or("").is_empty() {
+            return Ok(PlanSubmit::FeedbackRequired);
+        }
+        if !matches!(decision, "approve" | "request_changes" | "defer") {
+            anyhow::bail!("unknown plan decision {decision:?}");
+        }
+        let pid = plan_id.to_string();
+        let decision = decision.to_string();
+        let feedback = feedback.map(String::from);
+        self.conn
+            .call(move |c| {
+                let current: Option<PlanRow> = c
+                    .query_row(
+                        &format!(
+                            "SELECT {} FROM plan_reviews
+                             WHERE plan_id = ?1 AND revision = ?2",
+                            Self::plan_row_columns()
+                        ),
+                        rusqlite::params![pid, expected_revision],
+                        Self::map_plan_row,
+                    )
+                    .optional()?;
+                let Some(current) = current else {
+                    return Ok::<PlanSubmit, tokio_rusqlite::Error>(PlanSubmit::NotFound);
+                };
+                if decision == "approve" && !current.complete {
+                    return Ok(PlanSubmit::Incomplete);
+                }
+                // Only these two states accept a submission; everything
+                // else (another reviewer won, terminal, submitting) is
+                // a conflict surfaced with the current row.
+                if !matches!(current.status.as_str(), "awaiting_review" | "deferred") {
+                    return Ok(PlanSubmit::Conflict(Box::new(current)));
+                }
+                let intent = serde_json::json!({
+                    "decision": decision,
+                    "feedback": feedback,
+                });
+                let now = plan_now_ms();
+                let claimed = c.execute(
+                    "UPDATE plan_reviews
+                     SET status = 'submitting', decision = ?1,
+                         decision_intent_at = ?2, updated_at = ?2
+                     WHERE plan_id = ?3 AND revision = ?4
+                       AND status IN ('awaiting_review', 'deferred')",
+                    rusqlite::params![intent.to_string(), now, pid, expected_revision],
+                )?;
+                if claimed == 0 {
+                    let current: Option<PlanRow> = c
+                        .query_row(
+                            &format!(
+                                "SELECT {} FROM plan_reviews
+                                 WHERE plan_id = ?1 AND revision = ?2",
+                                Self::plan_row_columns()
+                            ),
+                            rusqlite::params![pid, expected_revision],
+                            Self::map_plan_row,
+                        )
+                        .optional()?;
+                    return Ok(match current {
+                        Some(row) => PlanSubmit::Conflict(Box::new(row)),
+                        None => PlanSubmit::NotFound,
+                    });
+                }
+                Ok(PlanSubmit::Claimed {
+                    session_id: current.session_id,
+                    request_id: current.request_id,
+                    previous: current.status,
+                })
+            })
+            .await
+            .map_err(Into::into)
+    }
+
+    /// Native ack: `submitting` settles into the decision's status and
+    /// records the confirmation time.
+    pub async fn settle_plan(
+        &self,
+        plan_id: &str,
+        revision: i64,
+        decision: &str,
+    ) -> anyhow::Result<()> {
+        let settled = match decision {
+            "approve" => "approved",
+            "request_changes" => "changes_requested",
+            "defer" => "deferred",
+            other => anyhow::bail!("unknown plan decision {other:?}"),
+        };
+        let pid = plan_id.to_string();
+        self.conn
+            .call(move |c| {
+                c.execute(
+                    "UPDATE plan_reviews
+                     SET status = ?1, applied_at = ?2, updated_at = ?2
+                     WHERE plan_id = ?3 AND revision = ?4 AND status = 'submitting'",
+                    rusqlite::params![settled, plan_now_ms(), pid, revision],
+                )?;
+                Ok::<(), tokio_rusqlite::Error>(())
+            })
+            .await
+            .map_err(Into::into)
+    }
+
+    /// Failed native relay: the decision intent stays recorded
+    /// (decision/decision_intent_at untouched) but the row returns to
+    /// its pre-claim status — an approval never reads as delivered.
+    pub async fn revert_plan(
+        &self,
+        plan_id: &str,
+        revision: i64,
+        previous: &str,
+    ) -> anyhow::Result<()> {
+        let pid = plan_id.to_string();
+        let previous = previous.to_string();
+        self.conn
+            .call(move |c| {
+                c.execute(
+                    "UPDATE plan_reviews SET status = ?1, updated_at = ?2
+                     WHERE plan_id = ?3 AND revision = ?4 AND status = 'submitting'",
+                    rusqlite::params![previous, plan_now_ms(), pid, revision],
+                )?;
+                Ok::<(), tokio_rusqlite::Error>(())
+            })
+            .await
+            .map_err(Into::into)
+    }
+
+    // ---- Web device pairing ----------------------------------------
+    //
+    // The pairing key is daemon-minted and single-use: the pair request
+    // consumes it AND rotates in a fresh one inside one locked step, so
+    // a code is good for exactly one pairing no matter how many devices
+    // race it (upstream's compare-and-rotate-under-one-lock).
+
+    /// The active pairing key, minting one if none exists yet.
+    pub async fn pairing_key_ensure(&self) -> anyhow::Result<String> {
+        self.conn
+            .call(move |c| {
+                let existing: Option<String> = c
+                    .query_row("SELECT key FROM web_pairing WHERE id = 1", [], |r| r.get(0))
+                    .optional()?;
+                if let Some(key) = existing {
+                    return Ok::<String, tokio_rusqlite::Error>(key);
+                }
+                let key = crate::cli_lifecycle::generate_pairing_key();
+                c.execute(
+                    "INSERT INTO web_pairing (id, key) VALUES (1, ?1)
+                     ON CONFLICT(id) DO UPDATE SET key = ?1, created_at = datetime('now')",
+                    rusqlite::params![key],
+                )?;
+                Ok::<String, tokio_rusqlite::Error>(key)
+            })
+            .await
+            .map_err(Into::into)
+    }
+
+    /// Spend the pairing key on one pairing: compare + delete + rotate
+    /// under one connection call — a code opens exactly one pairing.
+    /// Returns the fresh key for the next device, or None when the
+    /// submitted key does not match.
+    pub async fn consume_pairing_key(&self, key: &str) -> anyhow::Result<Option<String>> {
+        let key = key.trim().to_string();
+        self.conn
+            .call(move |c| {
+                let tx = c.transaction()?;
+                let spent = tx.execute(
+                    "DELETE FROM web_pairing WHERE id = 1 AND key = ?1",
+                    rusqlite::params![key],
+                )?;
+                if spent == 0 {
+                    return Ok::<Option<String>, tokio_rusqlite::Error>(None);
+                }
+                let fresh = crate::cli_lifecycle::generate_pairing_key();
+                tx.execute(
+                    "INSERT INTO web_pairing (id, key) VALUES (1, ?1)",
+                    rusqlite::params![fresh],
+                )?;
+                tx.commit()?;
+                Ok(Some(fresh))
+            })
+            .await
+            .map_err(Into::into)
+    }
+
+    /// Create a pending device row. `token_hash` is the SHA-256 of the
+    /// device token (the usable secret never touches the store).
+    pub async fn create_device(&self, name: &str, token_hash: &str) -> anyhow::Result<String> {
+        let id = uuid::Uuid::new_v4().to_string();
+        let name = name.trim().to_string();
+        let name = if name.is_empty() {
+            "unnamed device".to_string()
+        } else {
+            name
+        };
+        let (row_id, token_hash) = (id.clone(), token_hash.to_string());
+        self.conn
+            .call(move |c| -> tokio_rusqlite::Result<()> {
+                c.execute(
+                    "INSERT INTO web_devices (id, name, token_hash) VALUES (?1, ?2, ?3)",
+                    rusqlite::params![row_id, name, token_hash],
+                )?;
+                Ok(())
+            })
+            .await
+            .map_err(anyhow::Error::from)?;
+        Ok(id)
+    }
+
+    /// Approve a pending device — `approved_at` is what lets its token
+    /// through ws_ticket. Only transitions from pending.
+    pub async fn approve_device(&self, id: &str) -> anyhow::Result<bool> {
+        let id = id.to_string();
+        self.conn
+            .call(move |c| {
+                let n = c.execute(
+                    "UPDATE web_devices SET status = 'approved', approved_at = datetime('now')
+                     WHERE id = ?1 AND status = 'pending'",
+                    rusqlite::params![id],
+                )?;
+                Ok::<bool, tokio_rusqlite::Error>(n > 0)
+            })
+            .await
+            .map_err(Into::into)
+    }
+
+    /// Revoke (or deny) a device: the row goes, so the token hash goes
+    /// with it — the credential is dead immediately, no grace period.
+    pub async fn revoke_device(&self, id: &str) -> anyhow::Result<bool> {
+        let id = id.to_string();
+        self.conn
+            .call(move |c| {
+                let n = c.execute(
+                    "DELETE FROM web_devices WHERE id = ?1",
+                    rusqlite::params![id],
+                )?;
+                Ok::<bool, tokio_rusqlite::Error>(n > 0)
+            })
+            .await
+            .map_err(Into::into)
+    }
+
+    /// Rename a device (desktop-side label only).
+    pub async fn rename_device(&self, id: &str, name: &str) -> anyhow::Result<bool> {
+        let (id, name) = (id.to_string(), name.trim().to_string());
+        if name.is_empty() {
+            return Ok(false);
+        }
+        self.conn
+            .call(move |c| {
+                let n = c.execute(
+                    "UPDATE web_devices SET name = ?2 WHERE id = ?1",
+                    rusqlite::params![id, name],
+                )?;
+                Ok::<bool, tokio_rusqlite::Error>(n > 0)
+            })
+            .await
+            .map_err(Into::into)
+    }
+
+    /// Every device, oldest first — the desktop's device list.
+    pub async fn devices(&self) -> anyhow::Result<Vec<DeviceRow>> {
+        self.conn
+            .call(move |c| {
+                let mut stmt = c.prepare(
+                    "SELECT id, name, status, created_at, approved_at, last_seen
+                     FROM web_devices ORDER BY created_at, id",
+                )?;
+                let rows = stmt
+                    .query_map([], |r| {
+                        Ok(DeviceRow {
+                            id: r.get(0)?,
+                            name: r.get(1)?,
+                            status: r.get(2)?,
+                            created_at: r.get(3)?,
+                            approved_at: r.get(4)?,
+                            last_seen: r.get(5)?,
+                        })
+                    })?
+                    .collect::<Result<Vec<_>, _>>()?;
+                Ok::<_, tokio_rusqlite::Error>(rows)
+            })
+            .await
+            .map_err(Into::into)
+    }
+
+    /// Device-token check for ws_ticket: the SHA-256 must match an
+    /// APPROVED row. Pending rows mint nothing — fail closed.
+    pub async fn device_token_ok(&self, token_hash: &str) -> anyhow::Result<bool> {
+        let token_hash = token_hash.to_string();
+        self.conn
+            .call(move |c| {
+                let ok: bool = c
+                    .query_row(
+                        "SELECT 1 FROM web_devices
+                         WHERE token_hash = ?1 AND status = 'approved'",
+                        rusqlite::params![token_hash],
+                        |r| r.get::<_, i64>(0).map(|_| true),
+                    )
+                    .optional()?
+                    .unwrap_or(false);
+                Ok::<bool, tokio_rusqlite::Error>(ok)
+            })
+            .await
+            .map_err(Into::into)
+    }
+
+    /// Pair-status poll: the row's status when id AND token hash match,
+    /// None otherwise (the handler reads None as "revoked" — a device
+    /// that proves nothing gets no state).
+    pub async fn device_pair_status(
+        &self,
+        id: &str,
+        token_hash: &str,
+    ) -> anyhow::Result<Option<String>> {
+        let (id, token_hash) = (id.to_string(), token_hash.to_string());
+        self.conn
+            .call(move |c| {
+                let status: Option<String> = c
+                    .query_row(
+                        "SELECT status FROM web_devices WHERE id = ?1 AND token_hash = ?2",
+                        rusqlite::params![id, token_hash],
+                        |r| r.get(0),
+                    )
+                    .optional()?;
+                Ok::<Option<String>, tokio_rusqlite::Error>(status)
+            })
+            .await
+            .map_err(Into::into)
+    }
+
+    /// Throttled last-seen: at most one write per minute per device —
+    /// every ticket mint would otherwise rewrite the row.
+    pub async fn touch_device(&self, token_hash: &str) -> anyhow::Result<()> {
+        let token_hash = token_hash.to_string();
+        self.conn
+            .call(move |c| {
+                c.execute(
+                    "UPDATE web_devices SET last_seen = datetime('now')
+                     WHERE token_hash = ?1
+                       AND (last_seen IS NULL OR last_seen < datetime('now', '-60 seconds'))",
+                    rusqlite::params![token_hash],
+                )?;
+                Ok::<(), tokio_rusqlite::Error>(())
+            })
+            .await
+            .map_err(Into::into)
+    }
+
+    // ---- Native-history scanner ------------------------------------
+
+    /// The stored stat signature for one discovered native file, if the
+    /// scanner has seen it before.
+    pub async fn scanned_signature(
+        &self,
+        backend: &str,
+        native_handle: &str,
+    ) -> anyhow::Result<Option<(Option<i64>, Option<i64>)>> {
+        let (backend, native_handle) = (backend.to_string(), native_handle.to_string());
+        self.conn
+            .call(move |c| {
+                let sig: Option<(Option<i64>, Option<i64>)> = c
+                    .query_row(
+                        "SELECT size, mtime_ms FROM scanned_native
+                         WHERE backend = ?1 AND native_handle = ?2",
+                        rusqlite::params![backend, native_handle],
+                        |r| Ok((r.get(0)?, r.get(1)?)),
+                    )
+                    .optional()?;
+                Ok::<_, tokio_rusqlite::Error>(sig)
+            })
+            .await
+            .map_err(Into::into)
+    }
+
+    /// Record one scanned file → session mapping. Atomically refused
+    /// (returns false) when a tombstone exists for the handle: the
+    /// tombstone check and the insert share one connection call, so a
+    /// `session.delete` racing the sweep can never be re-upserted over.
+    pub async fn record_scanned(
+        &self,
+        backend: &str,
+        native_handle: &str,
+        size: Option<u64>,
+        mtime_ms: Option<i64>,
+        session_id: &str,
+    ) -> anyhow::Result<bool> {
+        let (backend, native_handle, session_id) = (
+            backend.to_string(),
+            native_handle.to_string(),
+            session_id.to_string(),
+        );
+        self.conn
+            .call(move |c| {
+                let n = c.execute(
+                    "INSERT INTO scanned_native
+                         (backend, native_handle, size, mtime_ms, session_id)
+                     SELECT ?1, ?2, ?3, ?4, ?5
+                     WHERE NOT EXISTS (
+                         SELECT 1 FROM session_tombstones
+                         WHERE backend = ?1 AND native_handle = ?2
+                     )
+                     ON CONFLICT(backend, native_handle) DO UPDATE SET
+                         size = ?3, mtime_ms = ?4, session_id = ?5,
+                         scanned_at = datetime('now')",
+                    rusqlite::params![
+                        backend,
+                        native_handle,
+                        size.map(|s| s as i64),
+                        mtime_ms,
+                        session_id
+                    ],
+                )?;
+                Ok::<bool, tokio_rusqlite::Error>(n > 0)
+            })
+            .await
+            .map_err(Into::into)
+    }
+
+    /// Every scanned (backend, native_handle → session_id) mapping —
+    /// the vanish pass reconciles this against fresh discovery.
+    pub async fn scanned_all(&self) -> anyhow::Result<Vec<(String, String, String)>> {
+        self.conn
+            .call(move |c| {
+                let mut stmt = c.prepare(
+                    "SELECT backend, native_handle, session_id FROM scanned_native
+                     ORDER BY scanned_at",
+                )?;
+                let rows = stmt
+                    .query_map([], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)))?
+                    .collect::<Result<Vec<_>, _>>()?;
+                Ok::<_, tokio_rusqlite::Error>(rows)
+            })
+            .await
+            .map_err(Into::into)
+    }
+
+    /// Drop one scanned mapping (the file vanished AND its session was
+    /// deleted — the tombstone makes any re-import impossible, so the
+    /// stale mapping would only haunt the vanish pass).
+    pub async fn drop_scanned(&self, backend: &str, native_handle: &str) -> anyhow::Result<()> {
+        let (backend, native_handle) = (backend.to_string(), native_handle.to_string());
+        self.conn
+            .call(move |c| {
+                c.execute(
+                    "DELETE FROM scanned_native WHERE backend = ?1 AND native_handle = ?2",
+                    rusqlite::params![backend, native_handle],
+                )?;
+                Ok::<(), tokio_rusqlite::Error>(())
+            })
+            .await
+            .map_err(Into::into)
+    }
+
+    /// Tombstone a deleted session's native handle — the sweep consults
+    /// this before creating anything.
+    pub async fn add_tombstone(&self, backend: &str, native_handle: &str) -> anyhow::Result<()> {
+        let (backend, native_handle) = (backend.to_string(), native_handle.to_string());
+        if backend.is_empty() || native_handle.is_empty() {
+            return Ok(());
+        }
+        self.conn
+            .call(move |c| {
+                c.execute(
+                    "INSERT OR IGNORE INTO session_tombstones (backend, native_handle)
+                     VALUES (?1, ?2)",
+                    rusqlite::params![backend, native_handle],
+                )?;
+                Ok::<(), tokio_rusqlite::Error>(())
+            })
+            .await
+            .map_err(Into::into)
+    }
+
+    /// Clear a tombstone — a session bound to the same native handle
+    /// again is the user's explicit new intent.
+    pub async fn clear_tombstone(&self, backend: &str, native_handle: &str) -> anyhow::Result<()> {
+        let (backend, native_handle) = (backend.to_string(), native_handle.to_string());
+        self.conn
+            .call(move |c| {
+                c.execute(
+                    "DELETE FROM session_tombstones WHERE backend = ?1 AND native_handle = ?2",
+                    rusqlite::params![backend, native_handle],
+                )?;
+                Ok::<(), tokio_rusqlite::Error>(())
+            })
+            .await
+            .map_err(Into::into)
+    }
+
+    /// Whether a handle is tombstoned (sweep-side skip check).
+    pub async fn is_tombstoned(&self, backend: &str, native_handle: &str) -> anyhow::Result<bool> {
+        let (backend, native_handle) = (backend.to_string(), native_handle.to_string());
+        self.conn
+            .call(move |c| {
+                let hit: bool = c
+                    .query_row(
+                        "SELECT 1 FROM session_tombstones WHERE backend = ?1 AND native_handle = ?2",
+                        rusqlite::params![backend, native_handle],
+                        |r| r.get::<_, i64>(0).map(|_| true),
+                    )
+                    .optional()?
+                    .unwrap_or(false);
+                Ok::<bool, tokio_rusqlite::Error>(hit)
+            })
+            .await
+            .map_err(Into::into)
+    }
+
+    // ---- Mission DAG runner -----------------------------------------
+
+    /// Store a flow definition snapshot: a re-create of the same
+    /// flow_id inserts the NEXT version (drafts and runs are isolated —
+    /// runs keep the snapshot they started with).
+    pub async fn create_mission_flow(
+        &self,
+        flow_id: &str,
+        name: &str,
+        definition: &str,
+    ) -> anyhow::Result<u32> {
+        let (flow_id, name, definition) = (
+            flow_id.to_string(),
+            name.to_string(),
+            definition.to_string(),
+        );
+        self.conn
+            .call(move |c| {
+                let next: u32 = c
+                    .query_row(
+                        "SELECT COALESCE(MAX(version), 0) + 1
+                         FROM mission_flows WHERE flow_id = ?1",
+                        rusqlite::params![flow_id],
+                        |r| r.get(0),
+                    )
+                    .map_err(tokio_rusqlite::Error::from)?;
+                c.execute(
+                    "INSERT INTO mission_flows (flow_id, version, name, definition)
+                     VALUES (?1, ?2, ?3, ?4)",
+                    rusqlite::params![flow_id, next, name, definition],
+                )
+                .map_err(tokio_rusqlite::Error::from)?;
+                Ok::<u32, tokio_rusqlite::Error>(next)
+            })
+            .await
+            .map_err(Into::into)
+    }
+
+    /// The latest snapshot of a flow: (version, name, definition JSON).
+    pub async fn latest_mission_flow(
+        &self,
+        flow_id: &str,
+    ) -> anyhow::Result<Option<(u32, String, String)>> {
+        let flow_id = flow_id.to_string();
+        self.conn
+            .call(move |c| {
+                let row = c
+                    .query_row(
+                        "SELECT version, name, definition FROM mission_flows
+                         WHERE flow_id = ?1 ORDER BY version DESC LIMIT 1",
+                        rusqlite::params![flow_id],
+                        |r| {
+                            Ok((
+                                r.get::<_, u32>(0)?,
+                                r.get::<_, String>(1)?,
+                                r.get::<_, String>(2)?,
+                            ))
+                        },
+                    )
+                    .optional()
+                    .map_err(tokio_rusqlite::Error::from)?;
+                Ok::<_, tokio_rusqlite::Error>(row)
+            })
+            .await
+            .map_err(Into::into)
+    }
+
+    /// Create a run carrying a deep-cloned snapshot of the definition.
+    pub async fn create_mission_run(
+        &self,
+        run_id: &str,
+        flow_id: &str,
+        version: u32,
+        snapshot: &str,
+    ) -> anyhow::Result<()> {
+        let (run_id, flow_id, version, snapshot) = (
+            run_id.to_string(),
+            flow_id.to_string(),
+            version,
+            snapshot.to_string(),
+        );
+        self.conn
+            .call(move |c| {
+                c.execute(
+                    "INSERT INTO mission_runs (run_id, flow_id, version, snapshot)
+                     VALUES (?1, ?2, ?3, ?4)",
+                    rusqlite::params![run_id, flow_id, version, snapshot],
+                )
+                .map_err(tokio_rusqlite::Error::from)?;
+                Ok::<(), tokio_rusqlite::Error>(())
+            })
+            .await
+            .map_err(Into::into)
+    }
+
+    /// The run's snapshot + flags: (snapshot, flow_id, interrupted,
+    /// ended_at).
+    /// The run row: (snapshot, flow_id, version, interrupted, ended,
+    /// cancelled).
+    pub async fn mission_run(
+        &self,
+        run_id: &str,
+    ) -> anyhow::Result<Option<(String, String, u32, bool, bool, bool)>> {
+        let run_id = run_id.to_string();
+        self.conn
+            .call(move |c| {
+                let row = c
+                    .query_row(
+                        "SELECT snapshot, flow_id, version, interrupted,
+                                (ended_at IS NOT NULL) AS ended, cancelled
+                         FROM mission_runs WHERE run_id = ?1",
+                        rusqlite::params![run_id],
+                        |r| {
+                            Ok((
+                                r.get::<_, String>(0)?,
+                                r.get::<_, String>(1)?,
+                                r.get::<_, u32>(2)?,
+                                r.get::<_, bool>(3)?,
+                                r.get::<_, bool>(4)?,
+                                r.get::<_, bool>(5)?,
+                            ))
+                        },
+                    )
+                    .optional()
+                    .map_err(tokio_rusqlite::Error::from)?;
+                Ok::<_, tokio_rusqlite::Error>(row)
+            })
+            .await
+            .map_err(Into::into)
+    }
+
+    /// All runs, newest first: (run_id, flow_id, version, interrupted,
+    /// ended, cancelled, created_at).
+    pub async fn mission_runs_list(
+        &self,
+    ) -> anyhow::Result<Vec<(String, String, u32, bool, bool, bool, String)>> {
+        self.conn
+            .call(move |c| {
+                let mut stmt = c.prepare(
+                    "SELECT run_id, flow_id, version, interrupted,
+                            (ended_at IS NOT NULL) AS ended, cancelled, created_at
+                     FROM mission_runs ORDER BY created_at DESC, run_id DESC",
+                )?;
+                let rows = stmt
+                    .query_map([], |r| {
+                        Ok((
+                            r.get::<_, String>(0)?,
+                            r.get::<_, String>(1)?,
+                            r.get::<_, u32>(2)?,
+                            r.get::<_, bool>(3)?,
+                            r.get::<_, bool>(4)?,
+                            r.get::<_, bool>(5)?,
+                            r.get::<_, String>(6)?,
+                        ))
+                    })?
+                    .collect::<Result<Vec<_>, _>>()
+                    .map_err(tokio_rusqlite::Error::from)?;
+                Ok::<_, tokio_rusqlite::Error>(rows)
+            })
+            .await
+            .map_err(Into::into)
+    }
+
+    /// Insert one queued task instance.
+    pub async fn insert_mission_task(&self, run_id: &str, node_id: &str) -> anyhow::Result<()> {
+        let (run_id, node_id) = (run_id.to_string(), node_id.to_string());
+        self.conn
+            .call(move |c| {
+                c.execute(
+                    "INSERT OR IGNORE INTO mission_tasks (task_id, run_id, node_id)
+                     VALUES (?1, ?2, ?3)",
+                    rusqlite::params![format!("{run_id}:{node_id}"), run_id, node_id],
+                )
+                .map_err(tokio_rusqlite::Error::from)?;
+                Ok::<(), tokio_rusqlite::Error>(())
+            })
+            .await
+            .map_err(Into::into)
+    }
+
+    /// Task rows for a run, node order: (node_id, status, attempt,
+    /// output, error).
+    pub async fn mission_tasks(
+        &self,
+        run_id: &str,
+    ) -> anyhow::Result<Vec<(String, String, u32, Option<String>, Option<String>)>> {
+        let run_id = run_id.to_string();
+        self.conn
+            .call(move |c| {
+                let mut stmt = c.prepare(
+                    "SELECT node_id, status, attempt, output, error FROM mission_tasks
+                     WHERE run_id = ?1 ORDER BY node_id",
+                )?;
+                let rows = stmt
+                    .query_map(rusqlite::params![run_id], |r| {
+                        Ok((
+                            r.get::<_, String>(0)?,
+                            r.get::<_, String>(1)?,
+                            r.get::<_, u32>(2)?,
+                            r.get::<_, Option<String>>(3)?,
+                            r.get::<_, Option<String>>(4)?,
+                        ))
+                    })?
+                    .collect::<Result<Vec<_>, _>>()
+                    .map_err(tokio_rusqlite::Error::from)?;
+                Ok::<_, tokio_rusqlite::Error>(rows)
+            })
+            .await
+            .map_err(Into::into)
+    }
+
+    /// Persist one task transition. `output`/`error` are written when
+    /// present; `started`/`ended` stamp the timestamps when the caller
+    /// says the transition touches them.
+    pub async fn set_mission_task_status(
+        &self,
+        run_id: &str,
+        node_id: &str,
+        transition: MissionTaskTransition,
+    ) -> anyhow::Result<()> {
+        let task_id = format!("{run_id}:{node_id}");
+        self.conn
+            .call(move |c| {
+                c.execute(
+                    "UPDATE mission_tasks SET status = ?1,
+                         attempt = ?2,
+                         output = COALESCE(?3, output),
+                         error = COALESCE(?4, error),
+                         started_at = CASE WHEN ?5 THEN datetime('now') ELSE started_at END,
+                         ended_at = CASE WHEN ?6 THEN datetime('now') ELSE ended_at END
+                     WHERE task_id = ?7",
+                    rusqlite::params![
+                        transition.status,
+                        transition.attempt,
+                        transition.output,
+                        transition.error,
+                        transition.stamp_started as i64,
+                        transition.stamp_ended as i64,
+                        task_id
+                    ],
+                )
+                .map_err(tokio_rusqlite::Error::from)?;
+                Ok::<(), tokio_rusqlite::Error>(())
+            })
+            .await
+            .map_err(Into::into)
+    }
+
+    /// The human inbox: one item per waiting human task.
+    pub async fn insert_mission_inbox(&self, run_id: &str, node_id: &str) -> anyhow::Result<()> {
+        let (run_id, node_id) = (run_id.to_string(), node_id.to_string());
+        self.conn
+            .call(move |c| {
+                c.execute(
+                    "INSERT INTO mission_inbox (task_id, run_id, node_id)
+                     VALUES (?1, ?2, ?3)",
+                    rusqlite::params![format!("{run_id}:{node_id}"), run_id, node_id],
+                )
+                .map_err(tokio_rusqlite::Error::from)?;
+                Ok::<(), tokio_rusqlite::Error>(())
+            })
+            .await
+            .map_err(Into::into)
+    }
+
+    /// Resolve one inbox item — CAS on `pending`, so of two answers
+    /// exactly one wins. Returns false when the item is already
+    /// resolved (or unknown).
+    pub async fn resolve_mission_inbox(
+        &self,
+        run_id: &str,
+        node_id: &str,
+        decision: &str,
+        feedback: Option<&str>,
+    ) -> anyhow::Result<bool> {
+        let task_id = format!("{run_id}:{node_id}");
+        let (decision, feedback) = (decision.to_string(), feedback.map(String::from));
+        self.conn
+            .call(move |c| {
+                let n = c.execute(
+                    "UPDATE mission_inbox SET status = 'resolved', decision = ?1,
+                         feedback = ?2, resolved_at = datetime('now')
+                     WHERE id = (
+                         SELECT id FROM mission_inbox
+                         WHERE task_id = ?3 AND status = 'pending'
+                         ORDER BY id LIMIT 1
+                     )",
+                    rusqlite::params![decision, feedback, task_id],
+                )?;
+                Ok::<bool, tokio_rusqlite::Error>(n > 0)
+            })
+            .await
+            .map_err(Into::into)
+    }
+
+    /// Inbox items for a run: (node_id, status, decision, feedback).
+    pub async fn mission_inbox_for_run(
+        &self,
+        run_id: &str,
+    ) -> anyhow::Result<Vec<(String, String, Option<String>, Option<String>)>> {
+        let run_id = run_id.to_string();
+        self.conn
+            .call(move |c| {
+                let mut stmt = c.prepare(
+                    "SELECT node_id, status, decision, feedback FROM mission_inbox
+                     WHERE run_id = ?1 ORDER BY created_at",
+                )?;
+                let rows = stmt
+                    .query_map(rusqlite::params![run_id], |r| {
+                        Ok((
+                            r.get::<_, String>(0)?,
+                            r.get::<_, String>(1)?,
+                            r.get::<_, Option<String>>(2)?,
+                            r.get::<_, Option<String>>(3)?,
+                        ))
+                    })?
+                    .collect::<Result<Vec<_>, _>>()
+                    .map_err(tokio_rusqlite::Error::from)?;
+                Ok::<_, tokio_rusqlite::Error>(rows)
+            })
+            .await
+            .map_err(Into::into)
+    }
+
+    /// Boot recovery: every run with unfinished work that has no
+    /// `ended_at` is crash-orphaned — mark `interrupted`, cancel its
+    /// non-terminal tasks, and close its pending inbox items. Returns
+    /// the recovered run ids.
+    pub async fn recover_interrupted_mission_runs(
+        &self,
+        live_run_ids: Vec<String>,
+    ) -> anyhow::Result<Vec<String>> {
+        self.conn
+            .call(move |c| {
+                let mut stmt = c.prepare(
+                    "SELECT run_id FROM mission_runs
+                     WHERE ended_at IS NULL AND interrupted = 0
+                       AND EXISTS (SELECT 1 FROM mission_tasks
+                                   WHERE run_id = mission_runs.run_id
+                                     AND status IN ('queued', 'running',
+                                                    'waiting_human'))",
+                )?;
+                let runs: Vec<String> = stmt
+                    .query_map([], |r| r.get::<_, String>(0))?
+                    .collect::<Result<Vec<_>, _>>()
+                    .map_err(tokio_rusqlite::Error::from)?
+                    .into_iter()
+                    .filter(|id| !live_run_ids.contains(id))
+                    .collect();
+                for run in &runs {
+                    c.execute(
+                        "UPDATE mission_runs SET interrupted = 1 WHERE run_id = ?1",
+                        rusqlite::params![run],
+                    )
+                    .map_err(tokio_rusqlite::Error::from)?;
+                    c.execute(
+                        "UPDATE mission_tasks SET status = 'cancelled', ended_at = datetime('now')
+                         WHERE run_id = ?1
+                           AND status IN ('queued', 'running', 'waiting_human')",
+                        rusqlite::params![run],
+                    )
+                    .map_err(tokio_rusqlite::Error::from)?;
+                    c.execute(
+                        "UPDATE mission_inbox SET status = 'resolved',
+                             decision = 'cancelled', resolved_at = datetime('now')
+                         WHERE run_id = ?1 AND status = 'pending'",
+                        rusqlite::params![run],
+                    )
+                    .map_err(tokio_rusqlite::Error::from)?;
+                }
+                Ok::<_, tokio_rusqlite::Error>(runs)
+            })
+            .await
+            .map_err(Into::into)
+    }
+
+    /// Mark a run `interrupted` (crash honesty) — used by boot recovery.
+    pub async fn mark_mission_interrupted(&self, run_id: &str) -> anyhow::Result<()> {
+        let run_id = run_id.to_string();
+        self.conn
+            .call(move |c| {
+                c.execute(
+                    "UPDATE mission_runs SET interrupted = 1 WHERE run_id = ?1",
+                    rusqlite::params![run_id],
+                )?;
+                Ok::<(), tokio_rusqlite::Error>(())
+            })
+            .await
+            .map_err(Into::into)
+    }
+
+    /// Mark a run ended (all tasks terminal).
+    pub async fn mark_mission_ended(&self, run_id: &str) -> anyhow::Result<()> {
+        let run_id = run_id.to_string();
+        self.conn
+            .call(move |c| {
+                c.execute(
+                    "UPDATE mission_runs SET ended_at = datetime('now') WHERE run_id = ?1",
+                    rusqlite::params![run_id],
+                )?;
+                Ok::<(), tokio_rusqlite::Error>(())
+            })
+            .await
+            .map_err(Into::into)
+    }
+
+    /// Mark a run explicitly cancelled (user cancel — distinct from the
+    /// crash-honest `interrupted`).
+    pub async fn mark_mission_run_cancelled(&self, run_id: &str) -> anyhow::Result<()> {
+        let run_id = run_id.to_string();
+        self.conn
+            .call(move |c| {
+                c.execute(
+                    "UPDATE mission_runs SET cancelled = 1,
+                         ended_at = COALESCE(ended_at, datetime('now'))
+                     WHERE run_id = ?1",
+                    rusqlite::params![run_id],
+                )?;
+                Ok::<(), tokio_rusqlite::Error>(())
+            })
+            .await
+            .map_err(Into::into)
+    }
+
+    /// Turn ended: the native ask died with it, so still-open reviews
+    /// expire (history must not pretend they are answerable). Decision
+    /// intents already on file stay. Returns the expired count.
+    pub async fn expire_open_plans(&self, session_id: &str) -> anyhow::Result<usize> {
+        let sid = session_id.to_string();
+        self.conn
+            .call(move |c| {
+                let n = c.execute(
+                    "UPDATE plan_reviews SET status = 'expired', updated_at = ?1
+                     WHERE session_id = ?2
+                       AND status IN ('awaiting_review', 'submitting', 'deferred')",
+                    rusqlite::params![plan_now_ms(), sid],
+                )?;
+                Ok::<usize, tokio_rusqlite::Error>(n)
+            })
+            .await
+            .map_err(Into::into)
+    }
+
     /// Delete a project. Refuses while sessions still reference it —
     /// their history is the project's; orphaning silently loses the
     /// grouping. The count rides the error message.
@@ -2041,5 +4082,109 @@ impl Store {
                 }
             })?;
         Ok(new_id)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{FtsQuery, Store};
+
+    fn q(input: &str) -> FtsQuery {
+        Store::fts5_query(input).expect("input should leave something searchable")
+    }
+
+    /// Sub-trigram terms move to the LIKE path; everything else stays
+    /// a quoted phrase on the FTS path. Mixed queries keep both.
+    #[test]
+    fn fts5_query_splits_short_terms_onto_the_like_path() {
+        // Pure short-token query: no MATCH at all.
+        assert_eq!(
+            q("커밋"),
+            FtsQuery {
+                match_expr: String::new(),
+                like_terms: vec!["커밋".into()],
+                like_not_terms: vec![]
+            }
+        );
+        // Mixed: long term keeps FTS (with rank/snippet), short term
+        // rides along as a substring conjunct.
+        assert_eq!(
+            q("error 커밋"),
+            FtsQuery {
+                match_expr: "\"error\"".into(),
+                like_terms: vec!["커밋".into()],
+                like_not_terms: vec![]
+            }
+        );
+        // Two short bare tokens: both must match (AND semantics).
+        assert_eq!(
+            q("ab cd"),
+            FtsQuery {
+                match_expr: String::new(),
+                like_terms: vec!["ab".into(), "cd".into()],
+                like_not_terms: vec![]
+            }
+        );
+        // A short quoted phrase is equally invisible to trigram.
+        assert_eq!(
+            q("\"timeout in relay\" ab"),
+            FtsQuery {
+                match_expr: "\"timeout in relay\"".into(),
+                like_terms: vec!["ab".into()],
+                like_not_terms: vec![]
+            }
+        );
+    }
+
+    /// NOT over a short term becomes an exclusion conjunct without
+    /// stranding a dangling NOT in the MATCH expression.
+    #[test]
+    fn fts5_query_keeps_short_not_operands_as_exclusions() {
+        assert_eq!(
+            q("error NOT 커밋"),
+            FtsQuery {
+                match_expr: "\"error\"".into(),
+                like_terms: vec![],
+                like_not_terms: vec!["커밋".into()]
+            }
+        );
+    }
+
+    /// Long-term behavior is unchanged: quoted phrases, prefix
+    /// queries, operator sanitization.
+    #[test]
+    fn fts5_query_keeps_long_terms_phrases_and_prefix_on_fts_path() {
+        let query = q("\"timeout in relay\"");
+        assert_eq!(query.match_expr, "\"timeout in relay\"");
+        assert!(query.like_terms.is_empty() && query.like_not_terms.is_empty());
+
+        assert_eq!(q("error*").match_expr, "\"error\"*");
+        // Leading/trailing operators drop; consecutive collapse.
+        assert_eq!(
+            q("AND error OR OR timeout").match_expr,
+            "\"error\" OR \"timeout\""
+        );
+        // `x AND NOT y` rewrites to the binary-exclusion form.
+        assert_eq!(
+            q("error AND NOT timeout").match_expr,
+            "\"error\" NOT \"timeout\""
+        );
+        // A 3-char term is exactly at the trigram minimum — FTS path.
+        assert_eq!(q("abc").match_expr, "\"abc\"");
+        // Prefix star on a short stem: substring conjunct (superset of
+        // the prefix), not a dropped token.
+        assert_eq!(q("ab*").like_terms, vec!["ab"]);
+    }
+
+    /// Operator-only or wildcard-only input is nothing searchable.
+    #[test]
+    fn fts5_query_returns_none_for_operator_only_input() {
+        for empty in ["AND OR", "NOT", "\"\"", "*"] {
+            assert!(Store::fts5_query(empty).is_none(), "{empty:?}");
+        }
+        // A trailing wildcard-only term is noise, not a dangling
+        // operator: the query degrades to its searchable part instead
+        // of producing an unparsable MATCH (or a 500).
+        assert_eq!(q("error AND *").match_expr, "\"error\"");
     }
 }

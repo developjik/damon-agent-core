@@ -32,8 +32,12 @@ def _err(rid: int, code: int, message: str) -> str:
 class MockDamon:
     """Minimal damon built on the websockets server."""
 
-    def __init__(self, ask_permission: bool = False) -> None:
+    def __init__(self, ask_permission: bool = False, ask_question: bool = False) -> None:
         self.ask_permission = ask_permission
+        self.ask_question = ask_question
+        # The response the question-card branch received (recorded by
+        # hand — _await_request bypasses the recording loop).
+        self.question_answer: Optional[dict] = None
         self.backends = [{"id": "mock", "available": True, "capabilities": {}}]
         # Every request any incarnation answered, oldest first — the
         # auto-resume tests assert session.resume hit the wire.
@@ -115,7 +119,43 @@ class MockDamon:
                     )
                 elif method == "turn.start":
                     session_id = m["params"]["sessionId"]
-                    if self.ask_permission:
+                    if self.ask_question:
+                        # A structured question card: the client answers
+                        # with the canonical answers map.
+                        request_id = f"question-{uuid.uuid4().hex[:8]}"
+                        await ws.send(
+                            json.dumps(
+                                {
+                                    "event": "session.event",
+                                    "sessionId": session_id,
+                                    "data": {
+                                        "type": "permission_requested",
+                                        "id": request_id,
+                                        "kind": "question",
+                                        "name": "AskUserQuestion",
+                                        "title": "deploy?",
+                                        "actions": [],
+                                        "questions": [
+                                            {
+                                                "question": "Deploy to staging?",
+                                                "header": "Env",
+                                                "options": [
+                                                    {"label": "yes"},
+                                                    {"label": "no"},
+                                                ],
+                                                "multiSelect": False,
+                                            }
+                                        ],
+                                    },
+                                }
+                            )
+                        )
+                        answer = await self._await_request(ws, "permission.respond")
+                        # _await_request recv()s directly from the socket,
+                        # bypassing the recording loop — record by hand.
+                        self.question_answer = answer["params"]["response"]
+                        await ws.send(_ok(answer["id"], {}))
+                    elif self.ask_permission:
                         request_id = f"perm-{uuid.uuid4().hex[:8]}"
                         await ws.send(
                             json.dumps(
@@ -262,6 +302,42 @@ async def test_permission_request_round_trip(mock: MockDamon) -> None:
         assert (await next_event(events))["type"] == "event"
         result = await turn
         assert result == {"turnId": "t-1", "stopReason": "end_turn"}
+    finally:
+        client.close()
+        await events.aclose()
+
+
+async def test_question_card_round_trip(mock: MockDamon) -> None:
+    mock.ask_question = True
+    client = await DamonClient.connect(mock.url)
+    events = client.events()
+    try:
+        await client.hello()
+        session_id = await client.new_session("/tmp")
+        turn = asyncio.create_task(client.prompt(session_id, "deploy the thing"))
+        assert (await next_event(events))["type"] == "connected"  # initial link-up, buffered
+        ev = await next_event(events)
+        assert ev["type"] == "event"
+        assert ev["sessionId"] == session_id
+        card = ev["event"]
+        assert card["type"] == "permission_requested"
+        assert card["kind"] == "question"
+        assert card["questions"][0]["question"] == "Deploy to staging?"
+        assert card["questions"][0]["options"][0]["label"] == "yes"
+
+        # The canonical answers shape: {question text → label}.
+        await client.respond_permission(
+            session_id,
+            card["id"],
+            {"behavior": "allow", "answers": {"Deploy to staging?": "yes"}},
+        )
+
+        assert (await next_event(events))["type"] == "event"
+        result = await turn
+        assert result == {"turnId": "t-1", "stopReason": "end_turn"}
+        # The answers map reached the daemon verbatim.
+        assert mock.question_answer is not None
+        assert mock.question_answer.get("answers") == {"Deploy to staging?": "yes"}
     finally:
         client.close()
         await events.aclose()

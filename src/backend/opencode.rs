@@ -23,6 +23,22 @@
 //!   description}]}]}); `POST /question/:id/reply {"answers":[[
 //!   …labels]]}` (or `/reject`) — verified end-to-end.
 //! - Interrupt: `POST /session/:id/abort`.
+//! - Session listing: `GET /session?directory=<cwd>` → array of
+//!   {id, title, directory, time{created, updated(ms)}} — verified
+//!   live (empty array for a fresh directory).
+//! - Modes: `GET /agent` → agents {name, description, mode:
+//!   "primary"|"subagent"|"all", hidden} — opencode's primary agents
+//!   are damon's modes; `POST /api/session/:id/agent {"agent": name}`
+//!   switches (204, session.agent flips) — verified live.
+//! - MCP: `POST /mcp {name, config:{type:"local", command:[…argv],
+//!   environment?, enabled?}}` registers a server in the running
+//!   instance (runtime-only in 1.18.32; there is no remove endpoint)
+//!   — verified live. Only issued on damon-spawned servers.
+//! - Steering: `prompt_async` on a busy session answers 204 and the
+//!   message is injected into the running turn as its next step; the
+//!   turn still settles with a single `session.idle` — verified live.
+//! - Reasoning: `message.part.updated` carries part.type "reasoning"
+//!   snapshots alongside text — verified live.
 //!
 //! Text parts arrive as full snapshots; the session emits only the
 //! not-yet-emitted tail per part id so persistence never double-counts.
@@ -30,7 +46,7 @@
 //! registers through the same client under its own provider id.
 
 use std::collections::HashMap;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -62,17 +78,7 @@ impl OpencodeClient {
                 .timeout(Duration::from_secs(30))
                 .build()
                 .expect("reqwest client"),
-            caps: Capabilities {
-                streaming: true,
-                session_persistence: true,
-                session_listing: false,
-                dynamic_modes: false,
-                mcp_servers: false,
-                reasoning_stream: false,
-                steer: false,
-                rewind: false,
-                subagent_events: false,
-            },
+            caps: opencode_capabilities(),
             provider,
         }
     }
@@ -84,6 +90,99 @@ impl OpencodeClient {
             .get_or_try_init(|| shared_server(&self.command))
             .await
             .cloned()
+    }
+
+    /// GET a JSON document from the shared server (auth attached).
+    async fn get_json_on(&self, server: &OpencodeServer, path: &str) -> Result<Value> {
+        let mut req = self.http.get(format!("{}{path}", server.base_url));
+        if let Some(a) = server.auth_header() {
+            req = req.header("authorization", a);
+        }
+        Ok(req.send().await?.error_for_status()?.json().await?)
+    }
+
+    /// POST a JSON document to the shared server; 204/empty → Null.
+    async fn post_json_on(
+        &self,
+        server: &OpencodeServer,
+        path: &str,
+        body: Value,
+    ) -> Result<Value> {
+        let mut req = self
+            .http
+            .post(format!("{}{path}", server.base_url))
+            .header("content-type", "application/json");
+        if let Some(a) = server.auth_header() {
+            req = req.header("authorization", a);
+        }
+        let resp = req.json(&body).send().await?.error_for_status()?;
+        if resp.status() == reqwest::StatusCode::NO_CONTENT {
+            return Ok(Value::Null);
+        }
+        let bytes = resp.bytes().await?;
+        if bytes.is_empty() {
+            return Ok(Value::Null);
+        }
+        Ok(serde_json::from_slice(&bytes)?)
+    }
+}
+
+/// Map GET /api/model's `{location, data: [ModelV2Info]}` into damon's
+/// model defs. Ids stay provider-qualified (`provider/model`) — the
+/// same shape prompt_async's `model` field and `set_model` take.
+fn catalog_models(v: &Value) -> Vec<ModelDef> {
+    let Some(items) = v.get("data").and_then(Value::as_array) else {
+        return vec![];
+    };
+    items
+        .iter()
+        .filter_map(|m| {
+            let id = m.get("id")?.as_str()?;
+            let provider = m
+                .get("providerID")
+                .and_then(Value::as_str)
+                .unwrap_or_default();
+            let name = m.get("name").and_then(Value::as_str).unwrap_or(id);
+            Some(ModelDef {
+                id: format!("{provider}/{id}"),
+                name: name.to_string(),
+                selectable: true,
+            })
+        })
+        .collect()
+}
+
+/// Build POST /api/session/:id/model's body. ModelRef requires BOTH
+/// `providerID` and `id`, so a bare model id is a caller error —
+/// rejected client-side instead of failing at the server.
+fn model_ref_body(model: &str) -> Result<Value> {
+    let (provider_id, model_id) = model.split_once('/').ok_or_else(|| {
+        anyhow::anyhow!(
+            "opencode model ids must be `provider/model` (e.g. `anthropic/claude-sonnet-4-5`)"
+        )
+    })?;
+    Ok(json!({"model": {"providerID": provider_id, "id": model_id}}))
+}
+
+/// Capability flags for both opencode and MiMo Code. A flag is set
+/// only where support is implemented and verified against opencode
+/// 1.18.32 (live server + its OpenAPI) — see the module docs.
+/// `rewind` stays false: damon has no rewind RPC consumer. Adopted
+/// servers still carry `mcp_servers` — damon ignores the config there
+/// (see `create_session`), it just cannot know spawn ownership until
+/// the server exists, and capabilities are static.
+fn opencode_capabilities() -> Capabilities {
+    Capabilities {
+        streaming: true,
+        session_persistence: true,
+        session_listing: true,  // GET /session?directory= — live-verified
+        dynamic_modes: true,    // GET /agent + POST /api/session/:id/agent — live-verified
+        mcp_servers: true,      // POST /mcp on damon-spawned servers — live-verified
+        reasoning_stream: true, // part.type "reasoning" snapshots — live-verified
+        steer: true,            // prompt_async while busy steers the open turn — live-verified
+        rewind: false,
+        subagent_events: false,
+        tool_allowlist: false,
     }
 }
 
@@ -103,13 +202,43 @@ impl AgentClient for OpencodeClient {
     }
 
     async fn fetch_catalog(&self, _cwd: Option<&Path>) -> Result<ProviderCatalog> {
-        // Model listing needs provider auth inside opencode; model ids
-        // pass through prompt_async's model field untouched.
-        Ok(ProviderCatalog::default())
+        let server = self.srv().await?;
+        let agents = self.get_json_on(&server, "/agent").await?;
+        let (modes, default_mode) = catalog_modes(&agents);
+        // GET /api/model lists the models the server has provider
+        // credentials for; a bare or unauthenticated server yields an
+        // empty list (or errors) — both map to an honest empty catalog.
+        let models = self
+            .get_json_on(&server, "/api/model")
+            .await
+            .map(|v| catalog_models(&v))
+            .unwrap_or_default();
+        Ok(ProviderCatalog {
+            models,
+            modes,
+            default_mode,
+        })
     }
 
     async fn create_session(&self, config: SessionConfig) -> Result<Arc<dyn AgentSession>> {
         let server = self.srv().await?;
+        // opencode has no MCP remove endpoint, and POST /mcp mutates
+        // state shared by every session on the server — so damon only
+        // registers config.mcp_servers on servers it spawned itself
+        // and silently ignores them on adopted listeners (the user's
+        // own server must not be rewired behind their back). Done
+        // before session creation: a bad config fails the RPC without
+        // orphaning a session on the server.
+        if server.damon_spawned() {
+            for (name, mcp) in &config.mcp_servers {
+                self.post_json_on(
+                    &server,
+                    "/mcp",
+                    json!({"name": name, "config": mcp_local_config(mcp)}),
+                )
+                .await?;
+            }
+        }
         let url = format!(
             "{}/session?directory={}",
             server.base_url,
@@ -141,6 +270,35 @@ impl AgentClient for OpencodeClient {
         Ok(self.session(&handle.native_handle, config, &server))
     }
 
+    /// Live-verified (opencode 1.18.32): GET /session?directory=<cwd>
+    /// lists that directory's sessions — `[]` for a fresh one, entries
+    /// with id/title/directory/time{created, updated} otherwise.
+    async fn list_importable_sessions(&self, cwd: &Path) -> Result<Vec<ImportableSession>> {
+        let server = self.srv().await?;
+        let mut req = self.http.get(format!(
+            "{}/session?directory={}",
+            server.base_url,
+            urlencoding_encode(&cwd.to_string_lossy())
+        ));
+        if let Some(a) = server.auth_header() {
+            req = req.header("authorization", a);
+        }
+        let list = req
+            .send()
+            .await?
+            .error_for_status()?
+            .json::<Value>()
+            .await?;
+        Ok(list
+            .as_array()
+            .map(|a| {
+                a.iter()
+                    .filter_map(|s| importable_session(self.provider, s))
+                    .collect()
+            })
+            .unwrap_or_default())
+    }
+
     async fn shutdown(&self) -> Result<()> {
         if let Some(server) = self.server.get()
             && let Some(mut child) = server.take_child().await
@@ -165,6 +323,7 @@ impl OpencodeClient {
             provider: self.provider,
             session_id: id.to_string(),
             config,
+            caps: self.caps.clone(),
             events: broadcast::channel(512).0,
             current_turn: Mutex::new(None),
             pending_asks: Mutex::new(HashMap::new()),
@@ -191,6 +350,8 @@ pub struct OpencodeSession {
     provider: &'static str,
     session_id: String,
     config: SessionConfig,
+    /// Same set as the owning client — sessions never diverge.
+    caps: Capabilities,
     events: broadcast::Sender<StreamEvent>,
     current_turn: Mutex<Option<String>>,
     pending_asks: Mutex<HashMap<String, PendingAsk>>,
@@ -300,34 +461,25 @@ impl OpencodeSession {
     async fn on_part(&self, part: &Value) {
         match part["type"].as_str().unwrap_or_default() {
             "text" => {
-                let role_is_assistant = {
-                    let roles = self.msg_roles.lock().await;
-                    part["messageID"]
-                        .as_str()
-                        .and_then(|id| roles.get(id))
-                        .is_some_and(|r| r == "assistant")
-                };
-                if !role_is_assistant {
-                    return;
-                }
                 let Some(text) = part["text"].as_str() else {
                     return;
                 };
-                // Snapshots: emit only the tail beyond what this part
-                // already delivered.
-                let id = part["id"].as_str().unwrap_or_default().to_string();
-                let mut emitted = self.part_emitted.lock().await;
-                let prev = emitted.get(&id).copied().unwrap_or(0);
-                if text.len() <= prev {
-                    return;
+                if let Some(tail) = self.assistant_snapshot_tail(part, text).await {
+                    self.emit_timeline(TimelineItem::AssistantMessage { text: tail })
+                        .await;
                 }
-                let tail = &text[prev..];
-                emitted.insert(id, text.len());
-                drop(emitted);
-                self.emit_timeline(TimelineItem::AssistantMessage {
-                    text: tail.to_string(),
-                })
-                .await;
+            }
+            // Live-verified (opencode 1.18.32): thinking models stream
+            // `reasoning` parts alongside text, as full snapshots in
+            // part.text — same tail-dedup treatment as text parts.
+            "reasoning" => {
+                let Some(text) = part["text"].as_str() else {
+                    return;
+                };
+                if let Some(tail) = self.assistant_snapshot_tail(part, text).await {
+                    self.emit_timeline(TimelineItem::Reasoning { text: tail })
+                        .await;
+                }
             }
             "tool" => {
                 let state = &part["state"];
@@ -347,6 +499,32 @@ impl OpencodeSession {
             }
             _ => {}
         }
+    }
+
+    /// Shared text/reasoning path: snapshot parts only reach the
+    /// timeline for assistant messages, and only the tail beyond what
+    /// that part id already delivered — persistence never
+    /// double-counts a snapshot.
+    async fn assistant_snapshot_tail(&self, part: &Value, text: &str) -> Option<String> {
+        let role_is_assistant = {
+            let roles = self.msg_roles.lock().await;
+            part["messageID"]
+                .as_str()
+                .and_then(|id| roles.get(id))
+                .is_some_and(|r| r == "assistant")
+        };
+        if !role_is_assistant {
+            return None;
+        }
+        let id = part["id"].as_str().unwrap_or_default().to_string();
+        let mut emitted = self.part_emitted.lock().await;
+        let prev = emitted.get(&id).copied().unwrap_or(0);
+        if text.len() <= prev {
+            return None;
+        }
+        let tail = text[prev..].to_string();
+        emitted.insert(id, text.len());
+        Some(tail)
     }
 
     async fn on_permission_asked(&self) {
@@ -379,6 +557,7 @@ impl OpencodeSession {
                 permission_action("reject", "Reject", true),
             ],
             suggestions: vec![],
+            questions: Vec::new(),
         };
         self.register_ask(
             ask,
@@ -425,6 +604,7 @@ impl OpencodeSession {
             detail: None,
             actions,
             suggestions: vec![],
+            questions: Vec::new(),
         };
         self.register_ask(
             ask,
@@ -580,6 +760,67 @@ fn map_tool(name: &str, state: &Value) -> ToolCallDetail {
     }
 }
 
+/// Map one `GET /session` entry onto damon's import shape. `time`
+/// carries epoch **milliseconds** (verified live); damon wants
+/// seconds. Entries without an id are skipped.
+fn importable_session(provider: &str, s: &Value) -> Option<ImportableSession> {
+    let id = s["id"].as_str()?;
+    Some(ImportableSession {
+        handle: PersistenceHandle {
+            provider: provider.to_string(),
+            native_handle: id.to_string(),
+            metadata: Value::Null,
+        },
+        title: s["title"].as_str().map(String::from),
+        cwd: s["directory"].as_str().map(PathBuf::from),
+        modified_at: s["time"]["updated"].as_u64().map(|ms| ms / 1000),
+        size: None,
+    })
+}
+
+/// Map `GET /agent` output onto damon modes: primary, non-hidden
+/// agents only (subagents are internal; compaction/summary/title are
+/// hidden machinery). "build" is opencode's default primary agent
+/// (verified live: fresh sessions run it without an explicit agent).
+fn catalog_modes(agents: &Value) -> (Vec<ModeDef>, Option<String>) {
+    let mut modes = Vec::new();
+    for a in agents.as_array().into_iter().flatten() {
+        if a["mode"].as_str() != Some("primary") || a["hidden"].as_bool().unwrap_or(false) {
+            continue;
+        }
+        let Some(name) = a["name"].as_str() else {
+            continue;
+        };
+        modes.push(ModeDef {
+            id: name.to_string(),
+            name: name.to_string(),
+            description: a["description"].as_str().map(String::from),
+        });
+    }
+    let default_mode = if modes.iter().any(|m| m.id == "build") {
+        Some("build".to_string())
+    } else {
+        modes.first().map(|m| m.id.clone())
+    };
+    (modes, default_mode)
+}
+
+/// Translate damon's normalized MCP config into opencode's
+/// McpLocalConfig (1.18.32 OpenAPI: `{type:"local", command:[…argv],
+/// cwd?, environment?, enabled?, timeout?}`). Damon's command + args
+/// collapse into one argv array; damon has no cwd/timeout knobs.
+fn mcp_local_config(mcp: &McpServerConfig) -> Value {
+    let mut command = Vec::with_capacity(mcp.args.len() + 1);
+    command.push(mcp.command.clone());
+    command.extend(mcp.args.iter().cloned());
+    json!({
+        "type": "local",
+        "command": command,
+        "environment": mcp.env,
+        "enabled": true,
+    })
+}
+
 /// Minimal percent-encoding for query values (paths).
 fn urlencoding_encode(s: &str) -> String {
     let mut out = String::with_capacity(s.len());
@@ -610,20 +851,8 @@ impl RequestExt for reqwest::RequestBuilder {
 #[async_trait]
 impl AgentSession for OpencodeSession {
     fn capabilities(&self) -> &Capabilities {
-        // Sessions inherit the client's capability set; recompute the
-        // same honest values.
-        static CAPS: std::sync::OnceLock<Capabilities> = std::sync::OnceLock::new();
-        CAPS.get_or_init(|| Capabilities {
-            streaming: true,
-            session_persistence: true,
-            session_listing: false,
-            dynamic_modes: false,
-            mcp_servers: false,
-            reasoning_stream: false,
-            steer: false,
-            rewind: false,
-            subagent_events: false,
-        })
+        // Same set as the owning client — sessions never diverge.
+        &self.caps
     }
 
     fn subscribe(&self) -> broadcast::Receiver<StreamEvent> {
@@ -637,46 +866,66 @@ impl AgentSession for OpencodeSession {
     async fn start_turn(&self, prompt: PromptInput) -> Result<String> {
         let turn_id = uuid::Uuid::new_v4().to_string();
         *self.current_turn.lock().await = Some(turn_id.clone());
-        let mut parts = vec![];
-        match prompt {
-            PromptInput::Text(t) => parts.push(json!({"type": "text", "text": t})),
-            PromptInput::Blocks(blocks) => {
-                let text: Vec<&str> = blocks
-                    .iter()
-                    .filter_map(|b| match b {
-                        PromptBlock::Text { text } => Some(text.as_str()),
-                        _ => None,
-                    })
-                    .collect();
-                parts.push(json!({"type": "text", "text": text.join("\n")}));
-                for b in &blocks {
-                    if let PromptBlock::Image { data, mime } = b {
-                        // Data-URL file parts (verified surface for
-                        // image attachments).
-                        parts.push(json!({
-                            "type": "file",
-                            "mime": mime,
-                            "url": format!("data:{mime};base64,{data}")
-                        }));
-                    }
-                }
-            }
-        }
-        let mut body = json!({"parts": parts});
-        if let Some(model) = &self.config.model {
-            if let Some((provider_id, model_id)) = model.split_once('/') {
-                body["model"] = json!({"providerID": provider_id, "modelID": model_id});
-            } else {
-                body["model"] = json!({"modelID": model});
-            }
-        }
-        self.post_json(&format!("/session/{}/prompt_async", self.session_id), body)
-            .await?;
+        self.post_json(
+            &format!("/session/{}/prompt_async", self.session_id),
+            self.prompt_body(&prompt),
+        )
+        .await?;
         self.emit(StreamEvent::in_turn(
             turn_id.clone(),
             StreamEventKind::TurnStarted,
         ));
         Ok(turn_id)
+    }
+
+    /// Live-verified (opencode 1.18.32): `prompt_async` on a busy
+    /// session answers 204 and the message is injected into the
+    /// running turn as the model's next step — the turn still settles
+    /// with a single `session.idle`, so damon sees one TurnCompleted.
+    /// If `expected_turn` has already settled, posting would start a
+    /// NEW turn instead of steering, so report `Unavailable` and let
+    /// the caller queue a normal follow-up. (Check-then-post has an
+    /// inherent race: a turn settling in between turns this into a
+    /// new turn server-side; the session then just sees its events
+    /// without an in-flight turn id.)
+    async fn steer(&self, prompt: PromptInput, expected_turn: &str) -> Result<SteerResult> {
+        if self.current_turn.lock().await.as_deref() != Some(expected_turn) {
+            return Ok(SteerResult::Unavailable);
+        }
+        let body = self.prompt_body(&prompt);
+        self.post_json(&format!("/session/{}/prompt_async", self.session_id), body)
+            .await?;
+        Ok(SteerResult::Accepted)
+    }
+
+    /// Live-verified (opencode 1.18.32): POST /api/session/:id/agent
+    /// `{"agent": name}` → 204 and the session's `agent` field flips;
+    /// the agent governs subsequent provider turns. The endpoint does
+    /// not validate the name at switch time, so callers should pick
+    /// ids from `fetch_catalog`.
+    async fn set_mode(&self, mode: &str) -> Result<()> {
+        self.post_json(
+            &format!("/api/session/{}/agent", self.session_id),
+            json!({"agent": mode}),
+        )
+        .await?;
+        self.emit(StreamEvent::new(StreamEventKind::ModeChanged {
+            mode: Some(mode.to_string()),
+        }));
+        Ok(())
+    }
+
+    /// Wire: POST /api/session/:id/model `{"model": {providerID, id}}`
+    /// (ModelRef — OpenAPI requires both fields). Governs subsequent
+    /// turns, like `set_mode`.
+    async fn set_model(&self, model: &str) -> Result<()> {
+        let body = model_ref_body(model)?;
+        self.post_json(&format!("/api/session/{}/model", self.session_id), body)
+            .await?;
+        self.emit(StreamEvent::new(StreamEventKind::ModelChanged {
+            model: model.to_string(),
+        }));
+        Ok(())
     }
 
     async fn interrupt(&self) -> Result<()> {
@@ -758,6 +1007,46 @@ impl AgentSession for OpencodeSession {
             native_handle: self.session_id.clone(),
             metadata: Value::Null,
         })
+    }
+}
+impl OpencodeSession {
+    /// Encode damon prompt input as prompt_async's body: text blocks
+    /// join into one text part; images ride as data-URL file parts
+    /// (verified surface for attachments). `model` passes through as a
+    /// ModelRef.
+    fn prompt_body(&self, prompt: &PromptInput) -> Value {
+        let mut parts = vec![];
+        match prompt {
+            PromptInput::Text(t) => parts.push(json!({"type": "text", "text": t})),
+            PromptInput::Blocks(blocks) => {
+                let text: Vec<&str> = blocks
+                    .iter()
+                    .filter_map(|b| match b {
+                        PromptBlock::Text { text } => Some(text.as_str()),
+                        _ => None,
+                    })
+                    .collect();
+                parts.push(json!({"type": "text", "text": text.join("\n")}));
+                for b in blocks {
+                    if let PromptBlock::Image { data, mime } = b {
+                        parts.push(json!({
+                            "type": "file",
+                            "mime": mime,
+                            "url": format!("data:{mime};base64,{data}")
+                        }));
+                    }
+                }
+            }
+        }
+        let mut body = json!({"parts": parts});
+        if let Some(model) = &self.config.model {
+            if let Some((provider_id, model_id)) = model.split_once('/') {
+                body["model"] = json!({"providerID": provider_id, "modelID": model_id});
+            } else {
+                body["model"] = json!({"modelID": model});
+            }
+        }
+        body
     }
 }
 

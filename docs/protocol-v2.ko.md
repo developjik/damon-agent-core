@@ -23,7 +23,9 @@ WebSocket(`GET /ws`) 또는 릴레이 터널 위의 JSON 메시지. 하나의 �
 
 인증: `Authorization: Bearer <token>` 헤더, 또는 `POST /v1/ws_ticket`이
 발급하는 단회성 `?ticket=`(쿼리 문자열 토큰은 거부 — 로그에 새어나가므로).
-루프백 + 토큰 미설정 → 오픈.
+루프백 + 토큰 미설정 → 오픈. 티켓 엔드포인트는 본문으로 승인된 웹 기기의
+자체 토큰도 받는다(`{"deviceToken": …}`) — 페어링의 기기별 폐기 가능
+자격증명([웹 기기](#웹-기기) 참조); 마스터 bearer 경로는 그대로다.
 
 ## 에러 코드
 
@@ -45,6 +47,8 @@ WebSocket(`GET /ws`) 또는 릴레이 터널 위의 JSON 메시지. 하나의 �
 | `-32005` | 응답이 1 MiB 프레임 예산 초과 | `limit`/`offset`으로 페이징 |
 | `-32006` | 세션에 턴이 이미 실행 중 | `turn.*` 이벤트 대기, 또는 먼저 `turn.cancel` |
 | `-32007` | worktree 작업 실패 — `error.data.kind`가 택소노미를 실어준다 | `data.kind`로 분기 (`pr_not_found`, `branch_exists`, …) |
+| `-32008` | 그 `requestId`에 보류 중인 ask가 없음 (`ASK_NOT_FOUND`) — 이미 답변됨, 에이전트가 정리함, 또는 턴 종료 | 그 카드 재시도 중단 |
+| `-32009` | 플랜 리뷰 충돌 (`PLAN_CONFLICT`) — 다른 표면이 결정을 선점했거나 호출이 낡은 리비전/닫힌 플랜을 겨냥 | `plan.list`로 다시 읽고 현재 리비전으로 결정 |
 
 0.5.0 이전 데몬은 모든 에러를 `-32000`으로 답했다; 메시지는 그대로라
 문자열 매칭 클라이언트도 계속 동작한다.
@@ -55,12 +59,17 @@ WebSocket(`GET /ws`) 또는 릴레이 터널 위의 JSON 메시지. 하나의 �
 |---|---|---|
 | `hello` | — | `{protocol, daemon, version, backends[], methods[]}` |
 | `backend.list` | — | `{backends: [{id, available, capabilities}]}` |
+| `backend.versions` | `{backend?}` — 하나만, 아니면 전체 카탈로그 | `{versions: [{backend, installed, version?, latest?, updateAvailable, updateKind: "npm"\|"manual"\|"unknown"}]}` — `latest`는 npm 패키지가 검증된 곳에만; 프룹은 이 호출에서만 실행, 스케줄되지 않음 |
+| `backend.update_plan` | `{backend}` | `{backend, action: "install"\|"update", kind, command[], manualCommand, canRun, blockers[], platform}` — `backend.update`가 실행할 정확한 argv와 복사-붙여넣기 대안; 부수 효과 없음 |
+| `backend.update` | `{backend, creationId?}` | `{creationId, ok: true, version?}` — 플랜을 실행(npm 글로벌 설치 또는 CLI 공식 인스톨러); 진행은 요청 연결로 `{"event":"backend.update_progress","creationId","data":{phase, line?, exitOk?}}` 스트리밍(줄당 캡); 검증된 채널이 없으면 `-32602`(플랜 blockers 참조), 실패/420s 타임아웃은 `-32000`(출력 꼬리가 메시지에 동승) |
+| `backend.update_cancel` | `{creationId}` | `{cancelled: bool}` — 해당 id의 실행 중 런이 없으면 false |
 | `session.create` | `{backend?, cwd?, model?, mode?, mcpServers?, projectId?}` — 프로젝트가 세션의 범위를 정한다: 루트가 cwd 기본값이 되고 기본값들이 미지정 파라미터를 채운다(명시 값 항상 우선) | `{sessionId, backend, replayed}` |
 | `session.resume` | `{sessionId}` — 또는 네이티브 세션 임포트는 `{handle:{provider,native_handle}, cwd?, title?}` | `{sessionId, backend, replayed}` |
 | `session.messages` | `{sessionId, limit?, offset?}` | `{messages: [{id, session_id, role, ts, data}]}` |
 | `session.export` | `{sessionId}` | `{session: {sessionId, createdAt, backend, title, tags, cwd}, messages: [{id, role, ts, data}], usage: {contextUsed, contextSize, costUsd, turns}}` |
 | `session.import` | `{backend, cwd?}` | `{sessions: [ImportableSession]}` |
 | `session.delete` | `{sessionId}` | `{deleted: bool}` |
+| `session.rescan` | `{}` | `{scanId, alreadyRunning, report: {scanned, reparsed, reused, archived, tombstoned, skippedBackends[]}}` — 모든 백엔드의 네이티브 세션 저장소를 훑어 데몬이 본 적 없는 세션의 북마크 행을 만든다; 단일 비행(실행 중이면 진행 중인 `scanId` 반환); 진행은 요청 연결로 `{"event":"history.scan_progress","scanId","data":{stage, …}}` 스트리밍; [히스토리 스캐너](#히스토리-스캐너) 참조 |
 | `session.close` | `{sessionId}` | `{closed: bool}` — 라이브 백엔드 프로세스를 종료하고 행/히스토리는 유지; `max_sessions` 슬롯 확보; 멱등 |
 | `session.restart` | `{sessionId}` | `{sessionId, backend, replayed}` — 라이브 백엔드를 죽이고(턴 도중엔 `-32006`으로 거부) 영속 핸들로 재접속 |
 | `session.status` | `{}` | `{sessions: [{sessionId, backend, busy, idleSecs}]}` — 라이브 백엔드 세션만 |
@@ -74,10 +83,22 @@ WebSocket(`GET /ws`) 또는 릴레이 터널 위의 JSON 메시지. 하나의 �
 | `session.usage` | `{sessionId?}` — 또는 글로벌 일별 롤업은 `{daily: true, days?}`(기본 7일) | 세션별 `{sessionId, contextUsed, contextSize, costUsd, turns}`, 모델별 `{sessions: [...]}`, 또는 `{daily: [{date, turns, costUsd, contextUsed}]}` |
 | `session.list` | `{limit?, offset?, backend?, cwd?, tag?, includeArchived?}` | `{sessions: [{sessionId, createdAt, backend, title, cwd, tags, pinned, archived}]}` — 고정 우선; 보관은 요청 시에만 |
 | `session.search` | `{query, limit?, sessionId?, backend?, cwd?, since?, until?}` | `{results: [{sessionId, messageId, snippet}]}` |
+| `usage.summary` | `{days?, tzOffsetMinutes?}` — 최근 `days`개 로컬 날(기본 7, 오늘 포함); `tzOffsetMinutes`는 UTC 스탬프를 호출자의 달력으로 옮긴다(기본 0 = UTC) | `{days, rows: [{date, backend, model, turns, contextUsed, contextSize, costUsd}], total: {turns, contextUsed, contextSize, costUsd}}` — 로컬 날 × 백엔드 × 모델당 한 행; context 컬럼은 턴별 스냅샷의 합, cost는 턴별 델타의 합; 행이 없는 날은 없다 |
+| `usage.clear` | `{}` | `{cleared: true}` — 모든 사용 행을 삭제; 세션과 메시지는 그대로 |
+| `mission.create` | `{flowId?, name?, definition}` — `flowId` 기본값은 새 uuid; 같은 `flowId` 재생성은 다음 버전을 삽입(실행은 시작한 스냅샷 유지) | `{flowId, version}` — 정의가 잘못되면 `-32602`(알 수 없는 노드 종류, prompt/backend 없는 agent 노드, `allowedTools` 없는 read-only, 루트 규칙, 파싱 불가 조건) |
+| `mission.start` | `{flowId}` — 최신 버전을 시작 | `{runId, version}` — `-32602` unknown flow; `-32003` 미등록 백엔드; `-32002` read-only 에이전트 노드 거부: 백엔드가 도구 허용목록을 강제할 수 없으며 damon은 read-only 단계를 강등하지 않는다 |
+| `mission.cancel` | `{runId}` | `{runId, cancelled}` — 실행 중인 스케줄러가 없으면 `false` |
+| `mission.respond` | `{runId, nodeId, decision, feedback?}` — `decision`은 `approve \| feedback \| exclude`; `feedback`는 비어 있지 않은 텍스트 필요 | `{accepted: true, live}` — 스토어 CAS가 단일 승자 게이트: 인박스 항목이 pending이 아니면(다른 답이 이김) `-32602` |
+| `mission.list` | `{}` | `{runs: [{runId, flowId, version, status, interrupted, ended, createdAt, tasks: [{nodeId, status, attempt}]}]}` — status는 항상 태스크 상태에서 도출(running / succeeded / failed / interrupted / cancelled), 저장하지 않음 |
+| `mission.get` | `{runId}` | `{runId, flowId, version, status, interrupted, ended, definition, tasks: [{nodeId, status, attempt, output?, error?}], inbox: [{nodeId, status, decision?, feedback?}]}` — `-32602` unknown run |
+| `mission.watch` | `{runId}` — 실행 중이어야 함 | `{runId, subscribed}` — `{"event":"mission.progress","runId","data":{node, status, attempt}}` 프레임 스트림 |
+| `mission.unwatch` | `{runId}` | `{runId, subscribed}` |
 | `turn.start` | `{sessionId, prompt, timeoutSecs?, detach?}` | `{turnId, stopReason, usage?}` — `detach`가 true면 즉시 `{turnId, detached: true}` |
 | `turn.steer` | `{sessionId, prompt, expectedTurn?}` | `{result}` |
 | `turn.cancel` | `{sessionId}` | `{cancelled: true}` |
-| `permission.respond` | `{sessionId, requestId, response}` | `{}` |
+| `permission.respond` | `{sessionId, requestId, response}` | `{}` — `kind: plan` ask에서는 결정이 영속 plan-review 행에도 기록된다 |
+| `plan.list` | `{sessionId}` | `{plans: [{planId, sessionId, requestId, revision, title, content, contentHash, complete, status, decision?, decisionIntentAt?, appliedAt?, createdAt, updatedAt, supersededBy?}]}` — 모든 플랜의 모든 리비전, 체인 순 |
+| `plan.respond` | `{planId, expectedRevision, decision, feedback?}` — `decision`은 `approve` \| `request_changes` \| `defer`; request_changes에는 비어 있지 않은 feedback 필수 | `{recorded: true, status, applied, planId, revision}` — `expectedRevision` CAS 클레임: 경쟁에서 지거나 낡은/닫힌 리비전이면 `-32009`; 불완전 플랜 승인과 feedback 없는 request_changes는 `-32602` 거부; `defer`는 라이브 ask를 건드리지 않고 비종단적으로 기록 |
 | `session.set_model` | `{sessionId, model}` | `{}` |
 | `session.set_mode` | `{sessionId, mode}` | `{}` |
 | `catalog.models` | `{backend}` | `{models[], modes[], commands[]}` |
@@ -88,9 +109,17 @@ WebSocket(`GET /ws`) 또는 릴레이 터널 위의 JSON 메시지. 하나의 �
 | `file.write` | `{sessionId, path, content: base64}` | `{written, path}` — cwd 감금; 디코드 1 MiB 상한 |
 | `file.list` | `{sessionId, path? — 기본 "."}` | `{entries: [{name, dir, bytes}], path}` — cwd 감금, 1000 엔트리 |
 | `file.index` | `{sessionId?, cwd?}` — 컴포저의 `@path` 피커: 루트의 gitignore 인식 워크 1회 | `{entries: [{rel, isDir}], truncated}` — `node_modules`/`target` 프룬, 숨김 항목 스킵, symlink 미추적; 10 000 엔트리 / 512 KiB 상한, 조기 중단 시 `truncated: true` |
+| `file.grant` | `{projectId?, path}` — `path`는 절대경로, 존재하는 디렉터리여야 함; symlink/`..`는 정규형으로 해석 | `{granted: true, root, projectId?}` — 파일 감금이 허용할 추가 디렉터리를 영속화(중복 그랜트는 멱등); claude 세션은 다음 실행 때 `--add-dir`로 받는다 |
+| `file.grants` | `{projectId?}` — 그 범위의 실효 그랜트(프로젝트 + 글로벌); 생략 시 글로벌만 | `{grants: [{root, projectId?, createdAt}]}` |
+| `file.ungrant` | `{projectId?, path}` — 저장된 정규 루트와 매치 | `{revoked: bool}` — 해당 그랜트가 없으면 false |
 | `channel.get_state` | `{convId, key}` | `{value: string?}` |
 | `channel.set_state` | `{convId, key, value}` | `{set: true}` |
 | `channel.delete_state` | `{convId, key}` | `{deleted: true}` |
+| `device.pairing_key` | `{}` | `{key: string}` — 일회용 페어링 키(8자 혼동 없는 문자), 첫 요청에서 발급; 다음 `POST /v1/pair`가 소비하면 하나의 락 안에서 새 키로 로테이션 |
+| `device.list` | `{}` | `{devices: [{deviceId, name, status: "pending"\|"approved", createdAt, approvedAt?, lastSeen?}]}` — lastSeen은 분당 1회로 제한(스로틀); 토큰 해시는 스토어 밖으로 나가지 않는다 |
+| `device.approve` | `{deviceId}` | `{approved: bool}` — pending에서만; 미지정/이미 승인이면 false |
+| `device.rename` | `{deviceId, name}` | `{renamed: bool}` — 빈 이름은 거부 |
+| `device.revoke` | `{deviceId}` | `{revoked: bool}` — 행이 토큰 해시와 함께 사라져 자격증명은 즉시 무효; pending 요청의 deny를 겸한다 |
 | `prompt.add` | `{text, sessionId?, cwd?}` — 보낸 프롬프트 하나, trim 후 300자 상한 | `{recorded: true}` — upsert: 재전송은 카운트를 올리고 최신으로 이동; cwd당 최신 200개만 남음 |
 | `prompt.recent` | `{limit? — 기본 50, 최대 200, sessionId?, cwd?}` | `{prompts: [{text, count}]}` — 최신순, cwd별 |
 | `skills.targets` | `{}` | `{targets: [{id, label, path, available}]}` — 허브가 싱크할 수 있는 CLI들의 스킬 디렉터리; `available`은 엔진 홈이 존재한다는 뜻(허브는 절대 만들지 않는다) |
@@ -128,6 +157,9 @@ WebSocket(`GET /ws`) 또는 릴레이 터널 위의 JSON 메시지. 하나의 �
 | `worktree.list` | `{repo? \| projectId?}` | `{repo, worktrees: [{path, branch?, head, isMain, locked, lockReason?, prunable, projectId?}], registered: [{projectId, name, path, parentId?, meta}]}` — git porcelain 뷰와 damon 행의 조인 |
 | `worktree.resolve_pr` | `{repo, input, branch?}` — `input`은 `1842`, `#1842`, GitHub PR URL; 상세는 `gh pr view`(3초 데드라인) | `{number, repo: "owner/repo", title?, state?, author?, degraded, suggestedBranch, suggestedPath, branchConflict, dirConflict}` — `degraded`는 gh 부재/지연; 번호와 슬러그는 여전히 확인됨 |
 | `worktree.merged` | `{repo, branch, base? — 기본 HEAD}` | `{merged: bool}` — 조상 검사; 스쿼시 머지는 false |
+| `mcp.inventory` | `{}` | `{entries: [{backend, name, transport, command?, url?, envKeys?, source, format, version, enabled?, readonlyReason?}], sources: [{backend, source, format, error?}]}` — 모든 백엔드의 네이티브 MCP 설정, REDACTED(env 값은 파일을 떠나지 않음; URL의 userinfo/query 제거; stdio는 프로그램 + 인자 수만); 깨진 설정 파일은 소스별로 오류를 보고하고 인벤토리는 계속된다 |
+| `mcp.probe` | `{backend, name}` | `{backend, name, result: "connected"\|"needs_auth"\|"failed"\|"unsupported", tools: string[] (이름만, ≤40), serverName?, protocolVersion?, elapsedMs, error?}` — 실제 핸드셰이크(stdio: 자체 프로세스 그룹, 25초 캡; HTTP: 12초 캡); 명시적 요청만, 스케줄 없음; 서버의 command/args/env는 와이어에 나가지 않는다 |
+| `mcp.setEnabled` | `{backend, name, enabled, expectedVersion, cwd?}` — 이번 라운드는 claude만 | `{set: true}` — ~/.claude.json에서 claude 자체의 프로젝트별 토글을 뒤집는다. 인벤토리 `version`으로 CAS(외부 편집은 `-32010` 거부); 파싱 실패한 설정은 절대 쓰지 않음; 읽기 전용 백엔드는 이유와 함께 `-32602` 거부 |
 
 `worktree.create` 실패는 `-32007`에 `data.kind`를 실어 온다:
 `not_a_repo`, `invalid_branch`, `branch_not_found`, `branch_exists`,
@@ -145,7 +177,128 @@ done`) — 긴 fetch가 침묵으로 흐르지 않는다. 하나의 PR에 하나
 `session.search` 쿼리는 토크나이즈되어 FTS5 파서에 그대로 넘겨지지
 않는다: 따옴표 구간은 구문이고, `AND`/`OR`/`NOT`은 통과하며, 텀 뒤
 **trailing `*`는 접두사 쿼리** — `error*`가 `error`/`errors`/`erroring`에
-매치(벌거벗은 `*`는 검색 가능한 게 없다).
+매치(벌거벗은 `*`는 검색 가능한 게 없다). 인덱스는 `trigram`
+토크나이저를 쓰므로 매치는 부분 문자열 매치다 — CJK 런 안까지
+(`커밋`이 `커밋 메시지`를 찾는다; 이전 unicode61 인덱스로는 불가능).
+3미만 문자 텀(trigram 최소값)은 MATCH가 조용히 버리므로 대신
+정확한 부분 문자열 LIKE 경로를 탄다: 짧은 텀은 필수 AND 접속사다
+(그걸 건드리는 `OR`는 AND로 좁아진다), NOT 피연산자의 배제는
+존중되고, 전부 짧은 텀으로만 이룬 쿼리는 랭킹 대신 최신순 히트와
+Rust에서 만든 스니펫을 돌려준다.
+
+### CLI 라이프사이클
+
+`backend.versions`는 카탈로그의 모든 백엔드에 대해 `<bin> --version`(10초
+캡)과 — npm 패키지가 검증된 곳에서는 — 레지스트리 최신 버전(`npm view`,
+15초 캡)을 동시에 프룹한다. 프룹은 명시적 요청에서만 실행된다: 스케줄링
+안 됨, 접속 시에도 안 됨. npm 맵은 각 CLI의 자체 설치 문서로 검증됐다
+(claude `@anthropic-ai/claude-code`, codex `@openai/codex`, omp
+`@oh-my-pi/pi-coding-agent`, pi `@earendil-works/pi-coding-agent`, qwen
+`@qwen-code/qwen-code`, opencode `opencode-ai`); 검증된 npm 배포가 없는
+백엔드(droid, mimo — 공식 인스톨러; zcode — 검증된 채널 없음)는 설치된
+버전만 프룹하고 `updateKind: "manual"`(공식 원라이너가 갱신 경로) 또는
+`"unknown"`(blockers만)을 보고한다 — 패키지를 추측하는 대신.
+
+`backend.update`는 `backend.update_plan`이 미리 보여준 플랜을 실행한다 —
+하나의 argv 생성이 양쪽에 쓰이므로 확인 대화가 실행 내용과 어긋날 수
+없다. 갱신은 절대 자동으로, 스케줄로 실행되지 않는다; 사용자가 시작하고,
+출력을(줄당 캡으로) 요청 연결에 스트리밍하며, 취소할 수 있다. `damond
+doctor`는 같은 10초 프룹을 재사용한다: 탐지된 백엔드는 버전을 인라인으로
+보고하고, 타임아웃 시 "version unknown"으로 열화된다.
+
+### 웹 기기
+
+LAN 위 폰은 더 이상 마스터 `auth_token`이 필요 없다. 데스크톱이 일회용
+페어링 키를 공개하고(`device.pairing_key`, 설정 서랍에서도), 기기가
+`POST /v1/pair`로 `{pairingKey, name}`을 소비한다 — 키는 하나의 락 안에서
+소비되고 로테이션되므로 하나의 코드는 정확히 하나의 페어링만 연다 — 그리고
+기기 토큰과 `pending` 행을 받는다(`{deviceId, token, status}`; 토큰은 딱 한
+번, 여기서 반환되고 데몬에는 SHA-256 해시로 저장된다). 기기는
+`POST /v1/pair/status`(`{deviceId, token}`)를 폴링해 `pending` / `approved` /
+`revoked`를 확인한다(행이 없으면 revoked — fail closed). 신뢰하는 표면이
+`device.approve`로 승인하고; 그 전까지 기기는 아무것도 발급하지 못한다.
+
+승인되면 기기는 `POST /v1/ws_ticket`(`{"deviceToken": …}`)에서 자신의
+토큰을 마스터 토큰이 발급하는 것과 같은 일회용 WS 티켓으로 교환한다.
+`device.revoke`는 행을 삭제한다 — 자격증명은 즉시 무효, 유예 기간 없음.
+비루프백 바인드는 여전히 해석 가능한 마스터 `auth_token` 없이 기동을
+거부한다; 릴레이 모드 기기는 마스터 토큰 로그인을 유지한다(E2E 핸드셰이크가
+마스터 시크릿을 증명 — 기기 토큰은 직접 닿는 표면이다). `hello`는
+비루프백 `/ws` 연결의 실시간 수인 `remoteClients`를 실어 "원격 제어
+활성" 배지를 표시할 수 있다.
+
+### 히스토리 스캐너
+
+데몬은 CLIS가 Damon 밖에서 만든 세션도 안다: `session.rescan`은 모든
+백엔드의 고유 네이티브 세션 저장소를 — 각 백엔드의 디스커버리를 통해,
+env 오버라이드(`CLAUDE_CONFIG_DIR`, `FACTORY_HOME_OVERRIDE`, …)를
+존중하며 — 훑고, 데몬이 본 적 없는 항목의 북마크 행(id, backend, native
+handle, cwd, title)을 만든다. PersistenceHandle 철학대로 프로바이더의
+세션 파일이 진실의 원천이고; 행은 북마크며, resume은 다른 네이티브 세션
+resume과 똑같이 동작한다.
+
+범위를 정확히: 스캔이 주는 것은 **가시성과 재개 가능성**이다 — 발견된
+세션이 `session.list`에 나타나고(파생된 제목과 cwd와 함께) 네이티브
+핸들이 다른 네이티브 세션처럼 resume된다. 트랜스크립트 메시지를
+추출하지는 않는다: 오늘 Damon에는 네이티브 핸들에 대한 메시지 추출
+경로가 없다(`session.import`는 listing 호출이고, resume은 핸들을 묶고
+새 턴만 스트리밍한다), 그래서 `session.search`는 damon이 실행한 턴의
+메시지만 색인한다. 스캔된 세션을 검색 색인에 넣는 백엔드별 트랜스크립트
+추출기는 향후 과제다.
+
+스윕은 증분이다: 발견된 항목마다 스탯 시그니처(크기, mtime)가 있고 —
+변함없으면 아무 작업도 없다. 트랜스크립트 헤드에서 파생된 제목은 노이즈
+필터를 거친다(붙여넣은 `<file …>` 봉투, `[Image #N, WxH]` 플레이스홀더,
+`<command-name>` 껍데기 등은 세션 이름이 되지 않고), 헤드 읽기는 16 KiB
+청크로 1 MiB에서 바이트 캡된다 — Codex는 첫 줄에 base_instructions 전체를
+싣으므로 무제한 읽기는 폭발한다.
+
+빈도: 부트 스캔 한 번(시작 몇 초 뒤) + 명시적 `session.rescan`;
+`[history] scan_interval_secs`가 타이머를 추가하고(0, 기본값 = 끔),
+`[history] enabled = false`는 자동 스윕을 아예 끈다. 전역 단일 비행 —
+실행 중인 스캔에 두 번째 `session.rescan`은 진행 중인 `scanId`를
+반환한다; 진행 이벤트는 요청 연결로 간다.
+
+실패는 갇힌다: 디스커버리가 실패한 백엔드는 `skippedBackends`에
+보고되고 나머지 스캔은 계속된다. 사라진 네이티브 파일은 프로바이더의
+진실이 사라졌다는 뜻 — 그 damon 세션은 **보관(archive)**된다
+(`session.list`에서 숨겨짐, 히스토리 보존), 삭제되지 않는다. 발견된
+세션의 `session.delete`는 네이티브 핸들을 툼스톤해 어떤 스윕도 다시
+가져오지 않게 하고; 같은 네이티브 핸들을 resume하면 툼스톤이 지워진다
+(사용자의 명시적 새 의도가 이긴다). 스캐너는 네이티브 파일을 절대
+쓰거나 지우지 않는다.
+
+### MCP 인벤토리와 프로브
+
+각 에이전트 CLI는 자체 문서가 말하는 곳에 MCP 설정을 둔다: claude는
+`~/.claude.json`(`mcpServers` + `projects[cwd]` 스코프,
+`CLAUDE_CONFIG_DIR` 존중), codex는 `~/.codex/config.toml`
+(`[mcp_servers.*]`, `CODEX_HOME` 존중), qwen은 `~/.qwen/settings.json`,
+opencode는 `$XDG_CONFIG_HOME/opencode/opencode.json`, droid는
+`~/.factory/mcp.json`. `mcp.inventory`는 이것들을 모두 읽고 항목별로
+트랜스포트, REDACTED된 command/URL(env 키는 예, 값은 결코;
+userinfo/query 제거; stdio는 프로그램 + 인자 수), 소스 파일,
+콘텐츠 해시 `version`, 백엔드가 추적하는 곳에서는 enabled 상태를
+보고한다. 파싱에 실패한 소스는 파일별로 보고되고(`sources[].error`)
+인벤토리를 중단하지 않는다. 검증된 설정 위치가 없는 백엔드는 추측한
+경로 대신 소스를 보고하지 않는다(omp/pi는 확장으로 MCP를 관리; zcode와
+mimo는 미검증).
+
+`mcp.probe {backend, name}`은 설정된 서버에 대한 실제 MCP 핸드셰이크를
+수행한다 — stdio는 자체 프로세스 그룹으로 스폰(종료 시 kill, 25초 캡),
+HTTP는 스트리머블-HTTP POST(12초 캡) — `initialize` →
+`notifications/initialized` → `tools/list`를 걸어 도구 이름(≤40)과
+서버 이름/프로토콜 버전을 돌려준다. 프루브는 명시적 요청에서만
+실행된다: 스케줄되지 않고, 자동 실행되지도 않는다. 서버의 command,
+args, 환경은 와이어에 나타나지 않는다.
+
+`mcp.setEnabled`는 이번 라운드는 claude 전용: claude TUI가 쓰는 같은
+프로젝트별 `disabledMcpServers` 스위치를 뒤집으며, 항목의 콘텐츠 해시
+`version`이 CAS로 보호된다 — 인벤토리 스냅샷 이후 외부 편집은
+`-32010`으로 거부된다. 설정은 파싱돼야 쓰여지고(깨진 파일은 절대 쓰지
+않음), 같은 경로의 쓰기는 직렬화되며, 교체는 원자적이다. 다른 모든
+백엔드는 이유와 함께 읽기 전용이다: 에이전트가 자기 설정을 소유한다;
+Damon은 CLI의 문서화된 스위치를 뒤집을 뿐, 설정을 대신 작성하지 않는다.
 
 ### 프로젝트
 
@@ -162,6 +315,18 @@ symlink 홉은 해석하고, 아직 없는 쓰기 대상은 가장 깊은 존재
 해석하며, 나머지는 어휘적 `..` 접기가 커버한다 — 탈출은 `-32602`로
 fail-closed. `allowed_dirs`와 조합해 세션이 애초에 가질 수 있는 cwd를
 제한한다.
+
+그랜티드 루트는 이 감금을 의도적으로 넓힌다: `file.grant`는 추가
+디렉터리를 영속화한다(절대경로, 존재, 정규화 — symlink로 `/private/var`에
+귀결되는 `/var` 그랜트는 후자를 저장해 감금 검사와 철회가 정확히
+일치). 프로젝트 또는 글로벌 범위로; `file.grants`는 범위의 실효
+그랜트를 나열하고 `file.ungrant`가 철회한다. 넓히기는 `file.*`에 즉시
+적용되고, 네이티브 확장 플래그가 있는 백엔드는 다음 실행 때 받는다
+(claude는 실효 그랜트당 `--add-dir` 하나 — 동등한 것이 없는 백엔드는
+가짜로 흉내 내지 않는다). 그랜트는 명시적 사용자 행위이며
+`allowed_dirs`로 묶이지 않는다 — 그 게이트는 세션이 어디서 실행될 수
+있는지를 제한하지, 명시적으로 그랜트된 세션이 무엇을 읽을 수 있는지가
+아니다.
 
 ### 컴포저 지원
 
@@ -237,6 +402,12 @@ fingerprint+TTL 디스크 캐시 뒤에서. `[skills] enabled = false`면
 contextUsed}` — cost는 턴별 델타의 합, context는 그날 마지막 스냅샷.
 행이 없는 날은 배열에 없다.
 
+`usage.summary`는 같은 행을 더 잘게 묶는다 — 로컬 날 × 백엔드 ×
+모델별로, `tzOffsetMinutes`가 UTC 스탬프를 호출자의 달력으로 옮겨
+버킷이 그 달력을 따르게 한다. 각 행은 턴 수와 합산 context 스냅샷,
+합산 cost 델타를 담고 창 전체 `total`이 함께 돌아온다.
+`usage.clear`는 모든 사용 행을 삭제한다(세션과 메시지는 그대로).
+
 `turn.start`는 턴이 끝날 때 resolve — 이벤트가 먼저 스트리밍되고 그다음
 응답. 연결 끊김은 그 연결이 시작한 턴을 취소한다.
 
@@ -262,6 +433,34 @@ assistant, reasoning, tool, compaction, error 행이 타임라인 이벤트로,
 create/resume 결과의 `replayed` 수가 보낸 프레임 수. 라이브 프레임에는
 `replay` 필드가 없다. 데몬의 인플라이트 저널을 넘친 턴은 리플레이되지
 않는다(라이브 나머지는 끊기지 않고 계속; 조립된 결과는 턴 끝에 영속화).
+
+### 미션 러너 (스테이지 1)
+
+단계형 에이전트 워크플로를 위한 상주 DAG 러너: 조건 라우팅 엣지 위의
+`input → agent → human → output` 노드. SQLite가 진실의 원천 — 모든 전이는
+팬아웃 전에 저장되고, 실행 상태는 태스크 상태에서 도출되며, 데몬 재시작 시
+끝나지 않은 실행은 `interrupted + cancelled`로 수렴한다(실행 중인 것처럼
+가장하지 않음).
+
+- **조건** — `key=value` / `key!=value` 절이 업스트림 출력과 플로우 설정을
+  읽는다(`and`가 `or`보다 우선, 없는 키 ⇒ false); 조건 없는 엣지는
+  기본값: 같은 소스의 명시적 형제가 하나도 안 맞았을 때만 발화.
+- **에이전트 노드**는 노드별 세션(시도마다 하나)에서 실제 damon 턴으로
+  실행 — 전사본이 스토어에 쌓여 `session.search`가 뒤따른다. 노드의 마지막
+  어시스턴트 메시지를 `key=value` 라인으로 파싱해 다운스트림 조건 컨텍스트로
+  쓴다.
+- **읽기 전용 단계**는 `allowedTools`를 런치 라인에 싣는다(claude:
+  `--allowedTools`); 강제할 수 없는 백엔드에서 `mission.start`는 해당 노드를
+  거부한다.
+- **휴먼 노드**는 태스크를 `waiting_human`에 세우고 인박스 항목을 만든다;
+  `mission.respond`가 해결한다(approve / feedback 재질문 / exclude — 브랜치
+  종료, 다운스트림 취소).
+- **실패**는 `settings.retries`까지 재시도 후 `failed` — 조용히 건너뛰지
+  않는다. `settings.concurrency`가 병렬 에이전트 노드를 제한한다(휴먼 노드는
+  슬롯을 점유하지 않음).
+
+의도된 스테이지 한계: `foreach` 노드 없음, 채널 기반 승인 없음(휴먼은 UI
+드로어나 와이어로 답한다), 시작 후 미션 편집 없음(취소 후 재생성).
 
 ## StreamEvent
 
@@ -289,6 +488,34 @@ create/resume 결과의 `replayed` 수가 보낸 프레임 수. 라이브 프레
 `PermissionResponse`는 `{behavior:"allow",action_id?,updated_input?}` 또는
 `{behavior:"deny",action_id?,message?,interrupt}` — `interrupt: true`인
 deny는 한 호출만 거부하는 게 아니라 거부 전달 직후 전체 턴을 인터럽트한다.
+
+### 플랜 리뷰
+
+`kind: plan` ask(claude의 ExitPlanMode)는 플랜 텍스트를 `input.plan`에
+싣는다. 데몬은 이를 영속 리뷰 행으로 기록한다(`plan.list`에서 확인;
+sessionId + planId + revision 키): 리뷰가 열려 있는 동안 다시 ask되면
+revision+1로 체인되고 이전 리비전은 대체된다. 라이브 ask가 전송
+통로로 남고, 행이 다중 표면 팩트소스다 — 폰, 챗 봇, 데스크톱 UI가 같은
+아티팩트를 보고 답한다.
+
+결정은 `plan.respond`(`planId`, `expectedRevision`, `decision`, 선택
+`feedback`)으로 간다: expectedRevision CAS 클레임 때문에 같은 리비전에
+답하는 두 표면은 정확히 하나의 승자와 패자의 타입화된 `-32009`로
+귀결되고, 낡거나 닫힌 리비전에 대한 결정은 에이전트에 절대 전달되지
+않는다. 결정 의도는 네이티브 릴레이 **전에** 영속화된다: 끊긴 파이프는
+기록을 남기고 행을 다시 연다(상태를 `awaiting_review`로 복귀, 의도는
+파일에 보존) — 일어나지 않은 성공을 보고하는 일은 없다. `approve`는
+라이브 ask에 allow를 전달하고, `request_changes`는 feedback을 message로
+싣는 deny를, `defer`는 ask를 건드리지 않고 비종단적으로 기록한다 —
+에이전트의 대기는 그대로 멈춰 있고 나중의 `plan.respond`가 still
+결정할 수 있다. 리뷰 불가능한 내용(`complete: false`)의 플랜 승인과
+feedback 없는 request_changes는 `-32602`로 거부된다.
+
+턴이 끝나면 아직 열린 리뷰는 만료된다(네이티브 ask가 프로세스와 함께
+죽었다 — 히스토리가 답변 가능한 척해선 안 된다; 기록된 의도는
+보존된다). 플랜 ask에 대한 `permission.respond`도 같은 영속 행에
+결정을 기록한다(deny의 `message`가 기록되는 feedback이 된다) — 게이트
+이전 클라이언트도 계속 동작한다.
 
 ## 릴레이 핸드셰이크
 

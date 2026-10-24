@@ -1045,7 +1045,12 @@ class DamonClient:
     ) -> None:
         """Answer a ``permission_requested`` event. ``response`` is a
         PermissionResponse: ``{"behavior": "allow", "action_id"?, …}`` or
-        ``{"behavior": "deny", "action_id"?, "message"?, "interrupt"?}``."""
+        ``{"behavior": "deny", "action_id"?, "message"?, "interrupt"?}``.
+        For ``kind: "question"`` asks (``event.questions`` present),
+        submit picks via ``{"behavior": "allow", "answers": {question:
+        label | [labels]}}``; an allow without answers skips. Fails with
+        code ``-32008`` (``ASK_NOT_FOUND``) when the card is already
+        settled; a transport error leaves it answerable."""
         await self._call(
             "permission.respond",
             {"sessionId": session_id, "requestId": request_id, "response": response},

@@ -114,16 +114,22 @@ damon-slack    --app-token xapp-… --bot-token xoxb-…
 
 채널의 각 채팅이 고유한 에이전트 세션에 매핑되고, 응답은 스트리밍되며, tool 권한 요청은 Telegram/Discord/Slack 모두 네이티브 버튼으로 도착한다(Slack은 Socket Mode로 버튼 눌림이 전달된다 — 앱 설정에서 Interactivity를 Socket Mode로 활성화할 것). `allow`/`deny`/`always` 답장도 어디서든 동작하고, 채널로 보낸 파일은 프롬프트 첨부로 함께 전달된다(Discord CDN URL은 Slack의 `url_private`처럼 프롬프트 시점에 내려받는다). `!cwd <dir>`과 `!agent <backend>`로 대화의 프로젝트·백엔드를 정하고, `!new`/`!fork`/`!delete`/`!cancel`/`!usage`도 함께 쓴다. 표면을 넘나드는 세션 픽업: `!sessions`로 모든 화면의 최근 세션을 보고, `!resume <id|제목>`으로 이 채팅에서 이어한다(자동 감시). `!watch`/`!unwatch <id|제목>`는 세션을 따라가 턴 완료·권한 요청을 이 채팅으로 알려준다 — 턴이 웹 UI나 CLI에서 돌아도 `allow`/`deny` 답장으로 바로 승인할 수 있다. 새 채널은 `damon_core::channel::ChannelApi`(`ready`/`recv`/`send`/`send_permission`/`send_media`)를 구현해 `Bridge`에 넘기면 된다 — 세션 매핑, 이벤트 demux, 권한 흐름은 이미 구현돼 있다.
 
+## 미션 (스테이지)
+
+`damon mission create <flow.json> && damon mission start <flow-id>`로 단계형 에이전트 워크플로를 실행한다: 조건 라우팅 엣지 위의 `input → agent → human → output` 노드(`key=value` 분기는 각 단계의 `key=value` 출력 라인을 읽고, 조건 없는 엣지는 아무것도 안 맞았을 때만 발화). 에이전트 노드는 노드별 세션에서 실제 damon 턴으로 실행 — 일반 전사본처럼 검색 가능 — 하한 병렬 제한과 단계별 재시도를 거쳐 실패는 정직하게 `failed`. 읽기 전용 단계는 `allowedTools`를 런치 라인에 싣고 강제할 수 없는 백엔드에서는 거부된다(claude는 가능; 절대 강등 없음). 휴먼 게이트는 실행을 `waiting_human`에 세운다: 웹 UI의 미션 드로어에서 답하거나 `damon mission respond`. 모든 전이는 팬아웃 전에 SQLite에 저장되므로 데몬 재시작 시 끝나지 않은 실행은 `interrupted`로 수렴 — 실행 중인 것처럼 가장하지 않는다. 스테이지 범위: `foreach` 없음, 채널 기반 승인 없음, 실행 중 미션 편집 없음.
+
 ## 원격 접근
 
 - **Tailscale**(권장): `ws://<tailscale-ip>:9470/ws`로 attach — WireGuard E2E, 데몬 설정 변경 없음.
 - **직접 TLS**: `tls_cert`/`tls_key` 설정 시 `wss` 서빙. 비루프백 바인드는 `auth_token` 없이 기동을 거부한다.
 - **자체 릴레이**: 공개 호스트에 `damon-relay`를 띄우고 데몬 config에 `[relay]` 추가 — 데몬이 아웃바운드로 연결하므로 인바운드 포트 불필요. X25519 키 교환 + `sha256(auth_token ‖ pubkey)` 증명 → AES-256-GCM; 릴레이는 평문을 볼 수 없다.
 - **어디서든 웹 UI**: 릴레이 자체가 번들 UI를 루트에서 서빙한다 — 폰이나 노트북 브라우저로 `http(s)://릴레이호스트/`를 열고 데몬 이름과 auth 토큰을 입력하면, 페이지가 같은 릴레이를 통해 E2E 핸드셰이크로 접속한다. VPN·포트포워딩·앱 설치가 필요 없고, 브라우저가 자체 암호화를 수행하므로 일반 `ws://` 호스팅에서도 동작한다.
+- **디바이스별 페어링**: 모든 기기에 마스터 `auth_token`을 나눠주는 대신, 설정 서랍에서 일회용 페어링 키를 공개하고(`device.pairing_key`) 기기가 `POST /v1/pair`로 소비하게 한 뒤, 신뢰하는 표면에서 대기 요청을 승인한다. 기기는 자체 토큰(데몬에는 SHA-256 해시로만 저장, 기기별 폐기 가능)을 받아 WS 티켓을 발급한다; revoke하면 즉시 무효다. 직접 닿는 기기는 웹 UI의 "pair this device" 폼으로 페어링하고, 릴레이 모드 기기는 기존 마스터 토큰 로그인을 유지한다.
 
 ## 문서
 
 - **[프로젝트 홈페이지](https://developjik.github.io/damon-agent-core/)** — Damon 한눈에 보기
+- [docs/features.ko.md](docs/features.ko.md) ([en](docs/features.md)) — 기능 안내서, 그림 포함 (비개발자용; [브라우저 버전](docs/features.ko.html))
 - [docs/protocol-v2.md](docs/protocol-v2.md) — 와이어 프로토콜 (메서드, 이벤트, 타입)
 - [docs/install.ko.md](docs/install.ko.md) ([en](docs/install.md)) — 설치 경로, 서비스 등록
 - [docs/integration.ko.md](docs/integration.ko.md) ([en](docs/integration.md)) — 에이전트 연결, 최소 클라이언트

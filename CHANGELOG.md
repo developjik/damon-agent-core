@@ -1,5 +1,344 @@
 # Changelog
 
+## Unreleased
+
+### Added — mission runner (staged DAG workflows)
+
+- **Resident mission DAG runner** — staged agent workflows with
+  `input | agent | human | output` nodes over condition-routed edges
+  (`key=value` / `key!=value`; `and` binds over `or`; missing key ⇒
+  false; condition-less edges are the fallback taken only when nothing
+  else matched). SQLite is the truth: every transition persists before
+  it fans out, run status always derives from the task states, and a
+  daemon restart converges unfinished runs to `interrupted + cancelled`
+  — never faked as still-running. Agent nodes run as real damon turns
+  on per-node sessions (transcripts searchable via `session.search`),
+  their final assistant message parses as `key=value` lines into the
+  downstream condition context, and failures retry up to
+  `settings.retries` before an honest `failed`.
+  `settings.concurrency` bounds parallel agent nodes; human nodes park
+  at `waiting_human` without occupying a slot. **New methods:**
+  `mission.create` (versioned flows — re-creating a flowId inserts the
+  next version), `mission.start` (single-flight per run, read-only
+  stages REFUSED on backends that cannot enforce a tool allowlist —
+  never downgraded), `mission.cancel`, `mission.respond` (approve /
+  feedback re-ask / exclude-cascades-downstream; the store CAS is the
+  one-winner gate), `mission.list`, `mission.get`, `mission.watch` /
+  `mission.unwatch` (progress frames). Session config grows
+  `allowedTools` (claude: `--allowedTools t1,t2`) with a matching
+  backend capability `tool_allowlist`. The web UI gains a Missions
+  drawer: flat runs list, per-node state chips, and inbox
+  approve/feedback. Staged limits, on purpose: no `foreach` nodes, no
+  channel-based approval, no editing a live mission.
+
+
+### Added — MCP inventory, probe, and claude-only toggle
+
+- **`mcp.inventory`** — every backend's NATIVE MCP config, read where
+  each CLI actually keeps it (paths verified on this machine and/or
+  from the CLI's own docs: claude `~/.claude.json` +
+  `projects[cwd]` scopes honoring `CLAUDE_CONFIG_DIR`; codex
+  `~/.codex/config.toml` `[mcp_servers.*]` honoring `CODEX_HOME`;
+  qwen `~/.qwen/settings.json`; opencode
+  `$XDG_CONFIG_HOME/opencode/opencode.json`; droid
+  `~/.factory/mcp.json`; omp/pi/zcode/mimo report no source rather
+  than a guessed path). Per entry: transport, REDACTED
+  command/URL (env keys yes / values never; URLs lose userinfo, query
+  and fragment; stdio shows the program + an arg count), source file,
+  format, content-hash version, enabled state where tracked, and the
+  readonly reason where the backend has no toggle. A config file that
+  fails to parse reports its error per source — the inventory never
+  aborts. **`mcp.probe {backend, name}`** — a REAL MCP handshake
+  against the configured server: stdio spawns it in its own process
+  group (killed on exit, 25s cap), HTTP POSTs streamable-HTTP (12s
+  cap); walks `initialize` → `notifications/initialized` →
+  `tools/list` and returns tool NAMES (≤40), the server's name and
+  protocol version. Explicit request only — never scheduled, never
+  auto-run — and the server's command/args/env never reach the wire.
+  **`mcp.setEnabled`** — claude-only: flips the same per-project
+  `disabledMcpServers` switch the claude TUI uses, CAS'd on the
+  entry's content-hash version (external edits reject `-32010`), with
+  parse-fail-never-writes, serialized same-path writes, and atomic
+  replace; every other backend is readonly with the reason. New
+  serde_json feature: `preserve_order` (no new dependency) so
+  rewriting a user's config file preserves its key order.
+
+### Added — native history auto-scanner
+
+- **`session.rescan`** — the daemon now discovers everything the CLIs
+  ever created outside Damon: one sweep walks every backend's own
+  native session storage (through each backend's discovery, honoring
+  env overrides like `CLAUDE_CONFIG_DIR` / `FACTORY_HOME_OVERRIDE`)
+  and creates damon bookmark rows — id, backend, native handle, cwd,
+  title — so pre-damon sessions show up in `session.list` and resume
+  like any native session. Bookmarks are rows, not transcript copies:
+  `session.search` still indexes only messages from damon-run turns
+  (Damon has no message-extraction path for native handles yet —
+  per-backend transcript extractors are future work). Incremental via stat signatures (size +
+  mtime — unchanged files skip entirely; SCAN_REPORT carries
+  scanned/reparsed/reused), single-flight globally (a second call
+  returns the in-flight scanId), progress events stream to the
+  requesting connection, and a failing backend is skipped
+  (`skippedBackends`), never an abort. Titles derived from transcript
+  heads are noise-filtered (`<file …>` envelopes, `[Image #N, WxH]`
+  placeholders, `<command-name>` shells), and head reads are
+  byte-capped at 1 MiB in 16 KiB chunks — Codex embeds its full
+  base_instructions prompt in line 1. A vanished native file archives
+  its damon session (the provider's truth is gone — history kept,
+  hidden); `session.delete` on a discovered session tombstones its
+  handle so no sweep re-imports it, and re-resuming the same handle
+  clears the tombstone. Cadence: boot scan + explicit `session.rescan`;
+  `[history] scan_interval_secs` (default 0 = off) adds a timer and
+  `[history] enabled = false` turns the automatic sweeps off. The
+  scanner never writes or deletes native files. New config section
+  `[history]`; new RPC `session.rescan`; `session.import`-listing
+  backends gain global discovery + bounded head peeks (16 KiB chunks)
+  + noise-title hygiene.
+
+### Added — web device pairing & approval
+
+- **Per-device credentials for remote surfaces** — instead of handing
+  every phone the master `auth_token`, the desktop reveals a one-time
+  pairing key (`device.pairing_key`, 8 unambiguous chars) and the
+  device spends it at `POST /v1/pair {pairingKey, name}`: the key is
+  consumed AND rotated in a single locked step (a code opens exactly
+  one pairing), a `pending web_devices` row is created (store
+  migration to user_version 7), and the device receives its token
+  once — stored SHA-256-hashed daemon-side, never in plaintext.
+  `POST /v1/pair/status` is the waiting page's poll; a trusted surface
+  approves via `device.approve` (rename/revoke/list alongside, revoke
+  kills the credential immediately — it doubles as deny). Approved
+  devices mint WS tickets at `POST /v1/ws_ticket` with
+  `{"deviceToken": …}` as an alternative to the master bearer; the
+  master path is byte-for-byte unchanged and non-loopback binds still
+  refuse to start without a resolvable master token. `hello` carries
+  `remoteClients` (live non-loopback `/ws` count) for a "remote
+  control active" badge; the settings drawer gains pairing-key
+  reveal/copy, pending approve/deny, rename/revoke with last-seen, and
+  a "pair this device" form for directly-reachable origins (relay-mode
+  devices keep the master-token login — device tokens are a
+  direct-reach surface today).
+
+### Added — CLI lifecycle manager (version probes, update plans, explicit updates)
+
+- **`backend.versions` / `backend.update_plan` / `backend.update` /
+  `backend.update_cancel`** — the "your codex is 4 versions behind"
+  loop closed: per-backend `--version` probes (10s cap) and npm-latest
+  checks (15s cap) run only on explicit request (never scheduled),
+  concurrently. The npm map is verified against each CLI's own install
+  docs (claude `@anthropic-ai/claude-code`, codex `@openai/codex`, omp
+  `@oh-my-pi/pi-coding-agent`, pi `@earendil-works/pi-coding-agent`,
+  qwen `@qwen-code/qwen-code`, opencode `opencode-ai`); droid and mimo
+  ship native installers (official one-liners are the update path,
+  `updateKind: "manual"`), and zcode has no verified channel
+  (`updateKind: "unknown"`, blockers only) — nothing is guessed.
+  `backend.update` executes the exact argv its plan previewed (one
+  argv construction serves both), streams per-line-capped progress to
+  the requesting connection, and is cancellable; `damond doctor` now
+  reports installed versions (same 10s cap, degrading to "version
+  unknown"). The web UI's settings drawer lists versions with an
+  update button (plan confirm → streamed output). Process access sits
+  behind an injectable runner, so tests stay process/network-free.
+
+### Added — durable plan-review / approval gate
+
+- **Typed plan review** (`plan.list` / `plan.respond`) with a durable
+  `plan_reviews` table (store migration to user_version 6): a
+  `kind: plan` ask (claude's ExitPlanMode) now records sessionId +
+  planId + revision with the verbatim plan text and a content hash; a
+  re-ask while the review is still open chains as revision+1 and
+  supersedes the old revision. `plan.respond` is an expectedRevision
+  CAS gate — two surfaces answering the same revision resolve to
+  exactly one win plus a typed `-32009` (`PLAN_CONFLICT`) for the
+  loser, and a decision on a stale or closed revision never reaches
+  the agent. The decision intent is persisted BEFORE the native
+  relay: a failed relay leaves the record and reopens the row (never
+  a fake success). Approving an incomplete plan and feedback-less
+  `request_changes` refuse with `-32602`; `defer` records
+  non-terminally without touching the live ask. `permission.respond`
+  on a plan ask lands its decision in the same durable row, so
+  pre-gate clients keep working. Chat cards render the plan
+  (truncated) and route allow/deny through the gate; the web UI's
+  approval dock shows revision + content with approve /
+  request-changes (feedback input) / defer. When the turn ends,
+  still-open reviews expire (recorded intents survive). `permission.kind`
+  gains the `plan` variant; backends without plan asks never create
+  rows.
+
+### Added — granted roots (inline access widening), usage aggregates, web UI refinements
+
+- **Granted roots** (`file.grant` / `file.grants` / `file.ungrant`) —
+  the loop-closer for a headless agent that hit an out-of-workspace
+  denial: the user grants an extra directory (absolute, must exist and
+  be a directory, canonicalized; duplicate grants are idempotent), the
+  grant persists in a new `granted_roots` table (store migration to
+  user_version 5; per-project scope, NULL = global), the daemon-side
+  `file.*` jail widens immediately for sessions in scope, and the
+  next backend launch rides one `--add-dir <root>` per effective grant
+  on claude (backends without a native equivalent are not faked).
+  `file.ungrant` re-confines; revocation matches the stored canonical
+  root, so a deleted grant directory stays revocable. Chat channels
+  get the same loop-closer as `!grant <dir>` / `!grants` /
+  `!ungrant <dir>`; the web UI's settings drawer lists effective
+  grants, adds (directory path input), and revokes.
+- **`usage.summary` / `usage.clear`** — usage rollup grouped per
+  (local day × backend × model) with a window total; `days` defaults
+  to 7 (today inclusive) and `tzOffsetMinutes` shifts the UTC stamps
+  into the caller's calendar so buckets match it. `usage.clear`
+  deletes every usage row (sessions and messages untouched).
+- **Web UI** — find bar, long-message collapse, and a crash watchdog.
+
+### Fixed — CJK and short-token full-text search
+
+- The FTS5 index now uses the **trigram tokenizer** (store migration
+  to user_version 4 drops, recreates, and rebuilds the index), so
+  substring search works inside CJK runs: `damon search "커밋"` finds
+  "커밋 메시지" — under the previous unicode61 tokenizer the whole run
+  indexed as one token and matched nothing.
+- Query terms shorter than the trigram minimum (3 characters) fall
+  back to an exact-substring LIKE path with AND semantics (NOT-operand
+  exclusions honored) instead of being silently dropped by MATCH; a
+  query built only of such terms returns newest-first hits with a
+  Rust-built snippet instead of ranked ones.
+
+### Added — codex / qwen / omp / pi / droid / zcode capability expansion (verified against the installed CLIs' native protocols)
+
+- **codex** — `session.create` with `mcp_servers` now passes a
+  `config` override on `thread/start` (`mcp_servers.<name>` under the
+  hood, exactly what `codex mcp add` writes), and Damon modes map to
+  `approvalPolicy` + `sandbox`/`sandboxPolicy` sent on `thread/start`
+  and re-applied on every `turn/start` ("this turn and subsequent
+  turns"), so `session.set_mode` and `session.set_model` (turn-level
+  model override) work mid-session. Catalog exposes `default`,
+  `read-only`, `full-access`.
+- **qwen** — MCP servers pass via `--mcp-config` (same
+  `{"mcpServers": …}` contract as claude), and the Task tool's
+  tool_use/tool_result pairs now raise subagent lifecycle events via
+  the shared stream-json parser (qwen's subagent tool is Task +
+  `subagent_type`, identical to claude's).
+- **omp / pi** — `session.list_importable` scans the CLI's own session
+  storage (`$PI_CODING_AGENT_DIR` / `~/.omp/agent` / `~/.pi/agent`,
+  `sessions/<cwd-slug>/*.jsonl`), parses the `{"type":"session"}`
+  header for id/title/cwd, filters by exact cwd, newest first.
+  Nested subagent transcripts are excluded.
+- **droid** — session import scans `~/.factory/sessions/<slug>/*.jsonl`
+  (`session_start` headers); `session.set_mode` maps to
+  `droid.update_session_settings {autonomyLevel}` (`low`/`medium`/
+  `high`, matching the CLI's `--auto` vocabulary); `session.set_model`
+  passes `modelId`, and the catalog comes from a live
+  `droid.list_models` probe; MCP servers register post-initialize via
+  `droid.add_mcp_server` (stdio). Steering stays off: the wire has no
+  steer method — mid-turn `add_user_message` feeds the next-turn
+  queue, not the open turn.
+- **zcode** — session import uses the app-server's `session/list`
+  (workspace-filtered); modes are the protocol's own enum (`plan`,
+  `build`, `edit`, `yolo`, `auto`, default `build`) switched via
+  `session/setMode`; `session.set_model` sends
+  `session/setModel {providerId, modelId}` (and `session/create`'s
+  model field was fixed to that shape); MCP servers ride
+  `session/create` as the protocol's `mcpServers` array
+  (`[{name, command, args, env:[{name,value}]}]`). Subagent events
+  stay off: `session/subagents` is a pull request over store-backed
+  sessions, with no push notification family to stream.
+- `rewind` stays off everywhere (the droid/zcode/codex/opencode wires
+  have rewind primitives, but Damon has no rewind RPC consumer yet).
+
+### Added — opencode/mimo capability expansion (live-verified against opencode 1.18.32)
+
+- **Session import** — `session.list_importable` now lists real
+  opencode sessions: `GET /session?directory=<cwd>` (empty array for a
+  fresh directory), mapped to Damon's import shape with title, cwd,
+  and modified time (the wire carries epoch milliseconds).
+- **Reasoning streaming** — `message.part.updated` frames with
+  `part.type "reasoning"` (thinking models) now flow into the timeline
+  as reasoning items, with the same snapshot-tail dedup text parts use,
+  so persistence never double-counts a snapshot.
+- **MCP registration on spawned servers** — `session.new` with
+  `mcp_servers` now registers each server via `POST /mcp`
+  (`{type:"local", command:[…argv], environment, enabled}`). Only on
+  servers Damon spawned itself: opencode has no MCP remove endpoint,
+  so Damon never rewires an adopted listener that belongs to the user.
+- **Agent modes** — the catalog now carries opencode's primary agents
+  (`build`, `plan`; hidden machinery like compaction/summary is
+  filtered) from `GET /agent`, and `session.set_mode` switches via
+  `POST /api/session/:id/agent` — verified to flip the session's
+  `agent` for subsequent turns.
+- **Model switching + catalog** — `session.set_model` posts
+  `POST /api/session/:id/model` (`{"model": {providerID, id}}` — both
+  ModelRef fields required, so ids are `provider/model`), and
+  `fetch_catalog` now lists `GET /api/model` entries, honestly empty
+  when the server holds no provider credentials.
+- **Mid-turn steering** — sending a message while a turn is running
+  (prompt_async on a busy session) is accepted by opencode and
+  injected into the running turn as the model's next step; the turn
+  still settles with a single idle, so surfaces see one
+  `turn_completed`. If the expected turn already settled, Damon
+  reports steering unavailable so the message queues as a normal
+  follow-up turn instead.
+- Capability flags flipped accordingly (`rewind` stays off — no Damon
+  consumer); sessions inherit the client's set instead of recomputing
+  it.
+
+### Added — mid-turn question cards (design ported from desktop-cc-gui's `answer_question`, MIT)
+
+- **Structured question cards end to end.** Every backend that asks the
+  user a question mid-turn (claude's AskUserQuestion, codex
+  `requestUserInput`, omp `select`/`input` dialogs, zcode
+  `requestUserInput`, droid `ask_user`, opencode question batches) now
+  normalizes into a `questions` payload on the `permission_requested`
+  event (`kind: "question"`, `{question, header?, options,
+  multiSelect}`), so every surface renders one consistent card instead
+  of a raw-input allow/deny. Claude's AskUserQuestion previously
+  surfaced as a generic tool approval with the questions buried in raw
+  JSON; opencode truncated batches to the first question.
+- **Answers flow back canonically.** `permission.respond` accepts an
+  `answers` map (`{question → label | [labels] | typed string}`) on the
+  allow response; each backend converts it to its own wire shape
+  (claude merges it into `updatedInput`, opencode aligns it to
+  per-question label arrays, droid rebuilds its index-keyed records).
+  An allow **without** answers is a skip; `Deny` refuses the ask.
+- **A failed delivery no longer kills the card.** Every backend now
+  removes a pending ask only *after* the answer reached the agent
+  (peek-then-remove) — a transport error leaves the card answerable,
+  and answering an unknown id fails with a new typed `-32008
+  ASK_NOT_FOUND` instead of a generic `-32000`, so clients can tell a
+  retryable miss from a settled card.
+- **No zombie cards.** Claude's `control_cancel_request` (the CLI
+  withdrawing its question) now settles the pending ask, and any ask
+  still parked when a turn ends settles with a `permission_resolved`
+  event before the terminal event.
+- **Web UI question cards** — per-question option buttons
+  (radio/toggle), an "Other…" free-text fallback, Answer/Skip/Decline,
+  and the card stays up when a respond fails. Also fixed: the tool
+  permission card used to close before the respond resolved.
+- **Chat bridges answer questions** (Telegram/Discord/Slack): a single-
+  question card renders one button per option plus the `❓` option list
+  (letters a/b/c… for button-less clients), any other text from the
+  requester becomes the answer, `!skip` dismisses, and multi-question
+  batches point at the web UI. The usual identity checks apply
+  unchanged.
+
+### Fixed — todo cards survive turn boundaries
+
+- The turn's final task-list snapshot now persists as a `todo` row
+  (items in `data.items`) and replays for late subscribers, so a
+  session reopened from history — refresh, another surface, daemon
+  restart — shows the ending task list instead of a live-only card
+  that evaporated with the turn. Intermediate snapshots stay
+  live-only (backends re-send the whole list; one final row, never
+  one per update). The web UI renders the persisted row through the
+  same card as the live event.
+
+### Fixed — codex stops advertising mode switching it can't do
+
+- Codex advertised `dynamic_modes` and a `default/plan/full-access`
+  mode catalog, but the app-server wire has no place to carry a mode
+  (`thread/start` takes model+cwd only, and there is no mode control
+  request) — the UI showed a picker whose choices did nothing, and a
+  `session.set_mode` call answered `-32002`. The capability and
+  catalog entries are gone until real wire support lands, so clients
+  hide the affordance instead of surfacing a dead control.
+
 ## 0.6.0 — 2026-09-27
 
 ### Added — git worktree workspaces (design ported from desktop-cc-gui's `git_worktree.rs`, MIT)

@@ -58,6 +58,35 @@ pub struct Config {
     /// `[skills]` — the skills hub. Hot-reloaded.
     #[serde(default)]
     pub skills: SkillsConfig,
+    /// `[history]` — native-session auto-discovery. Hot-reloaded.
+    #[serde(default = "default_history")]
+    pub history: HistoryConfig,
+}
+
+/// `[history]` — the native-history scanner. `enabled` gates the
+/// AUTOMATIC sweeps (boot pass + interval); an explicit
+/// `session.rescan` always runs.
+#[derive(Clone, Debug, Deserialize, PartialEq)]
+#[serde(deny_unknown_fields)]
+pub struct HistoryConfig {
+    /// Master switch for the automatic sweeps. Default true.
+    #[serde(default = "default_history_enabled")]
+    pub enabled: bool,
+    /// Seconds between automatic history scans. 0 (default) = boot scan
+    /// + explicit `session.rescan` only.
+    #[serde(default)]
+    pub scan_interval_secs: u64,
+}
+
+fn default_history_enabled() -> bool {
+    true
+}
+
+fn default_history() -> HistoryConfig {
+    HistoryConfig {
+        enabled: true,
+        scan_interval_secs: 0,
+    }
 }
 
 /// `[skills]` — the skills hub (install/sync manager for agent skill

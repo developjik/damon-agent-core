@@ -29,6 +29,14 @@ pub struct OpencodeServer {
 }
 
 impl OpencodeServer {
+    /// True when damon spawned this listener (vs adopting the user's
+    /// own default-port server). Gates surfaces that mutate shared
+    /// server state — MCP registration (`POST /mcp`, no remove
+    /// endpoint) is only allowed on servers damon owns.
+    pub fn damon_spawned(&self) -> bool {
+        self.password.is_some()
+    }
+
     /// Basic-auth header value for reqwest calls, when needed.
     pub fn auth_header(&self) -> Option<String> {
         self.password.as_ref().map(|p| {

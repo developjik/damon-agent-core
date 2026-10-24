@@ -255,6 +255,19 @@ mod tests {
 
     #[test]
     fn picker_roots_put_codex_system_ahead_of_plain_skills() {
+        // The roots derive from env-overridden home dirs (CODEX_HOME,
+        // XDG_CONFIG_HOME, …) — serialize against tests that flip those
+        // env vars (the MCP inventory tests) AND pin the vars this test
+        // reads: earlier locked tests leave them pointing at THEIR
+        // fixture dirs.
+        let _env = crate::tests_env_lock();
+        let xdg;
+        // SAFETY: env mutation serialized by the lock above.
+        unsafe {
+            std::env::remove_var("CODEX_HOME");
+            xdg = std::env::var("XDG_CONFIG_HOME").ok();
+            std::env::remove_var("XDG_CONFIG_HOME");
+        }
         let roots = picker_skill_roots();
         let paths: Vec<&str> = roots.iter().map(|(p, _)| p.to_str().unwrap()).collect();
         let sys = paths
@@ -268,5 +281,12 @@ mod tests {
         assert!(sys < plain, ".system must shadow the plain skills dir");
         // Every root carries the global source tag.
         assert!(roots.iter().all(|(_, s)| *s == "global"));
+        // Restore the env for concurrently running tests.
+        // SAFETY: env mutation serialized by the lock above.
+        unsafe {
+            if let Some(v) = xdg {
+                std::env::set_var("XDG_CONFIG_HOME", v);
+            }
+        }
     }
 }

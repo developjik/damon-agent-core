@@ -27,6 +27,12 @@ pub struct BackendSpec {
     pub env: &'static [(&'static str, &'static str)],
     /// How the agent authenticates — surfaced by doctor and errors.
     pub auth_hint: &'static str,
+    /// npm package to install/update through (`npm i -g`), when the CLI
+    /// ships that way. `None` → `manual_update` (or Unknown).
+    pub npm_package: Option<&'static str>,
+    /// Copy-paste update command for CLIs npm doesn't distribute.
+    /// Empty string + `npm_package: None` = no known update path.
+    pub manual_update: &'static str,
 }
 
 pub const BACKENDS: &[BackendSpec] = &[
@@ -45,6 +51,8 @@ pub const BACKENDS: &[BackendSpec] = &[
         ],
         env: &[],
         auth_hint: "log in with `claude` once; the subscription follows",
+        npm_package: Some("@anthropic-ai/claude-code"),
+        manual_update: "",
     },
     BackendSpec {
         id: "codex",
@@ -59,6 +67,8 @@ pub const BACKENDS: &[BackendSpec] = &[
         args: &["app-server", "--enable", "default_mode_request_user_input"],
         env: &[],
         auth_hint: "log in with `codex` once; the subscription follows",
+        npm_package: Some("@openai/codex"),
+        manual_update: "",
     },
     BackendSpec {
         id: "omp",
@@ -68,6 +78,8 @@ pub const BACKENDS: &[BackendSpec] = &[
         args: &["--mode", "rpc"],
         env: &[],
         auth_hint: "configure `omp` once; its provider auth follows",
+        npm_package: Some("@oh-my-pi/pi-coding-agent"),
+        manual_update: "",
     },
     BackendSpec {
         id: "pi",
@@ -81,6 +93,8 @@ pub const BACKENDS: &[BackendSpec] = &[
         args: &["--mode", "rpc"],
         env: &[],
         auth_hint: "configure `pi` with a provider API key; auth follows the CLI",
+        npm_package: Some("@earendil-works/pi-coding-agent"),
+        manual_update: "",
     },
     BackendSpec {
         id: "qwen",
@@ -101,6 +115,8 @@ pub const BACKENDS: &[BackendSpec] = &[
         ],
         env: &[],
         auth_hint: "log in with `qwen` (qwen-oauth) or configure an API key in its settings; auth follows the CLI",
+        npm_package: Some("@qwen-code/qwen-code"),
+        manual_update: "",
     },
     BackendSpec {
         id: "droid",
@@ -120,6 +136,8 @@ pub const BACKENDS: &[BackendSpec] = &[
         ],
         env: &[],
         auth_hint: "log in with `droid` or set FACTORY_API_KEY; custom models live in ~/.factory/settings.json",
+        npm_package: None,
+        manual_update: "curl -fsSL https://app.factory.ai/cli | sh",
     },
     BackendSpec {
         id: "opencode",
@@ -132,6 +150,8 @@ pub const BACKENDS: &[BackendSpec] = &[
         args: &[],
         env: &[],
         auth_hint: "configure providers in opencode itself; Damon adopts or spawns `opencode serve`",
+        npm_package: Some("opencode-ai"),
+        manual_update: "",
     },
     BackendSpec {
         id: "mimo",
@@ -143,6 +163,8 @@ pub const BACKENDS: &[BackendSpec] = &[
         args: &[],
         env: &[],
         auth_hint: "configure providers in mimo itself; Damon adopts or spawns `mimo serve`",
+        npm_package: None,
+        manual_update: "curl -fsSL https://mimo.xiaomi.com/install | bash",
     },
     BackendSpec {
         id: "zcode",
@@ -157,6 +179,8 @@ pub const BACKENDS: &[BackendSpec] = &[
         args: &["app-server", "--stdio"],
         env: &[],
         auth_hint: "log in with `zcode` (GLM Coding Plan); auth follows the CLI",
+        npm_package: None,
+        manual_update: "",
     },
 ];
 

@@ -2,12 +2,9 @@
 //! over stdio (Claude Code's `--output-format stream-json` family —
 //! other CLIs ship compatible or near-compatible dialects).
 //!
-//! Two session shapes share one dialect trait:
-//! - [`StreamJsonSession`] — bidirectional: prompts go in over stdin,
-//!   one process lives for the whole conversation (claude).
-//! - [`OneShotSession`] — the CLI only takes a prompt per process;
-//!   each turn respawns with the dialect's resume flag. Permissions
-//!   still relay while a turn's process is alive.
+//! One session shape drives the dialect trait:
+//! [`StreamJsonSession`] — bidirectional: prompts go in over stdin,
+//! one process lives for the whole conversation (claude).
 //!
 //! Per-vendor differences live in [`StreamJsonDialect`]: launch args,
 //! frame dispatch for vendor-private frames, permission wire format,
@@ -54,8 +51,8 @@ pub enum SessionKind {
 }
 
 /// What a dialect needs from its session: event emission, ask
-/// bookkeeping, and raw frame writes. Implemented by both session
-/// shapes so dialect translation code is shape-agnostic.
+/// bookkeeping, and raw frame writes. Implemented by the session so
+/// dialect translation code is shape-agnostic.
 #[async_trait]
 pub trait SessionCtx: Send + Sync {
     /// Push a normalized event to subscribers.
@@ -559,18 +556,9 @@ impl AgentClient for StreamJsonClient {
     }
 
     async fn create_session(&self, config: SessionConfig) -> Result<Arc<dyn AgentSession>> {
-        match self.dialect.session_kind() {
-            SessionKind::Persistent => {
-                StreamJsonSession::spawn(&self.resolved, self.dialect.clone(), config, None)
-                    .await
-                    .map(|s| s as Arc<dyn AgentSession>)
-            }
-            SessionKind::OneShot => Ok(OneShotSession::new(
-                &self.resolved,
-                self.dialect.clone(),
-                config,
-            ) as Arc<dyn AgentSession>),
-        }
+        StreamJsonSession::spawn(&self.resolved, self.dialect.clone(), config, None)
+            .await
+            .map(|s| s as Arc<dyn AgentSession>)
     }
 
     async fn resume_session(
@@ -578,21 +566,14 @@ impl AgentClient for StreamJsonClient {
         handle: &PersistenceHandle,
         config: SessionConfig,
     ) -> Result<Arc<dyn AgentSession>> {
-        match self.dialect.session_kind() {
-            SessionKind::Persistent => StreamJsonSession::spawn(
-                &self.resolved,
-                self.dialect.clone(),
-                config,
-                Some(&handle.native_handle),
-            )
-            .await
-            .map(|s| s as Arc<dyn AgentSession>),
-            SessionKind::OneShot => {
-                let s = OneShotSession::new(&self.resolved, self.dialect.clone(), config);
-                *s.shared.native_id.lock().await = Some(handle.native_handle.clone());
-                Ok(s as Arc<dyn AgentSession>)
-            }
-        }
+        StreamJsonSession::spawn(
+            &self.resolved,
+            self.dialect.clone(),
+            config,
+            Some(&handle.native_handle),
+        )
+        .await
+        .map(|s| s as Arc<dyn AgentSession>)
     }
 
     async fn list_importable_sessions(&self, cwd: &Path) -> Result<Vec<ImportableSession>> {

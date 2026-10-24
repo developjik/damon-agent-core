@@ -29,6 +29,18 @@ pub struct SessionConfig {
     pub mode: Option<String>,
     /// MCP servers handed to the agent in its native config shape.
     pub mcp_servers: HashMap<String, McpServerConfig>,
+    /// Extra directories granted beyond the cwd (user-granted roots).
+    /// Backends with a native widening flag take them at launch
+    /// (claude: one `--add-dir` per root); the rest ignore them — the
+    /// daemon-side file jail checks the same list regardless, and no
+    /// backend fakes support it lacks.
+    pub granted_roots: Vec<PathBuf>,
+    /// Per-session tool allowlist (mission read-only stages). Backends
+    /// with a native flag enforce it at launch (claude:
+    /// `--allowedTools t1,t2`); the rest ignore it — mission start
+    /// refuses read-only nodes on backends whose capability says they
+    /// cannot enforce the list, so nothing silently downgrades.
+    pub allowed_tools: Vec<String>,
 }
 
 /// One stdio MCP server, normalized. Backends translate to their own
@@ -73,6 +85,10 @@ pub struct Capabilities {
     pub rewind: bool,
     /// Emits subagent lifecycle/progress events.
     pub subagent_events: bool,
+    /// Can enforce a per-session tool allowlist at launch. Mission
+    /// read-only agent nodes require this — damon never downgrades a
+    /// read-only stage to full access.
+    pub tool_allowlist: bool,
 }
 
 /// A model a backend offers.
@@ -109,6 +125,10 @@ pub struct ImportableSession {
     pub cwd: Option<PathBuf>,
     /// Epoch seconds, when known.
     pub modified_at: Option<u64>,
+    /// Native file size in bytes, when the source is a file — part of
+    /// the scanner's stat signature.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub size: Option<u64>,
 }
 
 // ---------------------------------------------------------------------------
@@ -350,6 +370,112 @@ pub enum ToolCallDetail {
 pub enum PermissionKind {
     Tool,
     Question,
+    /// A plan-approval ask (claude's ExitPlanMode): the plan text rides
+    /// `input.plan`. The daemon also records a durable `plan_reviews`
+    /// row for these and gates approval through `plan.respond` — a
+    /// backend without a plan tool simply never emits the kind, so no
+    /// capability flag is needed.
+    Plan,
+}
+
+/// One selectable option inside a [`QuestionField`].
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct QuestionOption {
+    pub label: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub description: Option<String>,
+}
+
+/// One structured question inside a `kind: question` ask — the normalized
+/// form of claude's AskUserQuestion input, opencode's question batches,
+/// and omp select dialogs. An empty `options` list means free text.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct QuestionField {
+    pub question: String,
+    /// Short category chip the agent offered (AskUserQuestion's `header`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub header: Option<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub options: Vec<QuestionOption>,
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub multi_select: bool,
+}
+
+impl QuestionField {
+    /// Parse the native question shape shared by claude's AskUserQuestion
+    /// input and opencode's question batches:
+    /// `{question, header?, options: [{label, description?}], multiSelect?}`.
+    pub fn from_native(v: &Value) -> Option<Self> {
+        let question = v
+            .get("question")
+            .and_then(Value::as_str)
+            .map(str::to_string)?;
+        let header = v
+            .get("header")
+            .and_then(Value::as_str)
+            .map(str::to_string)
+            .filter(|h| !h.is_empty());
+        let options = v
+            .get("options")
+            .and_then(Value::as_array)
+            .map(|opts| {
+                opts.iter()
+                    .filter_map(|o| {
+                        let label = o.get("label").and_then(Value::as_str)?;
+                        Some(QuestionOption {
+                            label: label.to_string(),
+                            description: o
+                                .get("description")
+                                .and_then(Value::as_str)
+                                .map(str::to_string),
+                        })
+                    })
+                    .collect()
+            })
+            .unwrap_or_default();
+        Some(Self {
+            question,
+            header,
+            options,
+            multi_select: v
+                .get("multiSelect")
+                .or_else(|| v.get("multi_select"))
+                .and_then(Value::as_bool)
+                .unwrap_or(false),
+        })
+    }
+}
+
+/// Parse a native questions array (AskUserQuestion's `input.questions`,
+/// an opencode question batch) into normalized fields. A question
+/// missing its `question` text is skipped rather than failing the ask.
+pub fn parse_questions(arr: &[Value]) -> Vec<QuestionField> {
+    arr.iter().filter_map(QuestionField::from_native).collect()
+}
+
+/// Display title for a question batch — the first question's text.
+pub fn questions_title(questions: &[QuestionField]) -> String {
+    questions
+        .first()
+        .map(|q| q.question.clone())
+        .unwrap_or_else(|| "Question".to_string())
+}
+
+/// Pull one free-text answer out of the canonical `answers` shape — a
+/// bare string, the first string value of the map (or first label of an
+/// array value). For backends whose wire carries a single free-text
+/// answer (codex input requests, omp `input` dialogs).
+pub fn single_answer_text(answers: &Value) -> Option<String> {
+    match answers {
+        Value::String(s) => Some(s.clone()),
+        Value::Object(map) => map.values().find_map(|v| match v {
+            Value::String(s) => Some(s.clone()),
+            Value::Array(arr) => arr.first().and_then(Value::as_str).map(String::from),
+            _ => None,
+        }),
+        Value::Array(arr) => arr.first().and_then(Value::as_str).map(String::from),
+        _ => None,
+    }
 }
 
 /// A permission ask, normalized. `actions` are the buttons the agent
@@ -369,6 +495,10 @@ pub struct PermissionRequest {
     pub actions: Vec<PermissionAction>,
     /// "Always allow" style updates the agent suggested.
     pub suggestions: Vec<Value>,
+    /// Structured questions for `kind: question` asks. Additive wire
+    /// field: surfaces that don't know it keep rendering `actions`/`input`.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub questions: Vec<QuestionField>,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -405,6 +535,18 @@ pub enum PermissionResponse {
         /// (e.g. codex questions). `Option` so existing allow payloads that
         /// omit it stay deserializable.
         answer: Option<String>,
+        /// Question-card picks: `{question text → label | [labels] |
+        /// typed string}` as submitted on `permission.respond`. An allow
+        /// with answers submits the user's picks; an allow without them
+        /// skips/dismisses the card.
+        /// Structured answers to a `kind: question` ask's `questions`,
+        /// canonical shape `{question text → label}` (multi-select →
+        /// `[labels]`, free text → the typed string; a bare string is
+        /// accepted for single-question asks). Each backend converts to
+        /// its own wire shape. Additive: omitting it is an allow without
+        /// answers — for questions that means "skip/dismiss".
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        answers: Option<Value>,
     },
     Deny {
         action_id: Option<String>,
@@ -413,6 +555,15 @@ pub enum PermissionResponse {
         interrupt: bool,
     },
 }
+
+/// No pending ask for the given request id — already answered, settled
+/// by the agent (`control_cancel_request`, turn end), or never existed.
+/// The RPC layer maps this onto the typed `ASK_NOT_FOUND` wire code so
+/// clients know a retry is pointless (a *delivery* failure, by contrast,
+/// leaves the ask pending and surfaces as a plain internal error).
+#[derive(Debug, thiserror::Error)]
+#[error("no pending ask {0}")]
+pub struct AskNotFound(pub String);
 
 // ---------------------------------------------------------------------------
 // Steering
@@ -424,4 +575,58 @@ pub enum SteerResult {
     Accepted,
     /// Backend cannot steer — caller should queue as a follow-up turn.
     Unavailable,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use serde_json::json;
+
+    #[test]
+    fn parse_questions_reads_the_native_shape() {
+        let qs = parse_questions(&[
+            json!({"question": "Which database?", "header": "DB",
+                   "options": [{"label": "Postgres", "description": "relational"},
+                               {"label": "SQLite"}],
+                   "multiSelect": false}),
+            json!({"question": "Notes?"}),
+            // Missing question text — skipped, not fatal.
+            json!({"options": [{"label": "orphan"}]}),
+        ]);
+        assert_eq!(qs.len(), 2);
+        assert_eq!(qs[0].question, "Which database?");
+        assert_eq!(qs[0].header.as_deref(), Some("DB"));
+        assert_eq!(qs[0].options.len(), 2);
+        assert_eq!(qs[0].options[0].description.as_deref(), Some("relational"));
+        assert!(!qs[0].multi_select);
+        // snake_case alias accepted alongside the camelCase wire form.
+        assert!(!qs[1].multi_select);
+        assert!(qs[1].options.is_empty());
+    }
+
+    #[test]
+    fn single_answer_text_pulls_the_first_usable_answer() {
+        assert_eq!(single_answer_text(&json!("bare")), Some("bare".into()));
+        assert_eq!(
+            single_answer_text(&json!({"Anything else?": "ship it"})),
+            Some("ship it".into())
+        );
+        assert_eq!(
+            single_answer_text(&json!({"pick": ["A", "B"]})),
+            Some("A".into())
+        );
+        assert_eq!(single_answer_text(&json!({"n": 3})), None);
+    }
+
+    #[test]
+    fn questions_title_takes_the_first_question() {
+        let qs = vec![QuestionField {
+            question: "first".into(),
+            header: None,
+            options: vec![],
+            multi_select: false,
+        }];
+        assert_eq!(questions_title(&qs), "first");
+        assert_eq!(questions_title(&[]), "Question");
+    }
 }

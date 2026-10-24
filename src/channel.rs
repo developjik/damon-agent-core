@@ -90,21 +90,28 @@ pub trait ChannelApi: Send + Sync {
         3500
     }
     /// Deliver a permission prompt. `actions` is the agent's offered
-    /// list ({behavior, id, label}); adapters with native buttons
-    /// render them, and button presses must flow back through the
-    /// bridge's text path as a synthesized "allow"/"deny"/"always"
-    /// reply from the presser — the identity check and single
-    /// pending-lane semantics then apply unchanged. The default sends
-    /// the plain-text "🔐 title\nhint" message every channel supports.
+    /// list ({behavior, id, label}); `questions` is the event's
+    /// structured questions payload (empty for tool asks). Adapters
+    /// with native buttons render them, and button presses must flow
+    /// back through the bridge's text path as a synthesized reply from
+    /// the presser — the identity check and single pending-lane
+    /// semantics then apply unchanged. The default sends the
+    /// "🔐 title\nhint" message every channel supports (question cards
+    /// get "❓" text with the option list).
     async fn send_permission(
         &self,
         chat_id: &str,
         thread_id: Option<&str>,
         title: &str,
         actions: &[Value],
+        questions: &[Value],
     ) -> anyhow::Result<()> {
-        self.send_in_thread(chat_id, thread_id, &permission_prompt_text(title, actions))
-            .await
+        let text = if questions.is_empty() {
+            permission_prompt_text(title, actions)
+        } else {
+            question_prompt_text(title, questions)
+        };
+        self.send_in_thread(chat_id, thread_id, &text).await
     }
     /// Deliver media (decoded images/files) to a chat. The default
     /// degrades to a text note — a channel without uploads must still
@@ -133,16 +140,28 @@ pub trait ChannelApi: Send + Sync {
 struct Demux {
     /// session_id -> channel to that chat's turn handler
     sessions: HashMap<String, mpsc::UnboundedSender<ClientEvent>>,
-    /// conv_id -> (requester sender_id, answer channel). The sender id
-    /// binds the reply to whoever triggered the tool call. The answer
-    /// is the reply word ("allow", "always", "deny") the waiter maps
-    /// onto the request's offered actions.
-    pending_permissions: HashMap<String, (Option<String>, oneshot::Sender<String>)>,
+    /// conv_id -> one pending live-turn ask. The requester sender id
+    /// binds the reply to whoever triggered the tool call; the answer
+    /// is the reply text — a word ("allow", "always", "deny", "skip")
+    /// for tool asks, or the answer itself for question cards.
+    pending_permissions: HashMap<String, PendingAskLane>,
     /// conv_id -> a permission ask on a WATCHED session (no local turn
     /// owns it). The chat answers it with allow/deny/always exactly
     /// like a live turn's prompt; the reply goes straight to
     /// `permission.respond` instead of a waiting turn waiter.
     watched_asks: HashMap<String, WatchedAsk>,
+}
+
+/// One pending live-turn permission ask — see `Demux`. For question
+/// cards it also carries the structured `questions` payload so the
+/// waiter can turn a free-text reply into the canonical answers map.
+struct PendingAskLane {
+    requester: Option<String>,
+    answer: oneshot::Sender<String>,
+    /// kind: "question" (vs a plain tool approval).
+    is_question: bool,
+    /// The event's `questions` payload, verbatim.
+    questions: Vec<Value>,
 }
 
 /// One pending watched-session permission ask — see `Demux`.
@@ -555,17 +574,29 @@ impl Bridge {
                 return;
             }
         }
-        // "allow"/"deny"/"always" answers a pending permission request —
-        // but only from the sender who triggered it. In group chats
-        // anyone else typing "allow" must not approve a tool run.
+        // A pending ask answers a reply — the usual allow/deny/always
+        // words, or, for a question card, ANY text (an option label, a
+        // letter, or free text; `!skip` dismisses). Only the sender who
+        // triggered the ask may answer it: in group chats anyone else
+        // typing "allow" must not approve a tool run.
         let lower = text.trim().to_lowercase();
-        if lower == "allow" || lower == "deny" || lower == "always" {
+        let word_reply = matches!(lower.as_str(), "allow" | "deny" | "always");
+        let is_skip = lower == "!skip";
+        let lane_is_question = self
+            .demux
+            .lock()
+            .await
+            .pending_permissions
+            .get(&conv_id)
+            .map(|l| l.is_question)
+            .unwrap_or(false);
+        if word_reply || (lane_is_question && (is_skip || !text.trim_start().starts_with('!'))) {
             // Check + consume under ONE lock — splitting them let end_turn
             // remove the entry between the two and panic on unwrap.
             let mut demux = self.demux.lock().await;
             let authorized = match demux.pending_permissions.get(&conv_id) {
                 None => false,
-                Some((req, _)) => match (req, &sender_id) {
+                Some(lane) => match (&lane.requester, &sender_id) {
                     (Some(req), Some(sender)) => req == sender,
                     // An unidentified REQUESTER may only be answered by
                     // an unidentified sender (DM-style channels without
@@ -582,8 +613,10 @@ impl Bridge {
                 // may answer it (no requester identity is bound; the
                 // allowlist gate already filtered the sender). The reply
                 // goes straight to permission.respond — no turn waiter
-                // exists on this side.
-                if let Some(ask) = demux.watched_asks.get(&conv_id).cloned() {
+                // exists on this side. Watched asks stay word-reply-only
+                // (question cards for watched sessions point at the web
+                // UI in their hint text).
+                if word_reply && let Some(ask) = demux.watched_asks.get(&conv_id).cloned() {
                     demux.watched_asks.remove(&conv_id);
                     drop(demux);
                     let response = permission_response_for(&lower, &ask.actions);
@@ -622,25 +655,54 @@ impl Bridge {
                 // swallow the reply; it must not become a prompt.
                 return;
             } else {
-                if let Some((_, tx)) = demux.pending_permissions.remove(&conv_id) {
-                    // The waiter maps the reply word onto the request's
-                    // offered actions (allow/deny/always-scoped allow).
-                    let _ = tx.send(lower.clone());
+                let lane = demux.pending_permissions.get(&conv_id);
+                // A multi-question batch can't be answered in one chat
+                // message — point at the web UI instead of eating the
+                // text as a (partial) answer.
+                if lane.as_ref().is_some_and(|l| l.questions.len() > 1) && !word_reply && !is_skip {
+                    drop(demux);
+                    self.deliver(
+                        &chat_id,
+                        thread_id.as_deref(),
+                        "This card has several questions — answer in the web UI, or reply !skip",
+                    )
+                    .await;
+                    return;
+                }
+                if let Some(lane) = demux.pending_permissions.remove(&conv_id) {
+                    // Tool asks take the reply word; question cards take
+                    // "skip"/"deny" or the answer text itself — the
+                    // waiter maps it onto the canonical answers payload.
+                    let _ = lane.answer.send(if lane.is_question && !word_reply {
+                        if is_skip {
+                            "skip".to_string()
+                        } else {
+                            text.trim().to_string()
+                        }
+                    } else {
+                        lower.clone()
+                    });
+                    drop(demux);
+                    self.deliver(
+                        &chat_id,
+                        thread_id.as_deref(),
+                        if lane.is_question && is_skip {
+                            "⏭ skipped"
+                        } else if lane.is_question && !word_reply {
+                            "✅ answered"
+                        } else {
+                            match lower.as_str() {
+                                "allow" => "✅ allowed",
+                                "always" => "✅ always allowed",
+                                _ => "🚫 denied",
+                            }
+                        },
+                    )
+                    .await;
+                    return;
                 }
                 drop(demux);
-                self.deliver(
-                    &chat_id,
-                    thread_id.as_deref(),
-                    match lower.as_str() {
-                        "allow" => "✅ allowed",
-                        "always" => "✅ always allowed",
-                        _ => "🚫 denied",
-                    },
-                )
-                .await;
-                return;
             }
-            drop(demux);
         }
 
         // `!` commands are chat-local control messages — they never
@@ -909,6 +971,73 @@ impl Bridge {
                             "cwd set — it applies to the next new session (!new starts one now)"
                                 .to_string(),
                         )
+                    }
+                }
+            }
+            // Granted roots — the loop-closer when a headless agent
+            // reports an out-of-workspace denial. Channels grant
+            // globally (no project context): the grant widens the
+            // file jail for every session and rides claude's next
+            // launch as --add-dir. The RPC door validates (absolute,
+            // existing directory) and canonicalizes, so a bad path is
+            // refused with the reason, never persisted.
+            "grant" => {
+                if arg.is_empty() {
+                    Some("usage: !grant <absolute directory path>".to_string())
+                } else {
+                    match self
+                        .client
+                        .request("file.grant", json!({ "path": arg }))
+                        .await
+                    {
+                        Err(e) => Some(format!("grant failed: {e:#}")),
+                        Ok(v) => Some(format!(
+                            "granted {} — file tools can reach it now; claude sessions pick it up on their next launch",
+                            v["root"].as_str().unwrap_or(arg)
+                        )),
+                    }
+                }
+            }
+            "grants" => match self.client.request("file.grants", json!({})).await {
+                Err(e) => Some(format!("error: {e:#}")),
+                Ok(v) => {
+                    let roots: Vec<String> = v["grants"]
+                        .as_array()
+                        .map(|a| {
+                            a.iter()
+                                .map(|g| g["root"].as_str().unwrap_or("?").to_string())
+                                .collect()
+                        })
+                        .unwrap_or_default();
+                    Some(if roots.is_empty() {
+                        "no grants — sessions are confined to their cwd".to_string()
+                    } else {
+                        format!(
+                            "granted roots:\n{}",
+                            roots
+                                .iter()
+                                .map(|r| format!("• {r}"))
+                                .collect::<Vec<_>>()
+                                .join("\n")
+                        )
+                    })
+                }
+            },
+            "ungrant" => {
+                if arg.is_empty() {
+                    Some("usage: !ungrant <absolute directory path>".to_string())
+                } else {
+                    match self
+                        .client
+                        .request("file.ungrant", json!({ "path": arg }))
+                        .await
+                    {
+                        Err(e) => Some(format!("ungrant failed: {e:#}")),
+                        Ok(v) => Some(if v["revoked"].as_bool() == Some(true) {
+                            format!("revoked {arg} — sessions are back to cwd-only there")
+                        } else {
+                            format!("no such grant: {arg}")
+                        }),
                     }
                 }
             }
@@ -1257,6 +1386,7 @@ impl Bridge {
                  !sessions (recent sessions) · !resume <id|title> (continue one \
                  here, notifications on) · !watch/!unwatch <id|title> (follow a \
                  session's finishes and permission asks) · \
+                 !grant/!ungrant <dir> (widen file access — !grants lists) · \
                  allow/deny/always (answer a permission prompt)"
                     .to_string(),
             ),
@@ -1596,17 +1726,32 @@ impl Bridge {
                                     .or_else(|| event["name"].as_str())
                                     .unwrap_or("tool")
                                     .to_string();
+                                // Plan asks render the plan itself — the
+                                // answer (allow = approve, deny = request
+                                // changes) rides the same permission gate
+                                // and lands in the durable review row.
+                                let title = plan_preview(&event["input"])
+                                    .map(|plan| format!("🧭 {title}\n{plan}"))
+                                    .unwrap_or(title);
                                 // The agent's own offered actions —
                                 // "always" is only meaningful when an
                                 // allow action is session/always-scoped.
                                 let actions: Vec<Value> =
                                     event["actions"].as_array().cloned().unwrap_or_default();
+                                let questions: Vec<Value> =
+                                    event["questions"].as_array().cloned().unwrap_or_default();
+                                let is_question = event["kind"].as_str() == Some("question")
+                                    && !questions.is_empty();
                                 let (ptx, prx) = oneshot::channel();
-                                self.demux
-                                    .lock()
-                                    .await
-                                    .pending_permissions
-                                    .insert(conv_id.to_string(), (sender_id.clone(), ptx));
+                                self.demux.lock().await.pending_permissions.insert(
+                                    conv_id.to_string(),
+                                    PendingAskLane {
+                                        requester: sender_id.clone(),
+                                        answer: ptx,
+                                        is_question,
+                                        questions: questions.clone(),
+                                    },
+                                );
                                 // One call for every channel: adapters
                                 // with native buttons render them and
                                 // route presses back as synthesized
@@ -1616,7 +1761,9 @@ impl Bridge {
                                 // daemon's own permission timeout.
                                 if let Err(e) = self
                                     .ch
-                                    .send_permission(chat_id, thread_id, &title, &actions)
+                                    .send_permission(
+                                        chat_id, thread_id, &title, &actions, &questions,
+                                    )
                                     .await
                                 {
                                     warn!(error = %e, chat = %chat_id, "permission prompt send failed");
@@ -1649,10 +1796,13 @@ impl Bridge {
                                             "deny".to_string()
                                         }
                                     };
-                                    // Map the reply word onto an offered
-                                    // action — shared with the
-                                    // watched-ask replier.
-                                    let response = permission_response_for(&reply, &actions);
+                                    // Map the reply onto an offered
+                                    // action — or, for question cards,
+                                    // onto the canonical answers map
+                                    // (question-aware, shared with the
+                                    // UI's contract).
+                                    let response =
+                                        question_aware_response_for(&reply, &actions, &questions);
                                     let _ =
                                         client.respond_to_permission(&sid, &rid, response).await;
                                 });
@@ -1890,7 +2040,15 @@ impl Bridge {
                     .or_else(|| event["name"].as_str())
                     .unwrap_or("tool");
                 let actions = event["actions"].as_array().cloned().unwrap_or_default();
-                let ask_text = permission_prompt_text(name, &actions);
+                // Plan asks show the plan itself; the allow/deny reply
+                // words route through the same permission gate.
+                let ask_text = match plan_preview(&event["input"]) {
+                    Some(plan) => format!(
+                        "🧭 {name}\n{plan}\n{}",
+                        permission_prompt_text(name, &actions)
+                    ),
+                    None => permission_prompt_text(name, &actions),
+                };
                 let texts: Vec<(String, Option<String>, String)> = {
                     let mut demux = self.demux.lock().await;
                     watchers
@@ -2039,6 +2197,29 @@ pub(crate) fn permission_choices(actions: &[Value]) -> Vec<PermissionChoice> {
     out
 }
 
+/// The plan text of a `kind: plan` ask, truncated for a chat card —
+/// None for non-plan asks. Cut at a char boundary so a multi-byte
+/// character never splits mid-sequence.
+pub(crate) fn plan_preview(input: &Value) -> Option<String> {
+    const MAX: usize = 600;
+    let plan = input.get("plan")?.as_str()?.trim();
+    if plan.is_empty() {
+        return None;
+    }
+    let mut end = plan.len().min(MAX);
+    while end < plan.len() && !plan.is_char_boundary(end) {
+        end += 1;
+    }
+    Some(if end < plan.len() {
+        format!(
+            "{}\n… (truncated — full plan on a richer surface)",
+            &plan[..end]
+        )
+    } else {
+        plan.to_string()
+    })
+}
+
 /// Plain-text permission prompt body: the title plus the reply hint
 /// for channels without native buttons (and the doc text under them).
 pub(crate) fn permission_prompt_text(title: &str, actions: &[Value]) -> String {
@@ -2051,6 +2232,113 @@ pub(crate) fn permission_prompt_text(title: &str, actions: &[Value]) -> String {
         "reply 'allow' or 'deny'"
     };
     format!("🔐 {title}\n{hint}")
+}
+
+/// Plain-text question-card prompt body: the option list (letters a, b,
+/// c… for button-less channels), a free-text hint, or — for multi-
+/// question batches — a pointer to the web UI plus `!skip`.
+pub(crate) fn question_prompt_text(title: &str, questions: &[Value]) -> String {
+    if questions.len() > 1 {
+        return format!(
+            "❓ {title} ({} questions)\nanswer in the web UI, or reply !skip",
+            questions.len()
+        );
+    }
+    let opts: Vec<String> = questions
+        .first()
+        .and_then(|q| q["options"].as_array())
+        .map(|arr| {
+            arr.iter()
+                .filter_map(|o| o["label"].as_str())
+                .map(|l| l.to_string())
+                .collect()
+        })
+        .unwrap_or_default();
+    if opts.is_empty() {
+        format!("❓ {title}\nreply with your answer")
+    } else {
+        let listed = opts
+            .iter()
+            .enumerate()
+            .map(|(i, o)| format!("{}) {o}", option_letter(i)))
+            .collect::<Vec<_>>()
+            .join("  ");
+        format!("❓ {title}\n{listed}\nreply an option, its letter, or your own answer")
+    }
+}
+
+/// The a/b/c… letter for an option index.
+fn option_letter(i: usize) -> char {
+    char::from(b'a' + i.min(25) as u8)
+}
+
+/// Option buttons for a single-question card: (label, callback word)
+/// pairs that ride the same `perm:{word}` button pipeline as
+/// allow/deny — a press synthesizes the label as the reply text, which
+/// the question lane resolves into an answer. Buttons only when every
+/// label fits the wire limits (telegram callback_data caps at 64
+/// bytes; keep headroom) — otherwise the text hint carries the options.
+pub(crate) fn question_option_buttons(questions: &[Value]) -> Vec<(String, String)> {
+    if questions.len() != 1 {
+        return vec![];
+    }
+    let opts = match questions[0]["options"].as_array() {
+        Some(o) => o,
+        None => return vec![],
+    };
+    let mut out = vec![];
+    for o in opts {
+        let Some(label) = o["label"].as_str() else {
+            continue;
+        };
+        if label.len() > 48 || label.contains('\n') {
+            return vec![];
+        }
+        out.push((label.to_string(), format!("perm:{label}")));
+    }
+    out
+}
+
+/// Map a reply onto a permission response, question-aware: the usual
+/// words map onto offered actions ("skip" answers nothing); any other
+/// reply IS the answer to a single-question card — matched against the
+/// option letters first, else passed through as free text. Shared by
+/// the live-turn waiter so chat answers and UI answers resolve
+/// identically.
+pub(crate) fn question_aware_response_for(
+    reply: &str,
+    actions: &[Value],
+    questions: &[Value],
+) -> Value {
+    match reply {
+        "skip" => json!({"behavior": "allow"}),
+        "allow" | "always" | "deny" => permission_response_for(reply, actions),
+        _ => {
+            // Letter answer ("a", "b"…) resolves to the option label.
+            let letter_opt = if reply.len() == 1 {
+                let c = reply.chars().next().unwrap_or('?');
+                questions
+                    .first()
+                    .and_then(|q| q["options"].as_array())
+                    .and_then(|opts| {
+                        opts.iter()
+                            .filter_map(|o| o["label"].as_str())
+                            .enumerate()
+                            .find(|(i, _)| option_letter(*i) == c)
+                            .map(|(_, l)| l.to_string())
+                    })
+            } else {
+                None
+            };
+            let answer = letter_opt.unwrap_or_else(|| reply.to_string());
+            if questions.len() == 1 {
+                let q = questions[0]["question"].as_str().unwrap_or("");
+                json!({"behavior": "allow", "answers": {q: answer}})
+            } else {
+                permission_response_for("allow", actions)
+            }
+        }
+    }
 }
 
 /// Map a permission reply word onto the request's offered actions —
@@ -2531,5 +2819,88 @@ mod tests {
         );
         assert!(text.contains("Content-Type: image/png\r\n"));
         assert!(text.ends_with(&format!("--{boundary}--\r\n")));
+    }
+
+    #[test]
+    fn question_prompt_shows_options_with_letters() {
+        let questions = vec![json!({
+            "question": "Which database?",
+            "options": [{"label": "Postgres"}, {"label": "SQLite"}]
+        })];
+        let text = question_prompt_text("Which database?", &questions);
+        assert!(text.contains("❓ Which database?"));
+        assert!(text.contains("a) Postgres"));
+        assert!(text.contains("b) SQLite"));
+        assert!(text.contains("your own answer"));
+
+        // Free-text question: no option list, just the answer hint.
+        let free = question_prompt_text("Notes?", &[json!({"question": "Notes?"})]);
+        assert!(free.contains("reply with your answer"));
+
+        // Multi-question batch: points at the web UI and !skip.
+        let multi = question_prompt_text(
+            "a couple of things",
+            &[json!({"question": "a"}), json!({"question": "b"})],
+        );
+        assert!(multi.contains("2 questions"));
+        assert!(multi.contains("!skip"));
+    }
+
+    #[test]
+    fn option_buttons_come_only_from_fitting_labels() {
+        let questions = vec![json!({
+            "question": "pick",
+            "options": [{"label": "Postgres"}, {"label": "SQLite"}]
+        })];
+        let buttons = question_option_buttons(&questions);
+        assert_eq!(
+            buttons,
+            vec![
+                ("Postgres".to_string(), "perm:Postgres".to_string()),
+                ("SQLite".to_string(), "perm:SQLite".to_string())
+            ]
+        );
+
+        // A too-long label drops the buttons entirely — the text hint
+        // carries the options instead.
+        let long = vec![json!({
+            "question": "pick",
+            "options": [{"label": "x".repeat(49)}, {"label": "ok"}]
+        })];
+        assert!(question_option_buttons(&long).is_empty());
+
+        // Multi-question batches never get buttons.
+        let multi = vec![
+            json!({"question": "a", "options": [{"label": "x"}]}),
+            json!({"question": "b"}),
+        ];
+        assert!(question_option_buttons(&multi).is_empty());
+    }
+
+    #[test]
+    fn chat_replies_resolve_into_question_responses() {
+        let actions = vec![json!({"id": "allow", "behavior": "allow", "label": "Allow"})];
+        let questions = vec![json!({
+            "question": "Which database?",
+            "options": [{"label": "Postgres"}, {"label": "SQLite"}]
+        })];
+
+        // Free text becomes the canonical answers map.
+        let r = question_aware_response_for("use sqlite please", &actions, &questions);
+        assert_eq!(r["behavior"], "allow");
+        assert_eq!(r["answers"]["Which database?"], "use sqlite please");
+
+        // A letter picks the option by position.
+        let r = question_aware_response_for("b", &actions, &questions);
+        assert_eq!(r["answers"]["Which database?"], "SQLite");
+
+        // skip answers nothing — an allow without answers.
+        let r = question_aware_response_for("skip", &actions, &questions);
+        assert_eq!(r["behavior"], "allow");
+        assert!(r.get("answers").is_none());
+
+        // deny stays a denial.
+        let r = question_aware_response_for("deny", &actions, &questions);
+        assert_eq!(r["behavior"], "deny");
     }
 }
