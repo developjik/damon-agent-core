@@ -1,0 +1,25 @@
+# damon-relay systemd unit — part of the deploy pack.
+# Install: cp damon-relay /usr/local/bin/ && systemctl enable --now damon-relay
+[Unit]
+Description=damon relay (E2E-encrypted tunnel for damond)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+ExecStart=/usr/local/bin/damon-relay
+EnvironmentFile=-/etc/damon/relay.env
+Restart=always
+RestartSec=3
+# Least privilege: no shell, no new privileges, filesystem locked down
+# except the binary itself.
+NoNewPrivileges=true
+ProtectSystem=strict
+ProtectHome=true
+PrivateTmp=true
+PrivateDevices=true
+RestrictAddressFamilies=AF_INET AF_INET6
+CapabilityBoundingSet=
+AmbientCapabilities=
+
+[Install]
+WantedBy=multi-user.target

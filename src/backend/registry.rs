@@ -269,12 +269,11 @@ pub fn client_for(resolved: &ResolvedBackend) -> Option<Arc<dyn AgentClient>> {
 
 /// PATH lookup without shelling out to `which`.
 pub(crate) fn which(bin: &str) -> Option<PathBuf> {
-    let path = std::env::var_os("PATH")?;
     #[cfg(windows)]
     const EXTS: &[&str] = &[".exe", ".cmd", ".bat", ""];
     #[cfg(not(windows))]
     const EXTS: &[&str] = &[""];
-    for dir in std::env::split_paths(&path) {
+    for dir in search_dirs() {
         for ext in EXTS {
             let candidate = dir.join(format!("{bin}{ext}"));
             if candidate.is_file() {
@@ -285,9 +284,93 @@ pub(crate) fn which(bin: &str) -> Option<PathBuf> {
     None
 }
 
+/// Directories searched on every `which` call, in order: the process
+/// env's PATH first, then — on Windows — the CURRENT registry PATHs
+/// (machine, then user). A resident daemon keeps the PATH snapshot of
+/// whatever launched it; a CLI installed while the daemon runs is
+/// invisible to that snapshot but present in the registry, so re-
+/// reading it makes freshly installed CLIs detectable without a
+/// daemon restart (adapted from upstream desktop-cc-gui's registry
+/// PATH re-read).
+fn search_dirs() -> Vec<PathBuf> {
+    let dirs: Vec<PathBuf> = std::env::var_os("PATH")
+        .map(|p| std::env::split_paths(&p).collect())
+        .unwrap_or_default();
+    #[cfg(windows)]
+    {
+        let mut dirs = dirs;
+        dirs.extend(registry_path_dirs());
+        return dirs;
+    }
+    #[cfg(not(windows))]
+    dirs
+}
+
+/// The machine and user PATH values straight from the registry
+/// (adapted from upstream desktop-cc-gui). `RegGetValueW` expands
+/// `REG_EXPAND_SZ` values (`%SystemRoot%\...`) into plain text, so no
+/// manual expansion pass is needed. Read failures contribute nothing
+/// — the env PATH above still stands on its own.
+#[cfg(windows)]
+fn registry_path_dirs() -> Vec<PathBuf> {
+    use windows_sys::Win32::System::Registry::{
+        HKEY_CURRENT_USER, HKEY_LOCAL_MACHINE, RRF_RT_REG_SZ, RegGetValueW,
+    };
+
+    fn utf16(s: &str) -> Vec<u16> {
+        s.encode_utf16().chain([0]).collect()
+    }
+
+    fn read(root: windows_sys::Win32::System::Registry::HKEY, subkey: &str) -> Vec<PathBuf> {
+        let mut buf = [0u16; 32 * 1024];
+        let mut len = (buf.len() * 2) as u32;
+        let ret = unsafe {
+            RegGetValueW(
+                root,
+                utf16(subkey).as_ptr(),
+                utf16("Path").as_ptr(),
+                RRF_RT_REG_SZ,
+                std::ptr::null_mut(),
+                buf.as_mut_ptr().cast(),
+                &mut len,
+            )
+        };
+        if ret != 0 {
+            return Vec::new();
+        }
+        // `len` is bytes copied, including the NUL when present.
+        let chars = &buf[..(len as usize / 2).min(buf.len())];
+        let end = chars.iter().position(|&c| c == 0).unwrap_or(chars.len());
+        std::env::split_paths(&String::from_utf16_lossy(&chars[..end])).collect()
+    }
+
+    let mut out = read(
+        HKEY_LOCAL_MACHINE,
+        r"SYSTEM\CurrentControlSet\Control\Session Manager\Environment",
+    );
+    out.extend(read(HKEY_CURRENT_USER, "Environment"));
+    out
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn search_dirs_lead_with_the_env_path() {
+        // The env PATH is always the FIRST search source — the
+        // registry PATHs (Windows) only extend the list behind it.
+        let dirs = search_dirs();
+        let env: Vec<PathBuf> = std::env::var_os("PATH")
+            .map(|p| std::env::split_paths(&p).collect())
+            .unwrap_or_default();
+        let n = env.len().min(dirs.len());
+        assert!(
+            !dirs.is_empty(),
+            "a PATH-less environment cannot resolve CLIs"
+        );
+        assert_eq!(&dirs[..n], &env[..n]);
+    }
 
     #[test]
     fn catalog_lists_supported_backends() {

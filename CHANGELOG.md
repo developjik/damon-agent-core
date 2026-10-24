@@ -1,5 +1,100 @@
 # Changelog
 
+## 0.8.0 — 2026-10-24
+
+### Added — persistent memory ledgers (design ported from desktop-cc-gui's memory system, MIT)
+
+- One global `user` ledger plus per-`bot` ledgers, gated at every
+  write path and injected into turns. **Off by default**
+  (`[memory] enabled = false`) — injection changes what the agent
+  sees, so it is an explicit opt-in.
+- One gate chain, whole-write rejects, never sanitized or truncated:
+  security scan (prompt-injection phrases EN/KO, credential-shaped
+  tokens, invisible/bidi characters — reject, never clean) → capacity
+  (char caps, default 1375 user / 2200 per bot; the numbers ride the
+  rejection) → optional approval queue (`require_approval` parks
+  writes `pending` until `memory.approve`; approving is a one-shot
+  CAS).
+- Injection wraps the ACTIVE ledgers in a `<memory>` block that
+  declares itself data, not instructions, and prepends it to the
+  outgoing prompt only — the persisted user message keeps the clean
+  prompt. `turn.start` takes `memoryOwner` to name the bot ledger
+  riding along. The memory table lives OUTSIDE the FTS5 index on
+  purpose: conversation search never surfaces memory contents.
+- **New methods:** `memory.usage`, `memory.list`, `memory.pending`,
+  `memory.write`, `memory.remove`, `memory.approve`, `memory.reject`.
+  Rejections are typed `-32011` with `error.data.kind`
+  (`prompt_injection | secret | invisible | capacity`); the whole
+  surface turns away `-32002` while disabled.
+- Deliberately phase 2 (waits on the credential-custody decision):
+  the post-session background review and the stdio memory MCP server.
+
+### Fixed — a backend pipe held open by a grandchild no longer hangs the reader
+
+- When a backend CLI exits while a spawned grandchild keeps the
+  stdout pipe open, the NDJSON reader waited for an EOF that never
+  came: the read loop, every pump selecting on `exited`, and (with no
+  `timeoutSecs`) the turn itself hung for the grandchild's lifetime —
+  and the idle sweep skips busy sessions, so nothing reaped it. The
+  reader now polls `try_wait` on silent 200 ms ticks and aborts after
+  a 200 ms post-exit drain window (adapted from desktop-cc-gui's
+  POST_EXIT_DRAIN, MIT). Watchdog cancellation only lands at line
+  boundaries, so a partially assembled frame is never dropped, and
+  the stderr drain stops on transport exit too — a pipe-holding
+  grandchild can no longer leak it.
+
+### Added — bot personas: file-based identity for sessions (design ported from desktop-cc-gui's bots, MIT)
+
+- A persona is a plain file directory under `<data_dir>/bots/<id>/` —
+  `bot.json` (`{name, description?}`), `SOUL.md` (the personality),
+  `AGENTS.md` (behavior instructions). Files are the editing surface
+  (any editor); `bot.*` is the discovery surface.
+- `session.create` takes `persona: <bot id>`: the composed
+  `<persona>`/`<persona-instructions>` blocks ride in front of every
+  turn — identity first, then the `<memory>` block, then the user's
+  words. Unlike memory these ARE instructions (user-authored files,
+  not model-sourced data), so the memory gates deliberately do not
+  apply. The binding is fixed for the session's life and rides the
+  session row: resume/restart re-resolve the CURRENT files after a
+  daemon restart (a since-deleted bot unbinds silently).
+- **New methods:** `bot.list`, `bot.get`, `bot.save` (optional fields:
+  absent keeps, null clears, string sets), `bot.delete`.
+- Channel bridges: `--bot <id>` (or `DAMON_BOT`) binds a bridge-wide
+  default persona; `!bot` lists, `!bot <id>` binds per-chat (resetting
+  the session mapping like `!agent`), `!bot off` clears.
+
+### Changed — `device.revoke` cuts the device's live sockets immediately
+
+- The row (and token hash) dying already stopped NEW tickets; an
+  already-open `/ws` connection kept riding the dead credential until
+  it happened to disconnect. Minted device tickets now carry the
+  device id, each upgrade registers a kill handle, and revoke fires
+  them on the spot (`socketsCut` in the response) and purges the
+  device's unspent tickets (adapted from desktop-cc-gui's periodic
+  revocation re-check, made immediate — the daemon owns the sockets).
+
+### Added — `damon-relay --deploy-pack <dir>`: one-command self-host deploy kit
+
+- Writes everything a fresh server needs — README (systemd AND Docker
+  paths), `relay.env` template with a generate-me secret, hardened
+  systemd unit, `Dockerfile` + `docker-compose.yml` wrapping the
+  copied-in binary, and the daemon-side `[relay]` snippet — plus the
+  `damon-relay` executable itself (the one-click UX pattern from
+  desktop-cc-gui's relay deploy bundle; damon ships its own relay
+  server, so only the pattern is borrowed).
+
+### Changed — Windows: child-tree reaping and PATH freshness for a resident daemon
+
+- Backend subprocesses join a kill-on-close Job Object at spawn: a
+  tree-walk `taskkill` is powerless once the root died first, but job
+  membership reaps every descendant the moment the transport drops
+  the handle (adapted from desktop-cc-gui's Job Object hardening).
+- CLI lookup (`which`) now reads the CURRENT registry PATHs (machine,
+  then user) behind the env PATH on every resolve: a daemon started
+  once keeps its launcher's PATH snapshot forever, so a CLI installed
+  while it runs was invisible until restart — now it is detected
+  without one (adapted from desktop-cc-gui's registry PATH re-read).
+
 ## 0.7.0 — 2026-10-24
 
 ### Added — mission runner (staged DAG workflows)

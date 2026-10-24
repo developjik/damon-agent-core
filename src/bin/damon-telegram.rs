@@ -22,6 +22,10 @@ struct Args {
     /// unauthenticated agent access.
     #[arg(long, env = "DAMON_ALLOW", value_delimiter = ',')]
     allow: Vec<String>,
+    /// Persona bot id (bot.list) bound to chats without their own
+    /// !bot pref — the bot's SOUL/AGENTS rides every turn.
+    #[arg(long, env = "DAMON_BOT")]
+    bot: Option<String>,
 }
 
 #[tokio::main]
@@ -58,5 +62,6 @@ async fn main() -> anyhow::Result<()> {
     }
     let bridge = Bridge::new(tg, client);
     bridge.set_allowed(args.allow);
+    bridge.set_default_bot(args.bot);
     bridge.run().await
 }

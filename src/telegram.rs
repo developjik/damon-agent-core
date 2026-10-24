@@ -734,6 +734,11 @@ impl Bridge {
     pub fn set_allowed(&self, ids: impl IntoIterator<Item = String>) {
         self.inner.set_allowed(ids);
     }
+    /// Bind every chat (without its own `!bot` pref) to this persona —
+    /// see `channel::Bridge::set_default_bot`.
+    pub fn set_default_bot(&self, bot: Option<String>) {
+        self.inner.set_default_bot(bot);
+    }
     /// Main loop: the generic bridge drives TelegramChannel::recv — one
     /// poll loop, no second copy to drift.
     pub async fn run(self: &Arc<Self>) -> anyhow::Result<()> {

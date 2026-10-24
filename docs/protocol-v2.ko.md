@@ -49,6 +49,8 @@ WebSocket(`GET /ws`) 또는 릴레이 터널 위의 JSON 메시지. 하나의 �
 | `-32007` | worktree 작업 실패 — `error.data.kind`가 택소노미를 실어준다 | `data.kind`로 분기 (`pr_not_found`, `branch_exists`, …) |
 | `-32008` | 그 `requestId`에 보류 중인 ask가 없음 (`ASK_NOT_FOUND`) — 이미 답변됨, 에이전트가 정리함, 또는 턴 종료 | 그 카드 재시도 중단 |
 | `-32009` | 플랜 리뷰 충돌 (`PLAN_CONFLICT`) — 다른 표면이 결정을 선점했거나 호출이 낡은 리비전/닫힌 플랜을 겨냥 | `plan.list`로 다시 읽고 현재 리비전으로 결정 |
+| `-32010` | MCP setEnabled CAS 거부 (`MCP_CONFLICT`) — 인벤토리 스냅샷 이후 항목이 변경됨(외부 편집) | `mcp.inventory`로 다시 읽고 재시도 |
+| `-32011` | 메모리 쓰기가 게이트 체인에서 거부됨 (`MEMORY_REJECTED`) — `error.data.kind` = `prompt_injection` \| `secret` \| `invisible` \| `capacity` (capacity는 `limit`/`current`/`attempted` 동반); 쓰기 전체가 반사됨 — 세척·절단 없음 | 내용을 고치거나 장부를 정리한 뒤 다시 쓰기 |
 
 0.5.0 이전 데몬은 모든 에러를 `-32000`으로 답했다; 메시지는 그대로라
 문자열 매칭 클라이언트도 계속 동작한다.
@@ -63,7 +65,7 @@ WebSocket(`GET /ws`) 또는 릴레이 터널 위의 JSON 메시지. 하나의 �
 | `backend.update_plan` | `{backend}` | `{backend, action: "install"\|"update", kind, command[], manualCommand, canRun, blockers[], platform}` — `backend.update`가 실행할 정확한 argv와 복사-붙여넣기 대안; 부수 효과 없음 |
 | `backend.update` | `{backend, creationId?}` | `{creationId, ok: true, version?}` — 플랜을 실행(npm 글로벌 설치 또는 CLI 공식 인스톨러); 진행은 요청 연결로 `{"event":"backend.update_progress","creationId","data":{phase, line?, exitOk?}}` 스트리밍(줄당 캡); 검증된 채널이 없으면 `-32602`(플랜 blockers 참조), 실패/420s 타임아웃은 `-32000`(출력 꼬리가 메시지에 동승) |
 | `backend.update_cancel` | `{creationId}` | `{cancelled: bool}` — 해당 id의 실행 중 런이 없으면 false |
-| `session.create` | `{backend?, cwd?, model?, mode?, mcpServers?, projectId?}` — 프로젝트가 세션의 범위를 정한다: 루트가 cwd 기본값이 되고 기본값들이 미지정 파라미터를 채운다(명시 값 항상 우선) | `{sessionId, backend, replayed}` |
+| `session.create` | `{backend?, cwd?, model?, mode?, mcpServers?, projectId?, persona?}` — 프로젝트가 세션의 범위를 정한다: 루트가 cwd 기본값이 되고 기본값들이 미지정 파라미터를 채운다(명시 값 항상 우선); `persona`는 `bot.list`의 봇 id — SOUL/AGENTS 블록이 매 턴 앞에 실리며 세션 수명 동안 고정, resume 시 파일에서 재해석(모르는 id는 `-32602`) | `{sessionId, backend, persona?, replayed}` |
 | `session.resume` | `{sessionId}` — 또는 네이티브 세션 임포트는 `{handle:{provider,native_handle}, cwd?, title?}` | `{sessionId, backend, replayed}` |
 | `session.messages` | `{sessionId, limit?, offset?}` | `{messages: [{id, session_id, role, ts, data}]}` |
 | `session.export` | `{sessionId}` | `{session: {sessionId, createdAt, backend, title, tags, cwd}, messages: [{id, role, ts, data}], usage: {contextUsed, contextSize, costUsd, turns}}` |
@@ -93,7 +95,18 @@ WebSocket(`GET /ws`) 또는 릴레이 터널 위의 JSON 메시지. 하나의 �
 | `mission.get` | `{runId}` | `{runId, flowId, version, status, interrupted, ended, definition, tasks: [{nodeId, status, attempt, output?, error?}], inbox: [{nodeId, status, decision?, feedback?}]}` — `-32602` unknown run |
 | `mission.watch` | `{runId}` — 실행 중이어야 함 | `{runId, subscribed}` — `{"event":"mission.progress","runId","data":{node, status, attempt}}` 프레임 스트림 |
 | `mission.unwatch` | `{runId}` | `{runId, subscribed}` |
-| `turn.start` | `{sessionId, prompt, timeoutSecs?, detach?}` | `{turnId, stopReason, usage?}` — `detach`가 true면 즉시 `{turnId, detached: true}` |
+| `memory.usage` | `{scope: "user"\|"bot", owner?}` — `owner`는 봇 장부 이름 | `{scope, owner, chars, limit}` — chars는 ACTIVE 항목만 집계; `[memory]` 비활성 중엔 `-32002` |
+| `memory.list` | `{scope, owner?, includePending?}` | `{entries: [{id, scope, owner, content, source, status, createdAt, updatedAt}]}` |
+| `memory.pending` | `{}` | `{entries: [...]}` — 모든 장부의 pending 쓰기, 오래된 순 |
+| `memory.write` | `{scope, owner?, content, source?}` | `{id, status: "active"\|"pending"}` — 단일 게이트 체인: 스캔 → 한도 → 승인; 세척·절단 없음; `-32011`의 `error.data.kind` = `prompt_injection` \| `secret` \| `invisible` \| `capacity` (capacity는 `limit`/`current`/`attempted` 동반); 빈 내용이나 잘못된 scope/owner 쌍은 `-32602` |
+| `memory.remove` | `{id}` | `{removed: bool}` |
+| `memory.approve` | `{id}` — pending 쓰기 | `{approved: bool}` — 원샷 CAS: unknown이거나 이미 active면 `false` |
+| `memory.reject` | `{id}` | `{rejected: bool}` — pending 쓰기 삭제 |
+| `bot.list` | `{}` | `{bots: [{id, name, description?, hasSoul, hasAgents}], root}` — 페르소나는 `root/<id>/`의 평범한 파일들(`bot.json` + `SOUL.md` + `AGENTS.md`); 아무 에디터로 고치면 다음 세션부터 반영 |
+| `bot.get` | `{id}` | `{bot: {id, name, description?, soul?, agents?}}` — 파일 전문; 모르는 id는 `-32602` |
+| `bot.save` | `{id, name, description?, soul?, agents?}` — 선택 문자열 필드: 생략은 유지, null(또는 `""`)은 삭제, 문자열은 설정 | `{bot: {id, name}}` — 생성 또는 갱신; 실행 중 세션은 생성 시점의 블록을 유지 |
+| `bot.delete` | `{id}` | `{deleted: bool}` — 묶여 있던 세션의 이후 resume은 조용히 페르소나 없이 |
+| `turn.start` | `{sessionId, prompt, timeoutSecs?, detach?, memoryOwner?}` — `[memory]` 활성 시 `memoryOwner`가 지명한 봇 장부의 ACTIVE 항목이 user 장부와 함께 `<memory>` 블록으로 주입됨(데이터 선언 구분 블록; 저장되는 사용자 메시지는 깨끗한 원본 프롬프트 유지) | `{turnId, stopReason, usage?}` — `detach`가 true면 즉시 `{turnId, detached: true}` |
 | `turn.steer` | `{sessionId, prompt, expectedTurn?}` | `{result}` |
 | `turn.cancel` | `{sessionId}` | `{cancelled: true}` |
 | `permission.respond` | `{sessionId, requestId, response}` | `{}` — `kind: plan` ask에서는 결정이 영속 plan-review 행에도 기록된다 |
@@ -119,7 +132,7 @@ WebSocket(`GET /ws`) 또는 릴레이 터널 위의 JSON 메시지. 하나의 �
 | `device.list` | `{}` | `{devices: [{deviceId, name, status: "pending"\|"approved", createdAt, approvedAt?, lastSeen?}]}` — lastSeen은 분당 1회로 제한(스로틀); 토큰 해시는 스토어 밖으로 나가지 않는다 |
 | `device.approve` | `{deviceId}` | `{approved: bool}` — pending에서만; 미지정/이미 승인이면 false |
 | `device.rename` | `{deviceId, name}` | `{renamed: bool}` — 빈 이름은 거부 |
-| `device.revoke` | `{deviceId}` | `{revoked: bool}` — 행이 토큰 해시와 함께 사라져 자격증명은 즉시 무효; pending 요청의 deny를 겸한다 |
+| `device.revoke` | `{deviceId}` | `{revoked: bool, socketsCut: number}` — 행이 토큰 해시와 함께 사라져 자격증명은 즉시 무효; 이미 열려 있던 해당 기기의 `/ws` 연결도 그 즉시 절단되고 미사용 티켓도 폐기된다; pending 요청의 deny를 겸한다 |
 | `prompt.add` | `{text, sessionId?, cwd?}` — 보낸 프롬프트 하나, trim 후 300자 상한 | `{recorded: true}` — upsert: 재전송은 카운트를 올리고 최신으로 이동; cwd당 최신 200개만 남음 |
 | `prompt.recent` | `{limit? — 기본 50, 최대 200, sessionId?, cwd?}` | `{prompts: [{text, count}]}` — 최신순, cwd별 |
 | `skills.targets` | `{}` | `{targets: [{id, label, path, available}]}` — 허브가 싱크할 수 있는 CLI들의 스킬 디렉터리; `available`은 엔진 홈이 존재한다는 뜻(허브는 절대 만들지 않는다) |
@@ -219,13 +232,32 @@ LAN 위 폰은 더 이상 마스터 `auth_token`이 필요 없다. 데스크톱�
 `device.approve`로 승인하고; 그 전까지 기기는 아무것도 발급하지 못한다.
 
 승인되면 기기는 `POST /v1/ws_ticket`(`{"deviceToken": …}`)에서 자신의
-토큰을 마스터 토큰이 발급하는 것과 같은 일회용 WS 티켓으로 교환한다.
-`device.revoke`는 행을 삭제한다 — 자격증명은 즉시 무효, 유예 기간 없음.
-비루프백 바인드는 여전히 해석 가능한 마스터 `auth_token` 없이 기동을
+토큰을 마스터 토큰이 발급하는 것과 같은 일회용 WS 티켓으로 교환한다;
+발급된 티켓에는 기기 id가 찍혀 `/ws` 업그레이드가 어느 기기의 소켓인지
+알 수 있다. `device.revoke`는 행을 삭제한다 — 자격증명은 즉시 무효,
+유예 기간 없음 — 그리고 이미 열려 있던 그 기기의 소켓도 그 자리에서
+닫는다(응답의 `socketsCut`이 개수를 센다). 죽은 자격증명을 실은 연결이
+살아남는 일은 없다. 비루프백 바인드는 여전히 해석 가능한 마스터
+`auth_token` 없이 기동을
 거부한다; 릴레이 모드 기기는 마스터 토큰 로그인을 유지한다(E2E 핸드셰이크가
 마스터 시크릿을 증명 — 기기 토큰은 직접 닿는 표면이다). `hello`는
 비루프백 `/ws` 연결의 실시간 수인 `remoteClients`를 실어 "원격 제어
 활성" 배지를 표시할 수 있다.
+
+### 봇 페르소나
+
+페르소나는 `<data_dir>/bots/<id>/` 아래의 파일 디렉터리다:
+`bot.json`(`{name, description?}`; id가 곧 디렉터리 이름), `SOUL.md`(성격),
+`AGENTS.md`(행동 지침). 파일이 편집 표면이고 `bot.*`이 발견 표면이다 —
+채팅의 `!bot`과 웹 UI가 이 메서드들을 쓴다. `session.create {persona}`는
+파일들을 합성해 `<persona>`/`<persona-instructions>` 쌍으로 매 턴 앞에
+실는다(정체성 → `<memory>` 블록 → 사용자 문장 순서). 메모리 블록과
+달리 이것은 지시문이다 — 그게 핵심이다: 모델이 만든 데이터가 아니라
+사용자가 직접 쓴 파일이라 메모리 게이트가 의도적으로 적용되지 않는다.
+묶음은 세션 수명 동안 고정 — 파일 수정은 다음 세션부터 반영 — 되고
+세션 행에 실려 데몬 재시작 후 resume/restart가 재해석한다(그 사이 봇이
+삭제됐으면 조용히 풀린다). 채널 브리지는 `--bot <id>` 기본값을 받고
+채팅별 `!bot`/`!bot off`를 제공한다.
 
 ### 히스토리 스캐너
 

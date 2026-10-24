@@ -158,6 +158,85 @@ async fn bridge_delivers_response_and_maps_sessions() {
     }
 }
 
+/// Persona binding through the bridge: `!bot <id>` persists the pref,
+/// resets the session mapping, and the NEXT message's session is
+/// created with the persona — the mock's echo carries the injected
+/// block, so the persona reaching the backend is observable end to
+/// end. The bridge-wide `--bot` default binds chats with no pref.
+#[tokio::test]
+async fn bridge_bot_pref_binds_persona_on_session_create() {
+    let mut cfg = test_config();
+    cfg.data_dir = Some(std::env::temp_dir().join(format!(
+        "damon-chan-persona-{}",
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos()
+    )));
+    let shared: damon_core::config::SharedConfig = Arc::new(parking_lot::RwLock::new(cfg));
+    let store = Store::in_memory().await.unwrap();
+    let state = AppState::new(shared, store.clone()).await;
+    state
+        .sessions
+        .insert_client("mock".into(), common::mock_client());
+    let url = serve_app(state).await;
+
+    let client = damon_core::client::DamonClient::connect(&url, None)
+        .await
+        .unwrap();
+    client
+        .request(
+            "bot.save",
+            json!({"id":"tg-friend","name":"친구","soul":"항상 편하게 반말로 답한다."}),
+        )
+        .await
+        .unwrap();
+
+    let ch = Arc::new(MockChannel {
+        sent: Mutex::new(vec![]),
+    });
+    let bridge = Bridge::new(ch.clone(), client);
+    bridge.client().hello().await.unwrap();
+    bridge.spawn_event_router().await;
+
+    // !bot lists the saved bot with no binding yet.
+    bridge
+        .handle_message("chat-a".into(), None, None, "!bot".into(), Vec::new())
+        .await;
+    wait_for_sent(&ch.sent, "tg-friend (친구)").await;
+
+    // Binding resets the session mapping; the next prompt's session is
+    // created with the persona — the echo is the witness.
+    bridge
+        .handle_message(
+            "chat-a".into(),
+            None,
+            None,
+            "!bot tg-friend".into(),
+            Vec::new(),
+        )
+        .await;
+    wait_for_sent(&ch.sent, "bot set to tg-friend").await;
+    bridge
+        .handle_message("chat-a".into(), None, None, "안녕".into(), Vec::new())
+        .await;
+    wait_for_sent(&ch.sent, "<persona bot=\"친구\">").await;
+
+    // The bridge-wide default binds chats with no pref of their own.
+    bridge.set_default_bot(Some("tg-friend".into()));
+    bridge
+        .handle_message("chat-b".into(), None, None, "hi".into(), Vec::new())
+        .await;
+    wait_for_sent(&ch.sent, "echo: <persona").await;
+
+    // !bot off clears the pref — the chat falls back to the bridge
+    // default here, but the reset semantics (new session) still apply.
+    bridge
+        .handle_message("chat-a".into(), None, None, "!bot off".into(), Vec::new())
+        .await;
+    wait_for_sent(&ch.sent, "bot pref cleared").await;
+}
+
 /// Bridge restart no longer resets a conversation: the chat→session
 /// mapping and the !cwd/!agent prefs live in daemon-side
 /// channel_state rows, so a fresh Bridge (fresh connection, even)
@@ -1253,7 +1332,7 @@ async fn sessions_and_resume_continue_a_desk_session_in_the_chat() {
 
     // A "desk" session from another surface, given a friendly title.
     let desk = client
-        .create_session(Some("mock"), "/tmp", None)
+        .create_session(Some("mock"), "/tmp", None, None)
         .await
         .unwrap();
     client.rename_session(&desk, "desk work").await.unwrap();
@@ -1313,7 +1392,7 @@ async fn sessions_and_resume_continue_a_desk_session_in_the_chat() {
 async fn watch_pings_the_chat_when_another_surface_finishes() {
     let (_url, ch, bridge, client, _store) = serve_with_bridge().await;
     let desk = client
-        .create_session(Some("mock"), "/tmp", None)
+        .create_session(Some("mock"), "/tmp", None, None)
         .await
         .unwrap();
     client.rename_session(&desk, "long job").await.unwrap();
@@ -1344,7 +1423,7 @@ async fn watch_pings_the_chat_when_another_surface_finishes() {
 async fn watch_relayed_permission_ask_is_answerable_from_the_chat() {
     let (_url, ch, bridge, client, store) = serve_with_bridge().await;
     let desk = client
-        .create_session(Some("mock"), "/tmp", None)
+        .create_session(Some("mock"), "/tmp", None, None)
         .await
         .unwrap();
 
@@ -1395,7 +1474,7 @@ async fn watch_relayed_permission_ask_is_answerable_from_the_chat() {
 async fn unwatch_stops_the_pings() {
     let (_url, ch, bridge, client, _store) = serve_with_bridge().await;
     let desk = client
-        .create_session(Some("mock"), "/tmp", None)
+        .create_session(Some("mock"), "/tmp", None, None)
         .await
         .unwrap();
 
@@ -1441,7 +1520,7 @@ async fn unwatch_stops_the_pings() {
 async fn watches_survive_a_bridge_restart() {
     let (url, ch1, bridge1, client, _store) = serve_with_bridge().await;
     let desk = client
-        .create_session(Some("mock"), "/tmp", None)
+        .create_session(Some("mock"), "/tmp", None, None)
         .await
         .unwrap();
     client.rename_session(&desk, "long job").await.unwrap();

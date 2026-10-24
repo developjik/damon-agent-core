@@ -77,6 +77,11 @@ url  = "ws://your-relay:8080"
 name = "my-daemon"
 ```
 
+`damon-relay --deploy-pack <dir>` writes a ready-to-copy kit for that
+host — README (systemd AND Docker paths), `relay.env` template,
+hardened systemd unit, Dockerfile + compose, the daemon-side snippet,
+and the binary itself.
+
 The daemon dials out — no inbound port needed. Clients connect with:
 
 ```sh

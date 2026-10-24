@@ -9,7 +9,7 @@ async fn main() -> anyhow::Result<()> {
     let text = std::env::args().nth(1).unwrap_or_else(|| "hi".into());
     let client = DamonClient::connect("ws://127.0.0.1:9470/ws", None).await?;
     client.hello().await?;
-    let session = client.create_session(None, "/tmp", None).await?;
+    let session = client.create_session(None, "/tmp", None, None).await?;
 
     // turn_start() sends the request; the turn result arrives as TurnDone
     // on the event stream, ordered after that session's session.event pushes.

@@ -52,6 +52,8 @@ parsing messages:
 | `-32007` | worktree operation failed — `error.data.kind` carries the taxonomy | branch on `data.kind` (`pr_not_found`, `branch_exists`, …) |
 | `-32008` | no pending ask for that `requestId` (`ASK_NOT_FOUND`) — already answered, settled by the agent, or its turn ended | stop retrying that card |
 | `-32009` | plan-review conflict (`PLAN_CONFLICT`) — another surface claimed the decision, or the call targeted a stale revision / closed plan | refetch via `plan.list` and decide on the current revision |
+| `-32010` | MCP setEnabled CAS reject (`MCP_CONFLICT`) — the entry changed since the inventory snapshot (external edit) | refetch via `mcp.inventory` and retry |
+| `-32011` | memory write rejected at the gate chain (`MEMORY_REJECTED`) — `error.data.kind` = `prompt_injection` \| `secret` \| `invisible` \| `capacity` (capacity carries `limit`/`current`/`attempted`); the whole write bounced — nothing sanitized or truncated | fix the content or trim the ledger, then rewrite |
 
 Pre-0.5.0 daemons answered every error with `-32000`; messages are
 unchanged, so string-matching clients keep working.
@@ -66,7 +68,7 @@ unchanged, so string-matching clients keep working.
 | `backend.update_plan` | `{backend}` | `{backend, action: "install"\|"update", kind, command[], manualCommand, canRun, blockers[], platform}` — the exact argv `backend.update` runs plus the copy-paste fallback; no side effects |
 | `backend.update` | `{backend, creationId?}` | `{creationId, ok: true, version?}` — runs the plan (npm global install or the CLI's official installer); progress streams to the requesting connection as `{"event":"backend.update_progress","creationId","data":{phase, line?, exitOk?}}` with per-line caps; `-32602` when the backend has no verified channel (see the plan's blockers), `-32000` on failure or the 420s timeout (output tail rides the message) |
 | `backend.update_cancel` | `{creationId}` | `{cancelled: bool}` — false when no live run holds the id |
-| `session.create` | `{backend?, cwd?, model?, mode?, mcpServers?, projectId?}` — the project scopes the session: its root becomes the cwd default and its defaults fill unset params (explicit always wins) | `{sessionId, backend, replayed}` |
+| `session.create` | `{backend?, cwd?, model?, mode?, mcpServers?, projectId?, persona?}` — the project scopes the session: its root becomes the cwd default and its defaults fill unset params (explicit always wins); `persona` names a bot from `bot.list` whose SOUL/AGENTS block rides in front of every turn, bound for the session's life and re-resolved from the files on resume (`-32602` unknown persona) | `{sessionId, backend, persona?, replayed}` |
 | `session.resume` | `{sessionId}` — or `{handle:{provider,native_handle}, cwd?, title?}` to import a native session | `{sessionId, backend, replayed}` |
 | `session.messages` | `{sessionId, limit?, offset?}` | `{messages: [{id, session_id, role, ts, data}]}` |
 | `session.export` | `{sessionId}` | `{session: {sessionId, createdAt, backend, title, tags, cwd}, messages: [{id, role, ts, data}], usage: {contextUsed, contextSize, costUsd, turns}}` |
@@ -96,7 +98,18 @@ unchanged, so string-matching clients keep working.
 | `mission.get` | `{runId}` | `{runId, flowId, version, status, interrupted, ended, definition, tasks: [{nodeId, status, attempt, output?, error?}], inbox: [{nodeId, status, decision?, feedback?}]}` — `-32602` unknown run |
 | `mission.watch` | `{runId}` — must be live | `{runId, subscribed}` — streams `{"event":"mission.progress","runId","data":{node, status, attempt}}` frames |
 | `mission.unwatch` | `{runId}` | `{runId, subscribed}` |
-| `turn.start` | `{sessionId, prompt, timeoutSecs?, detach?}` | `{turnId, stopReason, usage?}` — or `{turnId, detached: true}` immediately when `detach` is true |
+| `memory.usage` | `{scope: "user"\|"bot", owner?}` — `owner` names the bot ledger | `{scope, owner, chars, limit}` — chars counts ACTIVE entries only; `-32002` while `[memory]` is disabled |
+| `memory.list` | `{scope, owner?, includePending?}` | `{entries: [{id, scope, owner, content, source, status, createdAt, updatedAt}]}` |
+| `memory.pending` | `{}` | `{entries: [...]}` — every ledger's pending writes, oldest first |
+| `memory.write` | `{scope, owner?, content, source?}` | `{id, status: "active"\|"pending"}` — one gate chain: scan → cap → approval; nothing is ever sanitized or truncated; `-32011` with `error.data.kind` = `prompt_injection` \| `secret` \| `invisible` \| `capacity` (capacity carries `limit`/`current`/`attempted`); empty content or a bad scope/owner pair refuses `-32602` |
+| `memory.remove` | `{id}` | `{removed: bool}` |
+| `memory.approve` | `{id}` — a pending write | `{approved: bool}` — one-shot CAS: `false` when unknown or already active |
+| `memory.reject` | `{id}` | `{rejected: bool}` — deletes the pending write |
+| `bot.list` | `{}` | `{bots: [{id, name, description?, hasSoul, hasAgents}], root}` — personas are plain files under `root/<id>/` (`bot.json` + `SOUL.md` + `AGENTS.md`); edit them with any editor, the next session picks the change up |
+| `bot.get` | `{id}` | `{bot: {id, name, description?, soul?, agents?}}` — full file contents; `-32602` unknown id |
+| `bot.save` | `{id, name, description?, soul?, agents?}` — optional string fields: absent keeps, null (or `""`) clears, a string sets | `{bot: {id, name}}` — creates or updates; running sessions keep the block they were created with |
+| `bot.delete` | `{id}` | `{deleted: bool}` — future resumes of bound sessions lose the persona silently |
+| `turn.start` | `{sessionId, prompt, timeoutSecs?, detach?, memoryOwner?}` — with `[memory]` enabled, `memoryOwner` names the bot ledger whose ACTIVE entries join the user ledger in the injected `<memory>` block (a delimited block that declares itself data, not instructions; the persisted user message keeps the clean prompt) | `{turnId, stopReason, usage?}` — or `{turnId, detached: true}` immediately when `detach` is true |
 | `turn.steer` | `{sessionId, prompt, expectedTurn?}` | `{result}` |
 | `turn.cancel` | `{sessionId}` | `{cancelled: true}` |
 | `permission.respond` | `{sessionId, requestId, response}` — for `kind: question` asks, an `answers` map (`{question → label | [labels]}`) submits picks; an allow without answers skips | `{}` — unknown `requestId` fails with `-32008`; a *delivery* failure leaves the ask answerable; on `kind: plan` asks the decision also lands in the durable plan-review row |
@@ -122,7 +135,7 @@ unchanged, so string-matching clients keep working.
 | `device.list` | `{}` | `{devices: [{deviceId, name, status: "pending"\|"approved", createdAt, approvedAt?, lastSeen?}]}` — lastSeen updates at most once a minute (throttled); the token hash never leaves the store |
 | `device.approve` | `{deviceId}` | `{approved: bool}` — only from pending; false when unknown or already approved |
 | `device.rename` | `{deviceId, name}` | `{renamed: bool}` — blank names refuse |
-| `device.revoke` | `{deviceId}` | `{revoked: bool}` — the row goes with the token hash, so the credential dies immediately; doubles as deny for pending requests |
+| `device.revoke` | `{deviceId}` | `{revoked: bool, socketsCut: number}` — the row goes with the token hash, so the credential dies immediately; the device's already-open `/ws` connections are cut on the spot and its unspent tickets are purged; doubles as deny for pending requests |
 | `prompt.add` | `{text, sessionId?, cwd?}` — one sent prompt, trimmed and capped at 300 chars | `{recorded: true}` — upsert: a resend bumps the count and moves the row to newest; the newest 200 per cwd survive |
 | `prompt.recent` | `{limit? — default 50, max 200, sessionId?, cwd?}` | `{prompts: [{text, count}]}` — newest first, per cwd |
 | `skills.targets` | `{}` | `{targets: [{id, label, path, available}]}` — the agent CLIs' skill directories the hub can sync into; `available` means the engine home exists (the hub never creates one) |
@@ -229,13 +242,35 @@ row reads revoked — fail closed). A trusted surface approves via
 
 Once approved, the device exchanges its token at
 `POST /v1/ws_ticket` (`{"deviceToken": …}`) for the same single-use
-WS tickets the master token mints. `device.revoke` deletes the row —
-the credential is dead immediately, no grace period. Non-loopback
+WS tickets the master token mints; each minted ticket carries the
+device id, so the `/ws` upgrade knows whose socket it holds.
+`device.revoke` deletes the row — the credential is dead immediately,
+no grace period — and the device's already-open sockets are closed on
+the spot (the response counts them in `socketsCut`), so a live
+connection never rides a dead credential. Non-loopback
 binds still refuse to start without a resolvable master `auth_token`;
 relay-mode devices keep the master-token login (the E2E handshake
 proves the master secret — device tokens are a direct-reach surface).
 `hello` carries `remoteClients`, the live count of non-loopback `/ws`
 connections, so surfaces can show a "remote control active" badge.
+
+### Bot personas
+
+A persona is a file directory under `<data_dir>/bots/<id>/`:
+`bot.json` (`{name, description?}`; the id is the directory name),
+`SOUL.md` (the personality), and `AGENTS.md` (behavior instructions).
+Files are the editing surface on purpose — any editor works — while
+`bot.*` is the discovery surface for chat (`!bot`) and the web UI.
+`session.create {persona}` composes the files into a
+`<persona>`/`<persona-instructions>` pair prepended to every turn
+(identity first, then the `<memory>` block, then the user's words);
+unlike the memory block it IS instructions, which is the point: these
+are the user's own authored files, not model-sourced data, so the
+memory gates deliberately do not apply. The binding is fixed for the
+session's life — file edits reach the NEXT session — and rides the
+session row so resume/restart re-resolve it after a daemon restart
+(a since-deleted bot unbinds silently). Channel bridges take a
+`--bot <id>` default and offer per-chat `!bot`/`!bot off`.
 
 ### The history scanner
 

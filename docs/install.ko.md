@@ -76,6 +76,11 @@ url  = "ws://your-relay:8080"
 name = "my-daemon"
 ```
 
+`damon-relay --deploy-pack <dir>`는 그 서버에 복사하기만 하면 되는
+키트를 만들어 준다 — README(systemd와 Docker 두 경로), `relay.env`
+템플릿, 강화된 systemd 유닛, Dockerfile + compose, 데몬 쪽 스니펫,
+그리고 바이너리 자체까지.
+
 데몬이 아웃바운드로 연결 — 인바운드 포트 불필요. 클라이언트:
 
 ```sh

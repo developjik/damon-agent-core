@@ -1,5 +1,6 @@
 pub mod api;
 pub mod backend;
+pub mod bots;
 pub mod channel;
 pub mod cli_lifecycle;
 pub mod client;
@@ -10,6 +11,7 @@ pub mod file_index;
 pub mod history_scan;
 pub mod logs;
 pub mod mcp_inventory;
+pub mod memory;
 pub mod mission;
 pub mod prompts;
 pub mod ratelimit;

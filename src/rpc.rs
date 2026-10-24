@@ -49,12 +49,12 @@ pub async fn ws_handler(
     ws: WebSocketUpgrade,
     ConnectInfo(peer): ConnectInfo<SocketAddr>,
 ) -> Result<Response, StatusCode> {
-    if !state
+    let Some(auth) = state
         .check_auth(&headers, q.ticket.as_deref(), peer.ip())
         .await
-    {
+    else {
         return Err(StatusCode::UNAUTHORIZED);
-    }
+    };
     // Remote-control badge: count non-loopback peers for hello — a
     // phone or second machine holding a direct /ws connection. The
     // counter decrements when THIS connection's run loop returns.
@@ -65,7 +65,7 @@ pub async fn ws_handler(
             .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
     }
     Ok(ws.on_upgrade(move |sock| async move {
-        run_connection(state.clone(), sock).await;
+        run_connection(state.clone(), sock, auth.device).await;
         if remote {
             state
                 .remote_ws
@@ -129,6 +129,11 @@ pub mod error_code {
     /// caller's inventory snapshot (external edit). Refetch via
     /// `mcp.inventory` and retry.
     pub const MCP_CONFLICT: i64 = -32010;
+    /// A memory write was rejected at the gate chain — `error.data.kind`
+    /// carries the taxonomy (`prompt_injection`, `secret`, `invisible`,
+    /// `capacity` with `limit`/`current`/`attempted`). The whole write
+    /// bounced; nothing was sanitized or truncated.
+    pub const MEMORY_REJECTED: i64 = -32011;
 }
 
 /// An error carrying a typed JSON-RPC code to the wire. Produced via
@@ -362,7 +367,14 @@ impl Conn {
     }
 }
 
-async fn run_connection(state: Arc<AppState>, socket: WebSocket) {
+/// One live /ws connection. `device` names the web device the socket
+/// authenticated as (device ticket path) — the connection registers a
+/// kill handle under it so `device.revoke` can cut an ALREADY-OPEN
+/// socket the moment its credential dies, instead of waiting for the
+/// next ticket exchange to refuse it (adapted from upstream
+/// desktop-cc-gui's revocation re-check, made immediate: the daemon
+/// owns the sockets and can signal them directly).
+async fn run_connection(state: Arc<AppState>, socket: WebSocket, device: Option<String>) {
     let (mut ws_tx, mut ws_rx) = socket.split();
     // Bounded outbound queue — a slow client sheds events, never blocks.
     let (tx, mut rx) = mpsc::channel::<Message>(256);
@@ -374,10 +386,44 @@ async fn run_connection(state: Arc<AppState>, socket: WebSocket) {
         log_follow: Mutex::new(None),
     });
 
+    // Revocation kill switch: revoke fires the sender, the writer
+    // drops the socket, and the read loop below unblocks into its
+    // normal disconnect cleanup.
+    let (kill_key, mut kill_rx) = match &device {
+        Some(d) => {
+            let (id, rx) = state.device_conns.register(d);
+            (Some((d.clone(), id)), Some(rx))
+        }
+        None => (None, None),
+    };
     let writer = tokio::spawn(async move {
-        while let Some(msg) = rx.recv().await {
-            if ws_tx.send(msg).await.is_err() {
-                break;
+        let revoked = async {
+            match kill_rx.as_mut() {
+                Some(rx) => {
+                    let _ = rx.await;
+                }
+                None => std::future::pending::<()>().await,
+            }
+        };
+        tokio::pin!(revoked);
+        loop {
+            tokio::select! {
+                // Revocation: say Close on the wire (dropping only the
+                // sink half would leave the shared socket open while
+                // the read half lives) — the peer answers, the read
+                // loop below unblocks into its normal cleanup.
+                _ = &mut revoked => {
+                    let _ = ws_tx.send(Message::Close(None)).await;
+                    break;
+                }
+                msg = rx.recv() => match msg {
+                    Some(m) => {
+                        if ws_tx.send(m).await.is_err() {
+                            break;
+                        }
+                    }
+                    None => break,
+                },
             }
         }
     });
@@ -409,6 +455,9 @@ async fn run_connection(state: Arc<AppState>, socket: WebSocket) {
     }
     if let Some(t) = conn.log_follow.lock().await.take() {
         t.cancel();
+    }
+    if let Some((device, id)) = kill_key {
+        state.device_conns.unregister(&device, id);
     }
     writer.abort();
 }
@@ -923,9 +972,90 @@ async fn dispatch(
         "device.revoke" => {
             let id = req_str(&params, "deviceId")?;
             // Deny and revoke are the same act: the row (and with it
-            // the token hash) is gone immediately.
+            // the token hash) is gone immediately. That alone stops
+            // NEW tickets — but an already-open socket rides a dead
+            // credential until it happens to disconnect, so the live
+            // ones are cut now too, and the device's unspent tickets
+            // die with it (adapted from upstream desktop-cc-gui's
+            // periodic revocation re-check, made immediate).
             let revoked = state.store.revoke_device(id).await?;
-            Ok(json!({"revoked": revoked}))
+            let mut sockets_cut = 0;
+            if revoked {
+                sockets_cut = state.device_conns.cut(id);
+                state
+                    .ws_tickets
+                    .lock()
+                    .await
+                    .retain(|_, t| t.device.as_deref() != Some(id));
+            }
+            Ok(json!({"revoked": revoked, "socketsCut": sockets_cut}))
+        }
+
+        // Bot personas — file-based identity under <data_dir>/bots/.
+        // The files are the editing surface; the RPC is the discovery
+        // surface (channel `!bot` and the web UI list/save through
+        // here). No gates: these are user-authored prompt files, same
+        // trust level as an AGENTS.md the agent already reads.
+        "bot.list" => {
+            let root = crate::bots::bots_root(state.config.read().data_dir.as_deref());
+            let bots: Vec<Value> = crate::bots::list(&root)
+                .into_iter()
+                .map(|b| {
+                    json!({
+                        "id": b.id,
+                        "name": b.name,
+                        "description": b.description,
+                        "hasSoul": b.soul.is_some(),
+                        "hasAgents": b.agents.is_some(),
+                    })
+                })
+                .collect();
+            Ok(json!({"bots": bots, "root": root.to_string_lossy()}))
+        }
+
+        "bot.get" => {
+            let id = req_str(&params, "id")?;
+            let root = crate::bots::bots_root(state.config.read().data_dir.as_deref());
+            let bot = crate::bots::load(&root, id).ok_or_else(|| {
+                RpcError::error(error_code::INVALID_PARAMS, format!("unknown bot `{id}`"))
+            })?;
+            Ok(json!({"bot": {
+                "id": bot.id, "name": bot.name, "description": bot.description,
+                "soul": bot.soul, "agents": bot.agents,
+            }}))
+        }
+
+        "bot.save" => {
+            let id = req_str(&params, "id")?;
+            let name = req_str(&params, "name")?;
+            // Optional string fields: absent keeps, null (or "") clears,
+            // a string sets.
+            let field = |v: &Value| match v {
+                Value::Null => crate::bots::Field::Clear,
+                Value::String(s) if s.trim().is_empty() => crate::bots::Field::Clear,
+                Value::String(s) => crate::bots::Field::Set(s.clone()),
+                _ => crate::bots::Field::Keep,
+            };
+            let req = crate::bots::BotSave {
+                id: id.to_string(),
+                name: name.to_string(),
+                description: field(params.get("description").unwrap_or(&Value::Null)),
+                soul: field(params.get("soul").unwrap_or(&Value::Null)),
+                agents: field(params.get("agents").unwrap_or(&Value::Null)),
+            };
+            let root = crate::bots::bots_root(state.config.read().data_dir.as_deref());
+            let bot = crate::bots::save(&root, &req)?;
+            Ok(json!({"bot": {"id": bot.id, "name": bot.name}}))
+        }
+
+        "bot.delete" => {
+            let id = req_str(&params, "id")?;
+            let root = crate::bots::bots_root(state.config.read().data_dir.as_deref());
+            let deleted = crate::bots::delete(&root, id)?;
+            // A deleted bot unbinds future resumes silently (resolve
+            // fails → no persona); live sessions keep their bound block
+            // until they end.
+            Ok(json!({"deleted": deleted}))
         }
 
         "project.create" => {
@@ -1279,13 +1409,29 @@ async fn dispatch(
                 None => None,
             };
             check_cwd_allowed(state, &cfg.cwd)?;
+            // Persona (optional): resolve the bot's files NOW — a
+            // typo'd or since-deleted id must fail the create, not the
+            // first turn. The composed block is fixed for the session's
+            // life; edits to the bot's files reach the NEXT session.
+            let persona = match params["persona"].as_str() {
+                Some(id) => {
+                    let root = crate::bots::bots_root(state.config.read().data_dir.as_deref());
+                    Some(crate::bots::resolve(&root, id).ok_or_else(|| {
+                        RpcError::error(
+                            error_code::INVALID_PARAMS,
+                            format!("unknown persona `{id}` — bot.save it first"),
+                        )
+                    })?)
+                }
+                None => None,
+            };
             // Effective granted roots (global + the project's) ride
             // the launch line for backends with a native widening flag
             // (claude --add-dir) and pre-warm the file jail.
             cfg.granted_roots = effective_grants(state, project.clone()).await?;
             let ms = state
                 .sessions
-                .create(backend.as_deref(), cfg.clone())
+                .create(backend.as_deref(), cfg.clone(), persona.clone())
                 .await?;
             state
                 .store
@@ -1294,13 +1440,22 @@ async fn dispatch(
             if let Some(pid) = &project {
                 let _ = state.store.set_session_project(&ms.id, Some(pid)).await;
             }
+            // The persona binding rides the session row so resume/
+            // restart re-resolve it after a daemon restart.
+            if let Some(p) = &persona {
+                let _ = state.store.set_session_persona(&ms.id, Some(&p.bot)).await;
+            }
             // Persist the resolved default model (explicit or project
             // default) — the row is the search/list surface for it.
             if let Some(m) = &cfg.model {
                 let _ = state.store.set_session_model(&ms.id, m).await;
             }
             let replayed = conn.subscribe(state, &ms).await;
-            Ok(json!({"sessionId": ms.id, "backend": ms.provider, "replayed": replayed}))
+            let mut out = json!({"sessionId": ms.id, "backend": ms.provider, "replayed": replayed});
+            if let Some(p) = &ms.persona {
+                out["persona"] = json!(p.bot);
+            }
+            Ok(out)
         }
 
         "session.resume" => {
@@ -1362,7 +1517,7 @@ async fn dispatch(
                 };
                 cfg.granted_roots =
                     effective_grants(state, state.store.session_project(&id).await?).await?;
-                let ms = state.sessions.resume(&id, &handle, cfg).await?;
+                let ms = state.sessions.resume(&id, &handle, cfg, None).await?;
                 let replayed = conn.subscribe(state, &ms).await;
                 return Ok(json!({"sessionId": id, "backend": ms.provider, "replayed": replayed}));
             }
@@ -1976,6 +2131,127 @@ async fn dispatch(
             let run_id = req_str(&params, "runId")?;
             let removed = conn.unsubscribe(&format!("mission:{run_id}")).await;
             Ok(json!({"runId": run_id, "subscribed": !removed}))
+        }
+
+        // Memory ledgers (adapted from upstream desktop-cc-gui). The
+        // `[memory] enabled` switch (hot) turns the whole surface away;
+        // writes pass one gate chain — scan → cap → approval — and any
+        // hit rejects the WHOLE write as MEMORY_REJECTED.
+        "memory.usage" => {
+            memory_enabled(state)?;
+            let scope = req_str(&params, "scope")?;
+            let owner = params["owner"].as_str().unwrap_or("").to_string();
+            crate::memory::validate_scope(scope, &owner)
+                .map_err(|m| RpcError::error(error_code::INVALID_PARAMS, m))?;
+            let cfg = state.config.read().memory.clone();
+            let chars = state.store.memory_ledger_chars(scope, &owner).await?;
+            Ok(json!({
+                "scope": scope,
+                "owner": owner,
+                "chars": chars,
+                "limit": crate::memory::ledger_cap(&cfg, scope),
+            }))
+        }
+
+        "memory.list" => {
+            memory_enabled(state)?;
+            let scope = req_str(&params, "scope")?;
+            let owner = params["owner"].as_str().unwrap_or("").to_string();
+            crate::memory::validate_scope(scope, &owner)
+                .map_err(|m| RpcError::error(error_code::INVALID_PARAMS, m))?;
+            let include_pending = params["includePending"].as_bool().unwrap_or(false);
+            let entries = state
+                .store
+                .memory_entries(scope, &owner, include_pending)
+                .await?;
+            Ok(json!({"entries": entries}))
+        }
+
+        "memory.pending" => {
+            memory_enabled(state)?;
+            let entries = state.store.memory_pending().await?;
+            Ok(json!({"entries": entries}))
+        }
+
+        "memory.write" => {
+            memory_enabled(state)?;
+            let scope = req_str(&params, "scope")?;
+            let owner = params["owner"].as_str().unwrap_or("").to_string();
+            let content = req_str(&params, "content")?;
+            let source = params["source"].as_str().unwrap_or("manual").to_string();
+            crate::memory::validate_scope(scope, &owner)
+                .map_err(|m| RpcError::error(error_code::INVALID_PARAMS, m))?;
+            let cfg = state.config.read().memory.clone();
+            let cap = crate::memory::ledger_cap(&cfg, scope);
+            let current =
+                usize::try_from(state.store.memory_ledger_chars(scope, &owner).await?).unwrap_or(0);
+            match crate::memory::check_write(&cfg, content, cap, current) {
+                Ok(outcome) => {
+                    let status = match outcome {
+                        crate::memory::WriteOutcome::Active => "active",
+                        crate::memory::WriteOutcome::Pending => "pending",
+                    };
+                    let id = state
+                        .store
+                        .memory_append(scope, &owner, content, &source, status)
+                        .await?;
+                    Ok(json!({"id": id, "status": status}))
+                }
+                Err(crate::memory::WriteRejection::Scan(r)) => Err(anyhow::Error::new(
+                    RpcError::new(
+                        error_code::MEMORY_REJECTED,
+                        format!("memory write rejected ({}): {}", r.kind, r.detail),
+                    )
+                    .with_data(json!({"kind": r.kind, "detail": r.detail})),
+                )),
+                Err(crate::memory::WriteRejection::Capacity {
+                    limit,
+                    current,
+                    attempted,
+                }) => Err(anyhow::Error::new(
+                    RpcError::new(
+                        error_code::MEMORY_REJECTED,
+                        "memory write rejected: ledger cap exceeded — trim or remove entries first",
+                    )
+                    .with_data(json!({
+                        "kind": "capacity",
+                        "limit": limit,
+                        "current": current,
+                        "attempted": attempted,
+                    })),
+                )),
+                Err(crate::memory::WriteRejection::Empty) => Err(RpcError::error(
+                    error_code::INVALID_PARAMS,
+                    "content must not be empty",
+                )),
+            }
+        }
+
+        "memory.remove" => {
+            memory_enabled(state)?;
+            let id = params["id"].as_i64().ok_or_else(|| {
+                RpcError::error(error_code::INVALID_PARAMS, "id (number) required")
+            })?;
+            let removed = state.store.memory_remove(id).await?;
+            Ok(json!({"removed": removed}))
+        }
+
+        "memory.approve" => {
+            memory_enabled(state)?;
+            let id = params["id"].as_i64().ok_or_else(|| {
+                RpcError::error(error_code::INVALID_PARAMS, "id (number) required")
+            })?;
+            let approved = state.store.memory_activate(id).await?;
+            Ok(json!({"approved": approved}))
+        }
+
+        "memory.reject" => {
+            memory_enabled(state)?;
+            let id = params["id"].as_i64().ok_or_else(|| {
+                RpcError::error(error_code::INVALID_PARAMS, "id (number) required")
+            })?;
+            let rejected = state.store.memory_remove(id).await?;
+            Ok(json!({"rejected": rejected}))
         }
 
         "turn.start" => {
@@ -3053,6 +3329,18 @@ fn skills_enabled(state: &AppState) -> Result<()> {
     ))
 }
 
+/// The `[memory] enabled` door for the whole `memory.*` surface —
+/// same single-door pattern as `[skills]`. Hot-reloaded.
+fn memory_enabled(state: &AppState) -> Result<()> {
+    if state.config.read().memory.enabled {
+        return Ok(());
+    }
+    Err(RpcError::error(
+        error_code::NOT_SUPPORTED,
+        "memory is disabled in config ([memory] enabled = false)",
+    ))
+}
+
 /// `[skills] extra_repos` parsed into repo entries (invalid specs are
 /// a config error, surfaced loudly rather than skipped).
 fn parse_extra_repos(state: &AppState) -> Result<Vec<crate::skills_hub::RepoEntry>> {
@@ -3316,9 +3604,23 @@ async fn reattach(state: &Arc<AppState>, conn: &Arc<Conn>, id: &str) -> Result<V
     // Granted roots re-widen on every relaunch: a grant made while a
     // session was down still reaches the backend's sandbox.
     cfg.granted_roots = effective_grants(state, state.store.session_project(id).await?).await?;
-    let ms = state.sessions.resume(id, &handle, cfg).await?;
+    // The persona re-resolves from the bot's CURRENT files — persona
+    // edits between daemon restarts reach the resumed session. A bot
+    // deleted in the meantime unbinds silently, same as `bot.delete`.
+    let persona = match state.store.session_persona(id).await? {
+        Some(bot) => {
+            let root = crate::bots::bots_root(state.config.read().data_dir.as_deref());
+            crate::bots::resolve(&root, &bot)
+        }
+        None => None,
+    };
+    let ms = state.sessions.resume(id, &handle, cfg, persona).await?;
     let replayed = conn.subscribe(state, &ms).await;
-    Ok(json!({"sessionId": id, "backend": ms.provider, "replayed": replayed}))
+    let mut out = json!({"sessionId": id, "backend": ms.provider, "replayed": replayed});
+    if let Some(p) = &ms.persona {
+        out["persona"] = json!(p.bot);
+    }
+    Ok(out)
 }
 
 // ---------------------------------------------------------------------------
@@ -3358,7 +3660,7 @@ impl crate::mission::MissionAgentRunner for MissionTurnRunner {
         let ms = self
             .state
             .sessions
-            .create(Some(&req.backend), cfg)
+            .create(Some(&req.backend), cfg, None)
             .await
             .map_err(|e| format!("agent node session create failed: {e}"))?;
         // Persist the session row so the turn's transcript is
@@ -3452,6 +3754,28 @@ async fn run_turn(
             .await?;
         let _ = state.store.set_title_if_empty(&ms.id, &user_text).await;
     }
+    // Memory injection (when [memory] is enabled): the ACTIVE ledgers
+    // ride in front of the prompt as a delimited, declared-as-data
+    // block. The persisted user message above keeps the clean prompt —
+    // history stays human. The config guard is cloned, never held
+    // across the store awaits.
+    let memory_cfg = state.config.read().memory.clone();
+    let prompt = crate::memory::inject_prompt(
+        &state.store,
+        &memory_cfg,
+        params["memoryOwner"].as_str(),
+        prompt,
+    )
+    .await?;
+    // Persona injection: a session created with `persona` carries its
+    // composed block in front of every turn — identity first, then the
+    // memory context block, then the user's words. Same prepend-only
+    // rule as memory: the persisted user message above keeps the clean
+    // prompt.
+    let prompt = match ms.persona.as_ref().and_then(|p| p.block.clone()) {
+        Some(block) => crate::memory::prepend_block(prompt, block),
+        None => prompt,
+    };
     // First use ends the fresh-session reap grace. (`busy` was already
     // claimed by the turn.start dispatcher — only the guard releases.)
     ms.ever_used
@@ -3791,11 +4115,15 @@ pub fn rpc_methods() -> Vec<Value> {
         json!({"name": "device.list", "params": {}, "result": {"devices": "array of {deviceId, name, status: 'pending'|'approved', createdAt, approvedAt?, lastSeen?} — lastSeen updates at most once a minute"}}),
         json!({"name": "device.approve", "params": {"deviceId": "string"}, "result": {"approved": "boolean — false when unknown or already approved"}}),
         json!({"name": "device.rename", "params": {"deviceId": "string", "name": "string"}, "result": {"renamed": "boolean — false when unknown or the name is blank"}}),
-        json!({"name": "device.revoke", "params": {"deviceId": "string"}, "result": {"revoked": "boolean — the row goes with the token hash, so the credential dies immediately; doubles as deny for pending requests"}}),
+        json!({"name": "device.revoke", "params": {"deviceId": "string"}, "result": {"revoked": "boolean — the row goes with the token hash, so the credential dies immediately; doubles as deny for pending requests", "socketsCut": "number — live /ws connections of this device cut on the spot; its unspent tickets are purged too"}}),
+        json!({"name": "bot.list", "params": {}, "result": "{bots: [{id, name, description?, hasSoul, hasAgents}], root} — personas live as files under root/<id>/; edit them with any editor"}),
+        json!({"name": "bot.get", "params": {"id": "string"}, "result": "{bot: {id, name, description?, soul?, agents?}} — full file contents", "errors": "-32602 unknown bot id"}),
+        json!({"name": "bot.save", "params": {"id": "string — lowercase/digits/-", "name": "string", "description?": "string | null — absent keeps, null clears", "soul?": "string | null — SOUL.md, absent keeps, null clears", "agents?": "string | null — AGENTS.md, same semantics"}, "result": "{bot: {id, name}} — creates or updates; edits reach the NEXT session (running sessions keep their bound block)"}),
+        json!({"name": "bot.delete", "params": {"id": "string"}, "result": "{deleted: boolean} — future resumes of bound sessions lose the persona silently"}),
         json!({"name": "mcp.inventory", "params": {}, "result": {"entries": "array of {backend, name, transport, command?, url?, envKeys?, source, format, version, enabled?, readonlyReason?} — REDACTED: env values never leave the file, URLs lose userinfo/query, stdio shows the program and an arg count", "sources": "array of {backend, source, format, error?} — one per config file; a broken file reports its error and the inventory continues"}}),
         json!({"name": "mcp.probe", "params": {"backend": "string", "name": "string"}, "result": "{backend, name, result: 'connected'|'needs_auth'|'failed'|'unsupported', tools: string[] — names only, ≤40, serverName?, protocolVersion?, elapsedMs, error?} — REAL handshake, explicit request only (never scheduled); stdio 25s cap, HTTP 12s cap; the server's command/args/env never reach the wire"}),
         json!({"name": "mcp.setEnabled", "params": {"backend": "string — claude only this round", "name": "string", "enabled": "boolean", "expectedVersion": "string — CAS from mcp.inventory", "cwd": "string? — project scope for the toggle, default the daemon cwd"}, "result": {"set": "boolean"}, "errors": "-32010 the entry changed since the snapshot (external edit); -32602 readonly backend (reason in the message) or parse-failed config (never written)"}),
-        json!({"name": "session.create", "params": {"backend": "string?", "cwd": "string?", "model": "string?", "mode": "string?", "mcpServers": "object?", "projectId": "string? — scopes the session: root becomes the cwd default, project defaults fill unset params"}, "result": {"sessionId": "string", "backend": "string", "replayed": "number — replay-tagged session.event frames sent for missed history"}}),
+        json!({"name": "session.create", "params": {"backend": "string?", "cwd": "string?", "model": "string?", "mode": "string?", "mcpServers": "object?", "projectId": "string? — scopes the session: root becomes the cwd default, project defaults fill unset params", "persona": "string? — bot id from bot.list; the bot's SOUL/AGENTS block rides in front of every turn, bound for the session's life and restored on resume"}, "result": {"sessionId": "string", "backend": "string", "persona?": "string — the bound bot id, when one was given", "replayed": "number — replay-tagged session.event frames sent for missed history"}, "errors": "-32602 unknown persona id"}),
         json!({"name": "session.resume", "params": {"sessionId": "string — or", "handle": "{provider, native_handle}", "cwd": "string?", "title": "string?"}, "result": {"sessionId": "string", "backend": "string", "replayed": "number"}}),
         json!({"name": "session.list", "params": {"limit": "number?", "offset": "number?", "backend": "string?", "cwd": "string?", "tag": "string?", "projectId": "string?"}, "result": {"sessions": "array of {sessionId, createdAt, backend, title, cwd, tags}"}}),
         json!({"name": "session.messages", "params": {"sessionId": "string", "limit": "number?", "offset": "number?"}, "result": {"messages": "array of {id, session_id, role, ts, data} — ts is unix ms, 0 when unknown"}}),
@@ -3814,6 +4142,13 @@ pub fn rpc_methods() -> Vec<Value> {
         json!({"name": "mission.get", "params": {"runId": "string"}, "result": "{runId, flowId, version, status, interrupted, ended, definition, tasks: [{nodeId, status, attempt, output?, error?}], inbox: [{nodeId, status, decision?, feedback?}]}", "errors": "-32602 unknown run"}),
         json!({"name": "mission.watch", "params": {"runId": "string — must be live"}, "result": {"runId": "string", "subscribed": "boolean — streams {event: mission.progress, runId, data} frames until mission.unwatch"}, "errors": "-32001 run is not live (finished, cancelled, or daemon restarted — mission.get reads the persisted state)"}),
         json!({"name": "mission.unwatch", "params": {"runId": "string"}, "result": {"runId": "string", "subscribed": "boolean"}}),
+        json!({"name": "memory.usage", "params": {"scope": "'user' | 'bot'", "owner": "string? — bot ledger name, e.g. telegram:12345"}, "result": "{scope, owner, chars, limit} — chars counts ACTIVE entries only", "errors": "-32002 memory disabled ([memory] enabled = false)"}),
+        json!({"name": "memory.list", "params": {"scope": "'user' | 'bot'", "owner": "string?", "includePending": "boolean? — default false (active only)"}, "result": "{entries: [{id, scope, owner, content, source, status, createdAt, updatedAt}]}", "errors": "-32002 memory disabled"}),
+        json!({"name": "memory.pending", "params": {}, "result": "{entries: [...] — every ledger's pending writes, oldest first}", "errors": "-32002 memory disabled"}),
+        json!({"name": "memory.write", "params": {"scope": "'user' | 'bot'", "owner": "string?", "content": "string", "source": "string? — provenance, default 'manual'"}, "result": "{id, status: 'active' | 'pending'} — one gate chain: scan → cap → approval; nothing is ever sanitized or truncated", "errors": "-32011 whole write rejected; error.data.kind = prompt_injection | secret | invisible | capacity (with limit/current/attempted); -32602 bad scope/owner or empty content"}),
+        json!({"name": "memory.remove", "params": {"id": "number"}, "result": "{removed: boolean}", "errors": "-32002 memory disabled"}),
+        json!({"name": "memory.approve", "params": {"id": "number — a pending write"}, "result": "{approved: boolean — false when unknown or already active (one-shot CAS)}", "errors": "-32002 memory disabled"}),
+        json!({"name": "memory.reject", "params": {"id": "number"}, "result": "{rejected: boolean — deletes the pending write}", "errors": "-32002 memory disabled"}),
         json!({"name": "session.watch", "params": {"sessionId": "string — must be live"}, "result": {"sessionId": "string", "subscribed": "boolean", "replayed": "number — subscribes this connection to the session's events without touching it; the cross-surface notification path"}}),
         json!({"name": "session.unwatch", "params": {"sessionId": "string"}, "result": {"sessionId": "string", "subscribed": "boolean — false when this connection was subscribed and now is not"}}),
         json!({"name": "session.set_pinned", "params": {"sessionId": "string", "pinned": "boolean"}, "result": {"updated": "boolean — pinned rows float to the top of session.list and survive the retention sweep"}}),
@@ -3825,7 +4160,7 @@ pub fn rpc_methods() -> Vec<Value> {
         json!({"name": "session.search", "params": {"query": "string", "limit": "number?", "sessionId": "string?", "backend": "string?", "cwd": "string?", "projectId": "string?", "since": "string? — RFC3339 or YYYY-MM-DD", "until": "string?"}, "result": {"results": "array of {sessionId, messageId, snippet}"}}),
         json!({"name": "usage.summary", "params": {"days": "number? — window in local days, today inclusive, default 7", "tzOffsetMinutes": "number? — caller's UTC offset shifting the day buckets, default 0 (UTC)"}, "result": {"days": "number", "rows": "array of {date, backend, model, turns, contextUsed, contextSize, costUsd} — one per local day × backend × model; context columns sum the per-turn snapshots", "total": "{turns, contextUsed, contextSize, costUsd}"}}),
         json!({"name": "usage.clear", "params": {}, "result": {"cleared": "boolean — every usage row deleted; sessions and messages untouched"}}),
-        json!({"name": "turn.start", "params": {"sessionId": "string", "prompt": "string|array", "timeoutSecs": "number?", "detach": "boolean? — true resolves immediately {turnId, detached:true} and the turn outlives the connection (not cancelled on disconnect); turn.cancel/timeoutSecs still apply"}, "result": {"turnId": "string", "stopReason": "string", "usage": "object?"}}),
+        json!({"name": "turn.start", "params": {"sessionId": "string", "prompt": "string|array", "timeoutSecs": "number?", "detach": "boolean? — true resolves immediately {turnId, detached:true} and the turn outlives the connection (not cancelled on disconnect); turn.cancel/timeoutSecs still apply", "memoryOwner": "string? — with [memory] enabled, this bot ledger's ACTIVE entries join the user ledger in the injected <memory> block; the persisted user message keeps the clean prompt"}, "result": {"turnId": "string", "stopReason": "string", "usage": "object?"}}),
         json!({"name": "turn.steer", "params": {"sessionId": "string", "prompt": "string|array"}, "result": {"result": "string"}}),
         json!({"name": "turn.cancel", "params": {"sessionId": "string"}, "result": {"cancelled": "boolean"}}),
         json!({"name": "permission.respond", "params": {"sessionId": "string", "requestId": "string", "response": "{behavior: allow|deny, action_id?, updated_input?, answer?, answers?{question → label|[labels]}} — for kind:question asks an answers map submits picks, an allow without answers skips"}, "result": {}, "errors": "-32008 requestId is not a pending ask (answered, withdrawn, or turn ended); delivery failures leave it answerable"}),
@@ -4016,6 +4351,10 @@ mod tests {
         "device.approve",
         "device.rename",
         "device.revoke",
+        "bot.list",
+        "bot.get",
+        "bot.save",
+        "bot.delete",
         "project.create",
         "project.list",
         "project.get",
@@ -4040,6 +4379,13 @@ mod tests {
         "mission.get",
         "mission.watch",
         "mission.unwatch",
+        "memory.usage",
+        "memory.list",
+        "memory.pending",
+        "memory.write",
+        "memory.remove",
+        "memory.approve",
+        "memory.reject",
         "session.watch",
         "session.unwatch",
         "session.messages",

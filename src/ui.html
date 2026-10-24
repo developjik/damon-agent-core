@@ -1340,6 +1340,13 @@
           login.</div>
       </section>
       <section>
+        <div class="panelHead">bots (personas)</div>
+        <div id="botList"></div>
+        <div class="setHint" id="botRootHint">Personas are files — bot.json, SOUL.md,
+          AGENTS.md in the bots directory. Edit them with any editor; the next
+          session picks the change up. Chat bridges bind one with !bot.</div>
+      </section>
+      <section>
         <div class="panelHead">notifications</div>
         <label class="setToggle">
           <input type="checkbox" id="notifyToggle">
@@ -3618,6 +3625,48 @@ function onCliUpdateProgress(v) {
   if (line) $("cliUpdateLog").textContent += line + "\n";
 }
 
+// ---------- bots / personas (settings drawer) ----------
+// Read-only listing: a persona IS files (bot.json + SOUL.md + AGENTS.md
+// under the bots root) — edit them with any editor and the NEXT session
+// picks the change up. Bridge chats bind one via !bot; session.create
+// takes persona: <id>.
+async function renderBots() {
+  const box = $("botList");
+  let bots = [], root = "";
+  try {
+    const v = await request("bot.list", {});
+    bots = v.bots || [];
+    root = v.root || "";
+  } catch {
+    return;
+  }
+  box.textContent = "";
+  if (!bots.length) {
+    const d = document.createElement("div");
+    d.className = "setHint";
+    d.textContent = "no bots — bot.save one over RPC, or create the files";
+    box.appendChild(d);
+  }
+  for (const b of bots) {
+    const row = document.createElement("div");
+    row.className = "statRow";
+    const name = document.createElement("span");
+    name.className = "statName";
+    name.textContent = b.name;
+    row.appendChild(name);
+    const meta = document.createElement("span");
+    meta.className = "statMeta";
+    meta.textContent = b.id + (b.hasSoul || b.hasAgents ? "" : " · no SOUL/AGENTS yet");
+    row.appendChild(meta);
+    box.appendChild(row);
+  }
+  if (root) {
+    $("botRootHint").textContent =
+      "Personas are files — bot.json, SOUL.md, AGENTS.md under " + root +
+      ". Edit with any editor; the next session picks the change up. Chat bridges bind one with !bot.";
+  }
+}
+
 // ---------- paired devices (settings drawer) ----------
 // Desktop-side management: reveal the one-time pairing key, approve or
 // deny pending requests, rename/revoke devices. The DEVICE side pairs
@@ -3804,6 +3853,7 @@ function openSettings() {
   renderGrants();
   renderCliVersions();
   renderDevices();
+  renderBots();
   refreshAgents(); // its hook re-renders the agent rows
   clearInterval(settingsTimer);
   settingsTimer = setInterval(() => {

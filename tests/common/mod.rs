@@ -35,6 +35,9 @@ pub fn mock_config(auth_token: Option<&str>) -> Config {
         max_sessions: None,
         allowed_dirs: Vec::new(),
         skills: Default::default(),
+        // Memory off by default — only the dedicated memory tests turn
+        // it on, so no other test's prompts get an injected block.
+        memory: Default::default(),
         // Scanner OFF in tests — the boot sweep would otherwise read
         // the machine's REAL native history into the test store. Tests
         // that exercise the scanner build their own enabled config.

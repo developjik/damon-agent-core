@@ -113,6 +113,7 @@ async fn main() -> anyhow::Result<()> {
                 "damon-relay {} — E2E-encrypted relay for damond\n\
                  \n\
                  Usage: damon-relay\n\
+                 \x20       damon-relay --deploy-pack <dir>\n\
                  \n\
                  Environment:\n\
                  \x20 DAMON_RELAY_BIND    listen address (default 0.0.0.0:8080)\n\
@@ -128,6 +129,21 @@ async fn main() -> anyhow::Result<()> {
         }
         Some("-V" | "--version") => {
             println!("damon-relay {}", env!("CARGO_PKG_VERSION"));
+            return Ok(());
+        }
+        // Self-host deploy pack: write everything a fresh server needs
+        // (systemd + Docker + env template + daemon-side snippet, plus
+        // this very binary) into a directory — see relay::deploy_pack_files.
+        Some("--deploy-pack") => {
+            let dir = std::env::args()
+                .nth(2)
+                .ok_or_else(|| anyhow::anyhow!("usage: damon-relay --deploy-pack <dir>"))?;
+            let written = damon_core::relay::write_deploy_pack(std::path::Path::new(&dir), true)?;
+            println!("deploy pack written to {dir}:");
+            for f in written {
+                println!("  {}", f.display());
+            }
+            println!("next: open {}/README.md", dir);
             return Ok(());
         }
         Some(other) => {

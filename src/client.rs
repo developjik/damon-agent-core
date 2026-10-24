@@ -355,17 +355,20 @@ impl DamonClient {
     }
 
     /// Create a session. `backend` picks the agent (None = daemon
-    /// default); `model` becomes the session's default model.
+    /// default); `model` becomes the session's default model;
+    /// `persona` binds a bot persona (None = none) whose SOUL/AGENTS
+    /// block rides in front of every turn.
     pub async fn create_session(
         &self,
         backend: Option<&str>,
         cwd: &str,
         model: Option<&str>,
+        persona: Option<&str>,
     ) -> anyhow::Result<String> {
         let v = self
             .request(
                 "session.create",
-                json!({"backend": backend, "cwd": cwd, "model": model}),
+                json!({"backend": backend, "cwd": cwd, "model": model, "persona": persona}),
             )
             .await?;
         let sid = v["sessionId"]

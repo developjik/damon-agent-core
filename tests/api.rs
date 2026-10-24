@@ -402,3 +402,159 @@ async fn web_device_pairing_full_flow() {
     assert_eq!(resp.status(), StatusCode::OK);
     let _ = base;
 }
+
+/// Revocation reaches ALREADY-OPEN sockets: the device's live /ws
+/// connection is cut the moment `device.revoke` lands (the row dies,
+/// the unspent tickets die, and the socket — riding a now-dead
+/// credential — is closed instead of lingering until it happens to
+/// disconnect). A master connection is untouched.
+#[tokio::test]
+async fn device_revoke_cuts_the_live_socket() {
+    use futures::{SinkExt, StreamExt};
+    use tokio_tungstenite::tungstenite::Message;
+
+    let cfg = common::mock_config(Some("master-tok"));
+    let shared: damon_core::config::SharedConfig = Arc::new(parking_lot::RwLock::new(cfg));
+    let store = damon_core::store::Store::in_memory().await.unwrap();
+    let state = damon_core::api::AppState::new(shared, store.clone()).await;
+    state
+        .sessions
+        .insert_client("mock".to_string(), common::mock_client());
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let server_state = state.clone();
+    tokio::spawn(async move {
+        let _ = axum::serve(
+            listener,
+            damon_core::api::router(server_state)
+                .into_make_service_with_connect_info::<std::net::SocketAddr>(),
+        )
+        .await;
+    });
+    let gated = damon_core::api::router(state.clone());
+
+    // Pair + approve a device directly through the store (the HTTP
+    // loop is covered by web_device_pairing_full_flow).
+    let token = format!("dev-{}", uuid::Uuid::new_v4());
+    let device_id = store
+        .create_device(
+            "pixel",
+            &damon_core::cli_lifecycle::hash_device_token(&token),
+        )
+        .await
+        .unwrap();
+    assert!(store.approve_device(&device_id).await.unwrap());
+
+    // Device mints a ticket and OPENS a WebSocket with it.
+    let resp = gated
+        .clone()
+        .oneshot(
+            Request::post("/v1/ws_ticket")
+                .header("content-type", "application/json")
+                .body(Body::from(format!(r#"{{"deviceToken":"{token}"}}"#)))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    let body = axum::body::to_bytes(resp.into_body(), 1 << 20)
+        .await
+        .unwrap();
+    let ticket = serde_json::from_slice::<serde_json::Value>(&body).unwrap()["ticket"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    let (mut device_ws, _) =
+        tokio_tungstenite::connect_async(format!("ws://{addr}/ws?ticket={ticket}"))
+            .await
+            .unwrap();
+    let _hello = tokio::time::timeout(std::time::Duration::from_secs(5), device_ws.next())
+        .await
+        .unwrap()
+        .unwrap()
+        .unwrap();
+
+    // A master connection revokes the device over the same surface a
+    // real trusted client uses — the RPC arm, not the store call.
+    use tokio_tungstenite::tungstenite::client::IntoClientRequest;
+    let mut req = format!("ws://{addr}/ws").into_client_request().unwrap();
+    req.headers_mut()
+        .insert("Authorization", "Bearer master-tok".parse().unwrap());
+    let (mut admin_ws, _) = tokio_tungstenite::connect_async(req).await.unwrap();
+    let _admin_hello = tokio::time::timeout(std::time::Duration::from_secs(5), admin_ws.next())
+        .await
+        .unwrap()
+        .unwrap()
+        .unwrap();
+    admin_ws
+        .send(Message::Text(
+            serde_json::json!({
+                "id": 7,
+                "method": "device.revoke",
+                "params": {"deviceId": device_id}
+            })
+            .to_string()
+            .into(),
+        ))
+        .await
+        .unwrap();
+    // Collect the revoke reply (skipping any pushed frames).
+    let reply = loop {
+        let frame = tokio::time::timeout(std::time::Duration::from_secs(5), admin_ws.next())
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap();
+        if let Message::Text(t) = frame
+            && serde_json::from_slice::<serde_json::Value>(t.as_bytes()).unwrap()["id"] == 7
+        {
+            break serde_json::from_slice::<serde_json::Value>(t.as_bytes()).unwrap();
+        }
+    };
+    assert_eq!(reply["result"]["revoked"], true, "{reply}");
+    assert_eq!(
+        reply["result"]["socketsCut"], 1,
+        "the device's live socket must be counted and cut: {reply}"
+    );
+
+    // The device socket actually dies — promptly, not at the next TCP
+    // timeout. Close frame, reset, or clean EOF all count.
+    let closed = tokio::time::timeout(std::time::Duration::from_secs(5), device_ws.next())
+        .await
+        .expect("revoked device socket must close");
+    let dead = match closed {
+        None => true,
+        Some(Err(_)) => true,
+        Some(Ok(Message::Close(_))) => true,
+        Some(Ok(other)) => panic!("expected closure, got another frame: {other:?}"),
+    };
+    assert!(dead);
+
+    // A second revoke reports nothing left to cut.
+    admin_ws
+        .send(Message::Text(
+            serde_json::json!({
+                "id": 8,
+                "method": "device.revoke",
+                "params": {"deviceId": device_id}
+            })
+            .to_string()
+            .into(),
+        ))
+        .await
+        .unwrap();
+    let reply = loop {
+        let frame = tokio::time::timeout(std::time::Duration::from_secs(5), admin_ws.next())
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap();
+        if let Message::Text(t) = frame
+            && serde_json::from_slice::<serde_json::Value>(t.as_bytes()).unwrap()["id"] == 8
+        {
+            break serde_json::from_slice::<serde_json::Value>(t.as_bytes()).unwrap();
+        }
+    };
+    assert_eq!(reply["result"]["revoked"], false, "{reply}");
+    assert_eq!(reply["result"]["socketsCut"], 0, "{reply}");
+}

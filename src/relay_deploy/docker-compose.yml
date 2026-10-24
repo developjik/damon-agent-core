@@ -1,0 +1,13 @@
+services:
+  relay:
+    build: .
+    image: damon-relay
+    restart: unless-stopped
+    env_file: relay.env
+    ports:
+      - "8080:8080"
+    # The relay keeps long-lived tunnel sockets — give them room.
+    ulimits:
+      nofile:
+        soft: 8192
+        hard: 8192

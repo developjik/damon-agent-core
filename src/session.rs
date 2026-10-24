@@ -133,6 +133,11 @@ pub struct ManagedSession {
     pub created_at: Instant,
     /// Current-turn event journal for late-subscriber replay.
     pub journal: Arc<EventJournal>,
+    /// Persona bound at create/resume time (bot id + composed block).
+    /// The block is prepended to every turn like the memory block;
+    /// the binding is fixed for the session's life — persona file
+    /// edits apply to the NEXT session, never mid-conversation.
+    pub persona: Option<crate::bots::Persona>,
 }
 
 /// A session younger than this that has NEVER run a turn is not
@@ -275,6 +280,7 @@ impl SessionManager {
         &self,
         backend: Option<&str>,
         config: SessionConfig,
+        persona: Option<crate::bots::Persona>,
     ) -> Result<Arc<ManagedSession>> {
         let cap = *self.max_sessions.read();
         if let Some(cap) = cap
@@ -301,6 +307,7 @@ impl SessionManager {
             busy: std::sync::atomic::AtomicBool::new(false),
             created_at: Instant::now(),
             journal,
+            persona,
         });
         let mut sessions = self.sessions.lock().await;
         let cap = *self.max_sessions.read();
@@ -327,6 +334,7 @@ impl SessionManager {
         session_id: &str,
         handle: &PersistenceHandle,
         config: SessionConfig,
+        persona: Option<crate::bots::Persona>,
     ) -> Result<Arc<ManagedSession>> {
         let client = self
             .clients
@@ -363,6 +371,7 @@ impl SessionManager {
             busy: std::sync::atomic::AtomicBool::new(false),
             created_at: Instant::now(),
             journal,
+            persona,
         });
         self.sessions
             .lock()

@@ -1501,7 +1501,7 @@ async fn v3_migration_reindexes_array_content_rows() {
             .unwrap()
     };
     assert_eq!(
-        v, 9,
+        v, 10,
         "migrations stamp user_version through the current one"
     );
 }
@@ -1791,7 +1791,7 @@ async fn v4_migration_rebuilds_fts_with_trigram_tokenizer() {
             .unwrap()
     };
     assert_eq!(
-        v, 9,
+        v, 10,
         "migrations stamp user_version through the current one"
     );
     let _ = std::fs::remove_file(&path);

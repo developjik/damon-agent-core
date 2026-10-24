@@ -61,6 +61,9 @@ pub struct Config {
     /// `[history]` — native-session auto-discovery. Hot-reloaded.
     #[serde(default = "default_history")]
     pub history: HistoryConfig,
+    /// `[memory]` — persistent memory ledgers. Hot-reloaded.
+    #[serde(default)]
+    pub memory: MemoryConfig,
 }
 
 /// `[history]` — the native-history scanner. `enabled` gates the
@@ -86,6 +89,51 @@ fn default_history() -> HistoryConfig {
     HistoryConfig {
         enabled: true,
         scan_interval_secs: 0,
+    }
+}
+
+/// `[memory]` — persistent memory ledgers (adapted from upstream
+/// desktop-cc-gui): one global `user` ledger plus per-`bot` ledgers,
+/// injected into turns as a delimited data block. Off by default:
+/// injection changes what the agent sees, so it is an explicit opt-in
+/// rather than a silent behavior change.
+#[derive(Clone, Debug, Deserialize, PartialEq)]
+#[serde(deny_unknown_fields)]
+pub struct MemoryConfig {
+    /// Master switch for the whole `memory.*` surface and turn
+    /// injection — same single door as `[skills]`. Default false.
+    /// Hot-reloaded.
+    #[serde(default)]
+    pub enabled: bool,
+    /// Char cap for the single `user` ledger. Writes that would cross
+    /// it are rejected with the numbers back — never truncated.
+    /// Default 1375 (upstream's cap).
+    #[serde(default = "default_user_max_chars")]
+    pub user_max_chars: usize,
+    /// Char cap per `bot` ledger. Default 2200 (upstream's cap).
+    #[serde(default = "default_bot_max_chars")]
+    pub bot_max_chars: usize,
+    /// All writes land `pending` until `memory.approve`. Default false.
+    #[serde(default)]
+    pub require_approval: bool,
+}
+
+fn default_user_max_chars() -> usize {
+    1375
+}
+
+fn default_bot_max_chars() -> usize {
+    2200
+}
+
+impl Default for MemoryConfig {
+    fn default() -> Self {
+        MemoryConfig {
+            enabled: false,
+            user_max_chars: default_user_max_chars(),
+            bot_max_chars: default_bot_max_chars(),
+            require_approval: false,
+        }
     }
 }
 

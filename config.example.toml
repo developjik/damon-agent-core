@@ -74,6 +74,21 @@
 #   "owner/repo@branch",                    # "owner/name" defaults to main
 # ]
 
+# Persistent memory ledgers (off by default — enabling changes what
+# the agent sees). One global `user` ledger plus per-`bot` ledgers;
+# every write passes a reject-only gate chain (prompt-injection /
+# credential / invisible-character scan → char cap → optional approval
+# queue), and ACTIVE entries ride in front of each turn's prompt as a
+# delimited <memory> block that declares itself data, not instructions.
+# The memory table stays outside the FTS5 index — conversation search
+# never surfaces memory contents.
+# [memory]
+# enabled = false
+# user_max_chars = 1375                     # cap for the user ledger
+# bot_max_chars = 2200                      # cap per bot ledger
+# require_approval = false                  # writes land pending until
+#                                           # memory.approve
+
 # Remote relay — dial out so clients can reach this daemon without an
 # inbound port. Run damon-relay on a public host first; the relay also
 # serves the web UI at its root, so any browser can open the relay host,

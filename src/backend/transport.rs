@@ -29,6 +29,14 @@ const MAX_LINE_BYTES: usize = 4 * 1024 * 1024;
 /// stderr lines are diagnostics, not protocol: keep the head of each
 /// line and drop the tail instead of dropping the whole line.
 const STDERR_LINE_CAP: usize = 8 * 1024;
+/// Watchdog poll tick: how long a silent pipe may sit before the
+/// reader checks whether the direct child is still alive.
+const PIPE_POLL_TICK: std::time::Duration = std::time::Duration::from_millis(200);
+/// After the child is reaped the pipe should deliver EOF immediately.
+/// If it stays silent this long instead, a grandchild is holding the
+/// write end open — abort the reader rather than wait forever
+/// (adapted from upstream desktop-cc-gui's POST_EXIT_DRAIN).
+const POST_EXIT_DRAIN: std::time::Duration = std::time::Duration::from_millis(200);
 
 /// Pending request waiters keyed by the protocol's own id shape
 /// (stringified — JSON-RPC numeric ids and Claude's string request_ids
@@ -44,10 +52,79 @@ pub struct NdjsonTransport {
     closed: AtomicBool,
     child: Mutex<Child>,
     last_used: AtomicU64,
+    /// Kill-on-close Job Object owning the child tree (Windows; None
+    /// elsewhere — Unix reaps the tree via the process group signal in
+    /// [`Self::shutdown`]). Held for the transport's life; the last
+    /// Arc dropping closes the job and the kernel reaps any straggler
+    /// descendants a tree-walk kill could no longer reach.
+    // Never read: the handle's Drop IS the cleanup.
+    #[allow(dead_code)]
+    job: Option<winjob::Job>,
     /// Fires once the process exits (stdout EOF, read error, or
     /// shutdown) — session pumps select on it so a dead backend fails
     /// the in-flight turn instead of leaving waiters on a silent pipe.
     exited: watch::Sender<bool>,
+}
+
+/// Windows: a kill-on-close Job Object for the child tree.
+/// `taskkill /T` walks the tree from the root — but a root that died
+/// first leaves grandchildren unparented and untracked; job membership
+/// instead kills EVERYTHING the moment the handle closes (adapted
+/// from upstream desktop-cc-gui's Job Object hardening).
+#[cfg(windows)]
+mod winjob {
+    use windows_sys::Win32::Foundation::CloseHandle;
+    use windows_sys::Win32::System::JobObjects::{
+        AssignProcessToJobObject, CreateJobObjectW, JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE,
+        JOBOBJECT_EXTENDED_LIMIT_INFORMATION, JobObjectExtendedLimitInformation,
+        SetInformationJobObject,
+    };
+
+    pub struct Job(windows_sys::Win32::Foundation::HANDLE);
+
+    /// Put the child in a kill-on-close job. None on any failure —
+    /// the transport then relies on taskkill alone, exactly as before.
+    pub fn assign(child: &tokio::process::Child) -> Option<Job> {
+        unsafe {
+            let job = CreateJobObjectW(std::ptr::null(), std::ptr::null());
+            if job.is_null() {
+                return None;
+            }
+            let mut info: JOBOBJECT_EXTENDED_LIMIT_INFORMATION = std::mem::zeroed();
+            info.BasicLimitInformation.LimitFlags = JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE;
+            let ok = SetInformationJobObject(
+                job,
+                JobObjectExtendedLimitInformation,
+                &info as *const _ as *const core::ffi::c_void,
+                std::mem::size_of::<JOBOBJECT_EXTENDED_LIMIT_INFORMATION>() as u32,
+            ) != 0
+                && child
+                    .raw_handle()
+                    .is_some_and(|h| AssignProcessToJobObject(job, h.cast()) != 0);
+            if !ok {
+                CloseHandle(job);
+                return None;
+            }
+            Some(Job(job))
+        }
+    }
+
+    impl Drop for Job {
+        fn drop(&mut self) {
+            unsafe { CloseHandle(self.0) };
+        }
+    }
+}
+
+/// Non-Windows stand-in: the process group (unix) already owns tree
+/// reaping, so there is no job handle to hold.
+#[cfg(not(windows))]
+#[allow(dead_code)]
+mod winjob {
+    pub struct Job;
+    pub fn assign(_child: &tokio::process::Child) -> Option<Job> {
+        None
+    }
 }
 
 impl NdjsonTransport {
@@ -92,6 +169,9 @@ impl NdjsonTransport {
         let stdin = child.stdin.take().context("stdin not piped")?;
         let stdout = child.stdout.take().context("stdout not piped")?;
         let stderr = child.stderr.take().context("stderr not piped")?;
+        // Job membership right after spawn, before the child can fork
+        // anything: grandchildren born later inherit the job too.
+        let job = winjob::assign(&child);
 
         let (frames, _) = broadcast::channel(512);
         let me = Arc::new(Self {
@@ -101,28 +181,41 @@ impl NdjsonTransport {
             closed: AtomicBool::new(false),
             child: Mutex::new(child),
             last_used: AtomicU64::new(epoch_secs()),
+            job,
             exited: watch::Sender::new(false),
         });
         // stderr must never block protocol I/O: a dedicated task drains
         // it line by line into the daemon log. Auth/login failures and
         // CLI errors land here — dropping them made those look like
         // silent hangs. Bounded reads keep a chatty backend from
-        // ballooning memory.
+        // ballooning memory. The drain also stops once the transport
+        // reports exit (EOF, watchdog, or shutdown): a grandchild
+        // holding the stderr pipe must not leak this task forever.
         {
             let backend = command.clone();
+            let mut exited = me.exited.subscribe();
             tokio::spawn(async move {
                 let mut reader = BufReader::new(stderr);
                 let mut buf: Vec<u8> = Vec::new();
                 loop {
-                    match read_capped_line(&mut reader, &mut buf, STDERR_LINE_CAP).await {
-                        Ok((true, _)) => {
-                            let line = String::from_utf8_lossy(&buf).trim().to_string();
-                            if !line.is_empty() {
-                                tracing::warn!(backend = %backend, "backend stderr: {line}");
+                    tokio::select! {
+                        r = read_capped_line(&mut reader, &mut buf, STDERR_LINE_CAP) => {
+                            match r {
+                                Ok((true, _)) => {
+                                    let line = String::from_utf8_lossy(&buf).trim().to_string();
+                                    if !line.is_empty() {
+                                        tracing::warn!(backend = %backend, "backend stderr: {line}");
+                                    }
+                                }
+                                Ok((false, _)) => return, // EOF
+                                Err(_) => return,
                             }
                         }
-                        Ok((false, _)) => return, // EOF
-                        Err(_) => return,
+                        _ = exited.changed() => {
+                            if *exited.borrow_and_update() {
+                                return;
+                            }
+                        }
                     }
                 }
             });
@@ -246,28 +339,57 @@ pub(crate) async fn kill_tree(child: &mut Child) {
 /// Line-by-line stdout reader: parses each line as JSON, broadcasts it,
 /// and on EOF fails every pending request so waiters never hang on a
 /// dead process. Stray non-JSON lines are tolerated (agents log noise).
+///
+/// The watchdog (PIPE_POLL_TICK + POST_EXIT_DRAIN, upstream
+/// desktop-cc-gui's fix) covers the exit-with-open-pipe case: the
+/// direct child dying normally while a spawned grandchild keeps the
+/// stdout write end open means EOF never arrives — without the
+/// watchdog this loop (and every pump selecting on `exited`) would
+/// hang for as long as the grandchild lives, and the idle sweep skips
+/// busy sessions, so nothing else would ever reap it.
 async fn read_loop(stdout: tokio::process::ChildStdout, me: Arc<NdjsonTransport>) {
     let mut reader = BufReader::new(stdout);
     let mut buf: Vec<u8> = Vec::new();
+    let mut child_exited_at: Option<std::time::Instant> = None;
     loop {
-        match read_capped_line(&mut reader, &mut buf, MAX_LINE_BYTES).await {
-            Ok((true, over_cap)) => {
-                if over_cap {
-                    tracing::warn!(bytes = buf.len(), "dropping oversized backend frame");
-                    continue;
+        // Cancellation discipline: the poll tick may only interrupt a
+        // read at a LINE boundary. A cancelled read may already hold
+        // assembled bytes in `buf`; restarting from a cleared buffer
+        // would drop them, so once a line is in progress the read runs
+        // unwatched to its end — the line cap bounds memory, and turn
+        // timeouts bound liveness.
+        if buf.is_empty() {
+            tokio::select! {
+                r = capped_line_resume(&mut reader, &mut buf, MAX_LINE_BYTES) => {
+                    if !handle_line(r, &buf, &me) {
+                        break;
+                    }
+                    buf.clear();
                 }
-                let Ok(msg) = serde_json::from_slice::<Value>(&buf) else {
-                    // Stray stdout noise — tolerate, don't kill the stream.
-                    continue;
-                };
-                // Broadcast is best-effort: no subscribers is not an error.
-                let _ = me.frames.send(msg);
+                _ = tokio::time::sleep(PIPE_POLL_TICK) => {
+                    // A silent tick is only suspicious once the child
+                    // is reaped; a live-but-thinking backend is normal.
+                    // The child lock is held for one non-blocking
+                    // try_wait, never across a read.
+                    if child_exited_at.is_none() {
+                        let mut child = me.child.lock().await;
+                        if matches!(child.try_wait(), Ok(Some(_))) {
+                            child_exited_at = Some(std::time::Instant::now());
+                        }
+                    } else if child_exited_at.is_some_and(|at| at.elapsed() >= POST_EXIT_DRAIN) {
+                        tracing::warn!(
+                            "backend pipe silent after child exit — a grandchild holds it open; aborting the reader"
+                        );
+                        break;
+                    }
+                }
             }
-            Ok((false, _)) => break, // EOF
-            Err(e) => {
-                tracing::debug!(error = %e, "backend stdout read failed");
+        } else {
+            let r = capped_line_resume(&mut reader, &mut buf, MAX_LINE_BYTES).await;
+            if !handle_line(r, &buf, &me) {
                 break;
             }
+            buf.clear();
         }
     }
     me.closed.store(true, Ordering::SeqCst);
@@ -280,6 +402,28 @@ async fn read_loop(stdout: tokio::process::ChildStdout, me: Arc<NdjsonTransport>
     let _ = me.exited.send(true);
 }
 
+/// Handle one completed read result. Returns false when the reader
+/// must stop (EOF or a hard read error).
+fn handle_line(res: std::io::Result<(bool, bool)>, buf: &[u8], me: &NdjsonTransport) -> bool {
+    match res {
+        Ok((true, over_cap)) => {
+            if over_cap {
+                tracing::warn!(bytes = buf.len(), "dropping oversized backend frame");
+            } else if let Ok(msg) = serde_json::from_slice::<Value>(buf) {
+                // Broadcast is best-effort: no subscribers is not an error.
+                let _ = me.frames.send(msg);
+            }
+            // Stray non-JSON stdout noise — tolerated, not fatal.
+            true
+        }
+        Ok((false, _)) => false, // EOF
+        Err(e) => {
+            tracing::debug!(error = %e, "backend stdout read failed");
+            false
+        }
+    }
+}
+
 /// Read one `\n`-terminated line into `buf` (newline stripped), never
 /// holding more than `cap` bytes. Returns `(true, over_cap)` with the
 /// line in `buf`, `(false, _)` at EOF. A line longer than `cap` is
@@ -289,8 +433,23 @@ async fn read_capped_line(
     buf: &mut Vec<u8>,
     cap: usize,
 ) -> std::io::Result<(bool, bool)> {
-    use tokio::io::AsyncBufReadExt;
     buf.clear();
+    capped_line_resume(reader, buf, cap).await
+}
+
+/// The assembling loop of [`read_capped_line`] without the clear, so a
+/// cancelled read can be resumed into the same `buf`. Cancellation is
+/// safe at every await: `consume()` and `buf` only ever advance
+/// together, so a dropped future leaves `buf` holding exactly the
+/// bytes already taken off the pipe — and an over-cap prefix makes
+/// `buf.len() == cap`, which keeps the truncation flag consistent on
+/// resume (any further chunk sets over_cap again).
+async fn capped_line_resume(
+    reader: &mut BufReader<impl tokio::io::AsyncRead + Unpin>,
+    buf: &mut Vec<u8>,
+    cap: usize,
+) -> std::io::Result<(bool, bool)> {
+    use tokio::io::AsyncBufReadExt;
     let mut over_cap = false;
     loop {
         let available = reader.fill_buf().await?;
@@ -475,6 +634,52 @@ mod tests {
             );
             tokio::time::sleep(std::time::Duration::from_millis(50)).await;
         }
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Regression: when the direct child exits but a spawned grandchild
+    /// keeps the stdout write end open, EOF never arrives — the reader
+    /// must abort itself within the post-exit drain window instead of
+    /// hanging for the grandchild's lifetime (upstream desktop-cc-gui's
+    /// POST_EXIT_DRAIN fix). Before the fix this read loop (and every
+    /// pump selecting on `exited`) wedged until `sleep` released the
+    /// pipe, and the idle sweep never reaped the busy session.
+    #[tokio::test]
+    async fn read_loop_aborts_when_grandchild_holds_the_pipe() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = std::env::temp_dir().join(format!("damon-drain-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        // The wrapper exits immediately; the background subshell
+        // inherits stdout and holds it open for a minute.
+        let script = dir.join("exit-fast.sh");
+        std::fs::write(&script, "#!/bin/sh\n(sleep 60) &\nexit 0\n").unwrap();
+        let mut perms = std::fs::metadata(&script).unwrap().permissions();
+        perms.set_mode(0o755);
+        std::fs::set_permissions(&script, perms).unwrap();
+
+        let cwd = std::env::temp_dir();
+        let t = NdjsonTransport::spawn(
+            "sh",
+            &[script.to_string_lossy().into_owned()],
+            &Default::default(),
+            &cwd,
+        )
+        .await
+        .unwrap();
+
+        // 10s bound: the watchdog fires within ~2 ticks (~400ms); a
+        // wedged reader would only wake when `sleep 60` ends.
+        let mut exited = t.exited();
+        tokio::time::timeout(std::time::Duration::from_secs(10), exited.changed())
+            .await
+            .expect("reader never aborted — grandchild held the pipe")
+            .unwrap();
+        assert!(*exited.borrow());
+        assert!(!t.is_alive());
+
+        // Reap the sleeping grandchild via the process-group kill.
+        t.shutdown().await;
         let _ = std::fs::remove_dir_all(&dir);
     }
 }

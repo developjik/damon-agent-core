@@ -188,8 +188,11 @@ pub struct AppState {
     auth_token_cache: tokio::sync::Mutex<AuthTokenCache>,
     /// Prometheus counters exported on GET /metrics.
     pub metrics: Metrics,
-    /// One-shot WS auth tickets → issue time. Consumed by /ws?ticket=.
-    pub ws_tickets: tokio::sync::Mutex<HashMap<String, Instant>>,
+    /// One-shot WS auth tickets → issue record. A ticket minted for a
+    /// web device carries the device id, so the /ws upgrade knows
+    /// which device's socket it carries — `device.revoke` cuts those
+    /// live sockets and purges the device's unspent tickets.
+    pub ws_tickets: tokio::sync::Mutex<HashMap<String, WsTicket>>,
     /// Per-source-IP token buckets for token-gated routes on non-loopback
     /// binds.
     rate_buckets: tokio::sync::Mutex<HashMap<IpAddr, (f64, Instant)>>,
@@ -222,6 +225,72 @@ pub struct AppState {
     /// human-respond command inbox. Persisted state lives in the store;
     /// this holds only what a LIVE scheduler needs.
     pub missions: crate::mission::MissionRegistry,
+    /// Live WS connections authenticated as a web device: device id →
+    /// per-connection kill handles. `device.revoke` drains a device's
+    /// entries and fires every handle; each connection removes its own
+    /// entry when it ends. Master-auth connections carry no device id
+    /// and are never registered here.
+    pub device_conns: DeviceConns,
+}
+
+/// One minted WS ticket: when it was issued (single-use, TTL-bounded)
+/// and which web device it was minted for (None = master auth).
+#[derive(Debug, Clone)]
+pub struct WsTicket {
+    pub issued: Instant,
+    pub device: Option<String>,
+}
+
+/// Registry of per-device live-socket kill handles — see
+/// `AppState::device_conns`.
+#[derive(Default)]
+pub struct DeviceConns {
+    inner: parking_lot::Mutex<HashMap<String, HashMap<u64, tokio::sync::oneshot::Sender<()>>>>,
+    next: std::sync::atomic::AtomicU64,
+}
+
+impl DeviceConns {
+    /// Register a device connection; the returned receiver resolves
+    /// when the device is revoked (drop it to be never-signaled).
+    pub fn register(&self, device: &str) -> (u64, tokio::sync::oneshot::Receiver<()>) {
+        let (tx, rx) = tokio::sync::oneshot::channel();
+        let id = self.next.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        self.inner
+            .lock()
+            .entry(device.to_string())
+            .or_default()
+            .insert(id, tx);
+        (id, rx)
+    }
+
+    /// Remove one connection's registration (its socket ended on its
+    /// own). Stale entries under a live device are impossible: revoke
+    /// drains the whole device.
+    pub fn unregister(&self, device: &str, id: u64) {
+        let mut g = self.inner.lock();
+        if let Some(m) = g.get_mut(device) {
+            m.remove(&id);
+            if m.is_empty() {
+                g.remove(device);
+            }
+        }
+    }
+
+    /// Revoke-time: fire every kill handle for the device. Returns how
+    /// many live sockets were signaled. Sends to dead receivers are
+    /// ignored — their connections unregister themselves.
+    pub fn cut(&self, device: &str) -> usize {
+        let mut g = self.inner.lock();
+        g.remove(device)
+            .map(|m| {
+                let n = m.len();
+                for (_, tx) in m {
+                    let _ = tx.send(());
+                }
+                n
+            })
+            .unwrap_or(0)
+    }
 }
 
 impl AppState {
@@ -260,6 +329,7 @@ impl AppState {
             remote_ws: std::sync::atomic::AtomicUsize::new(0),
             history_scan: parking_lot::Mutex::new(None),
             missions: crate::mission::MissionRegistry::new(),
+            device_conns: DeviceConns::default(),
         });
         // Crash-honest mission convergence: runs with unfinished work
         // and no end timestamp are orphans of a dead daemon — mark them
@@ -463,21 +533,24 @@ impl AppState {
 
     /// WS upgrade auth: bearer header or a single-use ?ticket=. Mirrors
     /// require_token's fail-closed rules for non-loopback binds.
+    /// Returns the authenticated identity — which web device the
+    /// connection carries, when it rode a device ticket — or None when
+    /// the upgrade must be refused.
     pub async fn check_auth(
         &self,
         headers: &axum::http::HeaderMap,
         ticket: Option<&str>,
         _peer: IpAddr,
-    ) -> bool {
+    ) -> Option<WsAuth> {
         let expected = match self.auth_token().await {
             Some(Ok(t)) => Some(t),
             // Configured but unresolvable: fail closed.
-            Some(Err(_)) => return false,
-            None if !self.bind.ip().is_loopback() => return false,
+            Some(Err(_)) => return None,
+            None if !self.bind.ip().is_loopback() => return None,
             None => None,
         };
         let Some(expected) = expected else {
-            return true; // loopback + no token configured
+            return Some(WsAuth { device: None }); // loopback + no token configured
         };
         if let Some(t) = headers
             .get("authorization")
@@ -485,18 +558,29 @@ impl AppState {
             .and_then(|v| v.strip_prefix("Bearer "))
             && crate::config::constant_time_eq(t.as_bytes(), expected.as_bytes())
         {
-            return true;
+            return Some(WsAuth { device: None });
         }
         // Single-use ticket: consume on attempt, valid or not — a
         // replayed ticket must never authenticate twice.
         if let Some(t) = ticket {
             let mut tickets = self.ws_tickets.lock().await;
-            if let Some(issued) = tickets.remove(t) {
-                return issued.elapsed() < WS_TICKET_TTL;
+            if let Some(record) = tickets.remove(t)
+                && record.issued.elapsed() < WS_TICKET_TTL
+            {
+                return Some(WsAuth {
+                    device: record.device,
+                });
             }
         }
-        false
+        None
     }
+}
+
+/// The authenticated /ws identity: the web device the connection
+/// belongs to (None = master auth or open loopback).
+#[derive(Debug, Clone)]
+pub struct WsAuth {
+    pub device: Option<String>,
 }
 
 pub fn router(state: Arc<AppState>) -> Router {
@@ -625,7 +709,7 @@ async fn ws_ticket(
         None => state.bind.ip().is_loopback(),
     };
     if master_ok {
-        return issue_ticket(&state).await;
+        return issue_ticket(&state, None).await;
     }
     if let Some(token) = body
         .and_then(|Json(b)| b.device_token)
@@ -636,20 +720,30 @@ async fn ws_ticket(
         if state.store.device_token_ok(&hash).await.unwrap_or(false) {
             // Throttled last-seen — the store bounds the writes.
             let _ = state.store.touch_device(&hash).await;
-            return issue_ticket(&state).await;
+            // Stamp the device id onto the ticket: the /ws upgrade
+            // needs it to register the socket for revocation cutoff.
+            let device = state.store.device_id_by_hash(&hash).await.ok().flatten();
+            return issue_ticket(&state, device).await;
         }
     }
     StatusCode::UNAUTHORIZED.into_response()
 }
 
-/// Mint one single-use ticket (sweep-on-insert as before).
-async fn issue_ticket(state: &Arc<AppState>) -> Response {
+/// Mint one single-use ticket (sweep-on-insert as before), stamped
+/// with the device it was minted for (None = master auth).
+async fn issue_ticket(state: &Arc<AppState>, device: Option<String>) -> Response {
     let ticket = uuid::Uuid::new_v4().to_string();
     let mut tickets = state.ws_tickets.lock().await;
     // Sweep expired entries on insert — a ticket abandoned without a
     // /ws upgrade would otherwise linger for the daemon's lifetime.
-    tickets.retain(|_, issued| issued.elapsed() < WS_TICKET_TTL);
-    tickets.insert(ticket.clone(), Instant::now());
+    tickets.retain(|_, t| t.issued.elapsed() < WS_TICKET_TTL);
+    tickets.insert(
+        ticket.clone(),
+        WsTicket {
+            issued: Instant::now(),
+            device,
+        },
+    );
     Json(json!({ "ticket": ticket })).into_response()
 }
 

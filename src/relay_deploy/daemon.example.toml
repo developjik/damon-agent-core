@@ -1,0 +1,12 @@
+# Daemon-side snippet — add to the config of every damond that should
+# be reachable through your relay, then set DAMON_RELAY_SECRET (the
+# relay's registration secret) in the daemon's environment.
+
+[relay]
+# Where your relay listens. wss:// works when TLS sits in front.
+url = "ws://your-server:8080"
+# The name this daemon answers to on the relay (letters, digits, . _ -).
+name = "my-daemon"
+# Never the raw secret inline — env:, keychain:, or !cmd references
+# only, re-resolved on the daemon side.
+secret = "env:DAMON_RELAY_SECRET"

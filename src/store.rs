@@ -457,6 +457,26 @@ pub struct MissionTaskTransition {
     pub stamp_ended: bool,
 }
 
+/// One memory-ledger row (wire shape). The memory tables are
+/// deliberately OUTSIDE the FTS5 index — conversation search must
+/// never surface memory contents.
+#[derive(Debug, Clone, serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct MemoryEntry {
+    pub id: i64,
+    /// `user` | `bot`.
+    pub scope: String,
+    /// Bot ledger name; empty for the user ledger.
+    pub owner: String,
+    pub content: String,
+    /// `manual` (…) — provenance of the write.
+    pub source: String,
+    /// `active` | `pending`.
+    pub status: String,
+    pub created_at: String,
+    pub updated_at: String,
+}
+
 impl Store {
     pub async fn open(path: &Path) -> anyhow::Result<Self> {
         if let Some(parent) = path.parent() {
@@ -598,7 +618,22 @@ impl Store {
                  CREATE INDEX IF NOT EXISTS idx_plan_reviews_session
                      ON plan_reviews(session_id, plan_id, revision);
                  CREATE INDEX IF NOT EXISTS idx_plan_reviews_request
-                     ON plan_reviews(request_id);",
+                     ON plan_reviews(request_id);
+                 -- Memory ledgers (user_version 10): one global `user`
+                 -- row set plus per-`bot` ledgers, injected into turns
+                 -- as a delimited data block. NO FTS wiring on purpose.
+                 CREATE TABLE IF NOT EXISTS memory_entries (
+                     id INTEGER PRIMARY KEY AUTOINCREMENT,
+                     scope TEXT NOT NULL CHECK (scope IN ('user','bot')),
+                     owner TEXT NOT NULL DEFAULT '',
+                     content TEXT NOT NULL,
+                     source TEXT NOT NULL DEFAULT 'manual',
+                     status TEXT NOT NULL DEFAULT 'active',
+                     created_at TEXT NOT NULL DEFAULT (datetime('now')),
+                     updated_at TEXT NOT NULL DEFAULT (datetime('now'))
+                 );
+                 CREATE INDEX IF NOT EXISTS idx_memory_ledger
+                     ON memory_entries(scope, owner, status);",
             )?;
             // Migrate pre-compaction databases. Check column existence
             // first — swallowing every ALTER error would hide real
@@ -640,6 +675,7 @@ impl Store {
                     "project_id",
                     "ALTER TABLE sessions ADD COLUMN project_id TEXT",
                 ),
+                ("persona", "ALTER TABLE sessions ADD COLUMN persona TEXT"),
             ] {
                 if !cols.contains(col)
                     && let Err(e) = c.execute_batch(ddl)
@@ -1028,6 +1064,28 @@ impl Store {
                      PRAGMA user_version = 9;",
                 )?;
             }
+
+            // Memory ledgers (user_version 10, adapted from upstream
+            // desktop-cc-gui): gate-checked persistent facts, one
+            // global `user` ledger plus per-`bot` ledgers. Never in
+            // FTS5 — see the table comment in the initial batch.
+            if v < 10 {
+                c.execute_batch(
+                    "CREATE TABLE IF NOT EXISTS memory_entries (
+                         id INTEGER PRIMARY KEY AUTOINCREMENT,
+                         scope TEXT NOT NULL CHECK (scope IN ('user','bot')),
+                         owner TEXT NOT NULL DEFAULT '',
+                         content TEXT NOT NULL,
+                         source TEXT NOT NULL DEFAULT 'manual',
+                         status TEXT NOT NULL DEFAULT 'active',
+                         created_at TEXT NOT NULL DEFAULT (datetime('now')),
+                         updated_at TEXT NOT NULL DEFAULT (datetime('now'))
+                     );
+                     CREATE INDEX IF NOT EXISTS idx_memory_ledger
+                         ON memory_entries(scope, owner, status);
+                     PRAGMA user_version = 10;",
+                )?;
+            }
             Ok::<(), rusqlite::Error>(()).map_err(tokio_rusqlite::Error::from)
         })
         .await?;
@@ -1054,7 +1112,8 @@ impl Store {
                      tags TEXT NOT NULL DEFAULT '[]',
                      pinned INTEGER NOT NULL DEFAULT 0,
                      archived INTEGER NOT NULL DEFAULT 0,
-                     project_id TEXT
+                     project_id TEXT,
+                     persona TEXT
                  );
                  CREATE TABLE messages (
                      id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -1205,7 +1264,19 @@ impl Store {
                     feedback TEXT,
                     created_at TEXT NOT NULL DEFAULT (datetime('now')),
                     resolved_at TEXT
-                );",
+                );
+                CREATE TABLE memory_entries (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    scope TEXT NOT NULL CHECK (scope IN ('user','bot')),
+                    owner TEXT NOT NULL DEFAULT '',
+                    content TEXT NOT NULL,
+                    source TEXT NOT NULL DEFAULT 'manual',
+                    status TEXT NOT NULL DEFAULT 'active',
+                    created_at TEXT NOT NULL DEFAULT (datetime('now')),
+                    updated_at TEXT NOT NULL DEFAULT (datetime('now'))
+                );
+                CREATE INDEX idx_memory_ledger
+                    ON memory_entries(scope, owner, status);",
             )
             .map_err(tokio_rusqlite::Error::from)
         })
@@ -2462,6 +2533,39 @@ impl Store {
         Ok(())
     }
 
+    /// Bind a session's persona bot id (create-time; None unbinds — a
+    /// deleted bot unbinds rather than poisoning the resume path).
+    pub async fn set_session_persona(&self, id: &str, bot: Option<&str>) -> anyhow::Result<()> {
+        let (sid, b) = (id.to_string(), bot.map(String::from));
+        self.conn
+            .call(move |c| {
+                c.execute(
+                    "UPDATE sessions SET persona = ?2 WHERE id = ?1",
+                    rusqlite::params![sid, b],
+                )?;
+                Ok::<(), tokio_rusqlite::Error>(())
+            })
+            .await?;
+        Ok(())
+    }
+
+    /// The session's persona bot id (None = no persona). Resume
+    /// re-resolves the bot's files from this — a persona edit between
+    /// daemon restarts reaches the resumed session.
+    pub async fn session_persona(&self, id: &str) -> anyhow::Result<Option<String>> {
+        let sid = id.to_string();
+        Ok(self
+            .conn
+            .call(move |c| {
+                c.query_row("SELECT persona FROM sessions WHERE id = ?1", [sid], |r| {
+                    r.get::<_, Option<String>>(0)
+                })
+                .optional()
+            })
+            .await?
+            .flatten())
+    }
+
     /// The session's project scope (None = unbound) — the key that
     /// selects a session's effective granted roots.
     pub async fn session_project(&self, id: &str) -> anyhow::Result<Option<String>> {
@@ -3067,6 +3171,26 @@ impl Store {
             .map_err(Into::into)
     }
 
+    /// The APPROVED device's id for a token hash (None = unknown,
+    /// pending, or revoked). ws_ticket stamps the id onto the minted
+    /// ticket so the /ws upgrade knows which device it carries —
+    /// `device.revoke` needs that to cut the device's live sockets.
+    pub async fn device_id_by_hash(&self, token_hash: &str) -> anyhow::Result<Option<String>> {
+        let token_hash = token_hash.to_string();
+        Ok(self
+            .conn
+            .call(move |c| {
+                c.query_row(
+                    "SELECT id FROM web_devices
+                     WHERE token_hash = ?1 AND status = 'approved'",
+                    rusqlite::params![token_hash],
+                    |r| r.get::<_, String>(0),
+                )
+                .optional()
+            })
+            .await?)
+    }
+
     /// Pair-status poll: the row's status when id AND token hash match,
     /// None otherwise (the handler reads None as "revoked" — a device
     /// that proves nothing gets no state).
@@ -3331,6 +3455,172 @@ impl Store {
                     .optional()
                     .map_err(tokio_rusqlite::Error::from)?;
                 Ok::<_, tokio_rusqlite::Error>(row)
+            })
+            .await
+            .map_err(Into::into)
+    }
+
+    /// Append one memory entry. `status` is `active` or `pending` —
+    /// the gate chain in `crate::memory` decides which; the store only
+    /// records the verdict.
+    pub async fn memory_append(
+        &self,
+        scope: &str,
+        owner: &str,
+        content: &str,
+        source: &str,
+        status: &str,
+    ) -> anyhow::Result<i64> {
+        let (scope, owner, content, source, status) = (
+            scope.to_string(),
+            owner.to_string(),
+            content.to_string(),
+            source.to_string(),
+            status.to_string(),
+        );
+        self.conn
+            .call(move |c| {
+                c.execute(
+                    "INSERT INTO memory_entries (scope, owner, content, source, status)
+                     VALUES (?1, ?2, ?3, ?4, ?5)",
+                    rusqlite::params![scope, owner, content, source, status],
+                )
+                .map_err(tokio_rusqlite::Error::from)?;
+                Ok::<i64, tokio_rusqlite::Error>(c.last_insert_rowid())
+            })
+            .await
+            .map_err(Into::into)
+    }
+
+    /// One ledger's entries, id-ordered. `include_pending` adds the
+    /// parked writes; the default view (and injection) is active-only.
+    pub async fn memory_entries(
+        &self,
+        scope: &str,
+        owner: &str,
+        include_pending: bool,
+    ) -> anyhow::Result<Vec<MemoryEntry>> {
+        let (scope, owner) = (scope.to_string(), owner.to_string());
+        self.conn
+            .call(move |c| {
+                // The only interpolation is a static branch constant —
+                // user input stays behind ? bindings.
+                let sql = format!(
+                    "SELECT id, scope, owner, content, source, status, created_at, updated_at
+                     FROM memory_entries WHERE scope = ?1 AND owner = ?2{} ORDER BY id",
+                    if include_pending {
+                        ""
+                    } else {
+                        " AND status = 'active'"
+                    }
+                );
+                let mut stmt = c.prepare(&sql).map_err(tokio_rusqlite::Error::from)?;
+                let rows = stmt
+                    .query_map(rusqlite::params![scope, owner], |r| {
+                        Ok(MemoryEntry {
+                            id: r.get(0)?,
+                            scope: r.get(1)?,
+                            owner: r.get(2)?,
+                            content: r.get(3)?,
+                            source: r.get(4)?,
+                            status: r.get(5)?,
+                            created_at: r.get(6)?,
+                            updated_at: r.get(7)?,
+                        })
+                    })
+                    .map_err(tokio_rusqlite::Error::from)?
+                    .collect::<Result<Vec<_>, _>>()
+                    .map_err(tokio_rusqlite::Error::from)?;
+                Ok::<_, tokio_rusqlite::Error>(rows)
+            })
+            .await
+            .map_err(Into::into)
+    }
+
+    /// The ledger's live size in characters — ACTIVE entries only
+    /// (pending writes own no capacity until approved). LENGTH() on
+    /// TEXT counts characters, matching the gate's char math.
+    pub async fn memory_ledger_chars(&self, scope: &str, owner: &str) -> anyhow::Result<i64> {
+        let (scope, owner) = (scope.to_string(), owner.to_string());
+        self.conn
+            .call(move |c| {
+                let chars: i64 = c
+                    .query_row(
+                        "SELECT COALESCE(SUM(LENGTH(content)), 0) FROM memory_entries
+                         WHERE scope = ?1 AND owner = ?2 AND status = 'active'",
+                        rusqlite::params![scope, owner],
+                        |r| r.get(0),
+                    )
+                    .map_err(tokio_rusqlite::Error::from)?;
+                Ok::<_, tokio_rusqlite::Error>(chars)
+            })
+            .await
+            .map_err(Into::into)
+    }
+
+    /// Every pending write across all ledgers, oldest first.
+    pub async fn memory_pending(&self) -> anyhow::Result<Vec<MemoryEntry>> {
+        self.conn
+            .call(move |c| {
+                let mut stmt = c
+                    .prepare(
+                        "SELECT id, scope, owner, content, source, status, created_at, updated_at
+                         FROM memory_entries WHERE status = 'pending' ORDER BY id",
+                    )
+                    .map_err(tokio_rusqlite::Error::from)?;
+                let rows = stmt
+                    .query_map([], |r| {
+                        Ok(MemoryEntry {
+                            id: r.get(0)?,
+                            scope: r.get(1)?,
+                            owner: r.get(2)?,
+                            content: r.get(3)?,
+                            source: r.get(4)?,
+                            status: r.get(5)?,
+                            created_at: r.get(6)?,
+                            updated_at: r.get(7)?,
+                        })
+                    })
+                    .map_err(tokio_rusqlite::Error::from)?
+                    .collect::<Result<Vec<_>, _>>()
+                    .map_err(tokio_rusqlite::Error::from)?;
+                Ok::<_, tokio_rusqlite::Error>(rows)
+            })
+            .await
+            .map_err(Into::into)
+    }
+
+    /// Delete one entry (any status). Returns false when the id is
+    /// unknown.
+    pub async fn memory_remove(&self, id: i64) -> anyhow::Result<bool> {
+        self.conn
+            .call(move |c| {
+                let n = c
+                    .execute(
+                        "DELETE FROM memory_entries WHERE id = ?1",
+                        rusqlite::params![id],
+                    )
+                    .map_err(tokio_rusqlite::Error::from)?;
+                Ok::<_, tokio_rusqlite::Error>(n > 0)
+            })
+            .await
+            .map_err(Into::into)
+    }
+
+    /// Promote a pending write to active. Returns false when the id is
+    /// unknown or already active — approving is a one-shot CAS.
+    pub async fn memory_activate(&self, id: i64) -> anyhow::Result<bool> {
+        self.conn
+            .call(move |c| {
+                let n = c
+                    .execute(
+                        "UPDATE memory_entries
+                         SET status = 'active', updated_at = datetime('now')
+                         WHERE id = ?1 AND status = 'pending'",
+                        rusqlite::params![id],
+                    )
+                    .map_err(tokio_rusqlite::Error::from)?;
+                Ok::<_, tokio_rusqlite::Error>(n > 0)
             })
             .await
             .map_err(Into::into)

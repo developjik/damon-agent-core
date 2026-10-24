@@ -225,6 +225,10 @@ struct ChatPrefs {
     /// Working directory for the conversation's NEXT session (None =
     /// the bridge process's cwd). Fixed per session at create time.
     cwd: Option<std::path::PathBuf>,
+    /// Persona bot id for the conversation's NEXT session (None = the
+    /// bridge's default bot, if any). Fixed per session at create
+    /// time — `!bot` resets the session mapping, same as `!agent`.
+    bot: Option<String>,
 }
 
 /// One prompt waiting behind a running turn, fully owned — the drain
@@ -273,6 +277,9 @@ pub struct Bridge {
     /// events() is single-consumer — a second router would get a dead
     /// receiver and exit silently, hanging every turn. Spawn at most one.
     router_started: std::sync::atomic::AtomicBool,
+    /// Bridge-wide persona default (channel binary `--bot <id>`);
+    /// per-chat `!bot` overrides it. Consulted only at session create.
+    default_bot: parking_lot::RwLock<Option<String>>,
 }
 
 impl Bridge {
@@ -291,7 +298,15 @@ impl Bridge {
                 watched_asks: HashMap::new(),
             }),
             router_started: std::sync::atomic::AtomicBool::new(false),
+            default_bot: parking_lot::RwLock::new(None),
         })
+    }
+
+    /// Set the bridge-wide persona default (channel binary `--bot`).
+    /// Chats without their own `!bot` pref bind this bot at session
+    /// create time.
+    pub fn set_default_bot(&self, bot: Option<String>) {
+        *self.default_bot.write() = bot;
     }
 }
 
@@ -344,6 +359,7 @@ impl Bridge {
         json!({
             "backend": p.backend,
             "cwd": p.cwd.as_ref().map(|c| c.to_string_lossy()),
+            "bot": p.bot,
         })
         .to_string()
     }
@@ -353,6 +369,7 @@ impl Bridge {
         ChatPrefs {
             backend: v["backend"].as_str().map(String::from),
             cwd: v["cwd"].as_str().map(std::path::PathBuf::from),
+            bot: v["bot"].as_str().map(String::from),
         }
     }
 
@@ -1121,6 +1138,95 @@ impl Bridge {
                     }
                 }
             },
+            // Persona picker: the bot's SOUL/AGENTS files ride in front
+            // of every turn of the conversation's NEXT session. Fixed
+            // per session at create time — setting it resets the
+            // session mapping, same reset semantics as !agent.
+            "bot" => match self.client.request("bot.list", json!({})).await {
+                Err(e) => Some(format!("error: {e:#}")),
+                Ok(v) => {
+                    let bots: Vec<(String, String)> = v["bots"]
+                        .as_array()
+                        .map(|a| {
+                            a.iter()
+                                .filter_map(|b| {
+                                    Some((
+                                        b["id"].as_str()?.to_string(),
+                                        b["name"].as_str().unwrap_or("?").to_string(),
+                                    ))
+                                })
+                                .collect()
+                        })
+                        .unwrap_or_default();
+                    if arg.is_empty() {
+                        let pref = self
+                            .chat_prefs
+                            .lock()
+                            .await
+                            .get(conv_id)
+                            .cloned()
+                            .unwrap_or_default();
+                        let eff = pref
+                            .bot
+                            .or_else(|| self.default_bot.read().clone())
+                            .unwrap_or_else(|| "(none)".to_string());
+                        let list = if bots.is_empty() {
+                            "(no bots — bot.save one, or create files under the bots dir)".into()
+                        } else {
+                            bots.iter()
+                                .map(|(id, name)| format!("{id} ({name})"))
+                                .collect::<Vec<_>>()
+                                .join(", ")
+                        };
+                        Some(format!(
+                            "bots: {list}\neffective: {eff}\n!bot <id> to bind, !bot off to clear"
+                        ))
+                    } else if arg == "off" {
+                        let prefs = {
+                            let mut map = self.chat_prefs.lock().await;
+                            let e = map.entry(conv_id.to_string()).or_default();
+                            e.bot = None;
+                            e.clone()
+                        };
+                        self.state_set(conv_id, "prefs", &Self::prefs_json(&prefs))
+                            .await;
+                        self.state_del(conv_id, "session").await;
+                        self.chat_sessions.lock().await.remove(conv_id);
+                        Some("bot pref cleared — the next message starts a fresh session with the bridge default (if any)".to_string())
+                    } else {
+                        match bots.iter().find(|(id, _)| id == arg) {
+                            None => {
+                                let ids: Vec<&str> =
+                                    bots.iter().map(|(id, _)| id.as_str()).collect();
+                                Some(format!(
+                                    "unknown bot '{arg}' — available: {}",
+                                    if ids.is_empty() {
+                                        "(none)".into()
+                                    } else {
+                                        ids.join(", ")
+                                    }
+                                ))
+                            }
+                            Some((id, name)) => {
+                                let prefs = {
+                                    let mut map = self.chat_prefs.lock().await;
+                                    let e = map.entry(conv_id.to_string()).or_default();
+                                    e.bot = Some(id.clone());
+                                    e.clone()
+                                };
+                                self.state_set(conv_id, "prefs", &Self::prefs_json(&prefs))
+                                    .await;
+                                self.state_del(conv_id, "session").await;
+                                self.chat_sessions.lock().await.remove(conv_id);
+                                Some(format!(
+                                    "bot set to {id} ({name}) — the next message starts a \
+                                     fresh session with that persona"
+                                ))
+                            }
+                        }
+                    }
+                }
+            },
             "usage" => {
                 let sid = self
                     .chat_sessions
@@ -1380,6 +1486,7 @@ impl Bridge {
             }
             "help" => Some(
                 "commands: !new (reset session) · !agent [name] (show/set backend) · \
+                 !bot [name] (show/set persona) · \
                  !cwd [path] (show/set working dir) · !fork (branch session) · \
                  !delete (remove session) · !cancel (stop the running turn and \
                  clear its queue) · !usage (token totals) · \
@@ -1455,9 +1562,17 @@ impl Bridge {
             .cwd
             .clone()
             .unwrap_or_else(|| std::env::current_dir().unwrap_or_else(|_| ".".into()));
+        // Persona: the chat's own !bot pref, else the bridge's --bot
+        // default. Fixed per session at create time, like backend/cwd.
+        let bot = pref.bot.clone().or_else(|| self.default_bot.read().clone());
         let sid = self
             .client
-            .create_session(pref.backend.as_deref(), &cwd.to_string_lossy(), None)
+            .create_session(
+                pref.backend.as_deref(),
+                &cwd.to_string_lossy(),
+                None,
+                bot.as_deref(),
+            )
             .await?;
         self.state_set(chat_id, "session", &sid).await;
         let mut map = self.chat_sessions.lock().await;

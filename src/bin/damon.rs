@@ -503,7 +503,7 @@ async fn main() -> anyhow::Result<()> {
                 Some(s) => resume_and_replay(&client, &s).await?,
                 None => {
                     client
-                        .create_session(backend.as_deref(), &cwd(), None)
+                        .create_session(backend.as_deref(), &cwd(), None, None)
                         .await?
                 }
             };
@@ -591,7 +591,7 @@ async fn main() -> anyhow::Result<()> {
                 Some(s) => client.resume_session(&s).await?,
                 None => {
                     client
-                        .create_session(backend.as_deref(), &cwd(), None)
+                        .create_session(backend.as_deref(), &cwd(), None, None)
                         .await?
                 }
             };
