@@ -1,0 +1,452 @@
+<!DOCTYPE html>
+<html lang="ko">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Damon 기능 안내서</title>
+<style>
+  :root {
+    --text: #1f2328;
+    --muted: #59636e;
+    --border: #d7dce2;
+    --accent: #1b4fd8;
+    --accent-soft: #f4f7ff;
+    --soft: #f6f8fa;
+  }
+  * { box-sizing: border-box; }
+  html { scroll-behavior: smooth; }
+  body {
+    margin: 0; color: var(--text); background: #fff;
+    font-family: "Apple SD Gothic Neo", "Pretendard", "Noto Sans KR", "Malgun Gothic", -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+    line-height: 1.8; font-size: 16px;
+    word-break: keep-all; overflow-wrap: break-word;
+    -webkit-font-smoothing: antialiased;
+  }
+  .wrap { max-width: 860px; margin: 0 auto; padding: 0 24px 72px; }
+  a { color: var(--accent); text-decoration: none; }
+  a:hover { text-decoration: underline; }
+
+  header.doc { padding: 52px 0 20px; border-bottom: 2px solid var(--text); }
+  h1 { font-size: 31px; margin: 0 0 8px; letter-spacing: -0.02em; line-height: 1.3; }
+  .sub { color: var(--muted); font-size: 16px; margin: 0 0 14px; }
+  .meta { font-size: 13px; color: var(--muted); }
+  .meta a { color: var(--muted); text-decoration: underline; text-underline-offset: 3px; }
+
+  nav.toc {
+    padding: 14px 0 16px; border-bottom: 1px solid var(--border);
+    font-size: 13.5px; line-height: 2.1; color: var(--muted);
+  }
+  nav.toc a { color: var(--text); margin-right: 1px; }
+  nav.toc .sep { color: #b6bdc6; margin: 0 6px; }
+
+  section { margin: 46px 0; }
+  h2 { font-size: 21.5px; margin: 0 0 12px; letter-spacing: -0.01em; line-height: 1.45; }
+  h2 .no { color: var(--muted); font-weight: 600; margin-right: 10px; }
+  h3 { font-size: 16px; margin: 26px 0 6px; }
+  p { margin: 10px 0; }
+  ul, ol { padding-left: 22px; margin: 10px 0; }
+  li { margin: 5px 0; }
+  li::marker { color: #8b949e; }
+
+  code {
+    font-family: "SF Mono", ui-monospace, Menlo, Consolas, monospace;
+    background: #f0f2f5; border-radius: 4px; padding: 1px 6px; font-size: 13px; color: #24292f;
+  }
+
+  /* figures */
+  .fig { border: 1px solid var(--border); border-radius: 8px; padding: 22px 18px 14px; margin: 16px 0; }
+  .figcap { text-align: center; color: var(--muted); font-size: 12.5px; margin-top: 14px; }
+
+  .row { display: flex; gap: 8px; align-items: stretch; justify-content: center; }
+  .col { display: flex; flex-direction: column; gap: 8px; flex: 1; }
+  .box {
+    border: 1px solid #c6cdd5; border-radius: 6px; padding: 9px 12px;
+    text-align: center; background: #fff; flex: 1;
+    display: flex; flex-direction: column; justify-content: center; line-height: 1.5;
+  }
+  .box b { font-size: 14px; font-weight: 600; }
+  .box small { display: block; color: var(--muted); font-size: 12px; margin-top: 2px; line-height: 1.5; }
+  .box.mini { padding: 6px 8px; font-size: 13px; }
+  .box.key { border-color: var(--accent); background: var(--accent-soft); }
+  .ar { align-self: center; color: #9aa4af; padding: 0 2px; flex: none; font-size: 15px; }
+  .ardn { text-align: center; color: #9aa4af; margin: 7px 0; font-size: 14px; }
+
+  .seq { list-style: none; counter-reset: s; padding-left: 0; max-width: 640px; margin: 16px auto; }
+  .seq li { counter-increment: s; position: relative; padding: 7px 0 7px 40px; border-bottom: 1px dashed #e8ecef; }
+  .seq li:last-child { border-bottom: none; }
+  .seq li::before {
+    content: counter(s); position: absolute; left: 12px; top: 9px;
+    color: var(--muted); font-weight: 600; font-size: 13px;
+    width: 20px; text-align: right;
+  }
+  .seq b { font-weight: 700; }
+
+  .note {
+    border-left: 3px solid var(--accent); background: var(--soft);
+    padding: 10px 16px; margin: 16px 0; font-size: 14.5px; color: #333c47;
+  }
+  .note.warn { border-left-color: #9a6700; background: #fdf6e3; color: #57470f; }
+
+  table { width: 100%; border-collapse: collapse; font-size: 14.5px; margin: 14px 0; }
+  th {
+    text-align: left; font-weight: 600; font-size: 13px; color: var(--text);
+    border-bottom: 1.5px solid var(--text); padding: 8px 10px; white-space: nowrap;
+  }
+  td { border-bottom: 1px solid var(--border); padding: 9px 10px; vertical-align: top; }
+  .twrap { overflow-x: auto; }
+
+  footer {
+    margin-top: 64px; padding: 20px 0 0; border-top: 1px solid var(--border);
+    color: var(--muted); font-size: 13px;
+  }
+
+  @media (max-width: 720px) {
+    .row { flex-direction: column; }
+    .ar { transform: rotate(90deg); }
+    header.doc { padding-top: 36px; }
+    h1 { font-size: 26px; }
+  }
+</style>
+</head>
+<body>
+<div class="wrap">
+
+<header class="doc">
+  <h1>Damon 기능 안내서</h1>
+  <p class="sub">AI 코딩 도우미를 한 자리에 모아 관리하는 로컬 프로그램의 기능을 소개합니다.</p>
+  <p class="meta">이 문서는 비개발자도 읽을 수 있도록 쉬운 말로 썼습니다. 같은 내용이 저장소의 <a href="features.ko.md">docs/features.ko.md</a>에도 있습니다.</p>
+</header>
+
+<nav class="toc">
+  <a href="#what">Damon이란?</a><span class="sep">·</span>
+  <a href="#structure">전체 구조</a><span class="sep">·</span>
+  <a href="#f1">1 통합 구동</a><span class="sep">·</span>
+  <a href="#f2">2 접속 창</a><span class="sep">·</span>
+  <a href="#f3">3 허가 승인</a><span class="sep">·</span>
+  <a href="#f4">4 기록과 검색</a><span class="sep">·</span>
+  <a href="#f5">5 대화 관리</a><span class="sep">·</span>
+  <a href="#f6">6 워크트리</a><span class="sep">·</span>
+  <a href="#f7">7 스킬 허브</a><span class="sep">·</span>
+  <a href="#f8">8 원격 접속</a><span class="sep">·</span>
+  <a href="#f9">9 안전장치</a><span class="sep">·</span>
+  <a href="#f10">10 상시 운영</a><span class="sep">·</span>
+  <a href="#f11">11 개발자용 API</a><span class="sep">·</span>
+  <a href="#summary">총정리</a>
+</nav>
+
+<section id="what">
+  <h2>Damon이 무엇인가요?</h2>
+  <p>요즘 AI 코딩 도구는 여럿입니다. Claude Code, Codex, Qwen Code처럼 터미널에서 돌아가는 도구들이 각자 따로 설치되어 있고, 대화도 따로 관리됩니다. Damon은 이런 도구들을 한데 묶어 주는 관제 프로그램입니다.</p>
+  <ul>
+    <li>설치·로그인되어 있는 도구를 알아서 찾아 연결합니다. Damon 쪽에서 추가로 입력할 것은 없습니다.</li>
+    <li>웹 브라우저, 텔레그램, 디스코드, 슬랙, 터미널 어디서 접속해도 같은 대화를 이어갈 수 있습니다.</li>
+    <li>지나간 모든 대화가 기록되고, 나중에 검색으로 다시 찾을 수 있습니다.</li>
+  </ul>
+  <p>이름의 유래: 유닉스에서 뒤에서 조용히 늘 도는 프로그램을 daemon(데몬)이라고 부릅니다. Damon은 그 말장난이면서 실제 모습이기도 합니다. 컴퓨터 안에서 상시 대기하며 사용자와 AI 도구 사이를 이어 줍니다.</p>
+</section>
+
+<section id="structure">
+  <h2>전체 구조</h2>
+  <p>사용자는 아무 창이나 하나 열어 말을 걸면 됩니다. Damon이 알아서 AI 도구에 전달하고 결과를 돌려줍니다.</p>
+  <div class="fig">
+    <div class="row">
+      <div class="col" style="flex:1.1;">
+        <div class="box"><b>웹 UI</b><small>브라우저</small></div>
+        <div class="box"><b>채팅 앱</b><small>텔레그램 · 디스코드 · 슬랙</small></div>
+        <div class="box"><b>터미널 CLI</b></div>
+        <div class="box"><b>직접 만든 앱</b><small>데스크톱 · 자동화 스크립트</small></div>
+      </div>
+      <div class="ar">→</div>
+      <div class="col">
+        <div class="box key"><b>Damon 본체</b><small>내 컴퓨터에서 상시 대기</small></div>
+        <div class="box mini">세션 관리</div>
+        <div class="box mini">허가(권한) 전달</div>
+        <div class="box mini">대화 기록 보관</div>
+        <div class="box mini">암호화 원격 접속</div>
+      </div>
+      <div class="ar">→</div>
+      <div class="col" style="flex:.9;">
+        <div class="box mini">Claude Code</div>
+        <div class="box mini">Codex CLI</div>
+        <div class="box mini">Oh My Pi · Pi</div>
+        <div class="box mini">Qwen Code · Droid</div>
+        <div class="box mini">OpenCode · MiMo</div>
+        <div class="box mini">ZCode</div>
+      </div>
+    </div>
+    <div class="figcap">그림 1. 사용자의 창 — Damon 본체 — AI 도우미. 어느 창으로 접속해도 같은 Damon에 도착합니다.</div>
+  </div>
+  <p>역할 분담이 이 구조의 핵심입니다. 모델 고르기, 도구 쓰기, 로그인 인증, 대화 맥락 관리는 전부 각 AI 도구의 몫입니다. Damon은 사용자가 마주하는 부분 — 대화 창, 기록, 승인, 원격 접속 — 만 책임집니다. 덕분에 Damon 설정에 API 키를 넣을 일이 없습니다.</p>
+</section>
+
+<section id="f1">
+  <h2><span class="no">1.</span>AI 코딩 도우미 9종, 설정 없이 통합 구동</h2>
+  <p>Damon을 켜면 설치되어 있는 CLI를 스스로 찾아 등록합니다. 로그인 상태와 모델, 도구 설정은 그대로 물려받습니다. 지원하는 도구는 Claude Code(Anthropic), Codex CLI(OpenAI), Oh My Pi, Pi, Qwen Code(Alibaba), Droid(Factory), OpenCode, MiMo, ZCode(Z.ai) 아홉 가지입니다.</p>
+  <div class="fig">
+    <div class="row">
+      <div class="box"><b>설치된 AI 도구</b><small>컴퓨터에 이미 있는 CLI</small></div>
+      <div class="ar">→</div>
+      <div class="box"><b>자동 탐지·등록</b><small>Damon 실행 시 스스로 찾음</small></div>
+      <div class="ar">→</div>
+      <div class="box"><b>로그인·모델 상속</b><small>새로 입력할 것 없음</small></div>
+      <div class="ar">→</div>
+      <div class="box key"><b>바로 대화</b></div>
+    </div>
+    <div class="figcap">그림 2. 백엔드 자동 탐지 흐름</div>
+  </div>
+  <ul>
+    <li><code>damond doctor</code> 명령으로 이 컴퓨터에서 연결 가능한 도구가 무엇인지 확인할 수 있습니다.</li>
+    <li>도구가 예고 없이 꺼지면 Damon이 다시 띄웁니다. 재시작 간격은 1초부터 시작해 점점 길어지고, 계속 실패하면 잠시 쉽니다.</li>
+    <li>목록에 오른 도구는 모두 작업 도중에 허가를 물을 수 있는 양방향 통신을 지원하는 것들뿐입니다. 어느 도구를 골라도 같은 방식으로 다룰 수 있습니다.</li>
+  </ul>
+</section>
+
+<section id="f2">
+  <h2><span class="no">2.</span>어디서나 대화 — 접속 창 여섯</h2>
+  <p>Damon 본체 하나에 여러 창이 동시에 붙을 수 있습니다. 사무실에서는 웹으로, 이동 중에는 텔레그램으로 같은 대화를 이어갑니다.</p>
+  <div class="twrap"><table>
+    <tr><th>접속 창</th><th>여는 방법</th><th>특징</th></tr>
+    <tr><td>웹 UI</td><td>브라우저에서 <code>http://127.0.0.1:9470/ui</code></td><td>설치가 필요 없습니다. 답변이 실시간으로 흘러나오고 코드에 색이 입혀집니다.</td></tr>
+    <tr><td>터미널 CLI</td><td><code>damon chat</code></td><td>한 줄 질문은 <code>damon prompt</code>로도 보낼 수 있습니다.</td></tr>
+    <tr><td>텔레그램</td><td><code>damon-telegram</code> 실행</td><td>허가 요청이 버튼으로 도착합니다.</td></tr>
+    <tr><td>디스코드</td><td><code>damon-discord</code> 실행</td><td>채팅방마다 다른 대화가 자동으로 배정됩니다.</td></tr>
+    <tr><td>슬랙</td><td><code>damon-slack</code> 실행</td><td>버튼형 허가 승인을 지원합니다.</td></tr>
+    <tr><td>직접 만든 앱</td><td>Rust · Node.js · Python 라이브러리</td><td>기능 11에서 다룹니다.</td></tr>
+  </table></div>
+  <div class="note">채팅 앱에서는 채팅방마다 대화가 하나씩 배정되고, 채팅방에 올린 파일이 질문에 함께 전달됩니다. 답변은 도착하는 대로 조금씩 흘러나옵니다.</div>
+  <h3>채팅에서 쓰는 명령 (<code>!</code>로 시작)</h3>
+  <div class="twrap"><table>
+    <tr><th>명령</th><th>하는 일</th></tr>
+    <tr><td><code>!new</code> · <code>!fork</code> · <code>!delete</code> · <code>!cancel</code></td><td>새 대화 시작, 대화 복제, 삭제, 진행 중 작업 중단</td></tr>
+    <tr><td><code>!cwd 폴더</code> · <code>!agent 도구</code></td><td>이 채팅이 작업할 폴더와 AI 도구 지정</td></tr>
+    <tr><td><code>!usage</code></td><td>토큰 사용량 확인</td></tr>
+    <tr><td><code>!sessions</code> · <code>!resume 이름</code></td><td>다른 화면에서 시작한 대화 목록 보기, 이 채팅에서 이어하기</td></tr>
+    <tr><td><code>!watch</code> · <code>!unwatch</code></td><td>다른 화면의 대화를 지켜보다가 끝나거나 허가가 필요하면 이 채팅으로 알림 받기</td></tr>
+  </table></div>
+</section>
+
+<section id="f3">
+  <h2><span class="no">3.</span>허가 승인 — AI가 뭘 하기 전에 물어봅니다</h2>
+  <p>AI가 파일을 고치거나 명령을 실행하기 전에 "해도 될까요?"라고 묻는 경우가 있습니다. Damon은 이 질문을 지금 열려 있는 어느 창으로든 전달하고, 답을 다시 AI에게 전합니다.</p>
+  <ol class="seq">
+    <li><b>사용자</b> — "이 버그 좀 고쳐줘"</li>
+    <li><b>Damon</b> — AI 도우미에게 작업을 전달합니다.</li>
+    <li><b>AI 도우미</b> — "test.sh를 실행해도 될까요?" 하고 물어옵니다.</li>
+    <li><b>Damon</b> — 지금 켜 놓은 창(웹, 텔레그램, 슬랙 등)에 승인 버튼을 띄웁니다.</li>
+    <li><b>사용자</b> — 허용, 거절, 이번 대화 전체 허용 중 하나로 답합니다.</li>
+    <li><b>AI 도우미</b> — 답을 받아 작업을 계속하고, 결과는 실시간으로 흘러나옵니다.</li>
+  </ol>
+  <div class="note warn">5분(기본값, 변경 가능) 동안 답이 없으면 자동으로 거절됩니다. 방치해도 안전합니다.</div>
+  <p>텔레그램에서 시작한 작업의 허가 요청에 웹에서 답할 수도 있고, 그 반대도 됩니다. 어느 창이든 같은 방식입니다.</p>
+</section>
+
+<section id="f4">
+  <h2><span class="no">4.</span>모든 대화를 기록하고, 나중에 검색</h2>
+  <p>Damon을 거친 모든 대화는 컴퓨터 안의 기록 보관소(SQLite 데이터베이스)에 저장됩니다.</p>
+  <div class="fig">
+    <div class="row" style="max-width:660px; margin:0 auto;">
+      <div class="box">질문과 답변</div>
+      <div class="box">AI의 생각 · 도구 사용 내역</div>
+      <div class="box">토큰 사용량 · 비용</div>
+    </div>
+    <div class="ardn">↓</div>
+    <div class="box key" style="max-width:420px; margin:0 auto;"><b>대화 기록 보관소</b><small>SQLite + 전문 검색 — 내 컴퓨터 안에</small></div>
+    <div class="ardn">↓</div>
+    <div class="row" style="max-width:720px; margin:0 auto;">
+      <div class="box"><b>검색</b><small>damon search "error timeout"</small></div>
+      <div class="box"><b>내보내기</b><small>Markdown · JSON</small></div>
+      <div class="box"><b>사용량 통계</b><small>damon usage</small></div>
+      <div class="box"><b>백업</b><small>damon backup</small></div>
+    </div>
+    <div class="figcap">그림 3. 기록되는 것과 기록으로 할 수 있는 일</div>
+  </div>
+  <ul>
+    <li>검색은 여러 단어를 한꺼번에 찾거나 <code>"정확한 문구"</code>, OR, NOT 같은 문법도 지원합니다.</li>
+    <li>오래된 대화는 보존 기간(기본 30일, 해제 가능)이 지나면 자동으로 정리됩니다.</li>
+    <li>백업은 프로그램이 돌고 있는 중에도 안전하게 뜰 수 있습니다.</li>
+  </ul>
+</section>
+
+<section id="f5">
+  <h2><span class="no">5.</span>대화(세션) 관리</h2>
+  <p>하나의 대화 덩어리를 세션이라고 부릅니다. Damon은 세션을 문서처럼 다룰 수 있게 해 줍니다.</p>
+  <div class="twrap"><table>
+    <tr><th>기능</th><th>설명</th></tr>
+    <tr><td>이어하기 (resume)</td><td>재부팅 후에도 대화 맥락이 그대로 복원됩니다.</td></tr>
+    <tr><td>포크 (fork)</td><td>지금까지의 기록을 복사해 새 대화로 분기합니다. 원본은 그대로 남습니다.</td></tr>
+    <tr><td>가져오기 (import)</td><td>Damon 없이 AI 도구를 직접 쓰던 때의 옛 대화를 찾아 등록합니다.</td></tr>
+    <tr><td>지켜보기 (watch)</td><td>다른 화면에서 돌고 있는 대화의 종료·허가 요청을 이 채팅으로 알려 줍니다.</td></tr>
+    <tr><td>끊김 없는 작업 (detach)</td><td>폰을 잠그거나 네트워크가 바뀌어도 시켜 둔 작업은 계속 진행됩니다.</td></tr>
+    <tr><td>중간 지시 (steer)</td><td>진행 중인 작업에 "그리고 이것도 확인해 줘"를 덧붙일 수 있습니다.</td></tr>
+    <tr><td>이름 · 고정 · 태그 · 보관</td><td>중요한 대화를 분류해 둡니다.</td></tr>
+    <tr><td>모델 · 모드 전환</td><td>대화 도중에도 AI 모델과 허가 수위(예: 읽기 전용 모드)를 바꿉니다.</td></tr>
+    <tr><td>자동 정리</td><td>잠들어 있는 도구는 30분 뒤 닫힙니다. 대화 기록은 유지됩니다.</td></tr>
+  </table></div>
+</section>
+
+<section id="f6">
+  <h2><span class="no">6.</span>프로젝트와 워크트리 — PR 하나, 에이전트 하나</h2>
+  <p>여러 작업을 동시에 벌일 때 코드 사본이 섞이면 곤란합니다. Damon은 GitHub의 PR(풀 리퀘스트, 코드 병합 요청) 하나당 격리된 작업 공간을 만들어 줍니다.</p>
+  <div class="fig">
+    <div class="row">
+      <div class="box"><b>검증</b><small>깃 저장소인지,<br>허용된 경로인지 확인</small></div>
+      <div class="ar">→</div>
+      <div class="box"><b>내려받기</b><small>PR의 코드를 별도 사본으로 받음<br>(도중 취소 가능)</small></div>
+      <div class="ar">→</div>
+      <div class="box"><b>공간 확보</b><small>메인 폴더는 그대로,<br>옆에 새 폴더 생성</small></div>
+      <div class="ar">→</div>
+      <div class="box"><b>등록</b><small>프로젝트 목록에<br>"PR #123"으로 등록</small></div>
+    </div>
+    <div class="ardn">↓</div>
+    <div class="box key" style="max-width:520px; margin:0 auto;"><b>격리된 코드 사본에서 에이전트 작업</b><small>메인 폴더와 섞이지 않습니다. 단계별 진행이 화면에 실시간으로 표시됩니다.</small></div>
+    <div class="figcap">그림 4. 워크트리 생성 — "PR 123번 코드 검토해 줘" 한 마디로 시작합니다.</div>
+  </div>
+  <ul>
+    <li>PR 번호 <code>123</code>, <code>#123</code>, PR 링크 어느 것이든 이해하고, <code>gh</code> 도구가 설치되어 있으면 PR 제목과 상태까지 미리 보여 줍니다.</li>
+    <li>같은 PR을 다시 요청하면 이미 만든 공간을 그대로 재사용합니다.</li>
+    <li>대화가 붙어 있는 작업 공간은 제거 요청을 거부합니다. 실수로 지워지는 일이 없습니다.</li>
+    <li>프로젝트 기능으로 폴더별 기본 도구·모델·모드를 정해 두면 그 폴더의 새 대화에 자동으로 적용됩니다.</li>
+  </ul>
+</section>
+
+<section id="f7">
+  <h2><span class="no">7.</span>스킬 허브 — 한 번 설치, 모든 도구에 배포</h2>
+  <p>스킬은 AI 도우미에게 더하는 능력입니다(예: PDF 다루기, 엑셀 작성법). 도구마다 스킬을 넣는 폴더가 달라 아홉 번 설치해야 하는 문제를, 중앙 보관함 하나에 설치한 뒤 설치된 도구 전부에 자동 배포하는 방식으로 풀었습니다.</p>
+  <div class="fig">
+    <div class="row" style="max-width:680px; margin:0 auto;">
+      <div class="box"><b>GitHub 저장소</b><small>anthropics/skills 등</small></div>
+      <div class="box"><b>skills.sh</b><small>검색 · 인기 목록</small></div>
+      <div class="box"><b>컴퓨터에 있던 기존 스킬</b></div>
+    </div>
+    <div class="ardn">↓</div>
+    <div class="box key" style="max-width:360px; margin:0 auto;"><b>스킬 허브</b><small>중앙 보관함 — 한 번만 설치</small></div>
+    <div class="ardn">↓ 자동 배포(동기화)</div>
+    <div class="row" style="max-width:680px; margin:0 auto;">
+      <div class="box">Claude Code<br><small>스킬 폴더</small></div>
+      <div class="box">Codex CLI<br><small>스킬 폴더</small></div>
+      <div class="box">Oh My Pi · Pi 등<br><small>설치된 도구 전부</small></div>
+    </div>
+    <div class="figcap">그림 5. 스킬 허브의 동기화. 설치는 <code>damon skills install anthropics/skills document-skills/pdf</code> 한 줄입니다.</div>
+  </div>
+  <ul>
+    <li>제거한 스킬도 5분 안에는 되돌릴 수 있습니다. 업데이트가 생기면 알려 줍니다.</li>
+    <li>프롬프트 라이브러리: 자주 쓰는 지시문을 저장해 두고 대화 입력창에서 꺼내 씁니다. 폴더별 것과 전역용을 지원합니다.</li>
+  </ul>
+  <h3>웹 입력창의 보조 선택기</h3>
+  <div class="twrap"><table>
+    <tr><th>입력</th><th>뜻</th><th>동작</th></tr>
+    <tr><td><code>/</code></td><td>명령 · 스킬</td><td>설치된 AI 도구가 이미 알고 있는 명령과 스킬 목록</td></tr>
+    <tr><td><code>@</code></td><td>파일</td><td>프로젝트 파일을 검색해 대화에 첨부</td></tr>
+    <tr><td><code>!</code></td><td>프롬프트</td><td>저장해 둔 지시문을 꺼내 내용을 채워 넣기</td></tr>
+  </table></div>
+</section>
+
+<section id="f8">
+  <h2><span class="no">8.</span>집 밖에서도 접속 — 원격 접근 세 가지</h2>
+  <p>Damon은 내 컴퓨터에서 돌기 때문에 기본적으로는 같은 네트워크에서만 접속됩니다. 밖에서 접속하려면 다음 중 하나를 씁니다.</p>
+  <ul>
+    <li><b>Tailscale</b> — 가장 쉽고 권장되는 방법. 가상 사설망으로 내 컴퓨터에 직접 연결하며 Damon 설정은 바꿀 것이 없습니다.</li>
+    <li><b>직접 TLS</b> — Damon이 암호화 통신(wss)으로 직접 문을 열어 줍니다. 접속 토큰이 필수입니다.</li>
+    <li><b>중계 서버 (damon-relay)</b> — 공개 서버 하나를 빌려 Damon이 밖으로 먼저 연결합니다. 내 컴퓨터는 문을 열 필요가 없습니다.</li>
+  </ul>
+  <div class="fig">
+    <div class="row" style="max-width:720px; margin:0 auto;">
+      <div class="box"><b>폰 · 노트북</b><small>브라우저만 있으면 됨</small></div>
+      <div class="ar">→</div>
+      <div class="box"><b>중계 서버</b><small>암호문만 전달 — 내용 확인 불가</small></div>
+      <div class="ar">→</div>
+      <div class="box key"><b>내 컴퓨터의 Damon</b></div>
+    </div>
+    <div class="figcap">그림 6. 중계 서버 방식. 종단간 암호화라 중계자조차 대화 내용을 볼 수 없습니다.</div>
+  </div>
+  <p>중계 서버 주소를 브라우저로 열면 웹 대화창이 바로 뜹니다. 앱 설치나 VPN 설정이 필요 없고, 세 방법 모두 결국 같은 Damon에 도착하므로 집 컴퓨터의 대화를 폰에서 이어볼 수 있습니다.</p>
+</section>
+
+<section id="f9">
+  <h2><span class="no">9.</span>안전장치</h2>
+  <p>내 컴퓨터에서 AI가 파일을 만지는 구조이므로 안전장치가 여러 겹으로 들어 있습니다.</p>
+  <div class="twrap"><table>
+    <tr><th>장치</th><th>하는 일</th></tr>
+    <tr><td>접속 토큰</td><td>외부 접속에는 반드시 토큰이 필요합니다. 없으면 애초에 실행을 거부합니다.</td></tr>
+    <tr><td>폴더 허용 목록</td><td>에이전트가 작업할 수 있는 폴더를 미리 제한합니다.</td></tr>
+    <tr><td>허가 질의</td><td>위험한 작업 전에 반드시 사용자 승인을 받습니다. (기능 3)</td></tr>
+    <tr><td>허가 시간 제한</td><td>답이 없는 허가 요청은 5분 뒤 자동 거절됩니다.</td></tr>
+    <tr><td>요청 횟수 제한</td><td>외부 접속에는 분당 요청 수 제한이 걸립니다.</td></tr>
+    <tr><td>비밀번호 보관</td><td>설정 파일에 비밀 키를 직접 쓰지 못하게 하고, 환경변수나 macOS 열쇠고리 참조만 허용합니다.</td></tr>
+    <tr><td>파일 접근 한정</td><td>원격에서 파일을 읽고 쓸 때 그 세션의 작업 폴더 밖으로 나가지 못합니다.</td></tr>
+    <tr><td>암호화 통신</td><td>원격 연결은 종단간 암호화입니다. 중계 서버도 내용을 볼 수 없습니다.</td></tr>
+  </table></div>
+</section>
+
+<section id="f10">
+  <h2><span class="no">10.</span>늘 켜 두기 — 상시 운영</h2>
+  <p>Damon은 한 번 켜 두고 잊고 사는 것이 기본 사용법입니다.</p>
+  <div class="fig">
+    <div class="row">
+      <div class="box"><b>설치</b><small>npm · cargo · brew<br>셋 중 아무거나</small></div>
+      <div class="ar">→</div>
+      <div class="box"><b>서비스 등록</b><small>damond service install<br>컴퓨터를 켜면 자동 실행</small></div>
+      <div class="ar">→</div>
+      <div class="box"><b>건강 점검</b><small>damon doctor<br>연결 상태 확인</small></div>
+      <div class="ar">→</div>
+      <div class="box key"><b>사용</b><small>문제가 생기면 damon logs</small></div>
+    </div>
+    <div class="figcap">그림 7. 설치부터 사용까지. macOS launchd, Linux systemd, Windows 작업 스케줄러에 자동 등록됩니다.</div>
+  </div>
+  <ul>
+    <li>설치: <code>npm install -g damon-agent</code> / <code>cargo install damon-core</code> / <code>brew install developjik/tap/damon</code></li>
+    <li>설정 파일은 주석 달린 예시 한 장이 전부이고, 아무것도 없어도 동작합니다. 고친 항목은 대부분 재시작 없이 즉시 반영됩니다.</li>
+    <li>유휴 도구 정리(30분), 오래된 세션 정리(보존 기간), 동시 세션 수 상한을 설정할 수 있습니다.</li>
+    <li>상태 확인: 실시간 로그(<code>damon logs</code>), 연결 점검(<code>damon doctor</code>), 지표(<code>/metrics</code>), 생존 확인(<code>/health</code>).</li>
+  </ul>
+</section>
+
+<section id="f11">
+  <h2><span class="no">11.</span>개발자를 위한 문 — API와 라이브러리</h2>
+  <p>이 절은 프로그램을 직접 만드는 분들에 해당합니다. Damon의 모든 기능은 JSON-RPC over WebSocket이라는 하나의 통신 규격으로 노출되어 있고, 세 언어의 공식 라이브러리가 있습니다.</p>
+  <div class="fig">
+    <div class="row">
+      <div class="col" style="flex:1.2;">
+        <div class="box"><b>Node.js / TypeScript</b><small>npm: damon-agent (타입 정의 포함)</small></div>
+        <div class="box"><b>Python</b><small>pip: damon-agent (비동기)</small></div>
+        <div class="box"><b>Rust</b><small>crates.io: damon-core</small></div>
+      </div>
+      <div class="ar">→</div>
+      <div class="box key" style="flex:1;"><b>Damon</b><small>하나의 통신 규격</small></div>
+      <div class="ar">→</div>
+      <div class="box" style="flex:.8;"><b>AI 도우미 9종</b></div>
+    </div>
+    <div class="figcap">그림 8. Damon을 자기 프로그램의 AI 백엔드로 쓰는 구조</div>
+  </div>
+  <p>연결이 끊겼다 다시 이어지면 라이브러리가 알아서 재구독하고, 그 사이 놓친 대화 내용을 되감아 채워 줍니다. 통신 규격 전문은 <a href="protocol-v2.ko.md">docs/protocol-v2.ko.md</a>, 연결 방법은 <a href="integration.ko.md">docs/integration.ko.md</a>에 있습니다.</p>
+</section>
+
+<section id="summary">
+  <h2>총정리</h2>
+  <div class="twrap"><table>
+    <tr><th>분류</th><th>기능</th><th>어디서 쓰나</th></tr>
+    <tr><td>통합 구동</td><td>AI 도구 9종 자동 탐지 · 구동 · 자동 재시작</td><td>자동</td></tr>
+    <tr><td>대화</td><td>실시간 스트리밍 답변, 코드 색상, 진행 중 취소와 덧붙이기</td><td>모든 창</td></tr>
+    <tr><td>허가</td><td>허용 / 거절 / 전체 허용, 시간 초과 자동 거절, 어느 창에서든 승인</td><td>모든 창</td></tr>
+    <tr><td>기록</td><td>전체 대화 저장, 전문 검색, 내보내기(MD/JSON), 백업, 사용량 통계</td><td>CLI · 웹</td></tr>
+    <tr><td>세션</td><td>이어하기, 포크, 이름·고정·태그·보관, 가져오기, 감시, 끊김 없는 작업</td><td>모든 창</td></tr>
+    <tr><td>프로젝트</td><td>폴더별 기본 설정, 워크트리 격리 작업 공간(PR 단위), 실시간 진행 표시</td><td>CLI · 웹</td></tr>
+    <tr><td>스킬</td><td>중앙 설치 후 전 도구 동기화, GitHub/skills.sh 탐색, 휴지통 복원, 프롬프트 라이브러리</td><td>CLI · 웹</td></tr>
+    <tr><td>입력 보조</td><td><code>/</code> 명령 · <code>@</code> 파일 · <code>!</code> 프롬프트 선택기, 입력 기록 자동완성</td><td>웹</td></tr>
+    <tr><td>원격</td><td>Tailscale · TLS · 중계 서버(종단간 암호화), 브라우저만 있으면 접속</td><td>설정 선택</td></tr>
+    <tr><td>보안</td><td>접속 토큰, 폴더 허용 목록, 요청 제한, 키체인 비밀 참조, 파일 접근 한정</td><td>설정</td></tr>
+    <tr><td>운영</td><td>부팅 시 자동 실행, 상태 점검, 로그, 지표, 자동 정리, 설정 핫 리로드</td><td>CLI</td></tr>
+    <tr><td>개발자</td><td>통신 규격 공개, Rust · Node · Python 라이브러리</td><td>라이브러리</td></tr>
+  </table></div>
+</section>
+
+<footer>
+  관련 문서 — 빠른 시작 <a href="../README.ko.md">README.ko.md</a> ·
+  설치 <a href="install.ko.md">docs/install.ko.md</a> ·
+  통신 규격 <a href="protocol-v2.ko.md">docs/protocol-v2.ko.md</a> ·
+  앱 연결 <a href="integration.ko.md">docs/integration.ko.md</a>
+</footer>
+
+</div>
+</body>
+</html>
