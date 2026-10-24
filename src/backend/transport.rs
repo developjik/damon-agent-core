@@ -80,7 +80,11 @@ mod winjob {
         SetInformationJobObject,
     };
 
-    pub struct Job(windows_sys::Win32::Foundation::HANDLE);
+    // A HANDLE is an opaque kernel object id (pointer-sized, never
+    // dereferenced here), not memory — storing it as usize keeps the
+    // transport Arc shareable without unsafe Send/Sync impls for a
+    // raw pointer type.
+    pub struct Job(usize);
 
     /// Put the child in a kill-on-close job. None on any failure —
     /// the transport then relies on taskkill alone, exactly as before.
@@ -105,13 +109,13 @@ mod winjob {
                 CloseHandle(job);
                 return None;
             }
-            Some(Job(job))
+            Some(Job(job as usize))
         }
     }
 
     impl Drop for Job {
         fn drop(&mut self) {
-            unsafe { CloseHandle(self.0) };
+            unsafe { CloseHandle(self.0 as windows_sys::Win32::Foundation::HANDLE) };
         }
     }
 }
