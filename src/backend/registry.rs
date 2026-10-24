@@ -296,13 +296,15 @@ fn search_dirs() -> Vec<PathBuf> {
     let dirs: Vec<PathBuf> = std::env::var_os("PATH")
         .map(|p| std::env::split_paths(&p).collect())
         .unwrap_or_default();
+    // Block-tail, not `return`: with the `#[cfg(not(windows))]` arm
+    // compiled out, a `return dirs` here is the function tail and
+    // windows clippy (-D warnings) flags needless_return.
     #[cfg(windows)]
-    {
+    let dirs = {
         let mut dirs = dirs;
         dirs.extend(registry_path_dirs());
-        return dirs;
-    }
-    #[cfg(not(windows))]
+        dirs
+    };
     dirs
 }
 
