@@ -4113,7 +4113,7 @@ async fn file_jail_widens_with_grants_and_closes_on_revoke() {
     assert_eq!(read_reply(&mut ws, 7).await["error"]["code"], -32602);
     rpc_send(
         &mut ws,
-        json!({"id":8,"method":"file.grant","params":{"path":"/definitely/not/there"}}),
+        json!({"id":8,"method":"file.grant","params":{"path":base.join("definitely/not/there")}}),
     )
     .await;
     assert_eq!(read_reply(&mut ws, 8).await["error"]["code"], -32602);
@@ -4147,9 +4147,12 @@ async fn file_jail_widens_with_grants_and_closes_on_revoke() {
     )
     .await;
     assert_eq!(read_reply(&mut ws, 12).await["result"]["revoked"], false);
+    // A POSIX-shaped "/…" is relative on Windows (no drive) and fails
+    // the absolute check with a different code than intended — derive
+    // the nonexistent path from the test's own temp base instead.
     rpc_send(
         &mut ws,
-        json!({"id":13,"method":"file.ungrant","params":{"path":"/definitely/not/there"}}),
+        json!({"id":13,"method":"file.ungrant","params":{"path":base.join("definitely/not/there")}}),
     )
     .await;
     assert_eq!(read_reply(&mut ws, 13).await["result"]["revoked"], false);
