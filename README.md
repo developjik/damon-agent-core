@@ -9,6 +9,12 @@
 
 **One daemon. Every coding agent.**
 
+<p align="center">
+  <a href="https://developjik.github.io/damon-agent-core/"><img src="docs/assets/damon-home.webp" alt="Damon landing page — one daemon, every coding agent" width="100%"></a>
+</p>
+
+<p align="center"><a href="https://developjik.github.io/damon-agent-core/"><b>▶ Live site — developjik.github.io/damon-agent-core</b></a></p>
+
 Damon is a local agent-control daemon written in Rust. It drives nine coding-agent CLIs — Claude Code, Codex CLI, Oh My Pi, Pi, Qwen Code, Droid, OpenCode, MiMo, ZCode — over their native bidirectional protocols; the model, tools, credentials, and context management belong to the agents, while Damon owns sessions, permission relaying, searchable history, chat channels, and remote access. The CLI, Telegram bot, desktop app, and web UI are all thin clients on the same resident daemon.
 
 The name is a pun on *daemon*, and literally the architecture.
@@ -59,6 +65,12 @@ curl localhost:9470/health
 ```
 
 Chat in the bundled web UI: `http://127.0.0.1:9470/ui` — sessions, streaming, permission prompts, no install. Streaming replies are paced over the arrival cadence (no batch dumps) with grapheme-safe rendering and syntax-highlighted code; `?revealDemo=1` on the URL demos it without a backend.
+
+<p align="center">
+  <img src="docs/assets/damon-chat-desk.webp" alt="Chat desk — a Claude Code session streamed through the daemon, with routing and memory badges" width="100%">
+</p>
+
+<p align="center"><sub>A chat surface on the same API — <a href="https://github.com/developjik/damon-chat-desk">chat desk</a>. The session, memory, and tool permissions are the daemon's; the UI only renders them.</sub></p>
 
 ## Architecture
 
