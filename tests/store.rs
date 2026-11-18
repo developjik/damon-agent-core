@@ -1906,13 +1906,23 @@ async fn usage_aggregate_tz_offset_shifts_day_buckets() {
     );
     {
         let c = rusqlite::Connection::open(&path).unwrap();
+        // Expectations are derived from the rows' own UTC stamps, not from
+        // 'now': between 00:00 and 03:00 UTC the -180-minute shift is still
+        // on yesterday's date, so 'now'-based expectations land a day behind
+        // the rows and the test fails on the hour, not on the code.
         let yesterday: String = c
-            .query_row("SELECT date('now', '-180 minutes', '-1 day')", [], |r| {
-                r.get(0)
-            })
+            .query_row(
+                "SELECT date(strftime('%Y-%m-%d', 'now') || ' 01:00:00', '-180 minutes')",
+                [],
+                |r| r.get(0),
+            )
             .unwrap();
         let today: String = c
-            .query_row("SELECT date('now', '-180 minutes')", [], |r| r.get(0))
+            .query_row(
+                "SELECT date(strftime('%Y-%m-%d', 'now') || ' 12:00:00', '-180 minutes')",
+                [],
+                |r| r.get(0),
+            )
             .unwrap();
         // Ordered by date: yesterday's 01:00-UTC row first.
         assert_eq!(shifted.rows[0].date, yesterday);

@@ -9,6 +9,12 @@
 
 **데몬 하나. 모든 코딩 에이전트.**
 
+<p align="center">
+  <a href="https://developjik.github.io/damon-agent-core/"><img src="docs/assets/damon-home.webp" alt="Damon 랜딩 페이지 — 데몬 하나, 모든 코딩 에이전트" width="100%"></a>
+</p>
+
+<p align="center"><a href="https://developjik.github.io/damon-agent-core/"><b>▶ 라이브 사이트 — developjik.github.io/damon-agent-core</b></a></p>
+
 Damon은 Rust로 만든 로컬 에이전트 컨트롤 데몬이다. 아홉 코딩 에이전트 CLI — Claude Code, Codex CLI, Oh My Pi, Pi, Qwen Code, Droid, OpenCode, MiMo, ZCode — 를 각자의 네이티브 양방향 프로토콜로 구동한다. 모델·툴·인증·컨텍스트 관리는 전부 에이전트 몫이고, Damon은 세션, 권한 릴레이, 검색 가능한 히스토리, 채팅 채널, 원격 접근을 소유한다. CLI, 텔레그램 봇, 데스크톱 앱, 웹 UI는 전부 같은 상주 데몬에 붙는 얇은 클라이언트다.
 
 이름은 *daemon*의 말장난이자, 말 그대로 실제 아키텍처다.
@@ -59,6 +65,12 @@ curl localhost:9470/health
 ```
 
 번들 웹 UI로 대화: `http://127.0.0.1:9470/ui` — 세션, 스트리밍, 권한 프롬프트까지, 설치 불필요. 스트리밍 답변은 도착 케이던스에 맞춰 흘러나오고(배치 덤프 없음) 그래펨 경계가 안전하며, 코드펜스는 문법 하이라이트로 렌더됩니다. `?revealDemo=1`을 붙이면 백엔드 없이 데모를 볼 수 있습니다.
+
+<p align="center">
+  <img src="docs/assets/damon-chat-desk.webp" alt="chat desk — 데몬을 거쳐 스트리밍되는 Claude Code 세션, 라우팅·메모리 배지" width="100%">
+</p>
+
+<p align="center"><sub>같은 API 위의 채팅 표면 — <a href="https://github.com/developjik/damon-chat-desk">chat desk</a>. 세션·메모리·툴 권한은 데몬의 것이고, UI는 그것을 그릴 뿐입니다.</sub></p>
 
 ## 구조
 
