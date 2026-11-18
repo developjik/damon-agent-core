@@ -90,7 +90,148 @@ Chat in the bundled web UI: `http://127.0.0.1:9470/ui` — sessions, streaming, 
                         and context all agent-owned)
 ```
 
-See [docs/protocol-v2.md](docs/protocol-v2.md) for the wire protocol and [docs/integration.md](docs/integration.md) for copy-paste Node/Python/Rust clients.
+### Topology — one daemon, one wire, every surface
+
+The same shape with the browser surface named. [`damon-chat-desk`](https://github.com/developjik/damon-chat-desk) is a static SPA with no server of its own: sessions, messages, memory, and plan revisions are all read from the daemon over the wire the CLI and the chat bots already use.
+
+```mermaid
+flowchart LR
+    subgraph desk ["🖥️ damon-chat-desk — static SPA, Vite + React"]
+        direction TB
+        K1["chat · plan cards · tool viewer"]
+        K2["JSON-RPC inspector"]
+    end
+
+    subgraph daemon ["🏠 damond — resident daemon on 127.0.0.1:9470"]
+        direction TB
+        R1["GET /health"]
+        R2["POST /v1/ws_ticket"]
+        R3["GET /ws — JSON-RPC v2"]
+        M1["sessions · memory ledgers · plan revisions"]
+    end
+
+    A["🤖 agent CLIs — claude · codex · omp · pi · qwen · droid · opencode · mimo · zcode"]
+
+    desk -->|"1 · probe for backends"| R1
+    desk -->|"2 · one single-use ticket"| R2
+    desk <-->|"3 · hello · session.* · turn.* · plan.* · memory.*"| R3
+    R1 --- M1
+    R2 --- M1
+    R3 --- M1
+    R3 <-->|"each CLI's own native protocol"| A
+```
+
+Three details on that wire are load-bearing:
+
+- **`/health` decides what is behind a URL.** An answer carrying `backends[]` is a daemon; an OpenAI-compatible server answers `/v1/models` instead and usually 404s `/health`; a URL that answers neither is reported unreachable rather than silently switched to a demo. A non-loopback bind answers `{"status":"ok"}` only — the roster stays local.
+- **`/v1/ws_ticket`, then `/ws`.** A browser cannot put an `Authorization` header on a WebSocket upgrade, so `POST /v1/ws_ticket` trades a master bearer token — or an approved device's own `deviceToken` — for a single-use ticket good for 60 seconds, and the socket opens as `/ws?ticket=…`. The ticket is consumed on the first attempt whether or not it succeeds, and a raw token in the query string is refused because it leaks into logs. Loopback with no `auth_token` configured stays open.
+- **One socket multiplexes every session.** Requests dispatch concurrently, so a streaming `turn.start` never blocks `turn.steer`, `turn.cancel`, or `permission.respond`.
+
+### Wire — handshake, turn, approval, interrupt
+
+A full first turn from the browser's side. The names on the arrows are the exact JSON-RPC methods and routes; envelopes and error codes are in [docs/protocol-v2.md](docs/protocol-v2.md).
+
+```mermaid
+sequenceDiagram
+    autonumber
+    participant W as chat desk · browser
+    participant D as damond · port 9470
+    participant A as agent CLI
+
+    W->>D: GET /health
+    D-->>W: status ok · version · backends
+    W->>D: POST /v1/ws_ticket — Bearer master token or deviceToken
+    D-->>W: single-use ticket · 60 s
+    W->>D: GET /ws?ticket=… — WebSocket upgrade
+    D-->>W: hello — protocol 2 · daemon · version · permissionTimeoutSecs
+
+    W->>D: session.create
+    D-->>W: sessionId · backend · replayed
+    Note over D,A: the agent keeps its own login, tools, and model
+    W->>D: turn.start
+    D->>A: prompt
+    D-->>W: session.event — turn_started
+    A-->>D: token stream
+    D-->>W: session.event — timeline · assistant_message
+    A-->>D: tool call
+    D-->>W: session.event — timeline · tool_call with its detail
+
+    alt the agent asks to act
+        A->>D: permission ask
+        D-->>W: session.event — permission_requested · kind tool or question
+        W->>D: permission.respond — requestId · allow or deny
+        D->>A: answer relayed
+    else the agent proposes a plan
+        A->>D: plan ask · kind plan
+        D-->>W: session.event — permission_requested carrying the plan text
+        W->>D: plan.list
+        D-->>W: planId · revision · status
+        W->>D: plan.respond — approve, request_changes, or defer
+        D->>A: allow, or deny carrying the feedback
+    end
+
+    opt steering or interrupting mid-turn
+        W->>D: turn.steer — prompt · expectedTurn
+        W->>D: turn.cancel
+        D->>A: interrupt
+    end
+
+    D-->>W: session.event — turn_completed with usage
+```
+
+What a client can rely on:
+
+- **Replay on attach.** The connection that first touches a session (`session.create`, `session.resume`, `turn.start`) receives what it missed first, as `session.event` frames tagged `"replay": true` — persisted rows, newest last and capped at 200, then the in-flight journal. `replayed` in the result says how many frames arrived.
+- **Plan decisions are compare-and-set.** `plan.respond` carries `expectedRevision`, so two surfaces answering the same revision resolve to exactly one win and a typed `-32009` for the loser; the decision is persisted before it is relayed to the agent, so a lost pipe reopens the row instead of reporting a success that did not happen.
+- **Steering is a backend capability.** `turn.steer` refuses with `-32002` on a backend that cannot steer mid-turn — queue that text as the next prompt instead of failing the turn.
+- **`turn.cancel` keeps what already arrived.** The partial answer stays in the transcript and the card closes as canceled, ready to retry or branch from.
+- **Detached turns outlive the socket.** `turn.start {detach: true}` answers `{turnId, detached: true}` immediately and runs on a task no connection owns — the locked-phone case — while replay picks it up on reconnect.
+
+See [docs/protocol-v2.md](docs/protocol-v2.md) for the full method table and events, and [docs/integration.md](docs/integration.md) for copy-paste Node/Python/Rust clients.
+
+## Chat desk — live demo and local wiring
+
+[`damon-chat-desk`](https://github.com/developjik/damon-chat-desk) is the reference client: a thin chat desk on exactly the protocol above — provider routing made visible, per-turn forking, a memory ledger panel, plan approval cards, and a JSON-RPC inspector that shows the frames as they move.
+
+**Live demo, no install and no keys:** <https://developjik.github.io/damon-chat-desk/> — it opens in demo mode (four simulated providers, one-click scenarios, the inspector streaming the same envelopes a real daemon sends). A published HTTPS page cannot reach `http://127.0.0.1` (mixed content and private-network blocking), which is what the demo is for; the wiring below is the local path.
+
+### Run it against your own daemon
+
+```sh
+# 1 — the daemon, from this repository (binds 127.0.0.1:9470 by default)
+cargo run --bin damond
+curl -s 127.0.0.1:9470/health
+# {"status":"ok","version":"0.8.0","backends":["claude","omp"]}
+
+# 2 — the desk
+git clone https://github.com/developjik/damon-chat-desk
+cd damon-chat-desk
+npm install
+npm run dev            # http://127.0.0.1:5173/
+```
+
+Then in the desk: **⚙ → Damon daemon → the `/dm` local proxy button** (`로컬 프록시 /dm`). Nothing else — the daemon URL already defaults to `http://127.0.0.1:9470`, and on loopback with no `auth_token` set the ticket route is open, so the master-token field stays empty.
+
+### Why the `/dm` proxy
+
+The daemon serves its own UI at `/ui` and sends no CORS headers, so a page on another origin cannot `fetch` it. `npm run dev` (port 5173; `npm run preview` uses 4173) therefore serves the desk and proxies `/dm/*` to `http://127.0.0.1:9470/*` with the prefix stripped — `ws: true`, so `/dm/ws` upgrades too. One origin, no CORS, no daemon change.
+
+| Desk action | What actually reaches the daemon |
+| --- | --- |
+| connect | `GET /dm/health` → `POST /dm/v1/ws_ticket` → `GET /dm/ws?ticket=…` |
+| send | `turn.start`, then `session.event` deltas |
+| steer mid-turn | `turn.steer` |
+| stop | `turn.cancel` |
+| approve a plan | `plan.list` → `plan.respond` with `expectedRevision` |
+| allow a tool | `permission.respond` |
+| branch a turn | `session.fork` |
+| memory panel | `memory.list` · `memory.write` · `memory.remove` · `memory.approve` · `memory.reject` |
+
+### A daemon on another machine
+
+An HTTPS-origin page needs a same-origin path to the daemon: a reverse proxy applying the same `/dm` rewrite is the whole rule. For a browser you would rather not hand the master token to, pair it instead — reveal a one-time key with `device.pairing_key`, spend it at `POST /v1/pair`, approve the pending row with `device.approve` from a trusted surface, and the desk keeps that device's own `deviceToken`, which mints tickets and is revocable per device.
+
+No agent CLI installed yet? The desk ships `python3 tools/mock-daemon.py` — the same surface on `:9470` (health, ticket, `/ws`, a streaming `turn.start`, plan approval, `memory.*`) so the wiring can be exercised without an agent.
 
 ## Configuration
 
@@ -141,6 +282,7 @@ Each chat maps to its own agent session, replies stream as rendered markdown, an
 ## Docs
 
 - **[Project homepage](https://developjik.github.io/damon-agent-core/)** — what Damon is, at a glance
+- [damon-chat-desk](https://github.com/developjik/damon-chat-desk) — reference web client on this API ([live demo](https://developjik.github.io/damon-chat-desk/))
 - [docs/features.md](docs/features.md) ([ko](docs/features.ko.md); [browser version](docs/features.ko.html)) — feature guide with diagrams, written for non-developers
 - [docs/protocol-v2.md](docs/protocol-v2.md) — wire protocol (methods, events, types)
 - [docs/install.md](docs/install.md) ([ko](docs/install.ko.md)) — install paths, service registration
