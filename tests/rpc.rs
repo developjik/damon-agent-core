@@ -5749,3 +5749,191 @@ async fn boot_recovery_marks_a_turn_cut_off_by_a_restart() {
         "interrupted"
     );
 }
+
+/// Send one request and return the `-32602`/`-3200x` it was refused
+/// with — the shape the param-validation tests below read.
+async fn refusal(ws: &mut Ws, id: u64, method: &str, params: Value) -> (i64, String) {
+    rpc_send(ws, json!({"id": id, "method": method, "params": params})).await;
+    let reply = read_reply(ws, id).await;
+    let err = &reply["error"];
+    let code = err["code"]
+        .as_i64()
+        .unwrap_or_else(|| panic!("{method} {params} was not refused: {reply}"));
+    (
+        code,
+        err["message"].as_str().unwrap_or_default().to_string(),
+    )
+}
+
+/// The `turn.*`, `permission.respond` and `plan.*` requests moved onto
+/// typed structs; the wire did not move with them. Every malformed
+/// request answers the pre-refactor `-32602` text, a dead session is
+/// still answered *before* the rest of the request is validated (the
+/// order the untyped reads had), junk in an optional param is still
+/// ignored, and a refused `turn.start` still releases its claim.
+#[tokio::test]
+async fn turn_family_params_keep_their_legacy_errors() {
+    let (_state, _store, addr) = serve(test_config(None)).await;
+    let (mut ws, _) = ws_connect(&format!("ws://{addr}/ws")).await;
+
+    // No live session yet: the required-field messages, in the order the
+    // legacy handlers checked them.
+    let mut id = 0;
+    let mut next = || {
+        id += 1;
+        id
+    };
+    for (method, params, code, message) in [
+        ("turn.start", json!({}), -32602, "sessionId required"),
+        // The dead session answers before the missing prompt does — this
+        // ordering is the one the untyped handler had (`req_str`, then
+        // the live lookup, then run_turn's prompt parse).
+        (
+            "turn.start",
+            json!({"sessionId": "gone"}),
+            -32001,
+            "session not live — call session.resume first",
+        ),
+        ("turn.steer", json!({}), -32602, "sessionId required"),
+        (
+            "turn.steer",
+            json!({"sessionId": "gone"}),
+            -32001,
+            "session not live",
+        ),
+        ("turn.cancel", json!({}), -32602, "sessionId required"),
+        (
+            "permission.respond",
+            json!({}),
+            -32602,
+            "sessionId required",
+        ),
+        (
+            "permission.respond",
+            json!({"sessionId": "gone"}),
+            -32001,
+            "session not live",
+        ),
+        ("plan.list", json!({}), -32602, "sessionId required"),
+        ("plan.respond", json!({}), -32602, "planId required"),
+        (
+            "plan.respond",
+            json!({"planId": "p"}),
+            -32602,
+            "expectedRevision must be a number",
+        ),
+        (
+            "plan.respond",
+            json!({"planId": "p", "expectedRevision": "1"}),
+            -32602,
+            "expectedRevision must be a number",
+        ),
+        (
+            "plan.respond",
+            json!({"planId": "p", "expectedRevision": 1}),
+            -32602,
+            "decision required",
+        ),
+        (
+            "plan.respond",
+            json!({"planId": "p", "expectedRevision": 1, "decision": "maybe"}),
+            -32602,
+            "decision must be approve | request_changes | defer",
+        ),
+        (
+            "plan.respond",
+            json!({"planId": "p", "expectedRevision": 1, "decision": "approve"}),
+            -32602,
+            "no plan review p revision 1",
+        ),
+    ] {
+        let n = next();
+        assert_eq!(
+            (code, message.to_string()),
+            refusal(&mut ws, n, method, params.clone()).await,
+            "{method} {params}"
+        );
+    }
+
+    // turn.cancel stays idempotent for an unknown session.
+    let n = next();
+    rpc_send(
+        &mut ws,
+        json!({"id": n, "method": "turn.cancel", "params": {"sessionId": "gone"}}),
+    )
+    .await;
+    assert_eq!(read_reply(&mut ws, n).await["result"]["cancelled"], true);
+
+    // A live session: the prompt is the next thing the wire checks.
+    let n = next();
+    rpc_send(
+        &mut ws,
+        json!({"id": n, "method": "session.create", "params": {"cwd": "/tmp"}}),
+    )
+    .await;
+    let sid = read_reply(&mut ws, n).await["result"]["sessionId"]
+        .as_str()
+        .unwrap()
+        .to_string();
+
+    for (method, params, message) in [
+        ("turn.start", json!({"sessionId": sid}), "prompt required"),
+        (
+            "turn.start",
+            json!({"sessionId": sid, "prompt": null}),
+            "prompt required",
+        ),
+        (
+            "turn.start",
+            json!({"sessionId": sid, "prompt": [{"nope": true}]}),
+            "prompt required",
+        ),
+        ("turn.steer", json!({"sessionId": sid}), "prompt required"),
+        (
+            "permission.respond",
+            json!({"sessionId": sid}),
+            "requestId required",
+        ),
+        (
+            "permission.respond",
+            json!({"sessionId": sid, "requestId": "r"}),
+            "response required",
+        ),
+        (
+            "permission.respond",
+            json!({"sessionId": sid, "requestId": "r", "response": {}}),
+            "response required",
+        ),
+    ] {
+        let n = next();
+        assert_eq!(
+            (-32602, message.to_string()),
+            refusal(&mut ws, n, method, params.clone()).await,
+            "{method} {params}"
+        );
+    }
+
+    // The refusals above claimed nothing: the next turn runs to the end.
+    // Its optional params are junk on purpose — an ill-typed optional was
+    // silently dropped before and still is.
+    let n = next();
+    rpc_send(
+        &mut ws,
+        json!({"id": n, "method": "turn.start", "params": {
+            "sessionId": sid, "prompt": "hello",
+            "timeoutSecs": "soon", "detach": "yes",
+            "idempotencyKey": 7, "memoryOwner": ["x"]}}),
+    )
+    .await;
+    let turn = read_reply(&mut ws, n).await;
+    assert_eq!(turn["result"]["stopReason"], "completed", "{turn}");
+
+    // plan.list over an empty chain is an empty list, not an error.
+    let n = next();
+    rpc_send(
+        &mut ws,
+        json!({"id": n, "method": "plan.list", "params": {"sessionId": sid}}),
+    )
+    .await;
+    assert_eq!(read_reply(&mut ws, n).await["result"]["plans"], json!([]));
+}

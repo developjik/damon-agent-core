@@ -1068,187 +1068,24 @@ pub(super) fn parse_family(method: &str, params: &Value) -> Result<()> {
 
 #[cfg(test)]
 mod tests {
-    use serde_json::{Map, Value, json};
+    use serde_json::json;
 
-    use super::super::rpc_methods;
+    use super::super::params::drift;
     use super::{FAMILY, parse_family};
-    use crate::rpc::params::Kind;
 
-    /// The catalog's type token → the kind the struct reads it as.
-    /// `None` means "not a type this module can compare" (a prose entry).
-    fn kind_of(token: &str) -> Option<Kind> {
-        match token {
-            "string" => Some(Kind::Str),
-            "number" => Some(Kind::UInt),
-            "boolean" => Some(Kind::Bool),
-            "string[]" => Some(Kind::StrArray),
-            "object" => Some(Kind::Object),
-            t if t.starts_with('{') => Some(Kind::Object),
-            _ => None,
-        }
-    }
-
-    /// A value of the declared kind — the params a client would send.
-    fn sample(kind: Kind) -> Value {
-        match kind {
-            Kind::Str => json!("sample"),
-            Kind::UInt | Kind::Int => json!(1),
-            Kind::Bool => json!(true),
-            Kind::StrArray | Kind::Array => json!(["a"]),
-            Kind::Object => json!({}),
-            Kind::Json => json!({}),
-        }
-    }
-
-    /// The catalog entry for one method, params object only.
-    fn catalog_params(method: &str) -> Map<String, Value> {
-        let entry = rpc_methods()
-            .into_iter()
-            .find(|m| m["name"] == json!(method))
-            .unwrap_or_else(|| panic!("{method} missing from rpc_methods()"));
-        entry["params"]
-            .as_object()
-            .cloned()
-            .unwrap_or_else(|| panic!("{method} advertises no params object"))
-    }
-
-    /// The schema catalog and the typed params are one contract, checked
-    /// both ways: every param `hello` advertises is a field the struct
-    /// reads (same name, same optionality, same JSON type), and every
-    /// field a struct reads is advertised. A handler reading a param the
-    /// catalog never named — the drift this refactor exists to stop —
-    /// fails here, as does a catalog entry left behind by a removed
-    /// field.
+    /// The catalog's `session.*` entries and the structs in this module
+    /// are one contract, checked both ways (see `params::drift`).
     #[test]
     fn catalog_declares_exactly_the_fields_the_structs_read() {
-        // Every session.* entry in the catalog belongs to this family.
-        let advertised: Vec<String> = rpc_methods()
-            .into_iter()
-            .filter_map(|m| m["name"].as_str().map(str::to_string))
-            .filter(|n| n.starts_with("session."))
-            .collect();
-        let mut listed: Vec<String> = FAMILY.iter().map(|(m, _)| m.to_string()).collect();
-        listed.sort();
-        let mut advertised = advertised;
-        advertised.sort();
-        assert_eq!(advertised, listed, "catalog and FAMILY disagree on the set");
-
-        for (method, fields) in FAMILY {
-            let params = catalog_params(method);
-            // Catalog → struct.
-            for (name, desc) in &params {
-                let desc = desc.as_str().unwrap_or_default();
-                // The type token is the head of the description, before
-                // the em-dash note ("string? — one backend, else all").
-                let head = desc.split(" — ").next().unwrap_or_default().trim();
-                let (token, optional) = match head.strip_suffix('?') {
-                    Some(t) => (t.trim(), true),
-                    None => (head, false),
-                };
-                let kind = kind_of(token)
-                    .unwrap_or_else(|| panic!("{method}.{name}: unreadable type {desc:?}"));
-                let field = fields.iter().find(|f| f.name == name).unwrap_or_else(|| {
-                    panic!("{method} advertises `{name}` but reads no such field")
-                });
-                assert_eq!(
-                    field.kind.schema_type(),
-                    kind.schema_type(),
-                    "{method}.{name}: catalog type and struct type disagree"
-                );
-                if kind == Kind::StrArray || kind == Kind::Array {
-                    assert!(
-                        matches!(field.kind, Kind::StrArray | Kind::Array),
-                        "{method}.{name}: array kind mismatch"
-                    );
-                }
-                assert_eq!(
-                    !field.required, optional,
-                    "{method}.{name}: catalog optionality and struct requiredness disagree"
-                );
-            }
-            // Struct → catalog.
-            for field in fields.iter() {
-                assert!(
-                    params.contains_key(field.name),
-                    "{method} reads `{}` but the catalog never names it",
-                    field.name
-                );
-            }
-        }
+        drift::catalog_matches(FAMILY, &["session."]);
     }
 
-    /// The field table is not decoration: dropping a required field fails
-    /// the call with its legacy message, and an optional field is
-    /// optional. Driven generically off `FAMILY`, so it covers every
-    /// method the family grows.
+    /// The table is what parse enforces: every required field removed or
+    /// mistyped fails with its declared message, every optional field
+    /// tolerates junk.
     #[test]
     fn the_declared_fields_are_the_fields_that_are_checked() {
-        for (method, fields) in FAMILY {
-            // All declared fields present, correctly typed: the call gets
-            // through parameter validation. (`session.resume` wants one
-            // of sessionId/handle; both present is still a valid shape.)
-            let mut all = Map::new();
-            for f in fields.iter() {
-                all.insert(f.name.to_string(), sample(f.kind));
-            }
-            let all = Value::Object(all);
-            if let Err(e) = parse_family(method, &all) {
-                let msg = format!("{e}");
-                // A required field the table declares must be accepted —
-                // any other rejection is a handler-level rule (unknown
-                // backend, unparseable bound), not a params check.
-                assert!(
-                    !msg.ends_with("required") && !msg.contains("must be"),
-                    "{method}: declared-everything params were refused: {msg}"
-                );
-            }
-
-            for f in fields.iter().filter(|f| f.required) {
-                let mut missing = all.as_object().cloned().unwrap_or_default();
-                missing.remove(f.name);
-                let err = parse_family(method, &Value::Object(missing))
-                    .expect_err(&format!("{method} accepted params without `{}`", f.name));
-                assert_eq!(
-                    f.message(),
-                    format!("{err}"),
-                    "{method}: wrong message without `{}`",
-                    f.name
-                );
-                // Ill-typed reads exactly like absent for a required field.
-                let mut wrong = all.as_object().cloned().unwrap_or_default();
-                wrong.insert(
-                    f.name.to_string(),
-                    match f.kind {
-                        Kind::Str => json!(7),
-                        Kind::Bool => json!("yes"),
-                        Kind::StrArray | Kind::Array => json!("nope"),
-                        _ => json!(null),
-                    },
-                );
-                let err = parse_family(method, &Value::Object(wrong))
-                    .expect_err(&format!("{method} accepted a mistyped `{}`", f.name));
-                assert_eq!(f.message(), format!("{err}"), "{method} `{}`", f.name);
-            }
-
-            for f in fields.iter().filter(|f| !f.required) {
-                // An ill-typed optional param is dropped, not refused.
-                let mut wrong = all.as_object().cloned().unwrap_or_default();
-                wrong.insert(f.name.to_string(), json!({"not": "the type"}));
-                if f.kind == Kind::Object || f.kind == Kind::Json {
-                    // An object is a valid Json/Object value: swap in a
-                    // scalar instead.
-                    wrong.insert(f.name.to_string(), json!(7));
-                }
-                if let Err(e) = parse_family(method, &Value::Object(wrong)) {
-                    let msg = format!("{e}");
-                    assert!(
-                        msg.ends_with("required") || msg.contains("must be"),
-                        "{method}: optional `{}` was refused: {msg}",
-                        f.name
-                    );
-                }
-            }
-        }
+        drift::fields_are_checked(FAMILY, parse_family);
     }
 
     /// The documented shapes parse: one representative request per method,
