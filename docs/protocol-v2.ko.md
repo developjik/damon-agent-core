@@ -70,7 +70,7 @@ WebSocket(`GET /ws`) 또는 릴레이 터널 위의 JSON 메시지. 하나의 �
 | `backend.update_plan` | `{backend}` | `{backend, action: "install"\|"update", kind, command[], manualCommand, canRun, blockers[], platform}` — `backend.update`가 실행할 정확한 argv와 복사-붙여넣기 대안; 부수 효과 없음 |
 | `backend.update` | `{backend, creationId?}` | `{creationId, ok: true, version?}` — 플랜을 실행(npm 글로벌 설치 또는 CLI 공식 인스톨러); 진행은 요청 연결로 `{"event":"backend.update_progress","creationId","data":{phase, line?, exitOk?}}` 스트리밍(줄당 캡); 검증된 채널이 없으면 `-32602`(플랜 blockers 참조), 실패/420s 타임아웃은 `-32000`(출력 꼬리가 메시지에 동승) |
 | `backend.update_cancel` | `{creationId}` | `{cancelled: bool}` — 해당 id의 실행 중 런이 없으면 false |
-| `session.create` | `{backend?, cwd?, model?, mode?, mcpServers?, projectId?, persona?}` — 프로젝트가 세션의 범위를 정한다: 루트가 cwd 기본값이 되고 기본값들이 미지정 파라미터를 채운다(명시 값 항상 우선); `persona`는 `bot.list`의 봇 id — SOUL/AGENTS 블록이 매 턴 앞에 실리며 세션 수명 동안 고정, resume 시 파일에서 재해석(모르는 id는 `-32602`) | `{sessionId, backend, persona?, replayed, cursor}` |
+| `session.create` | `{backend?, cwd?, model?, mode?, mcpServers?, allowedTools?, projectId?, persona?}` — 프로젝트가 세션의 범위를 정한다: 루트가 cwd 기본값이 되고 기본값들이 미지정 파라미터를 채운다(명시 값 항상 우선); `persona`는 `bot.list`의 봇 id — SOUL/AGENTS 블록이 매 턴 앞에 실리며 세션 수명 동안 고정, resume 시 파일에서 재해석(모르는 id는 `-32602`); `allowedTools`는 실행 시 강제할 수 있는 백엔드용 세션별 도구 허용 목록(claude: `--allowedTools`) | `{sessionId, backend, persona?, replayed, cursor}` |
 | `session.resume` | `{sessionId}` — 또는 네이티브 세션 임포트는 `{handle:{provider,native_handle}, cwd?, title?}` | `{sessionId, backend, replayed, cursor}` |
 | `session.messages` | `{sessionId, limit?, offset?}` | `{messages: [{id, session_id, role, ts, data}]}` |
 | `session.export` | `{sessionId}` | `{session: {sessionId, createdAt, backend, title, tags, cwd}, messages: [{id, role, ts, data}], usage: {contextUsed, contextSize, costUsd, turns}}` |
@@ -87,7 +87,7 @@ WebSocket(`GET /ws`) 또는 릴레이 터널 위의 JSON 메시지. 하나의 �
 | `session.set_tags` | `{sessionId, tags[]}` — 목록 전체를 교체 | `{updated: bool}` |
 | `session.rename` | `{sessionId, title}` | `{renamed: bool}` |
 | `session.fork` | `{sessionId, upto?}` | `{sessionId}` — 메시지·태그·사용 히스토리·백엔드 resume 핸들이 복사; 제목에 `" (fork)"` 접미 |
-| `session.usage` | `{sessionId?}` — 또는 글로벌 일별 롤업은 `{daily: true, days?}`(기본 7일) | 세션별 `{sessionId, contextUsed, contextSize, costUsd, turns}`, 모델별 `{sessions: [...]}`, 또는 `{daily: [{date, turns, costUsd, contextUsed}]}` |
+| `session.usage` | `{sessionId?}` — 또는 글로벌 일별 롤업은 `{daily: true, days?}`(기본 7일), 또는 프로젝트 하나로 범위를 좁힌 모델별 합계는 `{projectId?}` | 세션별 `{sessionId, contextUsed, contextSize, costUsd, turns}`, 모델별 `{sessions: [...]}`, 또는 `{daily: [{date, turns, costUsd, contextUsed}]}` |
 | `session.list` | `{limit?, offset?, backend?, cwd?, tag?, includeArchived?}` | `{sessions: [{sessionId, createdAt, backend, title, cwd, tags, pinned, archived}]}` — 고정 우선; 보관은 요청 시에만 |
 | `session.search` | `{query, limit?, sessionId?, backend?, cwd?, since?, until?}` | `{results: [{sessionId, messageId, snippet}]}` |
 | `usage.summary` | `{days?, tzOffsetMinutes?}` — 최근 `days`개 로컬 날(기본 7, 오늘 포함); `tzOffsetMinutes`는 UTC 스탬프를 호출자의 달력으로 옮긴다(기본 0 = UTC) | `{days, rows: [{date, backend, model, turns, contextUsed, contextSize, costUsd}], total: {turns, contextUsed, contextSize, costUsd}}` — 로컬 날 × 백엔드 × 모델당 한 행; context 컬럼은 턴별 스냅샷의 합, cost는 턴별 델타의 합; 행이 없는 날은 없다 |

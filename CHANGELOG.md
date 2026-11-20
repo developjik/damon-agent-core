@@ -2,6 +2,28 @@
 
 ## Unreleased
 
+### Changed — `session.*` request params are typed, and the schema is held to them
+
+- Every `session.*` handler deserializes into a per-method request struct
+  (`src/rpc/session.rs`) instead of indexing the raw `serde_json::Value`
+  — the first slice of the dispatch params refactor, cut along the
+  method-family boundary so the next families can follow the same shape.
+  Wire behavior is unchanged on purpose: the same `-32602` code and
+  message for a missing or ill-typed required param (`"sessionId
+  required"`, `"pinned must be a boolean"`, …), the same defaults, and
+  the same silently-ignored optional params.
+- Each struct declares a `Field` table (`src/rpc/params.rs`) that is both
+  its validation rule and its schema-catalog entry. A new test holds the
+  table to `rpc_methods()` (`hello` / `damond --print-rpc-schema`) in
+  both directions, so a handler reading a param the catalog never names —
+  or a catalog entry left behind by a removed field — fails the build.
+- The catalog caught up with what the handlers already read:
+  `session.create` advertises `allowedTools`, `session.list` advertises
+  `includeArchived` (the protocol doc already listed it), and
+  `session.usage` advertises `projectId` for the per-model view. The
+  `session.resume` params are now marked as the alternatives they are.
+  Additive — a request that worked before is answered the same way.
+
 ### Changed — session state is pure data with a boot checkpoint
 
 - The session layer's mutable picture (phase, open turn, parked ask,
