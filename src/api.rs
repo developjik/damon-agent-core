@@ -231,6 +231,10 @@ pub struct AppState {
     /// entry when it ends. Master-auth connections carry no device id
     /// and are never registered here.
     pub device_conns: DeviceConns,
+    /// Idempotency keys for the Keyed methods (`turn.start`,
+    /// `turn.steer`): a retry after a lost response replays the first
+    /// attempt's answer instead of running a second turn.
+    pub idempotency: crate::idempotency::IdempotencyCache,
 }
 
 /// One minted WS ticket: when it was issued (single-use, TTL-bounded)
@@ -330,6 +334,7 @@ impl AppState {
             history_scan: parking_lot::Mutex::new(None),
             missions: crate::mission::MissionRegistry::new(),
             device_conns: DeviceConns::default(),
+            idempotency: crate::idempotency::IdempotencyCache::new(crate::idempotency::DEFAULT_TTL),
         });
         // Crash-honest mission convergence: runs with unfinished work
         // and no end timestamp are orphans of a dead daemon — mark them
@@ -348,6 +353,36 @@ impl AppState {
                     }
                     Ok(_) => {}
                     Err(e) => tracing::error!(error = %e, "mission recovery failed"),
+                }
+            });
+        }
+        // Crash-honest TURN convergence, the same discipline one level
+        // down: a turn row still open at boot belongs to a dead daemon
+        // incarnation (this process has not started a turn yet). Mark it
+        // `interrupted` and leave a durable marker in the transcript, so
+        // reopening the session shows that the answer was cut short
+        // rather than a prompt with no reply and no explanation.
+        {
+            let state2 = state.clone();
+            tokio::spawn(async move {
+                match state2.store.recover_interrupted_turns().await {
+                    Ok(rows) if !rows.is_empty() => {
+                        for (session_id, turn_id) in &rows {
+                            let _ = state2
+                                .store
+                                .append(
+                                    session_id,
+                                    "error",
+                                    &json!({"content": format!(
+                                        "turn {turn_id} was interrupted — the daemon restarted mid-turn; tool calls it started may or may not have taken effect"
+                                    )}),
+                                )
+                                .await;
+                        }
+                        tracing::info!(count = rows.len(), "recovered interrupted turns");
+                    }
+                    Ok(_) => {}
+                    Err(e) => tracing::error!(error = %e, "turn recovery failed"),
                 }
             });
         }

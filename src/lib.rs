@@ -9,6 +9,7 @@ pub mod discord;
 pub mod discovery;
 pub mod file_index;
 pub mod history_scan;
+pub mod idempotency;
 pub mod logs;
 pub mod mcp_inventory;
 pub mod memory;

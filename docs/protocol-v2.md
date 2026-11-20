@@ -14,10 +14,14 @@ a long `turn.start` never serializes the socket.
 // response
 {"id": 1, "result": {"sessionId": "…", "backend": "claude"}}
 {"id": 1, "error": {"code": -32602, "message": "sessionId required"}}
-// server push (no id)
-{"event": "session.event", "sessionId": "…", "data": {…StreamEvent…}}
+// server push (no id) — every frame carries the session's event cursor
+{"event": "session.event", "sessionId": "…", "seq": 42, "data": {…StreamEvent…}}
 // sent on connect, and as the response to a "hello" request
-{"hello": {"protocol": 2, "daemon": "damond", "version": "0.5.0",
+{"hello": {"protocol": 2, "minProtocol": 2, "supported": [2],
+           "capabilities": {"eventSeq": true, "snapshotRequired": true, "connGap": true,
+                            "idempotentTurns": true, "turnLedger": true,
+                            "versionNegotiation": true},
+           "daemon": "damond", "version": "0.8.0",
            "permissionTimeoutSecs": 300}}
 ```
 
@@ -54,6 +58,7 @@ parsing messages:
 | `-32009` | plan-review conflict (`PLAN_CONFLICT`) — another surface claimed the decision, or the call targeted a stale revision / closed plan | refetch via `plan.list` and decide on the current revision |
 | `-32010` | MCP setEnabled CAS reject (`MCP_CONFLICT`) — the entry changed since the inventory snapshot (external edit) | refetch via `mcp.inventory` and retry |
 | `-32011` | memory write rejected at the gate chain (`MEMORY_REJECTED`) — `error.data.kind` = `prompt_injection` \| `secret` \| `invisible` \| `capacity` (capacity carries `limit`/`current`/`attempted`); the whole write bounced — nothing sanitized or truncated | fix the content or trim the ledger, then rewrite |
+| `-32012` | `hello` named a protocol version this daemon does not speak (`UNSUPPORTED_PROTOCOL`) — `error.data` = `{requested, supported[]}` | retry with a version from `supported`, or upgrade the client |
 
 Pre-0.5.0 daemons answered every error with `-32000`; messages are
 unchanged, so string-matching clients keep working.
@@ -62,23 +67,23 @@ unchanged, so string-matching clients keep working.
 
 | method | params | result |
 |---|---|---|
-| `hello` | — | `{protocol, daemon, version, backends[], methods[]}` |
+| `hello` | `{protocolVersion?, client?}` — naming a MAJOR version asks the daemon to confirm it; omitting it is the pre-negotiation shape and still answered | `{protocol, minProtocol, supported[], capabilities, daemon, version, backends[], methods[]}` — `-32012` (with `data.supported[]`) when `protocolVersion` is outside `minProtocol..=protocol`; `capabilities` gates the additive fields/events below (unknown keys are ignored) |
 | `backend.list` | — | `{backends: [{id, available, capabilities}]}` |
 | `backend.versions` | `{backend?}` — one backend, else the whole catalog | `{versions: [{backend, installed, version?, latest?, updateAvailable, updateKind: "npm"\|"manual"\|"unknown"}]}` — `latest` only where an npm package is verified; probes run on this call only, never scheduled |
 | `backend.update_plan` | `{backend}` | `{backend, action: "install"\|"update", kind, command[], manualCommand, canRun, blockers[], platform}` — the exact argv `backend.update` runs plus the copy-paste fallback; no side effects |
 | `backend.update` | `{backend, creationId?}` | `{creationId, ok: true, version?}` — runs the plan (npm global install or the CLI's official installer); progress streams to the requesting connection as `{"event":"backend.update_progress","creationId","data":{phase, line?, exitOk?}}` with per-line caps; `-32602` when the backend has no verified channel (see the plan's blockers), `-32000` on failure or the 420s timeout (output tail rides the message) |
 | `backend.update_cancel` | `{creationId}` | `{cancelled: bool}` — false when no live run holds the id |
-| `session.create` | `{backend?, cwd?, model?, mode?, mcpServers?, projectId?, persona?}` — the project scopes the session: its root becomes the cwd default and its defaults fill unset params (explicit always wins); `persona` names a bot from `bot.list` whose SOUL/AGENTS block rides in front of every turn, bound for the session's life and re-resolved from the files on resume (`-32602` unknown persona) | `{sessionId, backend, persona?, replayed}` |
-| `session.resume` | `{sessionId}` — or `{handle:{provider,native_handle}, cwd?, title?}` to import a native session | `{sessionId, backend, replayed}` |
+| `session.create` | `{backend?, cwd?, model?, mode?, mcpServers?, projectId?, persona?}` — the project scopes the session: its root becomes the cwd default and its defaults fill unset params (explicit always wins); `persona` names a bot from `bot.list` whose SOUL/AGENTS block rides in front of every turn, bound for the session's life and re-resolved from the files on resume (`-32602` unknown persona) | `{sessionId, backend, persona?, replayed, cursor}` |
+| `session.resume` | `{sessionId}` — or `{handle:{provider,native_handle}, cwd?, title?}` to import a native session | `{sessionId, backend, replayed, cursor}` |
 | `session.messages` | `{sessionId, limit?, offset?}` | `{messages: [{id, session_id, role, ts, data}]}` |
 | `session.export` | `{sessionId}` | `{session: {sessionId, createdAt, backend, title, tags, cwd}, messages: [{id, role, ts, data}], usage: {contextUsed, contextSize, costUsd, turns}}` |
 | `session.import` | `{backend, cwd?}` | `{sessions: [ImportableSession]}` |
 | `session.delete` | `{sessionId}` | `{deleted: bool}` |
 | `session.rescan` | `{}` | `{scanId, alreadyRunning, report: {scanned, reparsed, reused, archived, tombstoned, skippedBackends[]}}` — sweeps every backend's native session storage and creates damon bookmark rows for sessions the daemon has never seen; single-flight (a second call while one runs returns the in-flight `scanId`); progress streams to the requesting connection as `{"event":"history.scan_progress","scanId","data":{stage, …}}`; see [The history scanner](#the-history-scanner) |
 | `session.close` | `{sessionId}` | `{closed: bool}` — kills the live backend process, keeps the row/history; frees a `max_sessions` slot; idempotent |
-| `session.restart` | `{sessionId}` | `{sessionId, backend, replayed}` — kills the live backend (mid-turn refuses `-32006`) and reattaches through the persisted handle |
+| `session.restart` | `{sessionId}` | `{sessionId, backend, replayed, cursor}` — kills the live backend (mid-turn refuses `-32006`) and reattaches through the persisted handle |
 | `session.status` | `{}` | `{sessions: [{sessionId, backend, busy, idleSecs}]}` — live backend sessions only |
-| `session.watch` | `{sessionId}` — must be live | `{sessionId, subscribed, replayed}` — subscribes this connection to the session's events without creating/resuming/turning on it; the cross-surface notification path (a chat bridge pings its channel when a web-UI session finishes or asks for permission) |
+| `session.watch` | `{sessionId}` — must be live | `{sessionId, subscribed, replayed, cursor}` — subscribes this connection to the session's events without creating/resuming/turning on it; the cross-surface notification path (a chat bridge pings its channel when a web-UI session finishes or asks for permission) |
 | `session.unwatch` | `{sessionId}` | `{sessionId, subscribed}` — drops this connection's subscription; the session and other connections are untouched |
 | `session.set_pinned` | `{sessionId, pinned}` | `{updated: bool}` — pinned rows float first in `session.list` and survive the retention sweep |
 | `session.set_archived` | `{sessionId, archived}` | `{updated: bool}` — archived rows are hidden from `session.list` unless `includeArchived`, and survive the retention sweep |
@@ -109,8 +114,8 @@ unchanged, so string-matching clients keep working.
 | `bot.get` | `{id}` | `{bot: {id, name, description?, soul?, agents?}}` — full file contents; `-32602` unknown id |
 | `bot.save` | `{id, name, description?, soul?, agents?}` — optional string fields: absent keeps, null (or `""`) clears, a string sets | `{bot: {id, name}}` — creates or updates; running sessions keep the block they were created with |
 | `bot.delete` | `{id}` | `{deleted: bool}` — future resumes of bound sessions lose the persona silently |
-| `turn.start` | `{sessionId, prompt, timeoutSecs?, detach?, memoryOwner?}` — with `[memory]` enabled, `memoryOwner` names the bot ledger whose ACTIVE entries join the user ledger in the injected `<memory>` block (a delimited block that declares itself data, not instructions; the persisted user message keeps the clean prompt) | `{turnId, stopReason, usage?}` — or `{turnId, detached: true}` immediately when `detach` is true |
-| `turn.steer` | `{sessionId, prompt, expectedTurn?}` | `{result}` |
+| `turn.start` | `{sessionId, prompt, timeoutSecs?, detach?, idempotencyKey?, memoryOwner?}` — with `[memory]` enabled, `memoryOwner` names the bot ledger whose ACTIVE entries join the user ledger in the injected `<memory>` block (a delimited block that declares itself data, not instructions; the persisted user message keeps the clean prompt); `idempotencyKey` makes the call Keyed (see [Retry contract](#retry-contract-keyed-requests)) | `{turnId, stopReason, usage?}` — or `{turnId, detached: true}` immediately when `detach` is true; a repeated key replays the first answer with `duplicate: true`, or `{duplicate: true, inProgress: true}` while that turn runs |
+| `turn.steer` | `{sessionId, prompt, expectedTurn?, idempotencyKey?}` | `{result}` — a repeated key replays the first delivery |
 | `turn.cancel` | `{sessionId}` | `{cancelled: true}` |
 | `permission.respond` | `{sessionId, requestId, response}` — for `kind: question` asks, an `answers` map (`{question → label | [labels]}`) submits picks; an allow without answers skips | `{}` — unknown `requestId` fails with `-32008`; a *delivery* failure leaves the ask answerable; on `kind: plan` asks the decision also lands in the durable plan-review row |
 | `plan.list` | `{sessionId}` | `{plans: [{planId, sessionId, requestId, revision, title, content, contentHash, complete, status, decision?, decisionIntentAt?, appliedAt?, createdAt, updatedAt, supersededBy?}]}` — every revision of every plan, chain-ordered |
@@ -491,16 +496,78 @@ until the detached turn finishes.
 ### Event replay for late subscribers
 
 A connection that first touches a session (`session.create`,
-`session.resume`, `turn.start`) receives everything it missed BEFORE
-live streaming starts, as `session.event` frames tagged
+`session.resume`, `session.watch`, `turn.start`) receives everything it
+missed BEFORE live streaming starts, as `session.event` frames tagged
 `"replay": true`: persisted history from the store (user, assistant,
 reasoning, tool, todo, compaction, and error rows as timeline events,
-newest last, capped at 200),
-then the in-flight turn's journal. The `replayed` count in the
-create/resume result says how many frames were sent. Live frames carry
-no `replay` field. A turn that overflowed the daemon's in-flight
-journal is not replayed (the live remainder continues uninterrupted;
-the assembled result is still persisted at turn end).
+newest last, capped at 200), then the in-flight turn's journal. The
+`replayed` count in the create/resume/watch result says how many frames
+were sent, and `cursor` says where the session's numbering stands. Live
+frames carry no `replay` field.
+
+### Delivery honesty: `seq`, `session.gap`, `session.snapshot_required`
+
+Every `session.event` frame carries `seq` — a session-scoped,
+strictly-increasing cursor assigned once per event (report frames and
+live frames alike). It is what makes a gap visible instead of
+authoritative: a client that has seq 41 and then gets seq 47 knows 42–46
+are missing.
+
+- **`session.gap`** — `{event, sessionId, dropped, cursor}`: this
+  connection lost `dropped` events (its send queue overflowed, or it fell
+  behind the daemon's fan-out) immediately before the frame carrying
+  `cursor`. Consumption continues; the missing events are gone by
+  contract.
+- **`session.snapshot_required`** — `{event, sessionId, cursor, reason}`:
+  the in-flight journal shed this turn (it overflowed its 2,048-event cap,
+  or the daemon itself lagged the backend), so there is no replayable
+  prefix to send. Re-read `session.messages` to resync; the assembled turn
+  is still persisted when it ends. A client without this frame would
+  render a partial turn as the whole answer.
+
+The multi-surface guarantee is unchanged: every connection watching a
+session sees the same stream. What changed is that a hole in it is now
+announced — before, a slow client silently lost frames.
+
+### Retry contract (Keyed requests)
+
+Requests fall into four classes, and a client retries accordingly:
+
+| class | methods | retry |
+|---|---|---|
+| **Keyed** | `turn.start`, `turn.steer` | yes, with `idempotencyKey` |
+| Idempotent | `session.resume`, `session.create` (same params re-subscribe) | yes, unchanged |
+| Duplicating | `session.create`, `worktree.create`, `memory.write` | only with the caller's own `creationId`/intent — a blind retry duplicates |
+| Not retried | `session.event` (an event, not a request) | no — resync via replay/`session.snapshot_required` |
+
+`turn.start`/`turn.steer` accept an optional `idempotencyKey` (client
+chosen, one per turn — a counter or a uuid is fine). Semantics:
+
+- The key is remembered per session and method for **24 hours**.
+- A repeat while the first attempt is still running returns
+  `{duplicate: true, inProgress: true}` and subscribes the calling
+  connection to that turn's stream — it does not start a second turn.
+- A repeat after it settled replays the original result, marked
+  `duplicate: true`.
+- A failed or canceled attempt releases its key, so an honest retry still
+  starts a fresh turn (the client must see the failure, not a cached one).
+
+The cache lives in the daemon process. After a daemon restart the key is
+unknown — which is why turns also have a persisted ledger (below): the
+client can tell from the transcript whether its prompt ran, instead of
+guessing.
+
+### Turn ledger
+
+Every turn is a row in the `turns` table, opened once the backend accepts
+the prompt and settled with its stop reason (`completed`, `failed`,
+`canceled`, `timeout`, `closed`). The user message was already persisted
+up front; the ledger row is what makes the TURN durable. A daemon that
+dies mid-turn leaves the row open, and boot recovery converges it to
+`interrupted` and appends an `error` timeline row to the transcript — so
+reopening the session shows that the answer was cut short, and no surface
+reports a ghost turn as still running. (The mission runner applies the
+same rule to its runs.)
 
 ### The mission runner (staged)
 

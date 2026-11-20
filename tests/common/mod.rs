@@ -452,6 +452,21 @@ impl AgentSession for MockSession {
                     ));
                 }
             }
+        } else if text.contains("spam") {
+            // Journal-overflow probe: more events than the daemon's
+            // in-flight journal holds, inside one turn that never ends.
+            // A connection attaching now meets a SHED journal and must be
+            // told to resync (`session.snapshot_required`) instead of
+            // receiving a partial turn as if it were the whole one.
+            for i in 0..2_200usize {
+                self.emit(StreamEvent::in_turn(
+                    turn.clone(),
+                    StreamEventKind::Timeline(TimelineItem::AssistantMessage {
+                        text: format!("chunk {i} "),
+                    }),
+                ));
+            }
+            return Ok(turn);
         } else if text.contains("hang") {
             // Hang mid-turn until interrupted. Like a real backend,
             // start_turn returns immediately and the turn ends via an
