@@ -33,6 +33,7 @@ use tokio_util::sync::CancellationToken;
 use crate::api::AppState;
 use crate::backend::types::*;
 use crate::session::ManagedSession;
+use crate::state::TurnOutcome;
 use crate::store::{SearchFilter, SessionFilter};
 
 #[derive(Deserialize)]
@@ -121,6 +122,10 @@ pub fn server_capabilities() -> Value {
         // `hello` accepts `protocolVersion` and refuses an unsupported one
         // with `-32012` + `data.supported`.
         "versionNegotiation": true,
+        // `session.status` rows carry the ledger's `phase` (idle | busy |
+        // awaiting_input) and `pendingAsk`, and the response carries the
+        // sessions a dead daemon left behind as `recovered`.
+        "sessionPhase": true,
     })
 }
 
@@ -1722,8 +1727,8 @@ async fn dispatch(
             // through the persisted handle; a not-live session just
             // reattaches. Busy sessions refuse: restarting mid-turn
             // would kill the turn's process underneath the collector.
-            if let Some(ms) = state.sessions.get(id).await {
-                if ms.busy.load(std::sync::atomic::Ordering::Relaxed) {
+            if state.sessions.get(id).await.is_some() {
+                if state.sessions.record(id).is_some_and(|r| r.is_active()) {
                     return Err(RpcError::error(
                         error_code::TURN_IN_PROGRESS,
                         "a turn is already running on this session",
@@ -1762,17 +1767,53 @@ async fn dispatch(
 
         "session.status" => {
             // Live-session introspection: which backend processes are
-            // resident right now, which are mid-turn, how long idle.
-            // Complements the /metrics gauges with per-session detail.
+            // resident right now, what each one is doing (idle, mid-turn,
+            // or parked on an answer), how long idle. `recovered` names
+            // what a dead daemon left unfinished — a client reopening the
+            // app learns that a turn was cut off instead of finding a
+            // session that silently looks idle. Complements the /metrics
+            // gauges with per-session detail.
             let rows = state.sessions.live_status().await;
             let sessions: Vec<Value> = rows
                 .into_iter()
-                .map(|(id, backend, busy, idle_secs)| {
-                    json!({"sessionId": id, "backend": backend,
-                           "busy": busy, "idleSecs": idle_secs})
+                .map(|row| {
+                    let mut v = json!({
+                        "sessionId": row.id,
+                        "backend": row.provider,
+                        "busy": row.phase.is_active(),
+                        "phase": row.phase.as_str(),
+                        "idleSecs": row.idle_secs,
+                    });
+                    if let Some(turn_id) = row.turn_id {
+                        v["turnId"] = json!(turn_id);
+                    }
+                    if let Some(ask) = row.pending_ask {
+                        v["pendingAsk"] = json!({
+                            "requestId": ask.request_id,
+                            "kind": ask.kind.as_str(),
+                            "label": ask.label,
+                            "askedAtMs": ask.asked_at_ms,
+                        });
+                    }
+                    v
                 })
                 .collect();
-            Ok(json!({"sessions": sessions}))
+            let recovered: Vec<Value> = state
+                .sessions
+                .recovered_sessions()
+                .into_iter()
+                .filter_map(|r| {
+                    let mark = r.recovered?;
+                    Some(json!({
+                        "sessionId": r.id,
+                        "backend": r.provider,
+                        "phase": mark.from_phase.as_str(),
+                        "sinceMs": mark.at_ms,
+                        "turnId": mark.turn_id,
+                    }))
+                })
+                .collect();
+            Ok(json!({"sessions": sessions, "recovered": recovered}))
         }
 
         "session.watch" => {
@@ -2461,9 +2502,10 @@ async fn dispatch(
             }
             // Claim the session exclusively: a second concurrent start
             // would run two collectors on the same broadcast and
-            // double-persist every event. swap() is the claim;
+            // double-persist every event. The session ledger's phase is
+            // the one-and-only claim (#16 replaced the old atomic flag);
             // run_turn's BusyGuard releases it on every exit path.
-            if ms.busy.swap(true, std::sync::atomic::Ordering::AcqRel) {
+            if !state.sessions.begin_turn(&ms.id) {
                 release_key(state, &idem_key);
                 return Err(RpcError::error(
                     error_code::TURN_IN_PROGRESS,
@@ -3907,6 +3949,12 @@ impl crate::mission::MissionAgentRunner for MissionTurnRunner {
             .store
             .create_session(&ms.id, &cwd.to_string_lossy(), Some(&ms.provider))
             .await;
+        // Claim the session for the turn. A mission node runs on a fresh
+        // session, but without the claim the idle sweep would see a
+        // "free" session and could reap it mid-turn.
+        if !self.state.sessions.begin_turn(&ms.id) {
+            return Err("agent node session is already running a turn".to_string());
+        }
         // A sink connection: turn events are fanned out through the
         // session's broadcast channel; nobody is watching this one.
         let (tx, mut rx) = mpsc::channel::<Message>(256);
@@ -3970,11 +4018,11 @@ async fn run_turn(
     // Concurrency cap — held for the turn's whole life, whether the
     // collector ends up on this task or a detached one.
     let slot = PROMPT_SLOTS.acquire().await?;
-    // The dispatcher claimed `busy` with swap() — this guard releases
-    // it on every exit path, including the early parameter errors
-    // below, so a rejected turn never wedges the session. A detached
-    // turn hands the claim to its background collector instead.
-    let mut _busy = BusyGuard::new(ms.clone());
+    // The dispatcher claimed the session through the ledger — this guard
+    // releases it on every exit path, including the early parameter
+    // errors below, so a rejected turn never wedges the session. A
+    // detached turn hands the claim to its background collector instead.
+    let mut _busy = BusyGuard::new(state.sessions.clone(), &ms.id);
     let prompt: PromptInput = serde_json::from_value(params["prompt"].clone())
         .map_err(|_| RpcError::error(error_code::INVALID_PARAMS, "prompt required"))?;
     let timeout = params["timeoutSecs"]
@@ -4013,10 +4061,9 @@ async fn run_turn(
         Some(block) => crate::memory::prepend_block(prompt, block),
         None => prompt,
     };
-    // First use ends the fresh-session reap grace. (`busy` was already
-    // claimed by the turn.start dispatcher — only the guard releases.)
-    ms.ever_used
-        .store(true, std::sync::atomic::Ordering::Relaxed);
+    // First use ends the fresh-session reap grace — the claim set
+    // `everUsed` in the ledger (the dispatcher already took it; only the
+    // guard releases it).
 
     // The registration itself lives in the dispatcher (immediately after
     // the busy claim); this guard removes it again when the turn ends.
@@ -4045,13 +4092,12 @@ async fn run_turn(
         None => ms.session.start_turn(prompt).await?,
     };
 
-    // Turn ledger: from here the turn is a row, not just a live flag. A
-    // daemon that dies mid-turn leaves this row open, and boot recovery
-    // converges it to `interrupted` with a marker in the transcript —
-    // "no ghost turn reported as still running" is the same rule the
-    // mission runner already keeps. Best-effort: bookkeeping must never
-    // fail a turn that is already running.
+    // Both ledgers learn the turn id the backend just handed over: the
+    // store row (the durable one) and the session ledger's open turn (the
+    // live picture a restart reads back).
     let _ = state.store.begin_turn(&ms.id, &turn_id, &ms.provider).await;
+    state.sessions.note_turn_started(&ms.id, &turn_id);
+    _busy.track_turn(&turn_id);
 
     if detach {
         let busy = _busy.hand_off();
@@ -4281,7 +4327,7 @@ async fn drive_turn(
     let fresh_handle = ms
         .session
         .persistence_handle()
-        .or_else(|| ms.handle.clone());
+        .or_else(|| state.sessions.handle_of(&ms.id));
     if let Some(h) = &fresh_handle {
         let _ = state
             .store
@@ -4295,32 +4341,69 @@ async fn drive_turn(
     // that verdict.
     let _ = state.store.finish_turn(&ms.id, turn_id, stop_reason).await;
 
+    // Same settlement one level up: the session's phase goes back to
+    // idle with the turn's real outcome. The event tap usually got here
+    // first (`session.rs::SessionState::observe`), which makes this a
+    // no-op; it is what settles a turn whose boundary never arrived (a
+    // timeout, a closed channel, a collector error).
+    state.sessions.end_turn(
+        &ms.id,
+        Some(turn_id),
+        match stop_reason {
+            "completed" => TurnOutcome::Completed,
+            "canceled" => TurnOutcome::Canceled,
+            _ => TurnOutcome::Failed,
+        },
+    );
+
     state
         .metrics
         .record_turn(&ms.provider, stop_reason, started.elapsed());
     outcome.map(|()| (stop_reason, usage))
 }
 
-/// Drop-guard: clears the session's busy flag when the turn ends, so the
-/// idle sweep can reap it again. The Option lets a detached turn hand
-/// the claim to its background collector — the flag must stay set until
-/// the turn actually ends, not until run_turn returns its early
-/// response.
-struct BusyGuard(Option<Arc<ManagedSession>>);
+/// Drop-guard: releases the session's turn claim when the turn ends, so
+/// the idle sweep can reap it again. The claim itself lives in the
+/// session ledger (#16); this guard is what guarantees every exit path —
+/// an early parameter error, a failed turn, a panic — releases it.
+///
+/// The Option lets a detached turn hand the claim to its background
+/// collector: the claim must stay set until the turn actually ends, not
+/// until run_turn returns its early response. `turn_id` is set once the
+/// backend reports it, so a guard dropping late cannot settle a *newer*
+/// turn on the same session (`None` only while this task alone holds the
+/// claim, i.e. before the turn started).
+struct BusyGuard {
+    claim: Option<(Arc<crate::session::SessionManager>, String)>,
+    turn_id: Option<String>,
+}
 impl BusyGuard {
-    fn new(ms: Arc<ManagedSession>) -> Self {
-        Self(Some(ms))
+    fn new(sessions: Arc<crate::session::SessionManager>, session_id: &str) -> Self {
+        Self {
+            claim: Some((sessions, session_id.to_string())),
+            turn_id: None,
+        }
     }
-    /// Transfer the busy claim to another owner; the receiver's drop
-    /// releases the flag.
+    /// Pin the claim to the backend's turn id.
+    fn track_turn(&mut self, turn_id: &str) {
+        self.turn_id = Some(turn_id.to_string());
+    }
+    /// Transfer the claim to another owner; the receiver's drop releases
+    /// it.
     fn hand_off(&mut self) -> Self {
-        Self(self.0.take())
+        Self {
+            claim: self.claim.take(),
+            turn_id: self.turn_id.clone(),
+        }
     }
 }
 impl Drop for BusyGuard {
     fn drop(&mut self) {
-        if let Some(ms) = self.0.take() {
-            ms.busy.store(false, std::sync::atomic::Ordering::Relaxed);
+        if let Some((sessions, session_id)) = self.claim.take() {
+            // The event boundary usually settled it already; this is the
+            // fallback that keeps a session from staying claimed forever
+            // when no boundary ever arrived.
+            sessions.end_turn(&session_id, self.turn_id.as_deref(), TurnOutcome::Failed);
         }
     }
 }
@@ -4387,7 +4470,7 @@ pub fn rpc_methods() -> Vec<Value> {
         json!({"name": "session.rescan", "params": {}, "result": {"scanId": "string", "alreadyRunning": "boolean — true when a scan is in flight; its progress events go to the caller that started it", "report": "{scanned, reparsed, reused, archived, tombstoned, skippedBackends[]} — the finished sweep's summary; imported sessions appear in session.list and their handles resume like any native session"}, "errors": "best-effort: a failing backend is skipped (skippedBackends), never an abort; -32000 on store failure"}),
         json!({"name": "session.close", "params": {"sessionId": "string"}, "result": {"closed": "boolean — kills the live backend process, keeps the row/history; frees a max_sessions slot"}}),
         json!({"name": "session.restart", "params": {"sessionId": "string"}, "result": {"sessionId": "string", "backend": "string", "replayed": "number — kills the live backend (refuses with -32006 mid-turn) and reattaches through the persisted handle"}}),
-        json!({"name": "session.status", "params": {}, "result": {"sessions": "array of {sessionId, backend, busy, idleSecs} — live backend sessions only"}}),
+        json!({"name": "session.status", "params": {}, "result": {"sessions": "array of {sessionId, backend, busy, phase: idle|busy|awaiting_input, idleSecs, turnId?, pendingAsk?: {requestId, kind: permission|question|plan, label?, askedAtMs}} — live backend sessions only; busy is true while a turn is in flight or parked on an answer", "recovered": "array of {sessionId, backend, phase, sinceMs, turnId?} — sessions a previous daemon left mid-turn or awaiting an answer, converged to idle at boot; resuming the session clears the row (kept 24h)"}}),
         json!({"name": "mission.create", "params": {"flowId?": "string — defaults to a fresh uuid", "name?": "string", "definition": "{nodes: [{id, kind: input|agent|human|output, title?, prompt?, value?, backend?, cwd?, readOnly?, allowedTools?, artifact?}], edges: [{from, to, condition? — key=value | key!=value, and over or, missing key ⇒ false; absent = default edge taken only when nothing else matched}], settings?: {concurrency? default 4, retries? default 0}}"}, "result": {"flowId": "string", "version": "number — re-creating a flowId inserts the next version; runs keep their snapshot"}, "errors": "-32602 invalid definition (unknown node kind, missing prompt/backend/value, root rule)"}),
         json!({"name": "mission.start", "params": {"flowId": "string"}, "result": {"runId": "string", "version": "number"}, "errors": "-32602 unknown flow; -32003 backend not registered; -32002 read-only agent node refused — the backend cannot enforce a tool allowlist (never downgraded)"}),
         json!({"name": "mission.cancel", "params": {"runId": "string"}, "result": {"runId": "string", "cancelled": "boolean — false when the run is not live"}, "errors": ""}),

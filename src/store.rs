@@ -10,6 +10,11 @@ use tokio_rusqlite::Connection;
 #[derive(Clone)]
 pub struct Store {
     conn: Connection,
+    /// Where the database file lives. `None` for an in-memory store.
+    /// Neighbour files of the daemon's state (the session checkpoint)
+    /// live in its directory, so a daemon pointed at another store never
+    /// mixes pictures with the first one.
+    path: Option<std::path::PathBuf>,
 }
 
 #[derive(Debug, Clone, serde::Serialize)]
@@ -478,6 +483,13 @@ pub struct MemoryEntry {
 }
 
 impl Store {
+    /// Directory-relative identity of this store: the daemon keeps its
+    /// neighbour state files (the session checkpoint) here. `None` for an
+    /// in-memory store, which owns no directory.
+    pub fn path(&self) -> Option<&std::path::Path> {
+        self.path.as_deref()
+    }
+
     pub async fn open(path: &Path) -> anyhow::Result<Self> {
         if let Some(parent) = path.parent() {
             std::fs::create_dir_all(parent)
@@ -1113,7 +1125,11 @@ impl Store {
             Ok::<(), rusqlite::Error>(()).map_err(tokio_rusqlite::Error::from)
         })
         .await?;
-        Ok(Self { conn })
+        let db_path = path.to_path_buf();
+        Ok(Self {
+            conn,
+            path: Some(db_path),
+        })
     }
 
     /// In-memory store for tests.
@@ -1315,7 +1331,7 @@ impl Store {
             .map_err(tokio_rusqlite::Error::from)
         })
         .await?;
-        Ok(Self { conn })
+        Ok(Self { conn, path: None })
     }
 
     /// `agent` is the Damon agent id backing this session (e.g. "claude").

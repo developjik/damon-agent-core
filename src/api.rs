@@ -303,9 +303,17 @@ impl AppState {
     }
 
     pub async fn with_bind(config: SharedConfig, store: Store, bind: SocketAddr) -> Arc<Self> {
+        // The session checkpoint lives next to the database, so a daemon
+        // pointed at another store never adopts the first one's picture.
+        // An in-memory store has no directory and therefore no file: the
+        // ledger is this incarnation's only.
+        let checkpoint = store
+            .path()
+            .and_then(|p| p.parent())
+            .map(|dir| dir.join("sessions.state.json"));
         let sessions = {
             let cfg = config.read();
-            SessionManager::from_config(&cfg)
+            SessionManager::from_config_with_checkpoint(&cfg, checkpoint)
         };
         let skills = {
             let cfg = config.read();
@@ -315,6 +323,23 @@ impl AppState {
         };
         for id in sessions.available_backends() {
             info!(backend = id, "backend available");
+        }
+        // Session-state convergence (#16): the previous incarnation's
+        // checkpoint names what was running and what was waiting for an
+        // answer. Its processes died with it, so those rows converge to
+        // idle with a `recovered` mark — the daemon never reports a ghost
+        // as live. A missing or older checkpoint is not an error.
+        if let Some(report) = sessions.restore() {
+            if !report.recovered.is_empty() {
+                info!(
+                    path = %report.path.display(),
+                    count = report.recovered.len(),
+                    "converged sessions a previous daemon left mid-turn or awaiting an answer"
+                );
+            }
+            if report.pruned > 0 {
+                info!(count = report.pruned, "pruned aged recovered sessions");
+            }
         }
         let state = Arc::new(Self {
             config,

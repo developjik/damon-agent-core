@@ -23,6 +23,7 @@ pub mod session;
 pub mod skills_hub;
 pub mod slack;
 pub mod slash_catalog;
+pub mod state;
 pub mod store;
 pub mod telegram;
 pub mod ui;
