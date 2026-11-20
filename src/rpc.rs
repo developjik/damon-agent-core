@@ -34,7 +34,12 @@ use crate::api::AppState;
 use crate::backend::types::*;
 use crate::session::ManagedSession;
 use crate::state::TurnOutcome;
-use crate::store::{SearchFilter, SessionFilter};
+
+// A method family's typed request params live beside the dispatcher:
+// `params` holds the shared machinery, each family module holds its
+// structs and handlers (see the docs in `rpc/params.rs`).
+mod params;
+mod session;
 
 #[derive(Deserialize)]
 pub struct WsQuery {
@@ -1552,527 +1557,32 @@ async fn dispatch(
             Ok(json!({"merged": merged}))
         }
 
-        "session.create" => {
-            let mut cfg = session_config(&params)?;
-            let mut backend = params["backend"].as_str().map(String::from);
-            // A project scopes the session: its root becomes the cwd
-            // default and its defaults fill whatever the request left
-            // unset (explicit params always win).
-            let project = match params["projectId"].as_str() {
-                Some(pid) => {
-                    let p = state.store.get_project(pid).await?.ok_or_else(|| {
-                        RpcError::error(
-                            error_code::INVALID_PARAMS,
-                            format!("unknown project {pid}"),
-                        )
-                    })?;
-                    let defaults: Value = serde_json::from_str(&p.defaults).unwrap_or_default();
-                    if !params["cwd"].is_string() {
-                        cfg.cwd = std::path::PathBuf::from(&p.root);
-                    }
-                    if cfg.model.is_none()
-                        && let Some(m) = defaults["model"].as_str()
-                    {
-                        cfg.model = Some(m.to_string());
-                    }
-                    if cfg.mode.is_none()
-                        && let Some(m) = defaults["mode"].as_str()
-                    {
-                        cfg.mode = Some(m.to_string());
-                    }
-                    if cfg.mcp_servers.is_empty()
-                        && let Some(mcp) = defaults["mcpServers"].as_object()
-                    {
-                        cfg.mcp_servers = session_config(&json!({"mcpServers": mcp}))?.mcp_servers;
-                    }
-                    if backend.is_none()
-                        && let Some(b) = defaults["backend"].as_str()
-                    {
-                        backend = Some(b.to_string());
-                    }
-                    Some(pid.to_string())
-                }
-                None => None,
-            };
-            check_cwd_allowed(state, &cfg.cwd)?;
-            // Persona (optional): resolve the bot's files NOW — a
-            // typo'd or since-deleted id must fail the create, not the
-            // first turn. The composed block is fixed for the session's
-            // life; edits to the bot's files reach the NEXT session.
-            let persona = match params["persona"].as_str() {
-                Some(id) => {
-                    let root = crate::bots::bots_root(state.config.read().data_dir.as_deref());
-                    Some(crate::bots::resolve(&root, id).ok_or_else(|| {
-                        RpcError::error(
-                            error_code::INVALID_PARAMS,
-                            format!("unknown persona `{id}` — bot.save it first"),
-                        )
-                    })?)
-                }
-                None => None,
-            };
-            // Effective granted roots (global + the project's) ride
-            // the launch line for backends with a native widening flag
-            // (claude --add-dir) and pre-warm the file jail.
-            cfg.granted_roots = effective_grants(state, project.clone()).await?;
-            let ms = state
-                .sessions
-                .create(backend.as_deref(), cfg.clone(), persona.clone())
-                .await?;
-            state
-                .store
-                .create_session(&ms.id, &cfg.cwd.to_string_lossy(), Some(&ms.provider))
-                .await?;
-            if let Some(pid) = &project {
-                let _ = state.store.set_session_project(&ms.id, Some(pid)).await;
-            }
-            // The persona binding rides the session row so resume/
-            // restart re-resolve it after a daemon restart.
-            if let Some(p) = &persona {
-                let _ = state.store.set_session_persona(&ms.id, Some(&p.bot)).await;
-            }
-            // Persist the resolved default model (explicit or project
-            // default) — the row is the search/list surface for it.
-            if let Some(m) = &cfg.model {
-                let _ = state.store.set_session_model(&ms.id, m).await;
-            }
-            let replayed = conn.subscribe(state, &ms).await;
-            let mut out = json!({"sessionId": ms.id, "backend": ms.provider, "replayed": replayed, "cursor": ms.cursor()});
-            if let Some(p) = &ms.persona {
-                out["persona"] = json!(p.bot);
-            }
-            Ok(out)
-        }
-
-        "session.resume" => {
-            // Import path: a PersistenceHandle points at a native session
-            // that has no Damon row yet — mint one, bind it, resume.
-            if let Some(hv) = params.get("handle") {
-                let handle: PersistenceHandle =
-                    serde_json::from_value(hv.clone()).map_err(|_| {
-                        RpcError::error(
-                            error_code::INVALID_PARAMS,
-                            "handle must be {provider, native_handle, metadata?}",
-                        )
-                    })?;
-                if handle.provider.is_empty() || handle.native_handle.is_empty() {
-                    return Err(RpcError::error(
-                        error_code::INVALID_PARAMS,
-                        "handle requires provider and native_handle",
-                    ));
-                }
-                // Re-importing the same native session returns the
-                // existing row instead of duplicating it.
-                let id = match state
-                    .store
-                    .session_by_agent_session(&handle.provider, &handle.native_handle)
-                    .await?
-                {
-                    Some(existing) => existing,
-                    None => {
-                        let id = uuid::Uuid::new_v4().to_string();
-                        let cwd = params["cwd"]
-                            .as_str()
-                            .map(String::from)
-                            .or_else(|| handle.metadata["cwd"].as_str().map(String::from))
-                            .unwrap_or_else(|| ".".to_string());
-                        state
-                            .store
-                            .create_session(&id, &cwd, Some(&handle.provider))
-                            .await?;
-                        state
-                            .store
-                            .set_agent_session(&id, &handle.provider, &handle.native_handle)
-                            .await?;
-                        if let Some(title) = params["title"].as_str() {
-                            let _ = state.store.rename_session(&id, title).await;
-                        }
-                        id
-                    }
-                };
-                let cwd = state
-                    .store
-                    .session_cwd(&id)
-                    .await?
-                    .map(std::path::PathBuf::from)
-                    .unwrap_or_else(|| std::path::PathBuf::from("."));
-                check_cwd_allowed(state, &cwd)?;
-                let mut cfg = SessionConfig {
-                    cwd,
-                    ..Default::default()
-                };
-                cfg.granted_roots =
-                    effective_grants(state, state.store.session_project(&id).await?).await?;
-                let ms = state.sessions.resume(&id, &handle, cfg, None).await?;
-                let replayed = conn.subscribe(state, &ms).await;
-                return Ok(
-                    json!({"sessionId": id, "backend": ms.provider, "replayed": replayed, "cursor": ms.cursor()}),
-                );
-            }
-            let id = req_str(&params, "sessionId")?;
-            // Already live? Just subscribe and return.
-            if let Some(ms) = state.sessions.get(id).await {
-                let replayed = conn.subscribe(state, &ms).await;
-                return Ok(
-                    json!({"sessionId": id, "backend": ms.provider, "replayed": replayed, "cursor": ms.cursor()}),
-                );
-            }
-            reattach(state, conn, id).await
-        }
-
-        "session.restart" => {
-            let id = req_str(&params, "sessionId")?;
-            // A live session is killed first (a crashed/wedged process
-            // included — close is unconditional), then reattached
-            // through the persisted handle; a not-live session just
-            // reattaches. Busy sessions refuse: restarting mid-turn
-            // would kill the turn's process underneath the collector.
-            if state.sessions.get(id).await.is_some() {
-                if state.sessions.record(id).is_some_and(|r| r.is_active()) {
-                    return Err(RpcError::error(
-                        error_code::TURN_IN_PROGRESS,
-                        "a turn is already running on this session",
-                    ));
-                }
-                state.sessions.close(id).await?;
-            }
-            reattach(state, conn, id).await
-        }
-
-        "session.list" => {
-            let limit = params["limit"].as_u64().unwrap_or(50) as u32;
-            let offset = params["offset"].as_u64().unwrap_or(0) as u32;
-            let filter = SessionFilter {
-                backend: params["backend"].as_str().map(String::from),
-                cwd: params["cwd"].as_str().map(String::from),
-                tag: params["tag"].as_str().map(String::from),
-                project_id: params["projectId"].as_str().map(String::from),
-                include_archived: params["includeArchived"].as_bool().unwrap_or(false),
-            };
-            let rows = state
-                .store
-                .list_sessions_paged(limit, offset, filter)
-                .await?;
-            let sessions: Vec<Value> = rows
-                .into_iter()
-                .map(|s| {
-                    json!({"sessionId": s.id, "createdAt": s.created_at,
-                           "backend": s.backend, "title": s.title,
-                           "cwd": s.cwd, "tags": s.tags,
-                           "pinned": s.pinned, "archived": s.archived})
-                })
-                .collect();
-            Ok(json!({"sessions": sessions}))
-        }
-
-        "session.status" => {
-            // Live-session introspection: which backend processes are
-            // resident right now, what each one is doing (idle, mid-turn,
-            // or parked on an answer), how long idle. `recovered` names
-            // what a dead daemon left unfinished — a client reopening the
-            // app learns that a turn was cut off instead of finding a
-            // session that silently looks idle. Complements the /metrics
-            // gauges with per-session detail.
-            let rows = state.sessions.live_status().await;
-            let sessions: Vec<Value> = rows
-                .into_iter()
-                .map(|row| {
-                    let mut v = json!({
-                        "sessionId": row.id,
-                        "backend": row.provider,
-                        "busy": row.phase.is_active(),
-                        "phase": row.phase.as_str(),
-                        "idleSecs": row.idle_secs,
-                    });
-                    if let Some(turn_id) = row.turn_id {
-                        v["turnId"] = json!(turn_id);
-                    }
-                    if let Some(ask) = row.pending_ask {
-                        v["pendingAsk"] = json!({
-                            "requestId": ask.request_id,
-                            "kind": ask.kind.as_str(),
-                            "label": ask.label,
-                            "askedAtMs": ask.asked_at_ms,
-                        });
-                    }
-                    v
-                })
-                .collect();
-            let recovered: Vec<Value> = state
-                .sessions
-                .recovered_sessions()
-                .into_iter()
-                .filter_map(|r| {
-                    let mark = r.recovered?;
-                    Some(json!({
-                        "sessionId": r.id,
-                        "backend": r.provider,
-                        "phase": mark.from_phase.as_str(),
-                        "sinceMs": mark.at_ms,
-                        "turnId": mark.turn_id,
-                    }))
-                })
-                .collect();
-            Ok(json!({"sessions": sessions, "recovered": recovered}))
-        }
-
-        "session.watch" => {
-            // Subscribe THIS connection to a session's events without
-            // creating/resuming/turning on it — the cross-surface
-            // notification path. A chat bridge watches a session the
-            // web UI started and pings the chat when it finishes or
-            // asks for permission. Requires a live session: a detached
-            // one has no backend process broadcasting anything. The
-            // subscribe replays missed history (replay-tagged), which
-            // notification consumers skip.
-            let id = req_str(&params, "sessionId")?;
-            let ms = state.sessions.get(id).await.ok_or_else(|| {
-                RpcError::error(
-                    error_code::SESSION_NOT_LIVE,
-                    "session not live — resume it before watching",
-                )
-            })?;
-            let replayed = conn.subscribe(state, &ms).await;
-            Ok(
-                json!({"sessionId": id, "subscribed": true, "replayed": replayed, "cursor": ms.cursor()}),
-            )
-        }
-
-        "session.unwatch" => {
-            let id = req_str(&params, "sessionId")?;
-            let removed = conn.unsubscribe(id).await;
-            Ok(json!({"sessionId": id, "subscribed": !removed}))
-        }
-
-        "session.messages" => {
-            let id = req_str(&params, "sessionId")?;
-            let limit = params["limit"].as_u64().unwrap_or(200) as u32;
-            let offset = params["offset"].as_u64().unwrap_or(0) as u32;
-            let msgs = state.store.messages_paged(id, limit, offset).await?;
-            Ok(json!({"messages": msgs}))
-        }
-
-        "session.export" => {
-            let id = req_str(&params, "sessionId")?;
-            // Header + transcript + usage in one shot — the wire-side
-            // superset of the CLI's client-rendered export.
-            let overview = state
-                .store
-                .session_overview(id)
-                .await?
-                .with_context(|| format!("session not found: {id}"))?;
-            let msgs = state.store.messages_paged(id, u32::MAX, 0).await?;
-            let (used, size, cost, turns) = state.store.session_usage(id).await?;
-            Ok(json!({
-                "session": {
-                    "sessionId": overview.id, "createdAt": overview.created_at,
-                    "backend": overview.backend, "title": overview.title,
-                    "tags": overview.tags, "cwd": overview.cwd,
-                },
-                // Same per-row fields as session.messages minus the
-                // redundant session_id — it is in the header.
-                "messages": msgs.iter().map(|m| json!({
-                    "id": m.id, "role": m.role, "ts": m.ts, "data": m.data,
-                })).collect::<Vec<_>>(),
-                "usage": {
-                    "contextUsed": used, "contextSize": size,
-                    "costUsd": cost, "turns": turns,
-                },
-            }))
-        }
-
-        "session.import" => {
-            let backend = req_str(&params, "backend")?;
-            let clients = state.sessions.clients();
-            let client = clients
-                .iter()
-                .find(|(id, _)| id == backend)
-                .map(|(_, c)| c.clone())
-                .ok_or_else(|| RpcError::error(error_code::INVALID_PARAMS, "unknown backend"))?;
-            let cwd = params["cwd"]
-                .as_str()
-                .map(std::path::PathBuf::from)
-                .unwrap_or_else(|| std::env::current_dir().unwrap_or_else(|_| ".".into()));
-            check_cwd_allowed(state, &cwd)?;
-            let found = client.list_importable_sessions(&cwd).await?;
-            Ok(json!({"sessions": found}))
-        }
-
-        "session.delete" => {
-            let id = req_str(&params, "sessionId")?;
-            state.sessions.close(id).await.ok();
-            state.store.delete_session(id).await?;
-            Ok(json!({"deleted": true}))
-        }
-
-        "session.close" => {
-            let id = req_str(&params, "sessionId")?;
-            // Frees a max_sessions slot deterministically: kills the
-            // live backend process, keeps the row and history (the
-            // next session.resume reattaches). Idempotent — closing a
-            // not-live id succeeds without touching anything.
-            state.sessions.close(id).await?;
-            Ok(json!({"closed": true}))
-        }
-
-        // History scan: single-flight globally — a second call while
-        // one runs gets the in-flight scanId (and no progress events;
-        // the running caller owns the pipeline view). Progress frames
-        // ride the requesting connection (worktree precedent).
-        "session.rescan" => {
-            let scan_id = {
-                let mut slot = state.history_scan.lock();
-                match slot.as_ref() {
-                    Some(in_flight) => {
-                        return Ok(json!({
-                            "scanId": in_flight,
-                            "alreadyRunning": true,
-                        }));
-                    }
-                    None => {
-                        let id = uuid::Uuid::new_v4().to_string();
-                        *slot = Some(id.clone());
-                        id
-                    }
-                }
-            };
-            let pconn = conn.clone();
-            let sid = scan_id.clone();
-            let progress = move |payload: serde_json::Value| {
-                pconn.send(json!({
-                    "event": "history.scan_progress",
-                    "scanId": sid,
-                    "data": payload,
-                }));
-            };
-            let report = crate::history_scan::scan_history(state, &scan_id, &progress).await;
-            *state.history_scan.lock() = None;
-            let report = report?;
-            Ok(json!({
-                "scanId": scan_id,
-                "alreadyRunning": false,
-                "report": report.to_json(),
-            }))
-        }
-
-        "session.set_tags" => {
-            let id = req_str(&params, "sessionId")?;
-            let tags: Vec<String> =
-                serde_json::from_value(params["tags"].clone()).map_err(|_| {
-                    RpcError::error(
-                        error_code::INVALID_PARAMS,
-                        "tags must be an array of strings",
-                    )
-                })?;
-            let ok = state.store.set_tags(id, &tags).await?;
-            Ok(json!({"updated": ok}))
-        }
-
-        "session.set_pinned" => {
-            let id = req_str(&params, "sessionId")?;
-            let pinned = params["pinned"].as_bool().ok_or_else(|| {
-                RpcError::error(error_code::INVALID_PARAMS, "pinned must be a boolean")
-            })?;
-            let ok = state.store.set_pinned(id, pinned).await?;
-            Ok(json!({"updated": ok}))
-        }
-
-        "session.set_archived" => {
-            let id = req_str(&params, "sessionId")?;
-            let archived = params["archived"].as_bool().ok_or_else(|| {
-                RpcError::error(error_code::INVALID_PARAMS, "archived must be a boolean")
-            })?;
-            let ok = state.store.set_archived(id, archived).await?;
-            Ok(json!({"updated": ok}))
-        }
-
-        "session.rename" => {
-            let id = req_str(&params, "sessionId")?;
-            let title = req_str(&params, "title")?;
-            let ok = state.store.rename_session(id, title).await?;
-            Ok(json!({"renamed": ok}))
-        }
-
-        "session.fork" => {
-            let id = req_str(&params, "sessionId")?;
-            let upto = params["upto"].as_i64();
-            let new_id = state.store.fork_session(id, upto).await?;
-            Ok(json!({"sessionId": new_id}))
-        }
-
-        "session.usage" => {
-            let id = params["sessionId"].as_str();
-            // `daily` is a global-view mode: with a sessionId it is
-            // ignored — the per-session shape carries no day grouping.
-            if id.is_none() && params["daily"].as_bool().unwrap_or(false) {
-                let days = params["days"].as_u64().unwrap_or(7).max(1) as u32;
-                let rows = state.store.daily_usage(days).await?;
-                let daily: Vec<Value> = rows
-                    .into_iter()
-                    .map(|(date, turns, cost, used)| {
-                        json!({"date": date, "turns": turns,
-                               "costUsd": cost, "contextUsed": used})
-                    })
-                    .collect();
-                return Ok(json!({"daily": daily}));
-            }
-            match id {
-                Some(id) => {
-                    let (used, size, cost, turns) = state.store.session_usage(id).await?;
-                    Ok(json!({
-                        "sessionId": id,
-                        "contextUsed": used, "contextSize": size,
-                        "costUsd": cost, "turns": turns,
-                    }))
-                }
-                None => {
-                    let rows = state
-                        .store
-                        .usage_summary(params["projectId"].as_str().map(String::from))
-                        .await?;
-                    let sessions: Vec<Value> = rows
-                        .into_iter()
-                        .map(|(model, used, size, cost, turns)| {
-                            json!({"model": model, "contextUsed": used, "contextSize": size,
-                                   "costUsd": cost, "turns": turns})
-                        })
-                        .collect();
-                    Ok(json!({"sessions": sessions}))
-                }
-            }
-        }
-
-        "session.search" => {
-            let q = req_str(&params, "query")?;
-            let limit = params["limit"].as_u64().unwrap_or(20) as usize;
-            // Wire timestamps (RFC3339 or date-only) become unix-ms
-            // bounds here; the store stays a pure-ms API.
-            let filter = SearchFilter {
-                session_id: params["sessionId"].as_str().map(String::from),
-                backend: params["backend"].as_str().map(String::from),
-                cwd: params["cwd"].as_str().map(String::from),
-                project_id: params["projectId"].as_str().map(String::from),
-                since_ms: params["since"]
-                    .as_str()
-                    .map(parse_time_bound)
-                    .transpose()
-                    .map_err(|e| RpcError::error(error_code::INVALID_PARAMS, format!("{e:#}")))?,
-                until_ms: params["until"]
-                    .as_str()
-                    .map(parse_time_bound)
-                    .transpose()
-                    .map_err(|e| RpcError::error(error_code::INVALID_PARAMS, format!("{e:#}")))?,
-            };
-            let hits = state.store.search_filtered(q, limit, filter).await?;
-            let results: Vec<Value> = hits
-                .into_iter()
-                .map(|(session_id, message_id, snippet)| {
-                    json!({"sessionId": session_id, "messageId": message_id, "snippet": snippet})
-                })
-                .collect();
-            Ok(json!({"results": results}))
-        }
-
+        // ── session.* — the session control family. Each method's params
+        // are a typed struct in `rpc/session.rs` (the first slice of the
+        // dispatch params refactor); the arms stay one line each so this
+        // match remains the single table of what the daemon routes.
+        "session.create" => session::create(state, conn, &params).await,
+        "session.resume" => session::resume(state, conn, &params).await,
+        "session.restart" => session::restart(state, conn, &params).await,
+        "session.list" => session::list(state, &params).await,
+        "session.status" => session::status(state, &params).await,
+        "session.watch" => session::watch(state, conn, &params).await,
+        "session.unwatch" => session::unwatch(conn, &params).await,
+        "session.messages" => session::messages(state, &params).await,
+        "session.export" => session::export(state, &params).await,
+        "session.import" => session::import(state, &params).await,
+        "session.delete" => session::delete(state, &params).await,
+        "session.close" => session::close(state, &params).await,
+        "session.rescan" => session::rescan(state, conn, &params).await,
+        "session.set_tags" => session::set_tags(state, &params).await,
+        "session.set_pinned" => session::set_pinned(state, &params).await,
+        "session.set_archived" => session::set_archived(state, &params).await,
+        "session.rename" => session::rename(state, &params).await,
+        "session.fork" => session::fork(state, &params).await,
+        "session.usage" => session::usage(state, &params).await,
+        "session.search" => session::search(state, &params).await,
+        "session.set_model" => session::set_model(state, &params).await,
+        "session.set_mode" => session::set_mode(state, &params).await,
         "usage.summary" => {
             // days/tzOffsetMinutes default to 7/0 — a week of UTC-day
             // buckets, matching session.usage's daily rollup.
@@ -2797,28 +2307,6 @@ async fn dispatch(
             }
         }
 
-        "session.set_model" => {
-            let id = req_str(&params, "sessionId")?;
-            let ms =
-                state.sessions.get(id).await.ok_or_else(|| {
-                    RpcError::error(error_code::SESSION_NOT_LIVE, "session not live")
-                })?;
-            let model = req_str(&params, "model")?;
-            ms.session.set_model(model).await?;
-            Ok(json!({}))
-        }
-
-        "session.set_mode" => {
-            let id = req_str(&params, "sessionId")?;
-            let ms =
-                state.sessions.get(id).await.ok_or_else(|| {
-                    RpcError::error(error_code::SESSION_NOT_LIVE, "session not live")
-                })?;
-            let mode = req_str(&params, "mode")?;
-            ms.session.set_mode(mode).await?;
-            Ok(json!({}))
-        }
-
         "catalog.models" => {
             let backend = req_str(&params, "backend")?;
             let clients = state.sessions.clients();
@@ -3472,45 +2960,6 @@ async fn dispatch(
     }
 }
 
-fn session_config(params: &Value) -> Result<SessionConfig> {
-    let cwd = params["cwd"]
-        .as_str()
-        .map(std::path::PathBuf::from)
-        .unwrap_or_else(|| std::env::current_dir().unwrap_or_else(|_| ".".into()));
-    let mcp = params["mcpServers"]
-        .as_object()
-        .map(|m| {
-            m.iter()
-                .filter_map(|(name, v)| {
-                    Some((
-                        name.clone(),
-                        McpServerConfig {
-                            command: v["command"].as_str()?.to_string(),
-                            args: serde_json::from_value(v["args"].clone()).unwrap_or_default(),
-                            env: serde_json::from_value(v["env"].clone()).unwrap_or_default(),
-                        },
-                    ))
-                })
-                .collect()
-        })
-        .unwrap_or_default();
-    Ok(SessionConfig {
-        cwd,
-        model: params["model"].as_str().map(String::from),
-        mode: params["mode"].as_str().map(String::from),
-        mcp_servers: mcp,
-        granted_roots: Vec::new(),
-        allowed_tools: params["allowedTools"]
-            .as_array()
-            .map(|a| {
-                a.iter()
-                    .filter_map(|t| t.as_str().map(String::from))
-                    .collect()
-            })
-            .unwrap_or_default(),
-    })
-}
-
 /// Flatten a durable plan-review row for the wire — camelCase, absent
 /// Option fields omitted.
 fn plan_row_json(r: crate::store::PlanRow) -> Value {
@@ -3586,7 +3035,7 @@ async fn stored_cwd(state: &Arc<AppState>, id: &str) -> Result<std::path::PathBu
 /// same jail file.* uses), else a client-supplied cwd through the
 /// same `allowed_dirs` gate as session.create, else the daemon's own
 /// working directory — which is exactly what a session gets when it
-/// omits `cwd` (session_config's fallback), so a picker opened before
+/// omits `cwd` (`session.create`'s fallback), so a picker opened before
 /// the lazy first `session.create` indexes the directory the session
 /// will run in.
 /// The skills hub's root: `$DAMON_SKILLS_HUB_HOME` (tests) else
@@ -4460,9 +3909,9 @@ pub fn rpc_methods() -> Vec<Value> {
         json!({"name": "mcp.inventory", "params": {}, "result": {"entries": "array of {backend, name, transport, command?, url?, envKeys?, source, format, version, enabled?, readonlyReason?} — REDACTED: env values never leave the file, URLs lose userinfo/query, stdio shows the program and an arg count", "sources": "array of {backend, source, format, error?} — one per config file; a broken file reports its error and the inventory continues"}}),
         json!({"name": "mcp.probe", "params": {"backend": "string", "name": "string"}, "result": "{backend, name, result: 'connected'|'needs_auth'|'failed'|'unsupported', tools: string[] — names only, ≤40, serverName?, protocolVersion?, elapsedMs, error?} — REAL handshake, explicit request only (never scheduled); stdio 25s cap, HTTP 12s cap; the server's command/args/env never reach the wire"}),
         json!({"name": "mcp.setEnabled", "params": {"backend": "string — claude only this round", "name": "string", "enabled": "boolean", "expectedVersion": "string — CAS from mcp.inventory", "cwd": "string? — project scope for the toggle, default the daemon cwd"}, "result": {"set": "boolean"}, "errors": "-32010 the entry changed since the snapshot (external edit); -32602 readonly backend (reason in the message) or parse-failed config (never written)"}),
-        json!({"name": "session.create", "params": {"backend": "string?", "cwd": "string?", "model": "string?", "mode": "string?", "mcpServers": "object?", "projectId": "string? — scopes the session: root becomes the cwd default, project defaults fill unset params", "persona": "string? — bot id from bot.list; the bot's SOUL/AGENTS block rides in front of every turn, bound for the session's life and restored on resume"}, "result": {"sessionId": "string", "backend": "string", "persona?": "string — the bound bot id, when one was given", "replayed": "number — replay-tagged session.event frames sent for missed history", "cursor": "number — the newest session event seq handed out so far; the next live frame continues from it (gaps → session.gap)"}, "errors": "-32602 unknown persona id"}),
-        json!({"name": "session.resume", "params": {"sessionId": "string — or", "handle": "{provider, native_handle}", "cwd": "string?", "title": "string?"}, "result": {"sessionId": "string", "backend": "string", "replayed": "number", "cursor": "number"}}),
-        json!({"name": "session.list", "params": {"limit": "number?", "offset": "number?", "backend": "string?", "cwd": "string?", "tag": "string?", "projectId": "string?"}, "result": {"sessions": "array of {sessionId, createdAt, backend, title, cwd, tags}"}}),
+        json!({"name": "session.create", "params": {"backend": "string?", "cwd": "string?", "model": "string?", "mode": "string?", "mcpServers": "object?", "allowedTools": "string[]? — per-session tool allowlist for backends that enforce one at launch (claude: --allowedTools); non-string entries are dropped", "projectId": "string? — scopes the session: root becomes the cwd default, project defaults fill unset params", "persona": "string? — bot id from bot.list; the bot's SOUL/AGENTS block rides in front of every turn, bound for the session's life and restored on resume"}, "result": {"sessionId": "string", "backend": "string", "persona?": "string — the bound bot id, when one was given", "replayed": "number — replay-tagged session.event frames sent for missed history", "cursor": "number — the newest session event seq handed out so far; the next live frame continues from it (gaps → session.gap)"}, "errors": "-32602 unknown persona id"}),
+        json!({"name": "session.resume", "params": {"sessionId": "string? — resume a session damon already knows", "handle": "{provider, native_handle}? — import a native session that has no damon row yet", "cwd": "string?", "title": "string?"}, "result": {"sessionId": "string", "backend": "string", "replayed": "number", "cursor": "number"}, "errors": "-32602 sessionId or handle required; handle must be {provider, native_handle, metadata?}"}),
+        json!({"name": "session.list", "params": {"limit": "number?", "offset": "number?", "backend": "string?", "cwd": "string?", "tag": "string?", "projectId": "string?", "includeArchived": "boolean? — include archived rows, default false"}, "result": {"sessions": "array of {sessionId, createdAt, backend, title, cwd, tags, pinned, archived}"}}),
         json!({"name": "session.messages", "params": {"sessionId": "string", "limit": "number?", "offset": "number?"}, "result": {"messages": "array of {id, session_id, role, ts, data} — ts is unix ms, 0 when unknown"}}),
         json!({"name": "session.export", "params": {"sessionId": "string"}, "result": {"session": "{sessionId, createdAt, backend, title, tags, cwd}", "messages": "array of {id, role, ts, data}", "usage": "{contextUsed, contextSize, costUsd, turns}"}}),
         json!({"name": "session.import", "params": {"backend": "string", "cwd": "string?"}, "result": {"sessions": "array"}}),
@@ -4493,7 +3942,7 @@ pub fn rpc_methods() -> Vec<Value> {
         json!({"name": "session.set_tags", "params": {"sessionId": "string", "tags": "string[] — replaces the whole list"}, "result": {"updated": "boolean"}}),
         json!({"name": "session.rename", "params": {"sessionId": "string", "title": "string"}, "result": {"renamed": "boolean"}}),
         json!({"name": "session.fork", "params": {"sessionId": "string", "upto": "number?"}, "result": {"sessionId": "string — copies messages, tags, usage history, and the backend resume handle; title suffixed \" (fork)\""}}),
-        json!({"name": "session.usage", "params": {"sessionId": "string?", "daily": "boolean? — global view only", "days": "number? — daily window in days, default 7"}, "result": {"daily": "array of {date, turns, costUsd, contextUsed} when daily, else per-session/per-model totals"}}),
+        json!({"name": "session.usage", "params": {"sessionId": "string?", "daily": "boolean? — global view only", "days": "number? — daily window in days, default 7", "projectId": "string? — per-model view only: totals for one project"}, "result": {"daily": "array of {date, turns, costUsd, contextUsed} when daily, else per-session/per-model totals"}}),
         json!({"name": "session.search", "params": {"query": "string", "limit": "number?", "sessionId": "string?", "backend": "string?", "cwd": "string?", "projectId": "string?", "since": "string? — RFC3339 or YYYY-MM-DD", "until": "string?"}, "result": {"results": "array of {sessionId, messageId, snippet}"}}),
         json!({"name": "usage.summary", "params": {"days": "number? — window in local days, today inclusive, default 7", "tzOffsetMinutes": "number? — caller's UTC offset shifting the day buckets, default 0 (UTC)"}, "result": {"days": "number", "rows": "array of {date, backend, model, turns, contextUsed, contextSize, costUsd} — one per local day × backend × model; context columns sum the per-turn snapshots", "total": "{turns, contextUsed, contextSize, costUsd}"}}),
         json!({"name": "usage.clear", "params": {}, "result": {"cleared": "boolean — every usage row deleted; sessions and messages untouched"}}),

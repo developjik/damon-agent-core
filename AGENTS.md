@@ -36,7 +36,7 @@ Persistence goes through `src/store.rs` (`Store`, tokio-rusqlite wrapper, sessio
 | Path | Purpose |
 |---|---|
 | `src/backend/` | Agent-CLI abstraction: traits, normalized types, 8 per-brand translators |
-| `src/rpc.rs` | JSON-RPC v2 server over WebSocket — largest module, method dispatcher, `RpcError` |
+| `src/rpc.rs` | JSON-RPC v2 server over WebSocket — method dispatcher, `RpcError`; families that moved to typed params live beside it under `src/rpc/` (`params.rs` machinery, one module per family) |
 | `src/api.rs` | Axum HTTP/WS layer: `AppState`, routes, background sweeps, metrics |
 | `src/session.rs` | `SessionManager` / `ManagedSession`, idle reaping, event journal |
 | `src/state.rs` | Pure serializable session state (phases, open turn, parked ask, rollups) + the `sessions.state.json` checkpoint shape — no IO, no async, no process types (`tests/state_boundary.rs` enforces it) |
@@ -72,7 +72,7 @@ Linux dev needs `libdbus-1-dev pkg-config`. All six binaries get a `--help` smok
 - **Errors**: `anyhow::Result` with `.context()` for internal fallibility; `thiserror` only for wire-typed/domain errors (`RpcError` in `rpc.rs`, `HubError`, `FetchError`, `AskNotFound`, `NameTaken`). RPC handlers return `Result<Value, RpcError>`; codes live in `rpc::error_code` constants.
 - **Async**: `#[async_trait]` on all cross-backend traits. `tokio::sync::broadcast` for event fanout (lagging receivers are shed, never block); oneshot for pending permission answers; `Notify` for cancellation; `spawn_blocking` for fs-heavy work.
 - **State**: `Arc` everywhere. Short-lived/guard state in `parking_lot::{Mutex, RwLock}`; cross-await state in `tokio::sync::Mutex`; atomics for busy flags/counters. Config is `SharedConfig = Arc<parking_lot::RwLock<Config>>`, hot-reloaded via a `notify` watcher — only `bind` and `[relay]` need a restart.
-- **serde**: config structs use `#[serde(deny_unknown_fields)]` + `#[serde(default = ...)]` (see `config.rs`); wire DTOs use `#[serde(rename_all = "camelCase")]` + `skip_serializing_if = "Option::is_none"`. RPC layer is mostly untyped `serde_json::Value` with `req_str`/`json!` helpers.
+- **serde**: config structs use `#[serde(deny_unknown_fields)]` + `#[serde(default = ...)]` (see `config.rs`); wire DTOs use `#[serde(rename_all = "camelCase")]` + `skip_serializing_if = "Option::is_none"`. RPC params are typed per method family: one request struct per method plus a `Field` table that is both the validation rule and the `rpc_methods()` catalog entry, held to the catalog by a drift test (`src/rpc/params.rs`, `src/rpc/session.rs`). Families not yet migrated still read `serde_json::Value` with `req_str`/`json!`; RPC results stay `json!`.
 - **Naming**: provider ids are lowercase CLI names (`"claude"`, `"omp"`); RPC methods are `domain.verb` strings (`session.create`, `turn.start`); test fns are descriptive snake_case behavior sentences (`bridge_question_letter_reply_picks_the_option`).
 - **Secrets**: `SecretRef` (`env:`, `keychain:`, `!cmd`) re-resolves on TTL and fails closed. Non-loopback bind refuses to start without a resolvable `auth_token`; WS auth uses single-use tickets (`POST /v1/ws_ticket`), never raw query tokens. Preserve these invariants.
 - Doc comments explaining invariants/rationale are the norm — read surrounding docs before changing behavior.
