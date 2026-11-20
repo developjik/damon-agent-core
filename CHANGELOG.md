@@ -1,5 +1,61 @@
 # Changelog
 
+## Unreleased
+
+### Added — delivery honesty: a session event cursor and explicit gaps
+
+- Every `session.event` frame now carries `seq`, a session-scoped
+  strictly-increasing cursor assigned once per event (replay and live
+  frames share the numbering). `session.create` / `session.resume` /
+  `session.watch` / `session.restart` return the current `cursor`.
+- The in-flight journal is the session's event fan-out, so replay and
+  live frames cannot disagree about what a client has seen.
+- **`session.snapshot_required`** — when the journal shed a turn
+  (2,048-event cap or a daemon-side lag), the connection is told to
+  resync from `session.messages` instead of being handed a partial turn
+  as the whole answer. This is the case the docs used to describe as
+  "not replayed", with nothing on the wire saying so.
+- **`session.gap`** — a connection whose send queue overflowed (or that
+  fell behind the fan-out) gets `{dropped, cursor}` before the next
+  frame it does receive, instead of silently losing events.
+- The web UI resyncs on `snapshot_required` and reports gaps; the
+  daemon's own `tracing` path is unchanged.
+
+### Added — retry contract: `idempotencyKey` on the Keyed requests
+
+- `turn.start` / `turn.steer` accept an optional `idempotencyKey`
+  (per session + method, remembered 24 h). A repeat while the first
+  attempt runs returns `{duplicate: true, inProgress: true}` and
+  subscribes the retrying connection to that turn; a repeat after it
+  settled replays the original result with `duplicate: true`; a failed
+  or canceled attempt releases its key so the client can retry for real.
+- Without a key nothing changes — 0.8.0 request shapes are untouched.
+
+### Added — version negotiation and a capability set on `hello`
+
+- `hello` accepts `{protocolVersion, client}` and refuses a version it
+  does not speak with typed `-32012` + `error.data.{requested,
+  supported[]}` (ACP v2's shape). A param-less `hello` — the shape
+  every shipped client sends — keeps working exactly as before, which
+  is why this is additive rather than a protocol bump.
+- `hello` (call **and** connect-time push) now reports `minProtocol`,
+  `supported[]`, and `capabilities` (`eventSeq`, `snapshotRequired`,
+  `connGap`, `idempotentTurns`, `turnLedger`, `versionNegotiation`), so
+  a client feature-detects instead of parsing the daemon version.
+
+### Added — turn ledger and crash convergence
+
+- New `turns` table (schema v11): a row per turn, opened once the
+  backend accepts the prompt and settled with its stop reason. The
+  prompt was already persisted up front; the ledger is what makes the
+  TURN durable.
+- Boot recovery converges rows a dead daemon left open to `interrupted`
+  and appends an `error` marker to the transcript, so a reopened
+  session shows that the answer was cut short instead of a prompt with
+  no reply and no explanation — the same discipline the mission runner
+  already applies to its runs. `delete_session` / the retention sweep
+  take the ledger rows with the session.
+
 ## 0.8.0 — 2026-10-24
 
 ### Added — persistent memory ledgers (design ported from desktop-cc-gui's memory system, MIT)

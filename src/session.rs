@@ -26,17 +26,44 @@ fn is_turn_boundary(ev: &StreamEvent) -> bool {
     )
 }
 
+/// One session event tagged with the cursor the fan-out assigned it.
+///
+/// The cursor is session-scoped and strictly increasing, assigned once
+/// per event whether or not the journal keeps it. That single numbering
+/// is what makes delivery honest: a client holding seq 41 and then
+/// receiving seq 47 can *see* that 42–46 are missing instead of
+/// rendering a holed stream as the whole answer.
+#[derive(Clone)]
+pub struct SeqEvent {
+    pub seq: u64,
+    pub event: StreamEvent,
+}
+
+/// Live fan-out capacity. Each subscriber has its own receiver; a lagging
+/// one loses only its own events (`RecvError::Lagged`), and it knows how
+/// many because the cursor jumps.
+const FEED_CAP: usize = 512;
+
 /// Bounded buffer of the CURRENT turn's events for replay to
 /// subscribers that attach mid-turn (`rpc::Conn::subscribe`). Completed
 /// turns are not kept — their artifacts are persisted by
 /// `rpc::run_turn` and replayed from the store — so the journal holds
 /// exactly the events a late subscriber cannot get anywhere else.
+///
+/// It is also the session's event fan-out: every event gets its cursor
+/// here and is re-broadcast cursor-tagged, so replay and live frames
+/// carry the same numbering.
 pub struct EventJournal {
     inner: parking_lot::Mutex<JournalState>,
+    /// Cursor of the newest event fanned out (0 = none yet).
+    seq: std::sync::atomic::AtomicU64,
+    /// Cursor-tagged live fan-out — one receiver per subscribing
+    /// connection.
+    feed: tokio::sync::broadcast::Sender<SeqEvent>,
 }
 
 struct JournalState {
-    events: VecDeque<StreamEvent>,
+    events: VecDeque<SeqEvent>,
     /// The buffer overflowed mid-turn: the replayable prefix is now a
     /// garbled partial (deltas missing in the middle), so it is not
     /// replayed at all — the same shedding a lagging live broadcast
@@ -50,38 +77,76 @@ const JOURNAL_CAP: usize = 2048;
 
 impl EventJournal {
     fn new() -> Self {
+        let (feed, _) = tokio::sync::broadcast::channel(FEED_CAP);
         Self {
             inner: parking_lot::Mutex::new(JournalState {
                 events: VecDeque::new(),
                 shed: false,
             }),
+            seq: std::sync::atomic::AtomicU64::new(0),
+            feed,
         }
+    }
+
+    /// Cursor of the newest event handed to this session's fan-out (0 =
+    /// the session has produced nothing). A frame carrying `seq: N` tells
+    /// a client that every event up to N reached the connection — unless
+    /// a `session.gap` frame says how many were skipped.
+    pub fn cursor(&self) -> u64 {
+        self.seq.load(std::sync::atomic::Ordering::Relaxed)
+    }
+
+    /// Whether the journal shed the current turn's replayable prefix —
+    /// it overflowed, or the daemon itself fell behind the backend. A
+    /// subscriber must resync from the store when this is true.
+    pub fn is_shed(&self) -> bool {
+        self.inner.lock().shed
+    }
+
+    /// Subscribe to the cursor-tagged live fan-out.
+    pub(crate) fn subscribe(&self) -> tokio::sync::broadcast::Receiver<SeqEvent> {
+        self.feed.subscribe()
     }
 
     fn record(&self, ev: StreamEvent) {
-        let mut g = self.inner.lock();
-        if is_turn_boundary(&ev) {
-            // Turn over: from here the turn lives in the store. Keeping
-            // it would double-replay once run_turn persists it.
-            g.events.clear();
-            g.shed = false;
-            return;
+        let seq = self.seq.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1;
+        {
+            let mut g = self.inner.lock();
+            if is_turn_boundary(&ev) {
+                // Turn over: from here the turn lives in the store. Keeping
+                // it would double-replay once run_turn persists it.
+                g.events.clear();
+                g.shed = false;
+            } else {
+                if g.events.len() >= JOURNAL_CAP {
+                    g.events.pop_front();
+                    g.shed = true;
+                }
+                g.events.push_back(SeqEvent {
+                    seq,
+                    event: ev.clone(),
+                });
+            }
         }
-        if g.events.len() >= JOURNAL_CAP {
-            g.events.pop_front();
-            g.shed = true;
-        }
-        g.events.push_back(ev);
+        // Live fan-out last, and after the journal holds it: a subscriber
+        // that reads the journal then subscribes to the feed cannot see
+        // this event twice, only (in a race) miss it — which its cursor
+        // makes visible. No receivers is not an error: every connection
+        // owns its own receiver and reports its own gaps.
+        let _ = self.feed.send(SeqEvent { seq, event: ev });
     }
 
-    /// The in-flight turn's events, oldest first. Empty when the
-    /// journal shed (overflowed) — a partial turn replays garbled text.
-    pub(crate) fn snapshot_current_turn(&self) -> Vec<StreamEvent> {
+    /// The in-flight turn's replayable prefix, oldest first, or `None`
+    /// when the journal shed it (overflow, or the daemon itself fell
+    /// behind the backend): replaying a partial turn would render a garbled
+    /// answer as the whole one, so the caller points the client at the
+    /// store instead (`session.snapshot_required`).
+    pub(crate) fn replayable(&self) -> Option<Vec<SeqEvent>> {
         let g = self.inner.lock();
         if g.shed {
-            Vec::new()
+            None
         } else {
-            g.events.iter().cloned().collect()
+            Some(g.events.iter().cloned().collect())
         }
     }
 }
@@ -99,6 +164,10 @@ fn spawn_journal(session: &Arc<dyn AgentSession>) -> Arc<EventJournal> {
             match rx.recv().await {
                 Ok(ev) => j.record(ev),
                 Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => {
+                    // The daemon itself fell behind the backend: events are
+                    // gone before they ever got a cursor, so the journal is
+                    // unreplayable from here on. Live consumers still see the
+                    // cursor jump rather than a silent hole.
                     let mut g = j.inner.lock();
                     g.events.clear();
                     g.shed = true;
@@ -138,6 +207,20 @@ pub struct ManagedSession {
     /// the binding is fixed for the session's life — persona file
     /// edits apply to the NEXT session, never mid-conversation.
     pub persona: Option<crate::bots::Persona>,
+}
+
+impl ManagedSession {
+    /// Subscribe to this session's cursor-tagged live fan-out — the same
+    /// numbering the replay frames carry, so a connection can detect a
+    /// hole instead of rendering one.
+    pub fn subscribe_seq(&self) -> tokio::sync::broadcast::Receiver<SeqEvent> {
+        self.journal.subscribe()
+    }
+
+    /// Cursor of the newest event fanned out for this session (0 = none).
+    pub fn cursor(&self) -> u64 {
+        self.journal.cursor()
+    }
 }
 
 /// A session younger than this that has NEVER run a turn is not
@@ -497,13 +580,13 @@ mod tests {
         }));
         // The completed turn lives in the store — replaying it here
         // would duplicate every artifact.
-        assert!(j.snapshot_current_turn().is_empty());
+        assert!(j.replayable().unwrap_or_default().is_empty());
 
         j.record(assistant("turn-2 delta"));
-        let snap = j.snapshot_current_turn();
+        let snap = j.replayable().unwrap_or_default();
         assert_eq!(snap.len(), 1);
         assert!(matches!(
-            &snap[0].kind,
+            &snap[0].event.kind,
             StreamEventKind::Timeline(TimelineItem::AssistantMessage { text }) if text == "turn-2 delta"
         ));
     }
@@ -516,6 +599,25 @@ mod tests {
         }
         // A prefix with a hole in the middle replays garbled text —
         // shed entirely instead.
-        assert!(j.snapshot_current_turn().is_empty());
+        assert!(j.replayable().is_none());
+        // The cursor keeps counting, so a client can still see where
+        // the hole is (and reload from the store around it).
+        assert_eq!(j.cursor(), JOURNAL_CAP as u64 + 1);
+    }
+
+    #[test]
+    fn cursor_counts_every_event_and_turn_boundaries_do_not_reset_it() {
+        let j = EventJournal::new();
+        assert_eq!(j.cursor(), 0);
+        j.record(assistant("a"));
+        j.record(StreamEvent::new(StreamEventKind::TurnCompleted {
+            usage: None,
+        }));
+        j.record(assistant("b"));
+        assert_eq!(j.cursor(), 3);
+        // Frames carry the cursor the event was assigned.
+        let snap = j.replayable().unwrap_or_default();
+        assert_eq!(snap.len(), 1);
+        assert_eq!(snap[0].seq, 3);
     }
 }

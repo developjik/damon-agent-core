@@ -5447,3 +5447,305 @@ async fn memory_approval_queue_and_disabled_door() {
         0
     );
 }
+
+// ---------------------------------------------------------------------------
+// Delivery honesty, retry contract, and the turn ledger
+// ---------------------------------------------------------------------------
+
+/// `hello` negotiates the protocol version: an unsupported one is refused
+/// with the typed code and the supported list, a supported one answers
+/// with the capability set the additive fields hang off, and a
+/// param-less `hello` (the pre-negotiation shape) keeps working.
+#[tokio::test]
+async fn hello_negotiates_the_protocol_version() {
+    let (_state, _store, addr) = serve(test_config(None)).await;
+    let (mut ws, greeting) = ws_connect(&format!("ws://{addr}/ws")).await;
+    // The connect-time greeting carries the same contract as the call.
+    assert_eq!(greeting["hello"]["protocol"], 2, "{greeting}");
+    assert_eq!(greeting["hello"]["minProtocol"], 2, "{greeting}");
+    assert_eq!(greeting["hello"]["supported"], json!([2]), "{greeting}");
+    assert_eq!(greeting["hello"]["capabilities"]["eventSeq"], true);
+
+    // A client naming its version gets an explicit yes.
+    rpc_send(
+        &mut ws,
+        json!({"id":1,"method":"hello","params":{
+            "protocolVersion":2,"client":{"name":"test","version":"0.0.0"}}}),
+    )
+    .await;
+    let ok = read_reply(&mut ws, 1).await;
+    assert!(ok.get("error").is_none(), "hello(2) refused: {ok}");
+    assert_eq!(ok["result"]["protocol"], 2);
+    assert_eq!(ok["result"]["minProtocol"], 2);
+    assert_eq!(ok["result"]["capabilities"]["idempotentTurns"], true);
+    assert_eq!(ok["result"]["capabilities"]["snapshotRequired"], true);
+    assert_eq!(ok["result"]["capabilities"]["turnLedger"], true);
+
+    // An unsupported version is a typed refusal naming what is spoken.
+    rpc_send(
+        &mut ws,
+        json!({"id":2,"method":"hello","params":{"protocolVersion":9}}),
+    )
+    .await;
+    let bad = read_reply(&mut ws, 2).await;
+    assert_eq!(bad["error"]["code"], -32012, "refusal: {bad}");
+    assert_eq!(bad["error"]["data"]["supported"], json!([2]));
+    assert_eq!(bad["error"]["data"]["requested"], 9);
+
+    // No version at all — the pre-negotiation shape, still answered.
+    rpc_send(&mut ws, json!({"id":3,"method":"hello"})).await;
+    let legacy = read_reply(&mut ws, 3).await;
+    assert_eq!(legacy["result"]["protocol"], 2, "legacy hello: {legacy}");
+}
+
+/// A retried `turn.start` carrying the same `idempotencyKey` replays the
+/// first attempt's answer instead of running a second turn: "my response
+/// was lost — did the prompt land?" stops being a guess.
+#[tokio::test]
+async fn turn_start_idempotency_key_replays_the_first_answer() {
+    let (_state, store, addr) = serve(test_config(None)).await;
+    let (mut ws, _) = ws_connect(&format!("ws://{addr}/ws")).await;
+    rpc_send(
+        &mut ws,
+        json!({"id":1,"method":"session.create","params":{"cwd":"/tmp"}}),
+    )
+    .await;
+    let sid = read_reply(&mut ws, 1).await["result"]["sessionId"]
+        .as_str()
+        .unwrap()
+        .to_string();
+
+    rpc_send(
+        &mut ws,
+        json!({"id":2,"method":"turn.start","params":{
+            "sessionId":sid,"prompt":"hello","idempotencyKey":"k-1"}}),
+    )
+    .await;
+    let first = read_reply(&mut ws, 2).await;
+    assert_eq!(first["result"]["stopReason"], "completed", "first: {first}");
+    let turn_id = first["result"]["turnId"].as_str().unwrap().to_string();
+    assert!(
+        first["result"].get("duplicate").is_none(),
+        "the first attempt is not a duplicate: {first}"
+    );
+
+    // Same key, same answer — marked so the client can tell.
+    rpc_send(
+        &mut ws,
+        json!({"id":3,"method":"turn.start","params":{
+            "sessionId":sid,"prompt":"hello","idempotencyKey":"k-1"}}),
+    )
+    .await;
+    let again = read_reply(&mut ws, 3).await;
+    assert_eq!(again["result"]["duplicate"], true, "retry: {again}");
+    assert_eq!(again["result"]["turnId"], turn_id.as_str());
+    assert_eq!(again["result"]["stopReason"], "completed");
+
+    // Exactly one turn ran: one prompt row, one answer row, one ledger row.
+    let msgs = store.messages_paged(&sid, 200, 0).await.unwrap();
+    assert_eq!(
+        msgs.iter().filter(|m| m.role == "user").count(),
+        1,
+        "a keyed retry must not persist a second prompt: {msgs:?}"
+    );
+    assert_eq!(
+        msgs.iter().filter(|m| m.role == "assistant").count(),
+        1,
+        "a keyed retry must not run a second turn: {msgs:?}"
+    );
+    assert_eq!(
+        store.turn_row(&sid, &turn_id).await.unwrap().unwrap().0,
+        "completed"
+    );
+
+    // A different key owns a different turn.
+    rpc_send(
+        &mut ws,
+        json!({"id":4,"method":"turn.start","params":{
+            "sessionId":sid,"prompt":"hello","idempotencyKey":"k-2"}}),
+    )
+    .await;
+    let other = read_reply(&mut ws, 4).await;
+    assert_ne!(
+        other["result"]["turnId"],
+        turn_id.as_str(),
+        "a new key starts a new turn: {other}"
+    );
+}
+
+/// Every live frame carries the session cursor, strictly increasing, and
+/// the create/resume results report where a client's cursor stands.
+#[tokio::test]
+async fn session_events_carry_a_monotonic_cursor() {
+    let (_state, _store, addr) = serve(test_config(None)).await;
+    let (mut ws, _) = ws_connect(&format!("ws://{addr}/ws")).await;
+    rpc_send(
+        &mut ws,
+        json!({"id":1,"method":"session.create","params":{"cwd":"/tmp"}}),
+    )
+    .await;
+    let created = read_reply(&mut ws, 1).await;
+    let sid = created["result"]["sessionId"].as_str().unwrap().to_string();
+    assert_eq!(
+        created["result"]["cursor"], 0,
+        "a fresh session has produced nothing: {created}"
+    );
+
+    rpc_send(
+        &mut ws,
+        json!({"id":2,"method":"turn.start","params":{"sessionId":sid,"prompt":"hello"}}),
+    )
+    .await;
+    let mut frames = Vec::new();
+    let reply = loop {
+        let v = read_json(&mut ws).await;
+        if v.get("id").and_then(|i| i.as_u64()) == Some(2) {
+            break v;
+        }
+        if v["event"] == "session.event" {
+            frames.push(v);
+        }
+    };
+    assert_eq!(reply["result"]["stopReason"], "completed", "{reply}");
+    let seqs: Vec<u64> = frames.iter().filter_map(|f| f["seq"].as_u64()).collect();
+    assert!(
+        frames.len() >= 3 && seqs.len() == frames.len(),
+        "every live frame carries a seq: {frames:?}"
+    );
+    assert!(
+        seqs.windows(2).all(|w| w[1] > w[0]),
+        "the cursor must strictly increase: {seqs:?}"
+    );
+
+    // A second connection picks the numbering up where it was.
+    let (mut ws2, _) = ws_connect(&format!("ws://{addr}/ws")).await;
+    rpc_send(
+        &mut ws2,
+        json!({"id":3,"method":"session.resume","params":{"sessionId":sid}}),
+    )
+    .await;
+    let resumed = read_reply(&mut ws2, 3).await;
+    assert!(resumed.get("error").is_none(), "resume: {resumed}");
+    assert_eq!(
+        resumed["result"]["cursor"].as_u64(),
+        seqs.last().copied(),
+        "the cursor continues the session's numbering: {resumed}"
+    );
+}
+
+/// An overflowed in-flight journal is announced, not silently truncated: a
+/// connection attaching to a shed journal is told to resync from the store
+/// (`session.snapshot_required`) instead of being handed a partial turn as
+/// if it were the whole one.
+#[tokio::test]
+async fn shed_journal_asks_the_client_to_resync() {
+    let (state, _store, addr) = serve(test_config(None)).await;
+    let (mut ws, _) = ws_connect(&format!("ws://{addr}/ws")).await;
+    rpc_send(
+        &mut ws,
+        json!({"id":1,"method":"session.create","params":{"cwd":"/tmp"}}),
+    )
+    .await;
+    let sid = read_reply(&mut ws, 1).await["result"]["sessionId"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    // "spam" streams 2,200 events in a turn that never ends — more than
+    // the journal's 2,048-event cap.
+    rpc_send(
+        &mut ws,
+        json!({"id":2,"method":"turn.start","params":{"sessionId":sid,"prompt":"spam"}}),
+    )
+    .await;
+
+    let mut shed = false;
+    for _ in 0..200 {
+        if state.sessions.get(&sid).await.unwrap().journal.is_shed() {
+            shed = true;
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+    }
+    assert!(
+        shed,
+        "the journal never shed — the test prompt did not overflow it"
+    );
+
+    // A second surface watches the session: history replay, then the
+    // explicit resync request.
+    let (mut ws2, _) = ws_connect(&format!("ws://{addr}/ws")).await;
+    rpc_send(
+        &mut ws2,
+        json!({"id":3,"method":"session.watch","params":{"sessionId":sid}}),
+    )
+    .await;
+    let mut asked = None;
+    let reply = loop {
+        let v = read_json(&mut ws2).await;
+        if v.get("id").and_then(|i| i.as_u64()) == Some(3) {
+            break v;
+        }
+        if v["event"] == "session.snapshot_required" {
+            asked = Some(v);
+        }
+    };
+    assert!(reply.get("error").is_none(), "watch failed: {reply}");
+    let frame = asked.unwrap_or_else(|| panic!("no snapshot_required frame: {reply}"));
+    assert_eq!(frame["sessionId"], sid.as_str());
+    assert_eq!(frame["reason"], "journal_overflow", "{frame}");
+    assert!(
+        frame["cursor"].as_u64().unwrap_or(0) > 0,
+        "the frame says where the hole ends: {frame}"
+    );
+
+    // Clean up the parked turn.
+    rpc_send(
+        &mut ws,
+        json!({"id":4,"method":"turn.cancel","params":{"sessionId":sid}}),
+    )
+    .await;
+}
+
+/// Boot recovery converges a turn a dead daemon left open: the ledger row
+/// becomes `interrupted` and the transcript gets a durable marker, so a
+/// reopened session never shows a prompt with no answer and no reason.
+#[tokio::test]
+async fn boot_recovery_marks_a_turn_cut_off_by_a_restart() {
+    let store = Store::in_memory().await.unwrap();
+    store
+        .create_session("s1", "/tmp", Some("mock"))
+        .await
+        .unwrap();
+    store
+        .append("s1", "user", &json!({"content": "half a turn"}))
+        .await
+        .unwrap();
+    store.begin_turn("s1", "t-crash", "mock").await.unwrap();
+
+    let state = AppState::new(test_config(None), store.clone()).await;
+    state
+        .sessions
+        .insert_client("mock".into(), common::mock_client());
+
+    // The boot task is spawned, not awaited — poll for its effect.
+    let mut marked = false;
+    for _ in 0..100 {
+        let msgs = store.messages_paged("s1", 200, 0).await.unwrap();
+        if msgs.iter().any(|m| {
+            m.role == "error"
+                && m.data["content"]
+                    .as_str()
+                    .unwrap_or_default()
+                    .contains("interrupted")
+        }) {
+            marked = true;
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+    }
+    assert!(marked, "boot recovery left no marker in the transcript");
+    assert_eq!(
+        store.turn_row("s1", "t-crash").await.unwrap().unwrap().0,
+        "interrupted"
+    );
+}

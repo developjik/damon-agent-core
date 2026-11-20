@@ -2,8 +2,9 @@
 //! Wire shape:
 //!   request:   {"id": N, "method": "session.create", "params": {...}}
 //!   response:  {"id": N, "result": {...}} | {"id": N, "error": {"code","message"}}
-//!   event:     {"event": "session.event", "sessionId": "...", "data": <StreamEvent>}
-//!   hello:     {"hello": {"protocol": 2, "daemon": "damond", "version": "..."}}
+//!   event:     {"event": "session.event", "sessionId": "...", "seq": N, "data": <StreamEvent>}
+//!   hello:     {"hello": {"protocol": 2, "minProtocol": 2, "supported": [2],
+//!                        "capabilities": {...}, "daemon": "damond", "version": "..."}}
 //!
 //! One connection multiplexes every session. Each request is dispatched
 //! as its own task so a long `turn.start` never serializes the socket —
@@ -83,6 +84,46 @@ static PROMPT_SLOTS: tokio::sync::Semaphore = tokio::sync::Semaphore::const_new(
 /// the relay's encrypt buffer without bound.
 pub const MAX_RESPONSE_BYTES: usize = 1 << 20;
 
+/// The wire protocol this daemon speaks. Negotiation is MAJOR-only (the
+/// rule ACP v2 settled on): a client that names a version is answered
+/// yes or with an explicit `UNSUPPORTED_PROTOCOL` carrying `supported[]`,
+/// never a silent mismatch. Additive fields and events ride the
+/// `capabilities` object instead of the number, so a new one can never
+/// break a client that has not learned it yet.
+pub const PROTOCOL_VERSION: u64 = 2;
+
+/// Oldest protocol this daemon still speaks. Equal to
+/// [`PROTOCOL_VERSION`] today — the pair exists so a future breaking
+/// revision can keep a compatibility window instead of a flag day.
+pub const MIN_PROTOCOL: u64 = 2;
+
+/// The server-side capability set — what a client may rely on beyond the
+/// protocol number. Every key gates an additive field or event, so a
+/// client can feature-detect instead of guessing from the version string.
+/// Unknown keys are ignored (the same rule this daemon applies to
+/// unknown request fields).
+pub fn server_capabilities() -> Value {
+    json!({
+        // `session.event` frames carry a session-scoped `seq` cursor, and
+        // create/resume/watch/restart return it as `cursor`.
+        "eventSeq": true,
+        // An unreplayable in-flight journal is announced with a
+        // `session.snapshot_required` frame instead of a silent gap.
+        "snapshotRequired": true,
+        // A connection whose queue overflowed gets a `session.gap` frame
+        // naming how many events it missed.
+        "connGap": true,
+        // `turn.start`/`turn.steer` accept `idempotencyKey`.
+        "idempotentTurns": true,
+        // Turns are persisted in a ledger; a turn cut off by a daemon
+        // restart is settled as `interrupted` at boot.
+        "turnLedger": true,
+        // `hello` accepts `protocolVersion` and refuses an unsupported one
+        // with `-32012` + `data.supported`.
+        "versionNegotiation": true,
+    })
+}
+
 /// JSON-RPC error codes this daemon emits. `-32700..-32600` is the
 /// range the spec reserves for frame/request errors; Damon's own codes
 /// live in `-32000..-32099` and are wire contract — clients branch on
@@ -134,6 +175,10 @@ pub mod error_code {
     /// `capacity` with `limit`/`current`/`attempted`). The whole write
     /// bounced; nothing was sanitized or truncated.
     pub const MEMORY_REJECTED: i64 = -32011;
+    /// `hello` named a protocol version this daemon does not speak —
+    /// `error.data` carries `{requested, supported[]}`. The client should
+    /// pick a supported version (or upgrade) instead of retrying.
+    pub const UNSUPPORTED_PROTOCOL: i64 = -32012;
 }
 
 /// An error carrying a typed JSON-RPC code to the wire. Produced via
@@ -218,6 +263,72 @@ fn req_str<'a>(params: &'a Value, key: &str) -> Result<&'a str> {
         .ok_or_else(|| RpcError::error(error_code::INVALID_PARAMS, format!("{key} required")))
 }
 
+/// The idempotency-cache key for a Keyed request, when the caller
+/// supplied one. Scoped per session and method, so a client can mint one
+/// key per turn (a counter or a uuid) without colliding across sessions.
+fn idem_key_of(params: &Value, session_id: &str, method: &str) -> Option<String> {
+    params["idempotencyKey"]
+        .as_str()
+        .map(str::trim)
+        .filter(|k| !k.is_empty())
+        .map(|k| format!("{session_id}:{method}:{k}"))
+}
+
+/// Mark a replayed answer so the client can tell a duplicate from a fresh
+/// result: the turn it names already ran, and re-sending the prompt did
+/// not start a second one.
+fn duplicate_frame(mut v: Value) -> Value {
+    if let Some(obj) = v.as_object_mut() {
+        obj.insert("duplicate".to_string(), Value::Bool(true));
+    }
+    v
+}
+
+/// What claiming a `turn.start` key produced.
+enum KeyClaim {
+    /// No key, or the claim is ours: run the turn.
+    Owned,
+    /// An earlier attempt settled, or is still running: answer with this
+    /// frame instead of starting a second turn.
+    Answered(Value),
+}
+
+/// Claim `turn.start`'s idempotency key, if it has one. `Fresh` is the
+/// only outcome that does work — the other two replay the first attempt.
+async fn claim_key(
+    state: &Arc<AppState>,
+    conn: &Arc<Conn>,
+    ms: &Arc<ManagedSession>,
+    key: &Option<String>,
+) -> Result<KeyClaim> {
+    let Some(key) = key else {
+        return Ok(KeyClaim::Owned);
+    };
+    match state.idempotency.begin(key) {
+        crate::idempotency::Begin::Fresh => Ok(KeyClaim::Owned),
+        crate::idempotency::Begin::Done(v) => Ok(KeyClaim::Answered(duplicate_frame(v))),
+        crate::idempotency::Begin::InFlight => {
+            // The first attempt owns the turn and this request cannot
+            // await it (`turn.start` resolves when the TURN ends), so
+            // attach the retrying connection to the same stream: it sees
+            // the turn it would otherwise have started a second time.
+            conn.subscribe(state, ms).await;
+            Ok(KeyClaim::Answered(json!({
+                "sessionId": ms.id,
+                "duplicate": true,
+                "inProgress": true,
+            })))
+        }
+    }
+}
+
+/// Release a claim that never settled — the client may retry it.
+fn release_key(state: &AppState, key: &Option<String>) {
+    if let Some(key) = key {
+        state.idempotency.forget(key);
+    }
+}
+
 /// Cap on persisted rows replayed on subscribe. Beyond this the client
 /// pages `session.messages` explicitly.
 const REPLAY_HISTORY: u32 = 200;
@@ -281,8 +392,13 @@ impl Conn {
     /// live forwarder starts, everything the connection missed is
     /// replayed: persisted history from the store, then the in-flight
     /// turn's journal, each frame tagged `"replay": true` so clients
-    /// can render catch-up differently from live streaming. Returns the
-    /// number of replayed frames.
+    /// can render catch-up differently from live streaming. Every replay
+    /// frame carries the `seq` its event was assigned, so the live stream
+    /// continues the same numbering. When the journal shed its prefix the
+    /// connection gets one `session.snapshot_required` frame instead — a
+    /// partial turn replayed as the whole one is a lie, and the store is
+    /// the boundary the client should re-read. Returns the number of
+    /// replayed frames.
     ///
     /// The subscriptions lock is held across the store read on purpose:
     /// it serializes concurrent subscribes so replay frames are always
@@ -310,39 +426,74 @@ impl Conn {
                 }
             }
         }
-        for ev in session.journal.snapshot_current_turn() {
-            replayed += 1;
-            self.send(json!({
-                "event": "session.event",
+        match session.journal.replayable() {
+            Some(events) => {
+                for ev in events {
+                    replayed += 1;
+                    self.send(json!({
+                        "event": "session.event",
+                        "sessionId": session.id,
+                        "replay": true,
+                        "seq": ev.seq,
+                        "data": ev.event,
+                    }));
+                }
+            }
+            // Dropped deltas leave a hole in the middle of the turn — no
+            // replay to give, so say so and let the client re-read the
+            // store (`session.messages`), which run_turn keeps complete.
+            None => self.send(json!({
+                "event": "session.snapshot_required",
                 "sessionId": session.id,
-                "replay": true,
-                "data": ev,
-            }));
+                "cursor": session.cursor(),
+                "reason": "journal_overflow",
+            })),
         }
-        let mut rx = session.session.subscribe();
+        let mut rx = session.subscribe_seq();
         let tx = self.tx.clone();
         let sid = session.id.clone();
         subs.insert(
             sid.clone(),
             tokio::spawn(async move {
+                // Events this connection never received since the last one
+                // it did: either the broadcast skipped them (Lagged) or the
+                // send queue refused them. Whichever it was, the next frame
+                // it receives must be preceded by the admission — a stream
+                // with a silent hole is exactly what made a half answer
+                // look complete.
+                let mut dropped: u64 = 0;
                 loop {
                     match rx.recv().await {
                         Ok(ev) => {
+                            if dropped > 0 {
+                                let gap = json!({
+                                    "event": "session.gap",
+                                    "sessionId": sid,
+                                    "dropped": dropped,
+                                    "cursor": ev.seq,
+                                });
+                                if tx.try_send(Message::Text(gap.to_string().into())).is_ok() {
+                                    dropped = 0;
+                                }
+                            }
                             let frame = json!({
                                 "event": "session.event",
                                 "sessionId": sid,
-                                "data": ev,
+                                "seq": ev.seq,
+                                "data": ev.event,
                             });
                             if tx
                                 .try_send(Message::Text(frame.to_string().into()))
                                 .is_err()
                             {
-                                // Client lagging or gone — drop the frame,
-                                // keep the forwarder (channel may recover).
-                                continue;
+                                // Client lagging or gone — count it so the
+                                // next delivered frame carries the gap.
+                                dropped += 1;
                             }
                         }
-                        Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => continue,
+                        Err(tokio::sync::broadcast::error::RecvError::Lagged(n)) => {
+                            dropped += n;
+                        }
                         Err(tokio::sync::broadcast::error::RecvError::Closed) => break,
                     }
                 }
@@ -430,7 +581,10 @@ async fn run_connection(state: Arc<AppState>, socket: WebSocket, device: Option<
 
     conn.send(json!({
         "hello": {
-            "protocol": 2,
+            "protocol": PROTOCOL_VERSION,
+            "minProtocol": MIN_PROTOCOL,
+            "supported": [PROTOCOL_VERSION],
+            "capabilities": server_capabilities(),
             "daemon": "damond",
             "version": env!("CARGO_PKG_VERSION"),
             "permissionTimeoutSecs": state.config.read().permission_timeout_secs,
@@ -491,7 +645,10 @@ pub async fn handle_socket(
 
     conn.send(json!({
         "hello": {
-            "protocol": 2,
+            "protocol": PROTOCOL_VERSION,
+            "minProtocol": MIN_PROTOCOL,
+            "supported": [PROTOCOL_VERSION],
+            "capabilities": server_capabilities(),
             "daemon": "damond",
             "version": env!("CARGO_PKG_VERSION"),
             "permissionTimeoutSecs": state.config.read().permission_timeout_secs,
@@ -593,16 +750,40 @@ async fn dispatch(
     params: Value,
 ) -> Result<Value> {
     match method {
-        "hello" => Ok(json!({
-            "protocol": 2,
-            "daemon": "damond",
-            "version": env!("CARGO_PKG_VERSION"),
-            "backends": state.sessions.available_backends(),
-            "methods": rpc_methods(),
-            "remoteClients": state
-                .remote_ws
-                .load(std::sync::atomic::Ordering::Relaxed),
-        })),
+        "hello" => {
+            // Version negotiation (ACP v2's shape — MAJOR integer only): a
+            // client that names its version is answered yes, or refused with
+            // a typed error carrying the versions this daemon speaks. A
+            // `hello` WITHOUT a version is the pre-negotiation shape and
+            // keeps working exactly as before, which is why adding this did
+            // not move the protocol number.
+            if let Some(v) = params["protocolVersion"].as_u64()
+                && !(MIN_PROTOCOL..=PROTOCOL_VERSION).contains(&v)
+            {
+                return Err(anyhow::Error::new(
+                    RpcError::new(
+                        error_code::UNSUPPORTED_PROTOCOL,
+                        format!(
+                            "protocol version {v} is not supported — this daemon speaks {MIN_PROTOCOL}..={PROTOCOL_VERSION}"
+                        ),
+                    )
+                    .with_data(json!({"requested": v, "supported": [PROTOCOL_VERSION]})),
+                ));
+            }
+            Ok(json!({
+                "protocol": PROTOCOL_VERSION,
+                "minProtocol": MIN_PROTOCOL,
+                "supported": [PROTOCOL_VERSION],
+                "capabilities": server_capabilities(),
+                "daemon": "damond",
+                "version": env!("CARGO_PKG_VERSION"),
+                "backends": state.sessions.available_backends(),
+                "methods": rpc_methods(),
+                "remoteClients": state
+                    .remote_ws
+                    .load(std::sync::atomic::Ordering::Relaxed),
+            }))
+        }
 
         "backend.list" => {
             let mut out = Vec::new();
@@ -1451,7 +1632,7 @@ async fn dispatch(
                 let _ = state.store.set_session_model(&ms.id, m).await;
             }
             let replayed = conn.subscribe(state, &ms).await;
-            let mut out = json!({"sessionId": ms.id, "backend": ms.provider, "replayed": replayed});
+            let mut out = json!({"sessionId": ms.id, "backend": ms.provider, "replayed": replayed, "cursor": ms.cursor()});
             if let Some(p) = &ms.persona {
                 out["persona"] = json!(p.bot);
             }
@@ -1519,13 +1700,17 @@ async fn dispatch(
                     effective_grants(state, state.store.session_project(&id).await?).await?;
                 let ms = state.sessions.resume(&id, &handle, cfg, None).await?;
                 let replayed = conn.subscribe(state, &ms).await;
-                return Ok(json!({"sessionId": id, "backend": ms.provider, "replayed": replayed}));
+                return Ok(
+                    json!({"sessionId": id, "backend": ms.provider, "replayed": replayed, "cursor": ms.cursor()}),
+                );
             }
             let id = req_str(&params, "sessionId")?;
             // Already live? Just subscribe and return.
             if let Some(ms) = state.sessions.get(id).await {
                 let replayed = conn.subscribe(state, &ms).await;
-                return Ok(json!({"sessionId": id, "backend": ms.provider, "replayed": replayed}));
+                return Ok(
+                    json!({"sessionId": id, "backend": ms.provider, "replayed": replayed, "cursor": ms.cursor()}),
+                );
             }
             reattach(state, conn, id).await
         }
@@ -1607,7 +1792,9 @@ async fn dispatch(
                 )
             })?;
             let replayed = conn.subscribe(state, &ms).await;
-            Ok(json!({"sessionId": id, "subscribed": true, "replayed": replayed}))
+            Ok(
+                json!({"sessionId": id, "subscribed": true, "replayed": replayed, "cursor": ms.cursor()}),
+            )
         }
 
         "session.unwatch" => {
@@ -2262,11 +2449,22 @@ async fn dispatch(
                     "session not live — call session.resume first",
                 )
             })?;
+            // Keyed retry: a client that lost the response to an earlier
+            // attempt gets that attempt's answer instead of a second turn
+            // (which would spend tokens and re-run tool side effects).
+            // Without the key nothing changes — the pre-0.9 request shape
+            // stays byte for byte.
+            let idem_key = idem_key_of(&params, id, "turn.start");
+            match claim_key(state, conn, &ms, &idem_key).await? {
+                KeyClaim::Answered(frame) => return Ok(frame),
+                KeyClaim::Owned => {}
+            }
             // Claim the session exclusively: a second concurrent start
             // would run two collectors on the same broadcast and
             // double-persist every event. swap() is the claim;
             // run_turn's BusyGuard releases it on every exit path.
             if ms.busy.swap(true, std::sync::atomic::Ordering::AcqRel) {
+                release_key(state, &idem_key);
                 return Err(RpcError::error(
                     error_code::TURN_IN_PROGRESS,
                     "a turn is already running on this session",
@@ -2292,7 +2490,20 @@ async fn dispatch(
                 Some(c)
             };
             conn.subscribe(state, &ms).await;
-            run_turn(state, conn, &ms, params, detach, cancel).await
+            let out = run_turn(state, conn, &ms, params, detach, cancel).await;
+            match &out {
+                // Settled: the retry window holds this answer.
+                Ok(v) => {
+                    if let Some(key) = &idem_key {
+                        state.idempotency.finish(key, v.clone());
+                    }
+                }
+                // Failed or canceled before it settled: release the key so
+                // the client can ask again (a failed turn did not
+                // complete — replaying its error would hide the retry).
+                Err(_) => release_key(state, &idem_key),
+            }
+            out
         }
 
         "turn.steer" => {
@@ -2304,8 +2515,34 @@ async fn dispatch(
             let prompt: PromptInput = serde_json::from_value(params["prompt"].clone())
                 .map_err(|_| RpcError::error(error_code::INVALID_PARAMS, "prompt required"))?;
             let expected = params["expectedTurn"].as_str().unwrap_or_default();
-            let res = ms.session.steer(prompt, expected).await?;
-            Ok(json!({"result": res}))
+            // Same Keyed contract as turn.start: a steer delivered twice
+            // would hand the agent the same words twice.
+            let idem_key = idem_key_of(&params, id, "turn.steer");
+            if let Some(key) = &idem_key {
+                match state.idempotency.begin(key) {
+                    crate::idempotency::Begin::Done(v) => return Ok(duplicate_frame(v)),
+                    crate::idempotency::Begin::InFlight => {
+                        return Err(RpcError::error(
+                            error_code::TURN_IN_PROGRESS,
+                            "a steer with this idempotencyKey is still being delivered",
+                        ));
+                    }
+                    crate::idempotency::Begin::Fresh => {}
+                }
+            }
+            match ms.session.steer(prompt, expected).await {
+                Ok(res) => {
+                    let out = json!({"result": res});
+                    if let Some(key) = &idem_key {
+                        state.idempotency.finish(key, out.clone());
+                    }
+                    Ok(out)
+                }
+                Err(e) => {
+                    release_key(state, &idem_key);
+                    Err(e)
+                }
+            }
         }
 
         "turn.cancel" => {
@@ -3616,7 +3853,7 @@ async fn reattach(state: &Arc<AppState>, conn: &Arc<Conn>, id: &str) -> Result<V
     };
     let ms = state.sessions.resume(id, &handle, cfg, persona).await?;
     let replayed = conn.subscribe(state, &ms).await;
-    let mut out = json!({"sessionId": id, "backend": ms.provider, "replayed": replayed});
+    let mut out = json!({"sessionId": id, "backend": ms.provider, "replayed": replayed, "cursor": ms.cursor()});
     if let Some(p) = &ms.persona {
         out["persona"] = json!(p.bot);
     }
@@ -3808,14 +4045,23 @@ async fn run_turn(
         None => ms.session.start_turn(prompt).await?,
     };
 
+    // Turn ledger: from here the turn is a row, not just a live flag. A
+    // daemon that dies mid-turn leaves this row open, and boot recovery
+    // converges it to `interrupted` with a marker in the transcript —
+    // "no ghost turn reported as still running" is the same rule the
+    // mission runner already keeps. Best-effort: bookkeeping must never
+    // fail a turn that is already running.
+    let _ = state.store.begin_turn(&ms.id, &turn_id, &ms.provider).await;
+
     if detach {
         let busy = _busy.hand_off();
         let st = state.clone();
         let m = ms.clone();
+        let tid = turn_id.clone();
         tokio::spawn(async move {
             let _slot = slot;
             let _busy = busy;
-            if let Err(e) = drive_turn(&st, &m, events, timeout, None, started).await {
+            if let Err(e) = drive_turn(&st, &m, events, timeout, None, started, &tid).await {
                 tracing::warn!(session = %m.id, error = %e, "detached turn ended");
             }
         });
@@ -3823,7 +4069,8 @@ async fn run_turn(
     }
 
     let _slot = slot;
-    let (stop_reason, usage) = drive_turn(state, ms, events, timeout, cancel, started).await?;
+    let (stop_reason, usage) =
+        drive_turn(state, ms, events, timeout, cancel, started, &turn_id).await?;
     Ok(json!({
         "turnId": turn_id,
         "stopReason": stop_reason,
@@ -3832,12 +4079,12 @@ async fn run_turn(
 }
 
 /// Collect one turn's events to its boundary, persist every artifact,
-/// and record metrics. Shared by the blocking and detached paths; the
-/// `cancel` token is the starting connection's disconnect handle (None
-/// for detached turns — nothing but `turn.cancel`, a deny-with-
-/// interrupt, or `timeoutSecs` ends them early). Errors cover both a
-/// `turn_failed` boundary and persistence failures. Returns the stop
-/// reason and the usage snapshot.
+/// settle its turn-ledger row, and record metrics. Shared by the blocking
+/// and detached paths; the `cancel` token is the starting connection's
+/// disconnect handle (None for detached turns — nothing but
+/// `turn.cancel`, a deny-with-interrupt, or `timeoutSecs` ends them
+/// early). Errors cover both a `turn_failed` boundary and persistence
+/// failures. Returns the stop reason and the usage snapshot.
 #[allow(clippy::type_complexity)]
 async fn drive_turn(
     state: &Arc<AppState>,
@@ -3846,6 +4093,7 @@ async fn drive_turn(
     timeout: Option<std::time::Duration>,
     cancel: Option<CancellationToken>,
     started: std::time::Instant,
+    turn_id: &str,
 ) -> Result<(&'static str, Option<Usage>)> {
     let mut assistant = String::new();
     let mut reasoning = String::new();
@@ -4041,6 +4289,12 @@ async fn drive_turn(
             .await;
     }
 
+    // Settle the ledger row with how the turn actually ended. Best-effort
+    // like every write in this phase — and only an OPEN row is settled,
+    // so a turn boot recovery already converged to `interrupted` keeps
+    // that verdict.
+    let _ = state.store.finish_turn(&ms.id, turn_id, stop_reason).await;
+
     state
         .metrics
         .record_turn(&ms.provider, stop_reason, started.elapsed());
@@ -4105,7 +4359,7 @@ fn prompt_text(prompt: &PromptInput) -> String {
 /// contract, returned by `hello` and printed by `damond --print-rpc-schema`.
 pub fn rpc_methods() -> Vec<Value> {
     vec![
-        json!({"name": "hello", "result": {"protocol": "number", "backends": "array", "methods": "array"}}),
+        json!({"name": "hello", "params": {"protocolVersion": "number? — the MAJOR protocol version this client speaks; an unsupported one is refused with -32012 and data.supported[] (param-less hello keeps working as before)", "client": "{name, version}? — informational"}, "result": {"protocol": "number", "minProtocol": "number", "supported": "number[]", "capabilities": "object — feature gates a client may rely on: eventSeq, snapshotRequired, connGap, idempotentTurns, turnLedger, versionNegotiation (unknown keys are ignored)", "backends": "array", "methods": "array"}, "errors": "-32012 protocolVersion outside minProtocol..=protocol (data.requested / data.supported[])"}),
         json!({"name": "backend.list", "result": {"backends": "array"}}),
         json!({"name": "backend.versions", "params": {"backend": "string? — one backend, else all"}, "result": {"versions": "array of {backend, installed, version?, latest?, updateAvailable, updateKind: 'npm'|'manual'|'unknown'} — latest only where an npm package is verified; probes run on this call only, never scheduled"}}),
         json!({"name": "backend.update_plan", "params": {"backend": "string"}, "result": "{backend, action: 'install'|'update', kind: 'npm'|'manual'|'unknown', command: string[], manualCommand: string, canRun: bool, blockers: string[], platform} — the exact argv backend.update runs plus the copy-paste fallback; no side effects"}),
@@ -4123,8 +4377,8 @@ pub fn rpc_methods() -> Vec<Value> {
         json!({"name": "mcp.inventory", "params": {}, "result": {"entries": "array of {backend, name, transport, command?, url?, envKeys?, source, format, version, enabled?, readonlyReason?} — REDACTED: env values never leave the file, URLs lose userinfo/query, stdio shows the program and an arg count", "sources": "array of {backend, source, format, error?} — one per config file; a broken file reports its error and the inventory continues"}}),
         json!({"name": "mcp.probe", "params": {"backend": "string", "name": "string"}, "result": "{backend, name, result: 'connected'|'needs_auth'|'failed'|'unsupported', tools: string[] — names only, ≤40, serverName?, protocolVersion?, elapsedMs, error?} — REAL handshake, explicit request only (never scheduled); stdio 25s cap, HTTP 12s cap; the server's command/args/env never reach the wire"}),
         json!({"name": "mcp.setEnabled", "params": {"backend": "string — claude only this round", "name": "string", "enabled": "boolean", "expectedVersion": "string — CAS from mcp.inventory", "cwd": "string? — project scope for the toggle, default the daemon cwd"}, "result": {"set": "boolean"}, "errors": "-32010 the entry changed since the snapshot (external edit); -32602 readonly backend (reason in the message) or parse-failed config (never written)"}),
-        json!({"name": "session.create", "params": {"backend": "string?", "cwd": "string?", "model": "string?", "mode": "string?", "mcpServers": "object?", "projectId": "string? — scopes the session: root becomes the cwd default, project defaults fill unset params", "persona": "string? — bot id from bot.list; the bot's SOUL/AGENTS block rides in front of every turn, bound for the session's life and restored on resume"}, "result": {"sessionId": "string", "backend": "string", "persona?": "string — the bound bot id, when one was given", "replayed": "number — replay-tagged session.event frames sent for missed history"}, "errors": "-32602 unknown persona id"}),
-        json!({"name": "session.resume", "params": {"sessionId": "string — or", "handle": "{provider, native_handle}", "cwd": "string?", "title": "string?"}, "result": {"sessionId": "string", "backend": "string", "replayed": "number"}}),
+        json!({"name": "session.create", "params": {"backend": "string?", "cwd": "string?", "model": "string?", "mode": "string?", "mcpServers": "object?", "projectId": "string? — scopes the session: root becomes the cwd default, project defaults fill unset params", "persona": "string? — bot id from bot.list; the bot's SOUL/AGENTS block rides in front of every turn, bound for the session's life and restored on resume"}, "result": {"sessionId": "string", "backend": "string", "persona?": "string — the bound bot id, when one was given", "replayed": "number — replay-tagged session.event frames sent for missed history", "cursor": "number — the newest session event seq handed out so far; the next live frame continues from it (gaps → session.gap)"}, "errors": "-32602 unknown persona id"}),
+        json!({"name": "session.resume", "params": {"sessionId": "string — or", "handle": "{provider, native_handle}", "cwd": "string?", "title": "string?"}, "result": {"sessionId": "string", "backend": "string", "replayed": "number", "cursor": "number"}}),
         json!({"name": "session.list", "params": {"limit": "number?", "offset": "number?", "backend": "string?", "cwd": "string?", "tag": "string?", "projectId": "string?"}, "result": {"sessions": "array of {sessionId, createdAt, backend, title, cwd, tags}"}}),
         json!({"name": "session.messages", "params": {"sessionId": "string", "limit": "number?", "offset": "number?"}, "result": {"messages": "array of {id, session_id, role, ts, data} — ts is unix ms, 0 when unknown"}}),
         json!({"name": "session.export", "params": {"sessionId": "string"}, "result": {"session": "{sessionId, createdAt, backend, title, tags, cwd}", "messages": "array of {id, role, ts, data}", "usage": "{contextUsed, contextSize, costUsd, turns}"}}),
@@ -4160,8 +4414,8 @@ pub fn rpc_methods() -> Vec<Value> {
         json!({"name": "session.search", "params": {"query": "string", "limit": "number?", "sessionId": "string?", "backend": "string?", "cwd": "string?", "projectId": "string?", "since": "string? — RFC3339 or YYYY-MM-DD", "until": "string?"}, "result": {"results": "array of {sessionId, messageId, snippet}"}}),
         json!({"name": "usage.summary", "params": {"days": "number? — window in local days, today inclusive, default 7", "tzOffsetMinutes": "number? — caller's UTC offset shifting the day buckets, default 0 (UTC)"}, "result": {"days": "number", "rows": "array of {date, backend, model, turns, contextUsed, contextSize, costUsd} — one per local day × backend × model; context columns sum the per-turn snapshots", "total": "{turns, contextUsed, contextSize, costUsd}"}}),
         json!({"name": "usage.clear", "params": {}, "result": {"cleared": "boolean — every usage row deleted; sessions and messages untouched"}}),
-        json!({"name": "turn.start", "params": {"sessionId": "string", "prompt": "string|array", "timeoutSecs": "number?", "detach": "boolean? — true resolves immediately {turnId, detached:true} and the turn outlives the connection (not cancelled on disconnect); turn.cancel/timeoutSecs still apply", "memoryOwner": "string? — with [memory] enabled, this bot ledger's ACTIVE entries join the user ledger in the injected <memory> block; the persisted user message keeps the clean prompt"}, "result": {"turnId": "string", "stopReason": "string", "usage": "object?"}}),
-        json!({"name": "turn.steer", "params": {"sessionId": "string", "prompt": "string|array"}, "result": {"result": "string"}}),
+        json!({"name": "turn.start", "params": {"sessionId": "string", "prompt": "string|array", "timeoutSecs": "number?", "detach": "boolean? — true resolves immediately {turnId, detached:true} and the turn outlives the connection (not cancelled on disconnect); turn.cancel/timeoutSecs still apply", "idempotencyKey": "string? — Keyed retry: the same key replays the first attempt's result (marked duplicate:true) instead of starting a second turn; while the first is still running the reply is {duplicate:true, inProgress:true} and the connection is subscribed to that turn", "memoryOwner": "string? — with [memory] enabled, this bot ledger's ACTIVE entries join the user ledger in the injected <memory> block; the persisted user message keeps the clean prompt"}, "result": {"turnId": "string", "stopReason": "string", "usage": "object?"}}),
+        json!({"name": "turn.steer", "params": {"sessionId": "string", "prompt": "string|array", "idempotencyKey": "string? — same Keyed rule as turn.start (a repeat replays the first delivery)"}, "result": {"result": "string"}}),
         json!({"name": "turn.cancel", "params": {"sessionId": "string"}, "result": {"cancelled": "boolean"}}),
         json!({"name": "permission.respond", "params": {"sessionId": "string", "requestId": "string", "response": "{behavior: allow|deny, action_id?, updated_input?, answer?, answers?{question → label|[labels]}} — for kind:question asks an answers map submits picks, an allow without answers skips"}, "result": {}, "errors": "-32008 requestId is not a pending ask (answered, withdrawn, or turn ended); delivery failures leave it answerable"}),
         json!({"name": "plan.list", "params": {"sessionId": "string"}, "result": {"plans": "array of {planId, sessionId, requestId, revision, title, content, contentHash, complete, status, decision?, decisionIntentAt?, appliedAt?, createdAt, updatedAt, supersededBy?} — every revision, chain-ordered"}}),
