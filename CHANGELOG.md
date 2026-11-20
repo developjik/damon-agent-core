@@ -2,6 +2,30 @@
 
 ## Unreleased
 
+### Changed — session state is pure data with a boot checkpoint
+
+- The session layer's mutable picture (phase, open turn, parked ask,
+  timestamps, handle, rollups) moved out of the runtime objects into
+  `src/state.rs`: plain serializable records with plain transitions, no
+  IO, no async, no process handles. `SessionManager` owns the processes
+  and journals and applies those transitions; `tests/state_boundary.rs`
+  fails the build gate if the pure module grows a runtime import. Every
+  transition is now unit-tested without spawning an agent CLI.
+- `session.status` rows carry `phase` (`idle` | `busy` |
+  `awaiting_input`), the backend's `turnId` while a turn runs, and
+  `pendingAsk {requestId, kind, label, askedAtMs}` while one is parked.
+  `busy` stays true for a parked turn: it is not reapable.
+- The live state is checkpointed to `sessions.state.json` next to the
+  store (atomic replace, private permissions). A daemon killed mid-turn
+  or mid-ask leaves its rows there; the next boot converges them to idle
+  with a `recovered` mark and returns them as `session.status.recovered`
+  — no ghost session is reported live, and no interruption is counted
+  twice. Resuming a session drops its row; rows age out after 24 h.
+- `hello` advertises `capabilities.sessionPhase`. Additive: the request
+  and response shapes of 0.8.0 (and `damon-chat-desk`) keep working.
+- Mission agent nodes now claim their session's turn too, so the idle
+  sweep cannot reap a session mid-node.
+
 ### Added — delivery honesty: a session event cursor and explicit gaps
 
 - Every `session.event` frame now carries `seq`, a session-scoped

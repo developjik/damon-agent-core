@@ -79,7 +79,7 @@ WebSocket(`GET /ws`) 또는 릴레이 터널 위의 JSON 메시지. 하나의 �
 | `session.rescan` | `{}` | `{scanId, alreadyRunning, report: {scanned, reparsed, reused, archived, tombstoned, skippedBackends[]}}` — 모든 백엔드의 네이티브 세션 저장소를 훑어 데몬이 본 적 없는 세션의 북마크 행을 만든다; 단일 비행(실행 중이면 진행 중인 `scanId` 반환); 진행은 요청 연결로 `{"event":"history.scan_progress","scanId","data":{stage, …}}` 스트리밍; [히스토리 스캐너](#히스토리-스캐너) 참조 |
 | `session.close` | `{sessionId}` | `{closed: bool}` — 라이브 백엔드 프로세스를 종료하고 행/히스토리는 유지; `max_sessions` 슬롯 확보; 멱등 |
 | `session.restart` | `{sessionId}` | `{sessionId, backend, replayed, cursor}` — 라이브 백엔드를 죽이고(턴 도중엔 `-32006`으로 거부) 영속 핸들로 재접속 |
-| `session.status` | `{}` | `{sessions: [{sessionId, backend, busy, idleSecs}]}` — 라이브 백엔드 세션만 |
+| `session.status` | `{}` | `{sessions: [{sessionId, backend, busy, phase, idleSecs, turnId?, pendingAsk?}], recovered: [...]}` — 라이브 백엔드 세션과, 죽은 데몬이 남긴 세션(아래 *세션 상태* 참고) |
 | `session.watch` | `{sessionId}` — 라이브여야 함 | `{sessionId, subscribed, replayed, cursor}` — 이 연결을 세션 이벤트에 건드리지 않고(생성·재개·턴 없이) 구독; 표면을 넘나드는 알림 경로(웹 UI 세션이 끝나거나 권한을 요청하면 채팅 브리지가 채널로 알림) |
 | `session.unwatch` | `{sessionId}` | `{sessionId, subscribed}` — 이 연결의 구독 해제; 세션과 다른 연결은 그대로 |
 | `session.set_pinned` | `{sessionId, pinned}` | `{updated: bool}` — 고정 행은 `session.list` 최상단에 뜨고 보존 스윕에서 생존 |
@@ -525,6 +525,34 @@ create/resume/watch 결과의 `replayed` 수가 보낸 프레임 수이고 `curs
 `interrupted`로 수렴시키고 트랜스크립트에 `error` 타임라인 행을 덧붙인다 —
 세션을 다시 열면 답이 중간에 끊겼음이 보이고, 어떤 표면도 유령 턴을
 "실행 중"으로 보고하지 않는다. (미션 러너가 자기 런에 적용하는 규칙과 같다.)
+
+### 세션 상태: 단계, 대기 중인 질문, 부팅 체크포인트
+
+세션의 라이브 상태 — 유휴인지, 턴을 도는 중인지, 사용자의 답을 기다리는지 —
+는 그 세션을 실행하는 프로세스와 분리된 순수·직렬화 가능 데이터로 유지된다
+(`src/state.rs`, 그 둘레의 런타임은 `src/session.rs`). 와이어에는 두 가지로
+드러난다.
+
+- **`phase`** — 모든 `session.status` 행에 붙는다: `idle`, `busy`(턴 실행 중),
+  `awaiting_input`(권한·질문·플랜 답을 기다리며 멈춰 있음). 두 활성 단계 모두
+  `busy`가 `true`다 — 답을 기다리는 턴도 회수 대상이 아니고 스윕이 닫아서는
+  안 되는 세션이다. 대기 행에는 `pendingAsk: {requestId, kind, label?,
+  askedAtMs}`가, 실행 행에는 백엔드가 알려준 `turnId`가 함께 실린다.
+- **`recovered`** — 같은 응답에 실린다: 이전 데몬이 턴 도중이거나 답을
+  기다리던 채로 남긴 세션. 상태는 스토어 옆 `sessions.state.json`에
+  체크포인트된다(임시 파일 + rename 원자 교체, 권한 모드가 있는 플랫폼에서는
+  0600). 턴 중에 죽은 데몬은 그 파일에 `busy`/`awaiting_input` 행을 남기고,
+  다음 부팅이 그것을 `{atMs, fromPhase, turnId?}`가 붙은 `idle`로 수렴시킨다 —
+  더 이상 존재하지 않는 프로세스를 되살리지도, 유령을 라이브로 보고하지도
+  않는다. 스토어 테이블이 아니라 파일인 것은 의도다: 전이마다 문서 전체를
+  다시 쓰고, 스토어를 쓰는 어떤 로직보다 먼저 읽으며, SQLite 스키마(와
+  `user_version`)를 건드리지 않는다. 이어서 연 세션은 recovered 행이 사라지고, 행은 24시간 뒤 정리된다.
+  읽을 수 없거나 더 새 버전인 체크포인트는 통째로 무시한다(빈 그림이 틀린
+  그림보다 낫다).
+
+`hello`는 이 표면을 `capabilities.sessionPhase`로 알린다. 정상 종료와
+`session.close`/`session.delete`/회수는 그 세션들을 뺀 상태를 쓰므로, 예정된
+종료는 아무것도 중단으로 보고하지 않는다 — 진짜 크래시만 행을 남긴다.
 
 ### 미션 러너 (스테이지 1)
 

@@ -16,6 +16,7 @@ agent CLI subprocess (NDJSON / stream-json / HTTP+SSE)
   → src/backend/<brand>.rs                            (translate to normalized model)
   → tokio broadcast<StreamEvent>                      (AgentSession::subscribe)
   → src/session.rs ManagedSession + EventJournal      (late-subscriber replay, cap 2048)
+       + src/state.rs SessionLedger                    (pure phases/turns/asks, checkpointed)
   → src/rpc.rs run_turn/drive_turn                    (JSON-RPC dispatch, ~70 methods)
   → WebSocket client (src/client.rs / npm / python)   (src/api.rs axum /ws route)
 ```
@@ -38,6 +39,7 @@ Persistence goes through `src/store.rs` (`Store`, tokio-rusqlite wrapper, sessio
 | `src/rpc.rs` | JSON-RPC v2 server over WebSocket — largest module, method dispatcher, `RpcError` |
 | `src/api.rs` | Axum HTTP/WS layer: `AppState`, routes, background sweeps, metrics |
 | `src/session.rs` | `SessionManager` / `ManagedSession`, idle reaping, event journal |
+| `src/state.rs` | Pure serializable session state (phases, open turn, parked ask, rollups) + the `sessions.state.json` checkpoint shape — no IO, no async, no process types (`tests/state_boundary.rs` enforces it) |
 | `src/store.rs` | SQLite + FTS5 persistence (`Store::open` / `Store::in_memory`) |
 | `src/skills_hub/` | Skill package manager: discovery, fetch, install lifecycle, target roots |
 | `src/channel.rs` + `telegram.rs`/`slack.rs`/`discord.rs` | Chat bridge + per-platform adapters |

@@ -82,7 +82,7 @@ unchanged, so string-matching clients keep working.
 | `session.rescan` | `{}` | `{scanId, alreadyRunning, report: {scanned, reparsed, reused, archived, tombstoned, skippedBackends[]}}` — sweeps every backend's native session storage and creates damon bookmark rows for sessions the daemon has never seen; single-flight (a second call while one runs returns the in-flight `scanId`); progress streams to the requesting connection as `{"event":"history.scan_progress","scanId","data":{stage, …}}`; see [The history scanner](#the-history-scanner) |
 | `session.close` | `{sessionId}` | `{closed: bool}` — kills the live backend process, keeps the row/history; frees a `max_sessions` slot; idempotent |
 | `session.restart` | `{sessionId}` | `{sessionId, backend, replayed, cursor}` — kills the live backend (mid-turn refuses `-32006`) and reattaches through the persisted handle |
-| `session.status` | `{}` | `{sessions: [{sessionId, backend, busy, idleSecs}]}` — live backend sessions only |
+| `session.status` | `{}` | `{sessions: [{sessionId, backend, busy, phase, idleSecs, turnId?, pendingAsk?}], recovered: [...]}` — live backend sessions only, plus what a dead daemon left behind (see *Session state*) |
 | `session.watch` | `{sessionId}` — must be live | `{sessionId, subscribed, replayed, cursor}` — subscribes this connection to the session's events without creating/resuming/turning on it; the cross-surface notification path (a chat bridge pings its channel when a web-UI session finishes or asks for permission) |
 | `session.unwatch` | `{sessionId}` | `{sessionId, subscribed}` — drops this connection's subscription; the session and other connections are untouched |
 | `session.set_pinned` | `{sessionId, pinned}` | `{updated: bool}` — pinned rows float first in `session.list` and survive the retention sweep |
@@ -568,6 +568,39 @@ dies mid-turn leaves the row open, and boot recovery converges it to
 reopening the session shows that the answer was cut short, and no surface
 reports a ghost turn as still running. (The mission runner applies the
 same rule to its runs.)
+
+### Session state: phases, the parked ask, and the boot checkpoint
+
+A session's live state — is it idle, running a turn, or waiting on the
+user — is kept as plain, serializable data separate from the process that
+runs it (`src/state.rs`; the runtime around it is `src/session.rs`). Two
+things come out of that on the wire:
+
+- **`phase`** on every `session.status` row: `idle`, `busy` (a turn is
+  running), or `awaiting_input` (the turn is parked on a permission,
+  question, or plan answer). `busy` stays `true` for both active phases —
+  a parked turn is not reapable and not something a sweep may close. A
+  parked row also carries `pendingAsk: {requestId, kind, label?,
+  askedAtMs}`, and a running one carries the backend's `turnId` once it
+  has reported one.
+- **`recovered`** on the same response: sessions the previous daemon left
+  mid-turn or waiting for an answer. The state is checkpointed to
+  `sessions.state.json` next to the store (atomic tmp-file + rename, 0600
+  where the platform has modes); a daemon that dies mid-turn leaves a
+  `busy`/`awaiting_input` row there, and the next boot converges it to
+  `idle` with `{atMs, fromPhase, turnId?}` instead of resurrecting a
+  process that no longer exists or reporting a ghost as live. It is a
+  file rather than a store table on purpose: the whole document is
+  rewritten at each transition, it is read before any store-backed logic
+  runs, and it leaves the SQLite schema (and its `user_version`) alone. A resumed
+  session drops its recovered row; rows age out after 24 h. An unreadable
+  or newer-versioned checkpoint is ignored as a whole (an empty picture
+  beats a wrong one).
+
+`hello` advertises the surface as `capabilities.sessionPhase`. An orderly
+shutdown (and `session.close` / `session.delete` / reaping) writes the
+state without those sessions, so an expected exit reports nothing as
+interrupted — only a real crash leaves rows behind.
 
 ### The mission runner (staged)
 
