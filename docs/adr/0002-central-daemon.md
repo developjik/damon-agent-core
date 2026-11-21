@@ -40,9 +40,14 @@ relay tunnel, auth/rate limiting/metrics.
 `damond` 하나가 세션·저장·권한·채널·릴레이를 소유하고, CLI·웹 UI·
 채널 봇·외부 SDK는 전부 같은 JSON-RPC-over-WebSocket 클라이언트로
 둔다. 프로바이더 인증·모델·도구는 각 에이전트 CLI 소유로 돌린다
-(데몬은 자격증명을 대신 쥐지 않는다 — registry.rs의 각
-`auth_hint`가 "log in with `<cli>` once; the subscription follows"로
-통일된 것이 코드상의 흔적).
+(데몬은 자격증명을 대신 쥐지 않는다 — registry.rs의 9개
+`auth_hint`가 전부 "인증은 CLI 소유"를 가리키는 것이 코드상의
+흔적. 문구는 제각각이다: "log in with `claude`/`codex` once; the
+subscription follows"는 2개뿐이고, 나머지는 "configure `omp` once;
+its provider auth follows", "log in with `droid` or set
+FACTORY_API_KEY", "configure providers in opencode itself"처럼 각
+CLI의 인증 경로를 안내한다. 공통인 것은 원칙뿐 — 데몬이 키를 보관·
+대행하지 않고 각 CLI의 자체 인증을 따른다).
 
 ## Consequences
 

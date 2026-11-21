@@ -80,7 +80,7 @@ agent CLI subprocess (stream-json / NDJSON / HTTP+SSE)
 | `src/api.rs` | axum HTTP/WS 계층: 라우트, WS 티켓, 인증 캐시, rate limit, 백그라운드 sweep | `AppState`, `ws_ticket`, `auth_token_cached`, `WsTicket` |
 | `src/rpc.rs` | JSON-RPC v2 서버 — 최대 모듈(4,551줄), 메서드 디스패처, 턴 실행 | `ws_handler`, `handle_socket`, `run_turn`, `drive_turn`, `RpcError`, `error_code` |
 | `src/session.rs` | Damon session id → live `AgentSession` 매핑, idle reap, 이벤트 저널 | `SessionManager`, `ManagedSession`, `EventJournal` (`JOURNAL_CAP = 2048`) |
-| `src/store.rs` | SQLite + FTS5 영속 (sessions/messages/projects/usage/mission/memory 등) | `Store::open`, `Store::in_memory`, `Store::search`, `fts5_query` |
+| `src/store.rs` | SQLite + FTS5 영속 (sessions/messages/projects/usage/mission/memory 등) | `Store::open`, `Store::in_memory`, `Store::search_filtered`, `fts5_query` |
 | `src/memory/mod.rs` | 영속 메모리 원장(user/bot 스코프), 쓰기 게이트 체인 | `validate_scope`, `ledger_cap`, `SCOPE_USER`, `SCOPE_BOT` |
 | `src/memory/scan.rs` | 메모리 쓰기 게이트: prompt-injection·시크릿·보이지 않는 문자 탐지 | `scan` 모듈 (memory/mod.rs 게이트 1단계) |
 | `src/backend/mod.rs` | 백엔드 추상화 2단 트레이트 + 네이티브 히스토리 discovery 헬퍼 | `AgentClient`, `AgentSession`, `peek_head_lines`, `is_noise_title` |
