@@ -287,6 +287,7 @@ Each chat maps to its own agent session, replies stream as rendered markdown, an
 - [docs/protocol-v2.md](docs/protocol-v2.md) — wire protocol (methods, events, types)
 - [docs/install.md](docs/install.md) ([ko](docs/install.ko.md)) — install paths, service registration
 - [docs/integration.md](docs/integration.md) ([ko](docs/integration.ko.md)) — agent wiring, minimal clients
+- [ARCHITECTURE.md](ARCHITECTURE.md) · [ADRs](docs/adr) — module map and design records: why Rust, a resident daemon, SQLite FTS5, and nine per-CLI protocol adapters
 - [docs/release.md](docs/release.md) ([ko](docs/release.ko.md)) — release checklist
 - [config.example.toml](config.example.toml) — every option, commented
 - `import { DamonClient } from "damon-agent"` — dependency-free Node client in the npm package
