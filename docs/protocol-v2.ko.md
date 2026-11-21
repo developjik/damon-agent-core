@@ -14,10 +14,14 @@ WebSocket(`GET /ws`) 또는 릴레이 터널 위의 JSON 메시지. 하나의 �
 // 응답
 {"id": 1, "result": {"sessionId": "…", "backend": "claude"}}
 {"id": 1, "error": {"code": -32602, "message": "sessionId required"}}
-// 서버 push (id 없음)
-{"event": "session.event", "sessionId": "…", "data": {…StreamEvent…}}
+// 서버 push (id 없음) — 모든 프레임이 세션 이벤트 커서를 실음
+{"event": "session.event", "sessionId": "…", "seq": 42, "data": {…StreamEvent…}}
 // 접속 시 push되고, "hello" 요청의 응답으로도 발송
-{"hello": {"protocol": 2, "daemon": "damond", "version": "0.5.0",
+{"hello": {"protocol": 2, "minProtocol": 2, "supported": [2],
+           "capabilities": {"eventSeq": true, "snapshotRequired": true, "connGap": true,
+                            "idempotentTurns": true, "turnLedger": true,
+                            "versionNegotiation": true},
+           "daemon": "damond", "version": "0.8.0",
            "permissionTimeoutSecs": 300}}
 ```
 
@@ -51,6 +55,7 @@ WebSocket(`GET /ws`) 또는 릴레이 터널 위의 JSON 메시지. 하나의 �
 | `-32009` | 플랜 리뷰 충돌 (`PLAN_CONFLICT`) — 다른 표면이 결정을 선점했거나 호출이 낡은 리비전/닫힌 플랜을 겨냥 | `plan.list`로 다시 읽고 현재 리비전으로 결정 |
 | `-32010` | MCP setEnabled CAS 거부 (`MCP_CONFLICT`) — 인벤토리 스냅샷 이후 항목이 변경됨(외부 편집) | `mcp.inventory`로 다시 읽고 재시도 |
 | `-32011` | 메모리 쓰기가 게이트 체인에서 거부됨 (`MEMORY_REJECTED`) — `error.data.kind` = `prompt_injection` \| `secret` \| `invisible` \| `capacity` (capacity는 `limit`/`current`/`attempted` 동반); 쓰기 전체가 반사됨 — 세척·절단 없음 | 내용을 고치거나 장부를 정리한 뒤 다시 쓰기 |
+| `-32012` | `hello`가 이 데몬이 말하지 않는 프로토콜 버전을 지명함 (`UNSUPPORTED_PROTOCOL`) — `error.data` = `{requested, supported[]}` | `supported`에 있는 버전으로 재시도하거나 클라이언트를 업그레이드 |
 
 0.5.0 이전 데몬은 모든 에러를 `-32000`으로 답했다; 메시지는 그대로라
 문자열 매칭 클라이언트도 계속 동작한다.
@@ -59,30 +64,30 @@ WebSocket(`GET /ws`) 또는 릴레이 터널 위의 JSON 메시지. 하나의 �
 
 | 메서드 | 파라미터 | 결과 |
 |---|---|---|
-| `hello` | — | `{protocol, daemon, version, backends[], methods[]}` |
+| `hello` | `{protocolVersion?, client?}` — MAJOR 버전을 지명하면 데몬이 확인 응답; 생략하면 협상 이전 형태로 그대로 동작 | `{protocol, minProtocol, supported[], capabilities, daemon, version, backends[], methods[]}` — `protocolVersion`이 `minProtocol..=protocol` 밖이면 `-32012`(`data.supported[]` 동반); `capabilities`가 아래의 추가 필드·이벤트를 게이트한다(모르는 키는 무시) |
 | `backend.list` | — | `{backends: [{id, available, capabilities}]}` |
 | `backend.versions` | `{backend?}` — 하나만, 아니면 전체 카탈로그 | `{versions: [{backend, installed, version?, latest?, updateAvailable, updateKind: "npm"\|"manual"\|"unknown"}]}` — `latest`는 npm 패키지가 검증된 곳에만; 프룹은 이 호출에서만 실행, 스케줄되지 않음 |
 | `backend.update_plan` | `{backend}` | `{backend, action: "install"\|"update", kind, command[], manualCommand, canRun, blockers[], platform}` — `backend.update`가 실행할 정확한 argv와 복사-붙여넣기 대안; 부수 효과 없음 |
 | `backend.update` | `{backend, creationId?}` | `{creationId, ok: true, version?}` — 플랜을 실행(npm 글로벌 설치 또는 CLI 공식 인스톨러); 진행은 요청 연결로 `{"event":"backend.update_progress","creationId","data":{phase, line?, exitOk?}}` 스트리밍(줄당 캡); 검증된 채널이 없으면 `-32602`(플랜 blockers 참조), 실패/420s 타임아웃은 `-32000`(출력 꼬리가 메시지에 동승) |
 | `backend.update_cancel` | `{creationId}` | `{cancelled: bool}` — 해당 id의 실행 중 런이 없으면 false |
-| `session.create` | `{backend?, cwd?, model?, mode?, mcpServers?, projectId?, persona?}` — 프로젝트가 세션의 범위를 정한다: 루트가 cwd 기본값이 되고 기본값들이 미지정 파라미터를 채운다(명시 값 항상 우선); `persona`는 `bot.list`의 봇 id — SOUL/AGENTS 블록이 매 턴 앞에 실리며 세션 수명 동안 고정, resume 시 파일에서 재해석(모르는 id는 `-32602`) | `{sessionId, backend, persona?, replayed}` |
-| `session.resume` | `{sessionId}` — 또는 네이티브 세션 임포트는 `{handle:{provider,native_handle}, cwd?, title?}` | `{sessionId, backend, replayed}` |
+| `session.create` | `{backend?, cwd?, model?, mode?, mcpServers?, allowedTools?, projectId?, persona?}` — 프로젝트가 세션의 범위를 정한다: 루트가 cwd 기본값이 되고 기본값들이 미지정 파라미터를 채운다(명시 값 항상 우선); `persona`는 `bot.list`의 봇 id — SOUL/AGENTS 블록이 매 턴 앞에 실리며 세션 수명 동안 고정, resume 시 파일에서 재해석(모르는 id는 `-32602`); `allowedTools`는 실행 시 강제할 수 있는 백엔드용 세션별 도구 허용 목록(claude: `--allowedTools`) | `{sessionId, backend, persona?, replayed, cursor}` |
+| `session.resume` | `{sessionId}` — 또는 네이티브 세션 임포트는 `{handle:{provider,native_handle}, cwd?, title?}` | `{sessionId, backend, replayed, cursor}` |
 | `session.messages` | `{sessionId, limit?, offset?}` | `{messages: [{id, session_id, role, ts, data}]}` |
 | `session.export` | `{sessionId}` | `{session: {sessionId, createdAt, backend, title, tags, cwd}, messages: [{id, role, ts, data}], usage: {contextUsed, contextSize, costUsd, turns}}` |
 | `session.import` | `{backend, cwd?}` | `{sessions: [ImportableSession]}` |
 | `session.delete` | `{sessionId}` | `{deleted: bool}` |
 | `session.rescan` | `{}` | `{scanId, alreadyRunning, report: {scanned, reparsed, reused, archived, tombstoned, skippedBackends[]}}` — 모든 백엔드의 네이티브 세션 저장소를 훑어 데몬이 본 적 없는 세션의 북마크 행을 만든다; 단일 비행(실행 중이면 진행 중인 `scanId` 반환); 진행은 요청 연결로 `{"event":"history.scan_progress","scanId","data":{stage, …}}` 스트리밍; [히스토리 스캐너](#히스토리-스캐너) 참조 |
 | `session.close` | `{sessionId}` | `{closed: bool}` — 라이브 백엔드 프로세스를 종료하고 행/히스토리는 유지; `max_sessions` 슬롯 확보; 멱등 |
-| `session.restart` | `{sessionId}` | `{sessionId, backend, replayed}` — 라이브 백엔드를 죽이고(턴 도중엔 `-32006`으로 거부) 영속 핸들로 재접속 |
-| `session.status` | `{}` | `{sessions: [{sessionId, backend, busy, idleSecs}]}` — 라이브 백엔드 세션만 |
-| `session.watch` | `{sessionId}` — 라이브여야 함 | `{sessionId, subscribed, replayed}` — 이 연결을 세션 이벤트에 건드리지 않고(생성·재개·턴 없이) 구독; 표면을 넘나드는 알림 경로(웹 UI 세션이 끝나거나 권한을 요청하면 채팅 브리지가 채널로 알림) |
+| `session.restart` | `{sessionId}` | `{sessionId, backend, replayed, cursor}` — 라이브 백엔드를 죽이고(턴 도중엔 `-32006`으로 거부) 영속 핸들로 재접속 |
+| `session.status` | `{}` | `{sessions: [{sessionId, backend, busy, phase, idleSecs, turnId?, pendingAsk?}], recovered: [...]}` — 라이브 백엔드 세션과, 죽은 데몬이 남긴 세션(아래 *세션 상태* 참고) |
+| `session.watch` | `{sessionId}` — 라이브여야 함 | `{sessionId, subscribed, replayed, cursor}` — 이 연결을 세션 이벤트에 건드리지 않고(생성·재개·턴 없이) 구독; 표면을 넘나드는 알림 경로(웹 UI 세션이 끝나거나 권한을 요청하면 채팅 브리지가 채널로 알림) |
 | `session.unwatch` | `{sessionId}` | `{sessionId, subscribed}` — 이 연결의 구독 해제; 세션과 다른 연결은 그대로 |
 | `session.set_pinned` | `{sessionId, pinned}` | `{updated: bool}` — 고정 행은 `session.list` 최상단에 뜨고 보존 스윕에서 생존 |
 | `session.set_archived` | `{sessionId, archived}` | `{updated: bool}` — 보관 행은 `includeArchived` 없이는 `session.list`에서 숨고 보존 스윕에서 생존 |
 | `session.set_tags` | `{sessionId, tags[]}` — 목록 전체를 교체 | `{updated: bool}` |
 | `session.rename` | `{sessionId, title}` | `{renamed: bool}` |
 | `session.fork` | `{sessionId, upto?}` | `{sessionId}` — 메시지·태그·사용 히스토리·백엔드 resume 핸들이 복사; 제목에 `" (fork)"` 접미 |
-| `session.usage` | `{sessionId?}` — 또는 글로벌 일별 롤업은 `{daily: true, days?}`(기본 7일) | 세션별 `{sessionId, contextUsed, contextSize, costUsd, turns}`, 모델별 `{sessions: [...]}`, 또는 `{daily: [{date, turns, costUsd, contextUsed}]}` |
+| `session.usage` | `{sessionId?}` — 또는 글로벌 일별 롤업은 `{daily: true, days?}`(기본 7일), 또는 프로젝트 하나로 범위를 좁힌 모델별 합계는 `{projectId?}` | 세션별 `{sessionId, contextUsed, contextSize, costUsd, turns}`, 모델별 `{sessions: [...]}`, 또는 `{daily: [{date, turns, costUsd, contextUsed}]}` |
 | `session.list` | `{limit?, offset?, backend?, cwd?, tag?, includeArchived?}` | `{sessions: [{sessionId, createdAt, backend, title, cwd, tags, pinned, archived}]}` — 고정 우선; 보관은 요청 시에만 |
 | `session.search` | `{query, limit?, sessionId?, backend?, cwd?, since?, until?}` | `{results: [{sessionId, messageId, snippet}]}` |
 | `usage.summary` | `{days?, tzOffsetMinutes?}` — 최근 `days`개 로컬 날(기본 7, 오늘 포함); `tzOffsetMinutes`는 UTC 스탬프를 호출자의 달력으로 옮긴다(기본 0 = UTC) | `{days, rows: [{date, backend, model, turns, contextUsed, contextSize, costUsd}], total: {turns, contextUsed, contextSize, costUsd}}` — 로컬 날 × 백엔드 × 모델당 한 행; context 컬럼은 턴별 스냅샷의 합, cost는 턴별 델타의 합; 행이 없는 날은 없다 |
@@ -106,8 +111,8 @@ WebSocket(`GET /ws`) 또는 릴레이 터널 위의 JSON 메시지. 하나의 �
 | `bot.get` | `{id}` | `{bot: {id, name, description?, soul?, agents?}}` — 파일 전문; 모르는 id는 `-32602` |
 | `bot.save` | `{id, name, description?, soul?, agents?}` — 선택 문자열 필드: 생략은 유지, null(또는 `""`)은 삭제, 문자열은 설정 | `{bot: {id, name}}` — 생성 또는 갱신; 실행 중 세션은 생성 시점의 블록을 유지 |
 | `bot.delete` | `{id}` | `{deleted: bool}` — 묶여 있던 세션의 이후 resume은 조용히 페르소나 없이 |
-| `turn.start` | `{sessionId, prompt, timeoutSecs?, detach?, memoryOwner?}` — `[memory]` 활성 시 `memoryOwner`가 지명한 봇 장부의 ACTIVE 항목이 user 장부와 함께 `<memory>` 블록으로 주입됨(데이터 선언 구분 블록; 저장되는 사용자 메시지는 깨끗한 원본 프롬프트 유지) | `{turnId, stopReason, usage?}` — `detach`가 true면 즉시 `{turnId, detached: true}` |
-| `turn.steer` | `{sessionId, prompt, expectedTurn?}` | `{result}` |
+| `turn.start` | `{sessionId, prompt, timeoutSecs?, detach?, idempotencyKey?, memoryOwner?}` — `[memory]` 활성 시 `memoryOwner`가 지명한 봇 장부의 ACTIVE 항목이 user 장부와 함께 `<memory>` 블록으로 주입됨(데이터 선언 구분 블록; 저장되는 사용자 메시지는 깨끗한 원본 프롬프트 유지); `idempotencyKey`는 호출을 Keyed로 만든다([재시도 계약](#재시도-계약-keyed-요청) 참조) | `{turnId, stopReason, usage?}` — `detach`가 true면 즉시 `{turnId, detached: true}`; 같은 키의 재요청은 첫 응답을 `duplicate: true`로 재생하거나, 그 턴이 아직 돌고 있으면 `{duplicate: true, inProgress: true}` |
+| `turn.steer` | `{sessionId, prompt, expectedTurn?, idempotencyKey?}` | `{result}` — 같은 키의 재요청은 첫 전달을 재생 |
 | `turn.cancel` | `{sessionId}` | `{cancelled: true}` |
 | `permission.respond` | `{sessionId, requestId, response}` | `{}` — `kind: plan` ask에서는 결정이 영속 plan-review 행에도 기록된다 |
 | `plan.list` | `{sessionId}` | `{plans: [{planId, sessionId, requestId, revision, title, content, contentHash, complete, status, decision?, decisionIntentAt?, appliedAt?, createdAt, updatedAt, supersededBy?}]}` — 모든 플랜의 모든 리비전, 체인 순 |
@@ -458,13 +463,96 @@ contextUsed}` — cost는 턴별 델타의 합, context는 그날 마지막 스�
 ### 늦게 붙은 구독자의 이벤트 리플레이
 
 세션을 처음 건드리는 연결(`session.create`, `session.resume`,
-`turn.start`)은 라이브 스트리밍 시작 전에 놓친 모든 것을 `"replay": true`
-태그의 `session.event` 프레임으로 받는다: 스토어의 영속 히스토리(user,
-assistant, reasoning, tool, compaction, error 행이 타임라인 이벤트로,
-오래된 게 마지막, 200 상한), 그다음 인플라이트 턴의 저널.
-create/resume 결과의 `replayed` 수가 보낸 프레임 수. 라이브 프레임에는
-`replay` 필드가 없다. 데몬의 인플라이트 저널을 넘친 턴은 리플레이되지
-않는다(라이브 나머지는 끊기지 않고 계속; 조립된 결과는 턴 끝에 영속화).
+`session.watch`, `turn.start`)은 라이브 스트리밍 시작 전에 놓친 모든 것을
+`"replay": true` 태그의 `session.event` 프레임으로 받는다: 스토어의 영속
+히스토리(user, assistant, reasoning, tool, compaction, error 행이 타임라인
+이벤트로, 오래된 게 마지막, 200 상한), 그다음 인플라이트 턴의 저널.
+create/resume/watch 결과의 `replayed` 수가 보낸 프레임 수이고 `cursor`가
+세션 번호의 현위치. 라이브 프레임에는 `replay` 필드가 없다.
+
+### 배달의 정직성: `seq`, `session.gap`, `session.snapshot_required`
+
+모든 `session.event` 프레임은 `seq`를 실는다 — 이벤트마다 한 번 부여되는
+세션 단위의 단조 증가 커서(리플레이 프레임과 라이브 프레임이 같은 번호).
+이것이 구멍을 "정상"이 아니라 보이게 만든다: 41번을 받은 클라이언트가
+다음으로 47번을 받으면 42–46이 빠졌음을 안다.
+
+- **`session.gap`** — `{event, sessionId, dropped, cursor}`: 이 연결이
+  `dropped`개의 이벤트를 잃었다(송신 큐 오버플로 또는 데몬 팬아웃에서
+  뒤처짐)는 뜻이고, 그다음 프레임은 `cursor`를 실고 온다. 소비는 계속되며
+  빠진 이벤트는 계약상 사라진 것이다.
+- **`session.snapshot_required`** — `{event, sessionId, cursor, reason}`:
+  인플라이트 저널이 이 턴을 버렸다(2,048 이벤트 상한 초과, 또는 데몬이
+  백엔드보다 뒤처짐). 리플레이할 앞부분이 없으니 `session.messages`로
+  경계를 다시 읽으라. 조립된 턴은 끝날 때 그대로 영속화된다. 이 프레임이
+  없다면 클라이언트는 반쯤 잘린 턴을 완전한 답으로 그린다.
+
+멀티 표면 보장은 그대로다: 세션을 지켜보는 모든 연결이 같은 스트림을
+본다. 달라진 것은 그 스트림의 구멍이 이제 알려진다는 점이다 — 이전에는
+느린 클라이언트가 프레임을 조용히 잃었다.
+
+### 재시도 계약 (Keyed 요청)
+
+요청은 네 부류로 나뉘고, 클라이언트는 그에 맞춰 재시도한다:
+
+| 부류 | 메서드 | 재시도 |
+|---|---|---|
+| **Keyed** | `turn.start`, `turn.steer` | `idempotencyKey`를 실어 재시도 |
+| Idempotent | `session.resume`, `session.create`(같은 파라미터 재구독) | 그대로 재시도 |
+| Duplicating | `session.create`, `worktree.create`, `memory.write` | 호출자의 `creationId`/의도가 있을 때만 — 무조건 재시도는 중복 |
+| Not retried | `session.event`(요청이 아니라 이벤트) | 안 함 — 리플레이/`session.snapshot_required`로 재동기화 |
+
+`turn.start`/`turn.steer`는 선택적 `idempotencyKey`를 받는다(클라이언트가
+턴마다 하나 — 카운터나 uuid로 충분). 동작:
+
+- 키는 세션·메서드 단위로 **24시간** 기억된다.
+- 첫 시도가 아직 돌고 있는 중의 재요청은 `{duplicate: true, inProgress: true}`를
+  돌려주고 호출한 연결을 그 턴의 스트림에 붙인다 — 두 번째 턴을 만들지 않는다.
+- 첫 시도가 끝난 뒤의 재요청은 원래 결과를 `duplicate: true`로 재생한다.
+- 실패·취소로 끝난 시도는 키를 놓아준다. 정직한 재시도는 새 턴을 시작해야
+  하고(클라이언트가 실패를 봐야 한다), 캐시된 오류로 가리면 안 된다.
+
+캐시는 데몬 프로세스 안에 산다. 데몬 재시작 뒤에는 키를 모른다 — 그래서 턴에
+영속 원장(아래)이 있다: 클라이언트는 추측 대신 트랜스크립트에서 자기 프롬프트가
+실행됐는지를 확인할 수 있다.
+
+### 턴 원장
+
+모든 턴은 `turns` 테이블의 행이다. 백엔드가 프롬프트를 받아들이면 열리고,
+끝나면 정지 사유(`completed`, `failed`, `canceled`, `timeout`, `closed`)로
+정산된다. 사용자 메시지는 이미 선영속되지만, 턴 자체를 견디게 하는 것은 이
+원장 행이다. 턴 중에 죽은 데몬은 행을 열린 채 남기고, 부팅 복구가 그것을
+`interrupted`로 수렴시키고 트랜스크립트에 `error` 타임라인 행을 덧붙인다 —
+세션을 다시 열면 답이 중간에 끊겼음이 보이고, 어떤 표면도 유령 턴을
+"실행 중"으로 보고하지 않는다. (미션 러너가 자기 런에 적용하는 규칙과 같다.)
+
+### 세션 상태: 단계, 대기 중인 질문, 부팅 체크포인트
+
+세션의 라이브 상태 — 유휴인지, 턴을 도는 중인지, 사용자의 답을 기다리는지 —
+는 그 세션을 실행하는 프로세스와 분리된 순수·직렬화 가능 데이터로 유지된다
+(`src/state.rs`, 그 둘레의 런타임은 `src/session.rs`). 와이어에는 두 가지로
+드러난다.
+
+- **`phase`** — 모든 `session.status` 행에 붙는다: `idle`, `busy`(턴 실행 중),
+  `awaiting_input`(권한·질문·플랜 답을 기다리며 멈춰 있음). 두 활성 단계 모두
+  `busy`가 `true`다 — 답을 기다리는 턴도 회수 대상이 아니고 스윕이 닫아서는
+  안 되는 세션이다. 대기 행에는 `pendingAsk: {requestId, kind, label?,
+  askedAtMs}`가, 실행 행에는 백엔드가 알려준 `turnId`가 함께 실린다.
+- **`recovered`** — 같은 응답에 실린다: 이전 데몬이 턴 도중이거나 답을
+  기다리던 채로 남긴 세션. 상태는 스토어 옆 `sessions.state.json`에
+  체크포인트된다(임시 파일 + rename 원자 교체, 권한 모드가 있는 플랫폼에서는
+  0600). 턴 중에 죽은 데몬은 그 파일에 `busy`/`awaiting_input` 행을 남기고,
+  다음 부팅이 그것을 `{atMs, fromPhase, turnId?}`가 붙은 `idle`로 수렴시킨다 —
+  더 이상 존재하지 않는 프로세스를 되살리지도, 유령을 라이브로 보고하지도
+  않는다. 스토어 테이블이 아니라 파일인 것은 의도다: 전이마다 문서 전체를
+  다시 쓰고, 스토어를 쓰는 어떤 로직보다 먼저 읽으며, SQLite 스키마(와
+  `user_version`)를 건드리지 않는다. 이어서 연 세션은 recovered 행이 사라지고, 행은 24시간 뒤 정리된다.
+  읽을 수 없거나 더 새 버전인 체크포인트는 통째로 무시한다(빈 그림이 틀린
+  그림보다 낫다).
+
+`hello`는 이 표면을 `capabilities.sessionPhase`로 알린다. 정상 종료와
+`session.close`/`session.delete`/회수는 그 세션들을 뺀 상태를 쓰므로, 예정된
+종료는 아무것도 중단으로 보고하지 않는다 — 진짜 크래시만 행을 남긴다.
 
 ### 미션 러너 (스테이지 1)
 

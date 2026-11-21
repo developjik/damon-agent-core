@@ -26,20 +26,23 @@ serde = { version = "1", features = ["derive"] }
 serde_json = { version = "1", features = ["preserve_order"] } # preserve_order: rewriting a native CLI config (mcp.setEnabled) keeps the user's key order
 thiserror = "2"
 tokio = { version = "1", features = ["full"] }
-toml = "0.9"
+toml = "1.1"
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
-tokio-rusqlite = "0.8.0"
-rusqlite = { version = "0.40.2", features = ["bundled"] }
+tokio-rusqlite = "0.9.0"
+rusqlite = { version = "0.42", features = ["bundled"] }
 uuid = { version = "1.26.1", features = ["v4"] }
 tokio-tungstenite = "0.30.0"
 dotenvy = "0.15"
 sha2 = "0.10"
 base64 = "0.22"
 getrandom = "0.3"
-rand_core = "0.6"
-x25519-dalek = { version = "2", features = ["static_secrets"] }
-aes-gcm = "0.10"
+# The E2E relay stack moves as one: x25519-dalek 3 and aes-gcm 0.11 both
+# speak `rand_core` 0.10 (aes-gcm 0.11 dropped its own rand_core re-export
+# entirely), so a lone rand_core bump cannot type-check `relay.rs`.
+rand_core = "0.10"
+x25519-dalek = { version = "3", features = ["static_secrets"] }
+aes-gcm = "0.11"
 
 tokio-util = "0.7.19"
 axum-server = { version = "0.8.0", features = ["tls-rustls"] }
@@ -53,7 +56,7 @@ libc = "0.2"
 # Job Objects (kill-on-close child-tree reaping, see transport.rs) and
 # the registry PATH re-read (see registry.rs) on Windows.
 [target.'cfg(windows)'.dependencies]
-windows-sys = { version = "0.60", features = [
+windows-sys = { version = "0.61", features = [
     "Win32_Foundation",
     "Win32_Security",
     "Win32_System_JobObjects",

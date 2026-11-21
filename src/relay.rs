@@ -80,7 +80,7 @@ impl E2e {
 
         // 2. Our keypair — public key only, no proof yet. Echo the KDF
         //    marker so the client knows which proof we expect.
-        let secret = x25519_dalek::StaticSecret::random_from_rng(getrandom_rng());
+        let secret = x25519_dalek::StaticSecret::random_from_rng(&mut getrandom_rng());
         let public = x25519_dalek::PublicKey::from(&secret);
         let mut reply = json!({"e2e_pub": B64.encode(public.as_bytes())});
         if stretch {
@@ -128,7 +128,7 @@ impl E2e {
         //    KDF — a daemon that echoes it computes the stretched
         //    proof too; anything older ignores the unknown field and
         //    we fall back to the legacy single-hash proof.
-        let secret = x25519_dalek::StaticSecret::random_from_rng(getrandom_rng());
+        let secret = x25519_dalek::StaticSecret::random_from_rng(&mut getrandom_rng());
         let public = x25519_dalek::PublicKey::from(&secret);
         tx.send(json!({"e2e_pub": B64.encode(public.as_bytes()), "kdf": PROOF_KDF}).to_string())
             .await
@@ -215,7 +215,7 @@ impl E2e {
         let nonce = seq_nonce(seq);
         let ct = self
             .send_cipher
-            .encrypt(aes_gcm::Nonce::from_slice(&nonce), plaintext.as_bytes())
+            .encrypt(&aes_gcm::Nonce::from(nonce), plaintext.as_bytes())
             .map_err(|_| anyhow::anyhow!("encrypt failed"))?;
         let mut frame = Vec::with_capacity(20 + ct.len());
         frame.extend_from_slice(&seq.to_be_bytes());
@@ -238,9 +238,12 @@ impl E2e {
         if seq != expected {
             bail!("frame seq {seq} != expected {expected} — replay or reorder");
         }
+        // The length check above guarantees a 12-byte nonce window; keep the
+        // fallible conversion so a framing bug stays an error, never a panic.
+        let nonce = aes_gcm::Nonce::try_from(&frame[8..20]).context("bad frame nonce")?;
         let pt = self
             .recv_cipher
-            .decrypt(aes_gcm::Nonce::from_slice(&frame[8..20]), &frame[20..])
+            .decrypt(&nonce, &frame[20..])
             .map_err(|_| anyhow::anyhow!("decrypt failed — wrong key or tampered"))?;
         self.recv_seq.store(expected + 1, Ordering::Relaxed);
         Ok(String::from_utf8(pt)?)
@@ -308,27 +311,34 @@ fn seq_nonce(seq: u64) -> [u8; 12] {
     n
 }
 
-fn getrandom_rng() -> impl rand_core::RngCore + rand_core::CryptoRng {
+/// OS-entropy RNG for the handshake's ephemeral X25519 secret.
+///
+/// `rand_core` 0.10 (what `x25519-dalek` 3 passes to `random_from_rng`) is
+/// built on `TryRng` plus infallible `Rng`/`CryptoRng` blanket impls: the
+/// old `RngCore` methods are gone, and the fallible path wants a concrete
+/// error type. A `getrandom` failure is not recoverable here — the OS
+/// source either works or the process cannot be trusted with a secret — so
+/// it panics instead of handing back a weak key.
+fn getrandom_rng() -> impl rand_core::CryptoRng {
     struct R;
-    impl rand_core::RngCore for R {
-        fn next_u32(&mut self) -> u32 {
+    impl rand_core::TryRng for R {
+        type Error = core::convert::Infallible;
+        fn try_next_u32(&mut self) -> Result<u32, Self::Error> {
             let mut b = [0u8; 4];
             getrandom::fill(&mut b).unwrap();
-            u32::from_le_bytes(b)
+            Ok(u32::from_le_bytes(b))
         }
-        fn next_u64(&mut self) -> u64 {
+        fn try_next_u64(&mut self) -> Result<u64, Self::Error> {
             let mut b = [0u8; 8];
             getrandom::fill(&mut b).unwrap();
-            u64::from_le_bytes(b)
+            Ok(u64::from_le_bytes(b))
         }
-        fn fill_bytes(&mut self, dest: &mut [u8]) {
+        fn try_fill_bytes(&mut self, dest: &mut [u8]) -> Result<(), Self::Error> {
             getrandom::fill(dest).unwrap();
-        }
-        fn try_fill_bytes(&mut self, dest: &mut [u8]) -> Result<(), rand_core::Error> {
-            getrandom::fill(dest).map_err(|_| rand_core::Error::from(std::num::NonZeroU32::MIN))
+            Ok(())
         }
     }
-    impl rand_core::CryptoRng for R {}
+    impl rand_core::TryCryptoRng for R {}
     R
 }
 /// Connect to `relay_url` (ws://host:port), register as `name`, and serve
@@ -1038,7 +1048,7 @@ mod tests {
         let daemon =
             tokio::spawn(async move { E2e::daemon_handshake(&d2c_tx, &mut c2d_rx, "tok").await });
         // Legacy client: fresh keypair, bare hello.
-        let secret = x25519_dalek::StaticSecret::random_from_rng(getrandom_rng());
+        let secret = x25519_dalek::StaticSecret::random_from_rng(&mut getrandom_rng());
         let public = x25519_dalek::PublicKey::from(&secret);
         c2d_tx
             .send(json!({"e2e_pub": B64.encode(public.as_bytes())}).to_string())

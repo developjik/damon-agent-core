@@ -10,6 +10,11 @@ use tokio_rusqlite::Connection;
 #[derive(Clone)]
 pub struct Store {
     conn: Connection,
+    /// Where the database file lives. `None` for an in-memory store.
+    /// Neighbour files of the daemon's state (the session checkpoint)
+    /// live in its directory, so a daemon pointed at another store never
+    /// mixes pictures with the first one.
+    path: Option<std::path::PathBuf>,
 }
 
 #[derive(Debug, Clone, serde::Serialize)]
@@ -478,6 +483,13 @@ pub struct MemoryEntry {
 }
 
 impl Store {
+    /// Directory-relative identity of this store: the daemon keeps its
+    /// neighbour state files (the session checkpoint) here. `None` for an
+    /// in-memory store, which owns no directory.
+    pub fn path(&self) -> Option<&std::path::Path> {
+        self.path.as_deref()
+    }
+
     pub async fn open(path: &Path) -> anyhow::Result<Self> {
         if let Some(parent) = path.parent() {
             std::fs::create_dir_all(parent)
@@ -1086,10 +1098,38 @@ impl Store {
                      PRAGMA user_version = 10;",
                 )?;
             }
+
+            // Turn ledger (user_version 11): one row per turn, opened
+            // when the backend accepted the prompt and settled with how
+            // the turn ended. A daemon that dies mid-turn leaves
+            // `ended_at` NULL; boot recovery converges those rows to
+            // `interrupted` and drops a durable marker into the
+            // transcript — the same discipline the mission runner
+            // already applies to its runs.
+            if v < 11 {
+                c.execute_batch(
+                    "CREATE TABLE IF NOT EXISTS turns (
+                         turn_id TEXT NOT NULL,
+                         session_id TEXT NOT NULL,
+                         backend TEXT NOT NULL DEFAULT '',
+                         status TEXT NOT NULL DEFAULT 'running',
+                         started_at TEXT NOT NULL DEFAULT (datetime('now')),
+                         ended_at TEXT,
+                         PRIMARY KEY (session_id, turn_id)
+                     );
+                     CREATE INDEX IF NOT EXISTS idx_turns_open
+                         ON turns(ended_at);
+                     PRAGMA user_version = 11;",
+                )?;
+            }
             Ok::<(), rusqlite::Error>(()).map_err(tokio_rusqlite::Error::from)
         })
         .await?;
-        Ok(Self { conn })
+        let db_path = path.to_path_buf();
+        Ok(Self {
+            conn,
+            path: Some(db_path),
+        })
     }
 
     /// In-memory store for tests.
@@ -1276,12 +1316,22 @@ impl Store {
                     updated_at TEXT NOT NULL DEFAULT (datetime('now'))
                 );
                 CREATE INDEX idx_memory_ledger
-                    ON memory_entries(scope, owner, status);",
+                    ON memory_entries(scope, owner, status);
+                CREATE TABLE turns (
+                    turn_id TEXT NOT NULL,
+                    session_id TEXT NOT NULL,
+                    backend TEXT NOT NULL DEFAULT '',
+                    status TEXT NOT NULL DEFAULT 'running',
+                    started_at TEXT NOT NULL DEFAULT (datetime('now')),
+                    ended_at TEXT,
+                    PRIMARY KEY (session_id, turn_id)
+                );
+                CREATE INDEX idx_turns_open ON turns(ended_at);",
             )
             .map_err(tokio_rusqlite::Error::from)
         })
         .await?;
-        Ok(Self { conn })
+        Ok(Self { conn, path: None })
     }
 
     /// `agent` is the Damon agent id backing this session (e.g. "claude").
@@ -2129,6 +2179,13 @@ impl Store {
                     "DELETE FROM plan_reviews WHERE session_id = ?1",
                     rusqlite::params![id],
                 )?;
+                // The turn ledger is lifecycle state too — otherwise a
+                // later boot recovery would try to write an interrupted
+                // marker into a transcript that no longer exists.
+                tx.execute(
+                    "DELETE FROM turns WHERE session_id = ?1",
+                    rusqlite::params![id],
+                )?;
                 // Tombstone the native handle so the history sweep
                 // never re-imports what the user just deleted. The
                 // agent id + native handle are the sweep's identity.
@@ -2215,6 +2272,14 @@ impl Store {
                 // must not leave usage rows behind.
                 tx.execute(
                     "DELETE FROM usage WHERE session_id IN (
+                         SELECT value FROM json_each(?1))",
+                    rusqlite::params![ids_json],
+                )?;
+                // … nor turn-ledger rows, which boot recovery would
+                // otherwise replay as interrupted turns of a transcript
+                // that is gone.
+                tx.execute(
+                    "DELETE FROM turns WHERE session_id IN (
                          SELECT value FROM json_each(?1))",
                     rusqlite::params![ids_json],
                 )?;
@@ -3877,6 +3942,110 @@ impl Store {
                     })?
                     .collect::<Result<Vec<_>, _>>()
                     .map_err(tokio_rusqlite::Error::from)?;
+                Ok::<_, tokio_rusqlite::Error>(rows)
+            })
+            .await
+            .map_err(Into::into)
+    }
+
+    /// Open a turn's ledger row (`status = 'running'`). Written once the
+    /// backend accepted the prompt, so a daemon that dies mid-turn
+    /// leaves an open row for boot recovery instead of no trace at all.
+    /// `INSERT OR REPLACE` keeps a re-reported turn id idempotent.
+    pub async fn begin_turn(
+        &self,
+        session_id: &str,
+        turn_id: &str,
+        backend: &str,
+    ) -> anyhow::Result<()> {
+        let sid = session_id.to_string();
+        let tid = turn_id.to_string();
+        let backend = backend.to_string();
+        self.conn
+            .call(move |c| {
+                c.execute(
+                    "INSERT OR REPLACE INTO turns (turn_id, session_id, backend, status)
+                     VALUES (?1, ?2, ?3, 'running')",
+                    rusqlite::params![tid, sid, backend],
+                )?;
+                Ok::<(), tokio_rusqlite::Error>(())
+            })
+            .await
+            .map_err(Into::into)
+    }
+
+    /// Settle a turn's row with how it ended (`completed`, `failed`,
+    /// `canceled`, `timeout`, `closed`). Only an OPEN row is settled — a
+    /// turn already converged to `interrupted` keeps that verdict.
+    pub async fn finish_turn(
+        &self,
+        session_id: &str,
+        turn_id: &str,
+        status: &str,
+    ) -> anyhow::Result<()> {
+        let sid = session_id.to_string();
+        let tid = turn_id.to_string();
+        let status = status.to_string();
+        self.conn
+            .call(move |c| {
+                c.execute(
+                    "UPDATE turns SET status = ?3, ended_at = datetime('now')
+                     WHERE session_id = ?1 AND turn_id = ?2 AND ended_at IS NULL",
+                    rusqlite::params![sid, tid, status],
+                )?;
+                Ok::<(), tokio_rusqlite::Error>(())
+            })
+            .await
+            .map_err(Into::into)
+    }
+
+    /// One turn's ledger row — `(status, ended_at)`; `None` when the
+    /// session never ran it (or the ledger predates the row).
+    pub async fn turn_row(
+        &self,
+        session_id: &str,
+        turn_id: &str,
+    ) -> anyhow::Result<Option<(String, Option<String>)>> {
+        let sid = session_id.to_string();
+        let tid = turn_id.to_string();
+        self.conn
+            .call(move |c| {
+                let row = c
+                    .query_row(
+                        "SELECT status, ended_at FROM turns
+                         WHERE session_id = ?1 AND turn_id = ?2",
+                        rusqlite::params![sid, tid],
+                        |r| Ok((r.get::<_, String>(0)?, r.get::<_, Option<String>>(1)?)),
+                    )
+                    .optional()?;
+                Ok::<_, tokio_rusqlite::Error>(row)
+            })
+            .await
+            .map_err(Into::into)
+    }
+
+    /// Boot recovery: every turn row still open belongs to a previous
+    /// daemon incarnation — this process has not started a turn when
+    /// this runs. Converge them to `interrupted` (never faked as still
+    /// running) and return `(session_id, turn_id)` so the caller can put
+    /// a durable marker into each transcript.
+    pub async fn recover_interrupted_turns(&self) -> anyhow::Result<Vec<(String, String)>> {
+        self.conn
+            .call(move |c| {
+                let mut stmt =
+                    c.prepare("SELECT session_id, turn_id FROM turns WHERE ended_at IS NULL")?;
+                let rows: Vec<(String, String)> = stmt
+                    .query_map([], |r| Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?)))?
+                    .collect::<Result<Vec<_>, _>>()
+                    .map_err(tokio_rusqlite::Error::from)?;
+                for (sid, tid) in &rows {
+                    c.execute(
+                        "UPDATE turns SET status = 'interrupted', ended_at = datetime('now')
+                         WHERE session_id = ?1 AND turn_id = ?2 AND ended_at IS NULL",
+                        rusqlite::params![sid, tid],
+                    )
+                    .map_err(tokio_rusqlite::Error::from)?;
+                }
                 Ok::<_, tokio_rusqlite::Error>(rows)
             })
             .await

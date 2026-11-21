@@ -1931,6 +1931,12 @@ async function connect() {
     try { v = JSON.parse(ev.data); } catch { return; }
     if (v.id !== undefined) onResponse(v);
     else if (v.event === "session.event") onSessionEvent(v);
+    // The daemon's in-flight journal shed a turn, so the stream on screen
+    // can have a hole in the middle; the store is the resync boundary.
+    else if (v.event === "session.snapshot_required") onSnapshotRequired(v);
+    // A slow connection skipped events — say so instead of showing a
+    // half answer as if it were complete.
+    else if (v.event === "session.gap") onSessionGap(v);
     else if (v.event === "worktree.progress") onWorktreeProgress(v);
     else if (v.event === "backend.update_progress") onCliUpdateProgress(v);
     else if (v.hello) daemonInfo = Object.assign(daemonInfo || {}, v.hello);
@@ -2399,6 +2405,28 @@ function onTimeline(sid, ev) {
       break;
     }
   }
+}
+// The daemon's journal shed this session's in-flight turn, so the stream
+// on screen may have a hole in the middle (deltas dropped under load).
+// Mid-turn a reload would wipe the live view, so warn and let the turn
+// finish; between turns rebuild from the persisted rows, which the daemon
+// keeps complete.
+function onSnapshotRequired(v) {
+  const sid = v.sessionId;
+  if (!sid || sid !== activeSession) return;
+  if (liveTurns.has(sid)) {
+    sysline("stream gap — this answer may be incomplete (reload to see the saved copy)");
+    return;
+  }
+  sysline("stream gap — reloading from history");
+  loadMessages(sid);
+}
+// A slow connection skipped events: name how many rather than letting a
+// holed stream pass for the whole answer.
+function onSessionGap(v) {
+  const sid = v.sessionId;
+  if (!sid || sid !== activeSession) return;
+  sysline("slowed connection — " + (v.dropped || 0) + " event(s) skipped");
 }
 function onSessionEvent(v) {
   const sid = v.sessionId;

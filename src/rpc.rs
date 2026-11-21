@@ -2,8 +2,9 @@
 //! Wire shape:
 //!   request:   {"id": N, "method": "session.create", "params": {...}}
 //!   response:  {"id": N, "result": {...}} | {"id": N, "error": {"code","message"}}
-//!   event:     {"event": "session.event", "sessionId": "...", "data": <StreamEvent>}
-//!   hello:     {"hello": {"protocol": 2, "daemon": "damond", "version": "..."}}
+//!   event:     {"event": "session.event", "sessionId": "...", "seq": N, "data": <StreamEvent>}
+//!   hello:     {"hello": {"protocol": 2, "minProtocol": 2, "supported": [2],
+//!                        "capabilities": {...}, "daemon": "damond", "version": "..."}}
 //!
 //! One connection multiplexes every session. Each request is dispatched
 //! as its own task so a long `turn.start` never serializes the socket —
@@ -32,7 +33,16 @@ use tokio_util::sync::CancellationToken;
 use crate::api::AppState;
 use crate::backend::types::*;
 use crate::session::ManagedSession;
-use crate::store::{SearchFilter, SessionFilter};
+use crate::state::TurnOutcome;
+
+// A method family's typed request params live beside the dispatcher:
+// `params` holds the shared machinery, each family module holds its
+// structs and handlers (see the docs in `rpc/params.rs`).
+mod params;
+mod permission;
+mod plan;
+mod session;
+mod turn;
 
 #[derive(Deserialize)]
 pub struct WsQuery {
@@ -82,6 +92,50 @@ static PROMPT_SLOTS: tokio::sync::Semaphore = tokio::sync::Semaphore::const_new(
 /// Largest single outbound frame — a runaway response must not grow
 /// the relay's encrypt buffer without bound.
 pub const MAX_RESPONSE_BYTES: usize = 1 << 20;
+
+/// The wire protocol this daemon speaks. Negotiation is MAJOR-only (the
+/// rule ACP v2 settled on): a client that names a version is answered
+/// yes or with an explicit `UNSUPPORTED_PROTOCOL` carrying `supported[]`,
+/// never a silent mismatch. Additive fields and events ride the
+/// `capabilities` object instead of the number, so a new one can never
+/// break a client that has not learned it yet.
+pub const PROTOCOL_VERSION: u64 = 2;
+
+/// Oldest protocol this daemon still speaks. Equal to
+/// [`PROTOCOL_VERSION`] today — the pair exists so a future breaking
+/// revision can keep a compatibility window instead of a flag day.
+pub const MIN_PROTOCOL: u64 = 2;
+
+/// The server-side capability set — what a client may rely on beyond the
+/// protocol number. Every key gates an additive field or event, so a
+/// client can feature-detect instead of guessing from the version string.
+/// Unknown keys are ignored (the same rule this daemon applies to
+/// unknown request fields).
+pub fn server_capabilities() -> Value {
+    json!({
+        // `session.event` frames carry a session-scoped `seq` cursor, and
+        // create/resume/watch/restart return it as `cursor`.
+        "eventSeq": true,
+        // An unreplayable in-flight journal is announced with a
+        // `session.snapshot_required` frame instead of a silent gap.
+        "snapshotRequired": true,
+        // A connection whose queue overflowed gets a `session.gap` frame
+        // naming how many events it missed.
+        "connGap": true,
+        // `turn.start`/`turn.steer` accept `idempotencyKey`.
+        "idempotentTurns": true,
+        // Turns are persisted in a ledger; a turn cut off by a daemon
+        // restart is settled as `interrupted` at boot.
+        "turnLedger": true,
+        // `hello` accepts `protocolVersion` and refuses an unsupported one
+        // with `-32012` + `data.supported`.
+        "versionNegotiation": true,
+        // `session.status` rows carry the ledger's `phase` (idle | busy |
+        // awaiting_input) and `pendingAsk`, and the response carries the
+        // sessions a dead daemon left behind as `recovered`.
+        "sessionPhase": true,
+    })
+}
 
 /// JSON-RPC error codes this daemon emits. `-32700..-32600` is the
 /// range the spec reserves for frame/request errors; Damon's own codes
@@ -134,6 +188,10 @@ pub mod error_code {
     /// `capacity` with `limit`/`current`/`attempted`). The whole write
     /// bounced; nothing was sanitized or truncated.
     pub const MEMORY_REJECTED: i64 = -32011;
+    /// `hello` named a protocol version this daemon does not speak —
+    /// `error.data` carries `{requested, supported[]}`. The client should
+    /// pick a supported version (or upgrade) instead of retrying.
+    pub const UNSUPPORTED_PROTOCOL: i64 = -32012;
 }
 
 /// An error carrying a typed JSON-RPC code to the wire. Produced via
@@ -281,8 +339,13 @@ impl Conn {
     /// live forwarder starts, everything the connection missed is
     /// replayed: persisted history from the store, then the in-flight
     /// turn's journal, each frame tagged `"replay": true` so clients
-    /// can render catch-up differently from live streaming. Returns the
-    /// number of replayed frames.
+    /// can render catch-up differently from live streaming. Every replay
+    /// frame carries the `seq` its event was assigned, so the live stream
+    /// continues the same numbering. When the journal shed its prefix the
+    /// connection gets one `session.snapshot_required` frame instead — a
+    /// partial turn replayed as the whole one is a lie, and the store is
+    /// the boundary the client should re-read. Returns the number of
+    /// replayed frames.
     ///
     /// The subscriptions lock is held across the store read on purpose:
     /// it serializes concurrent subscribes so replay frames are always
@@ -310,39 +373,74 @@ impl Conn {
                 }
             }
         }
-        for ev in session.journal.snapshot_current_turn() {
-            replayed += 1;
-            self.send(json!({
-                "event": "session.event",
+        match session.journal.replayable() {
+            Some(events) => {
+                for ev in events {
+                    replayed += 1;
+                    self.send(json!({
+                        "event": "session.event",
+                        "sessionId": session.id,
+                        "replay": true,
+                        "seq": ev.seq,
+                        "data": ev.event,
+                    }));
+                }
+            }
+            // Dropped deltas leave a hole in the middle of the turn — no
+            // replay to give, so say so and let the client re-read the
+            // store (`session.messages`), which run_turn keeps complete.
+            None => self.send(json!({
+                "event": "session.snapshot_required",
                 "sessionId": session.id,
-                "replay": true,
-                "data": ev,
-            }));
+                "cursor": session.cursor(),
+                "reason": "journal_overflow",
+            })),
         }
-        let mut rx = session.session.subscribe();
+        let mut rx = session.subscribe_seq();
         let tx = self.tx.clone();
         let sid = session.id.clone();
         subs.insert(
             sid.clone(),
             tokio::spawn(async move {
+                // Events this connection never received since the last one
+                // it did: either the broadcast skipped them (Lagged) or the
+                // send queue refused them. Whichever it was, the next frame
+                // it receives must be preceded by the admission — a stream
+                // with a silent hole is exactly what made a half answer
+                // look complete.
+                let mut dropped: u64 = 0;
                 loop {
                     match rx.recv().await {
                         Ok(ev) => {
+                            if dropped > 0 {
+                                let gap = json!({
+                                    "event": "session.gap",
+                                    "sessionId": sid,
+                                    "dropped": dropped,
+                                    "cursor": ev.seq,
+                                });
+                                if tx.try_send(Message::Text(gap.to_string().into())).is_ok() {
+                                    dropped = 0;
+                                }
+                            }
                             let frame = json!({
                                 "event": "session.event",
                                 "sessionId": sid,
-                                "data": ev,
+                                "seq": ev.seq,
+                                "data": ev.event,
                             });
                             if tx
                                 .try_send(Message::Text(frame.to_string().into()))
                                 .is_err()
                             {
-                                // Client lagging or gone — drop the frame,
-                                // keep the forwarder (channel may recover).
-                                continue;
+                                // Client lagging or gone — count it so the
+                                // next delivered frame carries the gap.
+                                dropped += 1;
                             }
                         }
-                        Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => continue,
+                        Err(tokio::sync::broadcast::error::RecvError::Lagged(n)) => {
+                            dropped += n;
+                        }
                         Err(tokio::sync::broadcast::error::RecvError::Closed) => break,
                     }
                 }
@@ -430,7 +528,10 @@ async fn run_connection(state: Arc<AppState>, socket: WebSocket, device: Option<
 
     conn.send(json!({
         "hello": {
-            "protocol": 2,
+            "protocol": PROTOCOL_VERSION,
+            "minProtocol": MIN_PROTOCOL,
+            "supported": [PROTOCOL_VERSION],
+            "capabilities": server_capabilities(),
             "daemon": "damond",
             "version": env!("CARGO_PKG_VERSION"),
             "permissionTimeoutSecs": state.config.read().permission_timeout_secs,
@@ -491,7 +592,10 @@ pub async fn handle_socket(
 
     conn.send(json!({
         "hello": {
-            "protocol": 2,
+            "protocol": PROTOCOL_VERSION,
+            "minProtocol": MIN_PROTOCOL,
+            "supported": [PROTOCOL_VERSION],
+            "capabilities": server_capabilities(),
             "daemon": "damond",
             "version": env!("CARGO_PKG_VERSION"),
             "permissionTimeoutSecs": state.config.read().permission_timeout_secs,
@@ -593,16 +697,40 @@ async fn dispatch(
     params: Value,
 ) -> Result<Value> {
     match method {
-        "hello" => Ok(json!({
-            "protocol": 2,
-            "daemon": "damond",
-            "version": env!("CARGO_PKG_VERSION"),
-            "backends": state.sessions.available_backends(),
-            "methods": rpc_methods(),
-            "remoteClients": state
-                .remote_ws
-                .load(std::sync::atomic::Ordering::Relaxed),
-        })),
+        "hello" => {
+            // Version negotiation (ACP v2's shape — MAJOR integer only): a
+            // client that names its version is answered yes, or refused with
+            // a typed error carrying the versions this daemon speaks. A
+            // `hello` WITHOUT a version is the pre-negotiation shape and
+            // keeps working exactly as before, which is why adding this did
+            // not move the protocol number.
+            if let Some(v) = params["protocolVersion"].as_u64()
+                && !(MIN_PROTOCOL..=PROTOCOL_VERSION).contains(&v)
+            {
+                return Err(anyhow::Error::new(
+                    RpcError::new(
+                        error_code::UNSUPPORTED_PROTOCOL,
+                        format!(
+                            "protocol version {v} is not supported — this daemon speaks {MIN_PROTOCOL}..={PROTOCOL_VERSION}"
+                        ),
+                    )
+                    .with_data(json!({"requested": v, "supported": [PROTOCOL_VERSION]})),
+                ));
+            }
+            Ok(json!({
+                "protocol": PROTOCOL_VERSION,
+                "minProtocol": MIN_PROTOCOL,
+                "supported": [PROTOCOL_VERSION],
+                "capabilities": server_capabilities(),
+                "daemon": "damond",
+                "version": env!("CARGO_PKG_VERSION"),
+                "backends": state.sessions.available_backends(),
+                "methods": rpc_methods(),
+                "remoteClients": state
+                    .remote_ws
+                    .load(std::sync::atomic::Ordering::Relaxed),
+            }))
+        }
 
         "backend.list" => {
             let mut out = Vec::new();
@@ -1366,485 +1494,32 @@ async fn dispatch(
             Ok(json!({"merged": merged}))
         }
 
-        "session.create" => {
-            let mut cfg = session_config(&params)?;
-            let mut backend = params["backend"].as_str().map(String::from);
-            // A project scopes the session: its root becomes the cwd
-            // default and its defaults fill whatever the request left
-            // unset (explicit params always win).
-            let project = match params["projectId"].as_str() {
-                Some(pid) => {
-                    let p = state.store.get_project(pid).await?.ok_or_else(|| {
-                        RpcError::error(
-                            error_code::INVALID_PARAMS,
-                            format!("unknown project {pid}"),
-                        )
-                    })?;
-                    let defaults: Value = serde_json::from_str(&p.defaults).unwrap_or_default();
-                    if !params["cwd"].is_string() {
-                        cfg.cwd = std::path::PathBuf::from(&p.root);
-                    }
-                    if cfg.model.is_none()
-                        && let Some(m) = defaults["model"].as_str()
-                    {
-                        cfg.model = Some(m.to_string());
-                    }
-                    if cfg.mode.is_none()
-                        && let Some(m) = defaults["mode"].as_str()
-                    {
-                        cfg.mode = Some(m.to_string());
-                    }
-                    if cfg.mcp_servers.is_empty()
-                        && let Some(mcp) = defaults["mcpServers"].as_object()
-                    {
-                        cfg.mcp_servers = session_config(&json!({"mcpServers": mcp}))?.mcp_servers;
-                    }
-                    if backend.is_none()
-                        && let Some(b) = defaults["backend"].as_str()
-                    {
-                        backend = Some(b.to_string());
-                    }
-                    Some(pid.to_string())
-                }
-                None => None,
-            };
-            check_cwd_allowed(state, &cfg.cwd)?;
-            // Persona (optional): resolve the bot's files NOW — a
-            // typo'd or since-deleted id must fail the create, not the
-            // first turn. The composed block is fixed for the session's
-            // life; edits to the bot's files reach the NEXT session.
-            let persona = match params["persona"].as_str() {
-                Some(id) => {
-                    let root = crate::bots::bots_root(state.config.read().data_dir.as_deref());
-                    Some(crate::bots::resolve(&root, id).ok_or_else(|| {
-                        RpcError::error(
-                            error_code::INVALID_PARAMS,
-                            format!("unknown persona `{id}` — bot.save it first"),
-                        )
-                    })?)
-                }
-                None => None,
-            };
-            // Effective granted roots (global + the project's) ride
-            // the launch line for backends with a native widening flag
-            // (claude --add-dir) and pre-warm the file jail.
-            cfg.granted_roots = effective_grants(state, project.clone()).await?;
-            let ms = state
-                .sessions
-                .create(backend.as_deref(), cfg.clone(), persona.clone())
-                .await?;
-            state
-                .store
-                .create_session(&ms.id, &cfg.cwd.to_string_lossy(), Some(&ms.provider))
-                .await?;
-            if let Some(pid) = &project {
-                let _ = state.store.set_session_project(&ms.id, Some(pid)).await;
-            }
-            // The persona binding rides the session row so resume/
-            // restart re-resolve it after a daemon restart.
-            if let Some(p) = &persona {
-                let _ = state.store.set_session_persona(&ms.id, Some(&p.bot)).await;
-            }
-            // Persist the resolved default model (explicit or project
-            // default) — the row is the search/list surface for it.
-            if let Some(m) = &cfg.model {
-                let _ = state.store.set_session_model(&ms.id, m).await;
-            }
-            let replayed = conn.subscribe(state, &ms).await;
-            let mut out = json!({"sessionId": ms.id, "backend": ms.provider, "replayed": replayed});
-            if let Some(p) = &ms.persona {
-                out["persona"] = json!(p.bot);
-            }
-            Ok(out)
-        }
-
-        "session.resume" => {
-            // Import path: a PersistenceHandle points at a native session
-            // that has no Damon row yet — mint one, bind it, resume.
-            if let Some(hv) = params.get("handle") {
-                let handle: PersistenceHandle =
-                    serde_json::from_value(hv.clone()).map_err(|_| {
-                        RpcError::error(
-                            error_code::INVALID_PARAMS,
-                            "handle must be {provider, native_handle, metadata?}",
-                        )
-                    })?;
-                if handle.provider.is_empty() || handle.native_handle.is_empty() {
-                    return Err(RpcError::error(
-                        error_code::INVALID_PARAMS,
-                        "handle requires provider and native_handle",
-                    ));
-                }
-                // Re-importing the same native session returns the
-                // existing row instead of duplicating it.
-                let id = match state
-                    .store
-                    .session_by_agent_session(&handle.provider, &handle.native_handle)
-                    .await?
-                {
-                    Some(existing) => existing,
-                    None => {
-                        let id = uuid::Uuid::new_v4().to_string();
-                        let cwd = params["cwd"]
-                            .as_str()
-                            .map(String::from)
-                            .or_else(|| handle.metadata["cwd"].as_str().map(String::from))
-                            .unwrap_or_else(|| ".".to_string());
-                        state
-                            .store
-                            .create_session(&id, &cwd, Some(&handle.provider))
-                            .await?;
-                        state
-                            .store
-                            .set_agent_session(&id, &handle.provider, &handle.native_handle)
-                            .await?;
-                        if let Some(title) = params["title"].as_str() {
-                            let _ = state.store.rename_session(&id, title).await;
-                        }
-                        id
-                    }
-                };
-                let cwd = state
-                    .store
-                    .session_cwd(&id)
-                    .await?
-                    .map(std::path::PathBuf::from)
-                    .unwrap_or_else(|| std::path::PathBuf::from("."));
-                check_cwd_allowed(state, &cwd)?;
-                let mut cfg = SessionConfig {
-                    cwd,
-                    ..Default::default()
-                };
-                cfg.granted_roots =
-                    effective_grants(state, state.store.session_project(&id).await?).await?;
-                let ms = state.sessions.resume(&id, &handle, cfg, None).await?;
-                let replayed = conn.subscribe(state, &ms).await;
-                return Ok(json!({"sessionId": id, "backend": ms.provider, "replayed": replayed}));
-            }
-            let id = req_str(&params, "sessionId")?;
-            // Already live? Just subscribe and return.
-            if let Some(ms) = state.sessions.get(id).await {
-                let replayed = conn.subscribe(state, &ms).await;
-                return Ok(json!({"sessionId": id, "backend": ms.provider, "replayed": replayed}));
-            }
-            reattach(state, conn, id).await
-        }
-
-        "session.restart" => {
-            let id = req_str(&params, "sessionId")?;
-            // A live session is killed first (a crashed/wedged process
-            // included — close is unconditional), then reattached
-            // through the persisted handle; a not-live session just
-            // reattaches. Busy sessions refuse: restarting mid-turn
-            // would kill the turn's process underneath the collector.
-            if let Some(ms) = state.sessions.get(id).await {
-                if ms.busy.load(std::sync::atomic::Ordering::Relaxed) {
-                    return Err(RpcError::error(
-                        error_code::TURN_IN_PROGRESS,
-                        "a turn is already running on this session",
-                    ));
-                }
-                state.sessions.close(id).await?;
-            }
-            reattach(state, conn, id).await
-        }
-
-        "session.list" => {
-            let limit = params["limit"].as_u64().unwrap_or(50) as u32;
-            let offset = params["offset"].as_u64().unwrap_or(0) as u32;
-            let filter = SessionFilter {
-                backend: params["backend"].as_str().map(String::from),
-                cwd: params["cwd"].as_str().map(String::from),
-                tag: params["tag"].as_str().map(String::from),
-                project_id: params["projectId"].as_str().map(String::from),
-                include_archived: params["includeArchived"].as_bool().unwrap_or(false),
-            };
-            let rows = state
-                .store
-                .list_sessions_paged(limit, offset, filter)
-                .await?;
-            let sessions: Vec<Value> = rows
-                .into_iter()
-                .map(|s| {
-                    json!({"sessionId": s.id, "createdAt": s.created_at,
-                           "backend": s.backend, "title": s.title,
-                           "cwd": s.cwd, "tags": s.tags,
-                           "pinned": s.pinned, "archived": s.archived})
-                })
-                .collect();
-            Ok(json!({"sessions": sessions}))
-        }
-
-        "session.status" => {
-            // Live-session introspection: which backend processes are
-            // resident right now, which are mid-turn, how long idle.
-            // Complements the /metrics gauges with per-session detail.
-            let rows = state.sessions.live_status().await;
-            let sessions: Vec<Value> = rows
-                .into_iter()
-                .map(|(id, backend, busy, idle_secs)| {
-                    json!({"sessionId": id, "backend": backend,
-                           "busy": busy, "idleSecs": idle_secs})
-                })
-                .collect();
-            Ok(json!({"sessions": sessions}))
-        }
-
-        "session.watch" => {
-            // Subscribe THIS connection to a session's events without
-            // creating/resuming/turning on it — the cross-surface
-            // notification path. A chat bridge watches a session the
-            // web UI started and pings the chat when it finishes or
-            // asks for permission. Requires a live session: a detached
-            // one has no backend process broadcasting anything. The
-            // subscribe replays missed history (replay-tagged), which
-            // notification consumers skip.
-            let id = req_str(&params, "sessionId")?;
-            let ms = state.sessions.get(id).await.ok_or_else(|| {
-                RpcError::error(
-                    error_code::SESSION_NOT_LIVE,
-                    "session not live — resume it before watching",
-                )
-            })?;
-            let replayed = conn.subscribe(state, &ms).await;
-            Ok(json!({"sessionId": id, "subscribed": true, "replayed": replayed}))
-        }
-
-        "session.unwatch" => {
-            let id = req_str(&params, "sessionId")?;
-            let removed = conn.unsubscribe(id).await;
-            Ok(json!({"sessionId": id, "subscribed": !removed}))
-        }
-
-        "session.messages" => {
-            let id = req_str(&params, "sessionId")?;
-            let limit = params["limit"].as_u64().unwrap_or(200) as u32;
-            let offset = params["offset"].as_u64().unwrap_or(0) as u32;
-            let msgs = state.store.messages_paged(id, limit, offset).await?;
-            Ok(json!({"messages": msgs}))
-        }
-
-        "session.export" => {
-            let id = req_str(&params, "sessionId")?;
-            // Header + transcript + usage in one shot — the wire-side
-            // superset of the CLI's client-rendered export.
-            let overview = state
-                .store
-                .session_overview(id)
-                .await?
-                .with_context(|| format!("session not found: {id}"))?;
-            let msgs = state.store.messages_paged(id, u32::MAX, 0).await?;
-            let (used, size, cost, turns) = state.store.session_usage(id).await?;
-            Ok(json!({
-                "session": {
-                    "sessionId": overview.id, "createdAt": overview.created_at,
-                    "backend": overview.backend, "title": overview.title,
-                    "tags": overview.tags, "cwd": overview.cwd,
-                },
-                // Same per-row fields as session.messages minus the
-                // redundant session_id — it is in the header.
-                "messages": msgs.iter().map(|m| json!({
-                    "id": m.id, "role": m.role, "ts": m.ts, "data": m.data,
-                })).collect::<Vec<_>>(),
-                "usage": {
-                    "contextUsed": used, "contextSize": size,
-                    "costUsd": cost, "turns": turns,
-                },
-            }))
-        }
-
-        "session.import" => {
-            let backend = req_str(&params, "backend")?;
-            let clients = state.sessions.clients();
-            let client = clients
-                .iter()
-                .find(|(id, _)| id == backend)
-                .map(|(_, c)| c.clone())
-                .ok_or_else(|| RpcError::error(error_code::INVALID_PARAMS, "unknown backend"))?;
-            let cwd = params["cwd"]
-                .as_str()
-                .map(std::path::PathBuf::from)
-                .unwrap_or_else(|| std::env::current_dir().unwrap_or_else(|_| ".".into()));
-            check_cwd_allowed(state, &cwd)?;
-            let found = client.list_importable_sessions(&cwd).await?;
-            Ok(json!({"sessions": found}))
-        }
-
-        "session.delete" => {
-            let id = req_str(&params, "sessionId")?;
-            state.sessions.close(id).await.ok();
-            state.store.delete_session(id).await?;
-            Ok(json!({"deleted": true}))
-        }
-
-        "session.close" => {
-            let id = req_str(&params, "sessionId")?;
-            // Frees a max_sessions slot deterministically: kills the
-            // live backend process, keeps the row and history (the
-            // next session.resume reattaches). Idempotent — closing a
-            // not-live id succeeds without touching anything.
-            state.sessions.close(id).await?;
-            Ok(json!({"closed": true}))
-        }
-
-        // History scan: single-flight globally — a second call while
-        // one runs gets the in-flight scanId (and no progress events;
-        // the running caller owns the pipeline view). Progress frames
-        // ride the requesting connection (worktree precedent).
-        "session.rescan" => {
-            let scan_id = {
-                let mut slot = state.history_scan.lock();
-                match slot.as_ref() {
-                    Some(in_flight) => {
-                        return Ok(json!({
-                            "scanId": in_flight,
-                            "alreadyRunning": true,
-                        }));
-                    }
-                    None => {
-                        let id = uuid::Uuid::new_v4().to_string();
-                        *slot = Some(id.clone());
-                        id
-                    }
-                }
-            };
-            let pconn = conn.clone();
-            let sid = scan_id.clone();
-            let progress = move |payload: serde_json::Value| {
-                pconn.send(json!({
-                    "event": "history.scan_progress",
-                    "scanId": sid,
-                    "data": payload,
-                }));
-            };
-            let report = crate::history_scan::scan_history(state, &scan_id, &progress).await;
-            *state.history_scan.lock() = None;
-            let report = report?;
-            Ok(json!({
-                "scanId": scan_id,
-                "alreadyRunning": false,
-                "report": report.to_json(),
-            }))
-        }
-
-        "session.set_tags" => {
-            let id = req_str(&params, "sessionId")?;
-            let tags: Vec<String> =
-                serde_json::from_value(params["tags"].clone()).map_err(|_| {
-                    RpcError::error(
-                        error_code::INVALID_PARAMS,
-                        "tags must be an array of strings",
-                    )
-                })?;
-            let ok = state.store.set_tags(id, &tags).await?;
-            Ok(json!({"updated": ok}))
-        }
-
-        "session.set_pinned" => {
-            let id = req_str(&params, "sessionId")?;
-            let pinned = params["pinned"].as_bool().ok_or_else(|| {
-                RpcError::error(error_code::INVALID_PARAMS, "pinned must be a boolean")
-            })?;
-            let ok = state.store.set_pinned(id, pinned).await?;
-            Ok(json!({"updated": ok}))
-        }
-
-        "session.set_archived" => {
-            let id = req_str(&params, "sessionId")?;
-            let archived = params["archived"].as_bool().ok_or_else(|| {
-                RpcError::error(error_code::INVALID_PARAMS, "archived must be a boolean")
-            })?;
-            let ok = state.store.set_archived(id, archived).await?;
-            Ok(json!({"updated": ok}))
-        }
-
-        "session.rename" => {
-            let id = req_str(&params, "sessionId")?;
-            let title = req_str(&params, "title")?;
-            let ok = state.store.rename_session(id, title).await?;
-            Ok(json!({"renamed": ok}))
-        }
-
-        "session.fork" => {
-            let id = req_str(&params, "sessionId")?;
-            let upto = params["upto"].as_i64();
-            let new_id = state.store.fork_session(id, upto).await?;
-            Ok(json!({"sessionId": new_id}))
-        }
-
-        "session.usage" => {
-            let id = params["sessionId"].as_str();
-            // `daily` is a global-view mode: with a sessionId it is
-            // ignored — the per-session shape carries no day grouping.
-            if id.is_none() && params["daily"].as_bool().unwrap_or(false) {
-                let days = params["days"].as_u64().unwrap_or(7).max(1) as u32;
-                let rows = state.store.daily_usage(days).await?;
-                let daily: Vec<Value> = rows
-                    .into_iter()
-                    .map(|(date, turns, cost, used)| {
-                        json!({"date": date, "turns": turns,
-                               "costUsd": cost, "contextUsed": used})
-                    })
-                    .collect();
-                return Ok(json!({"daily": daily}));
-            }
-            match id {
-                Some(id) => {
-                    let (used, size, cost, turns) = state.store.session_usage(id).await?;
-                    Ok(json!({
-                        "sessionId": id,
-                        "contextUsed": used, "contextSize": size,
-                        "costUsd": cost, "turns": turns,
-                    }))
-                }
-                None => {
-                    let rows = state
-                        .store
-                        .usage_summary(params["projectId"].as_str().map(String::from))
-                        .await?;
-                    let sessions: Vec<Value> = rows
-                        .into_iter()
-                        .map(|(model, used, size, cost, turns)| {
-                            json!({"model": model, "contextUsed": used, "contextSize": size,
-                                   "costUsd": cost, "turns": turns})
-                        })
-                        .collect();
-                    Ok(json!({"sessions": sessions}))
-                }
-            }
-        }
-
-        "session.search" => {
-            let q = req_str(&params, "query")?;
-            let limit = params["limit"].as_u64().unwrap_or(20) as usize;
-            // Wire timestamps (RFC3339 or date-only) become unix-ms
-            // bounds here; the store stays a pure-ms API.
-            let filter = SearchFilter {
-                session_id: params["sessionId"].as_str().map(String::from),
-                backend: params["backend"].as_str().map(String::from),
-                cwd: params["cwd"].as_str().map(String::from),
-                project_id: params["projectId"].as_str().map(String::from),
-                since_ms: params["since"]
-                    .as_str()
-                    .map(parse_time_bound)
-                    .transpose()
-                    .map_err(|e| RpcError::error(error_code::INVALID_PARAMS, format!("{e:#}")))?,
-                until_ms: params["until"]
-                    .as_str()
-                    .map(parse_time_bound)
-                    .transpose()
-                    .map_err(|e| RpcError::error(error_code::INVALID_PARAMS, format!("{e:#}")))?,
-            };
-            let hits = state.store.search_filtered(q, limit, filter).await?;
-            let results: Vec<Value> = hits
-                .into_iter()
-                .map(|(session_id, message_id, snippet)| {
-                    json!({"sessionId": session_id, "messageId": message_id, "snippet": snippet})
-                })
-                .collect();
-            Ok(json!({"results": results}))
-        }
-
+        // ── session.* — the session control family. Each method's params
+        // are a typed struct in `rpc/session.rs` (the first slice of the
+        // dispatch params refactor); the arms stay one line each so this
+        // match remains the single table of what the daemon routes.
+        "session.create" => session::create(state, conn, &params).await,
+        "session.resume" => session::resume(state, conn, &params).await,
+        "session.restart" => session::restart(state, conn, &params).await,
+        "session.list" => session::list(state, &params).await,
+        "session.status" => session::status(state, &params).await,
+        "session.watch" => session::watch(state, conn, &params).await,
+        "session.unwatch" => session::unwatch(conn, &params).await,
+        "session.messages" => session::messages(state, &params).await,
+        "session.export" => session::export(state, &params).await,
+        "session.import" => session::import(state, &params).await,
+        "session.delete" => session::delete(state, &params).await,
+        "session.close" => session::close(state, &params).await,
+        "session.rescan" => session::rescan(state, conn, &params).await,
+        "session.set_tags" => session::set_tags(state, &params).await,
+        "session.set_pinned" => session::set_pinned(state, &params).await,
+        "session.set_archived" => session::set_archived(state, &params).await,
+        "session.rename" => session::rename(state, &params).await,
+        "session.fork" => session::fork(state, &params).await,
+        "session.usage" => session::usage(state, &params).await,
+        "session.search" => session::search(state, &params).await,
+        "session.set_model" => session::set_model(state, &params).await,
+        "session.set_mode" => session::set_mode(state, &params).await,
         "usage.summary" => {
             // days/tzOffsetMinutes default to 7/0 — a week of UTC-day
             // buckets, matching session.usage's daily rollup.
@@ -2254,291 +1929,17 @@ async fn dispatch(
             Ok(json!({"rejected": rejected}))
         }
 
-        "turn.start" => {
-            let id = req_str(&params, "sessionId")?;
-            let ms = state.sessions.get(id).await.ok_or_else(|| {
-                RpcError::error(
-                    error_code::SESSION_NOT_LIVE,
-                    "session not live — call session.resume first",
-                )
-            })?;
-            // Claim the session exclusively: a second concurrent start
-            // would run two collectors on the same broadcast and
-            // double-persist every event. swap() is the claim;
-            // run_turn's BusyGuard releases it on every exit path.
-            if ms.busy.swap(true, std::sync::atomic::Ordering::AcqRel) {
-                return Err(RpcError::error(
-                    error_code::TURN_IN_PROGRESS,
-                    "a turn is already running on this session",
-                ));
-            }
-            // Register disconnect-cancel ownership immediately, before
-            // any further await: a client that hangs up right after
-            // `turn.start` must not leak an uncancellable turn. The
-            // closed-flag check covers a disconnect whose sweep already
-            // ran (it found an empty map); detach skips ownership
-            // entirely — its turn outlives the connection by design.
-            let detach = params["detach"].as_bool().unwrap_or(false);
-            let cancel = if detach {
-                None
-            } else {
-                let c = CancellationToken::new();
-                let mut owned = conn.owned_turns.lock().await;
-                owned.insert(ms.id.clone(), c.clone());
-                if conn.closed.load(std::sync::atomic::Ordering::SeqCst) {
-                    c.cancel();
-                }
-                drop(owned);
-                Some(c)
-            };
-            conn.subscribe(state, &ms).await;
-            run_turn(state, conn, &ms, params, detach, cancel).await
-        }
+        "turn.start" => turn::start(state, conn, &params).await,
 
-        "turn.steer" => {
-            let id = req_str(&params, "sessionId")?;
-            let ms =
-                state.sessions.get(id).await.ok_or_else(|| {
-                    RpcError::error(error_code::SESSION_NOT_LIVE, "session not live")
-                })?;
-            let prompt: PromptInput = serde_json::from_value(params["prompt"].clone())
-                .map_err(|_| RpcError::error(error_code::INVALID_PARAMS, "prompt required"))?;
-            let expected = params["expectedTurn"].as_str().unwrap_or_default();
-            let res = ms.session.steer(prompt, expected).await?;
-            Ok(json!({"result": res}))
-        }
+        "turn.steer" => turn::steer(state, &params).await,
 
-        "turn.cancel" => {
-            let id = req_str(&params, "sessionId")?;
-            if let Some(ms) = state.sessions.get(id).await {
-                ms.session.interrupt().await?;
-            }
-            Ok(json!({"cancelled": true}))
-        }
+        "turn.cancel" => turn::cancel(state, &params).await,
 
-        "permission.respond" => {
-            let id = req_str(&params, "sessionId")?;
-            let ms =
-                state.sessions.get(id).await.ok_or_else(|| {
-                    RpcError::error(error_code::SESSION_NOT_LIVE, "session not live")
-                })?;
-            let request_id = req_str(&params, "requestId")?;
-            let response: PermissionResponse = serde_json::from_value(params["response"].clone())
-                .map_err(|_| {
-                RpcError::error(error_code::INVALID_PARAMS, "response required")
-            })?;
-            // Plan asks land their decision in the durable review row
-            // too — intent BEFORE the native write (the "lost pipe"
-            // record), settled on ack, reverted on failure. The gate's
-            // winner owns the record: if plan.respond claimed it
-            // first, this legacy call proceeds natively without
-            // touching the row (the backend's one-shot ask dedups the
-            // double delivery anyway). Legacy semantics are untouched
-            // for non-plan asks and for plans with no open row.
-            let mut plan_claim: Option<(String, i64, String, String)> = None;
-            if let Ok(Some(row)) = state.store.open_plan_for_request(request_id).await {
-                let (decision, feedback) = match &response {
-                    PermissionResponse::Allow { .. } => ("approve", None),
-                    PermissionResponse::Deny { message, .. } => {
-                        ("request_changes", message.clone())
-                    }
-                };
-                if let Ok(crate::store::PlanSubmit::Claimed { previous, .. }) = state
-                    .store
-                    .submit_plan_decision(&row.plan_id, row.revision, decision, feedback.as_deref())
-                    .await
-                {
-                    plan_claim = Some((
-                        row.plan_id.clone(),
-                        row.revision,
-                        decision.to_string(),
-                        previous,
-                    ));
-                }
-            }
-            let delivered = ms
-                .session
-                .respond_to_permission(request_id, response.clone())
-                .await;
-            if let Some((pid, rev, decision, previous)) = plan_claim {
-                match &delivered {
-                    Ok(()) => {
-                        let _ = state.store.settle_plan(&pid, rev, &decision).await;
-                    }
-                    Err(_) => {
-                        let _ = state.store.revert_plan(&pid, rev, &previous).await;
-                    }
-                }
-            }
-            delivered?;
-            // A deny with `interrupt` kills the whole turn, not just
-            // this call — backends only apply the flag to the pending
-            // ask, so the daemon drives the follow-up interrupt here.
-            // Best-effort: the deny itself already took effect.
-            if matches!(
-                response,
-                PermissionResponse::Deny {
-                    interrupt: true,
-                    ..
-                }
-            ) && let Err(e) = ms.session.interrupt().await
-            {
-                tracing::warn!(error = %e, session = %id, "post-deny interrupt failed");
-            }
-            Ok(json!({}))
-        }
+        "permission.respond" => permission::respond(state, &params).await,
 
-        "plan.list" => {
-            let id = req_str(&params, "sessionId")?;
-            let rows = state.store.plan_reviews(id).await?;
-            let plans: Vec<Value> = rows.into_iter().map(plan_row_json).collect();
-            Ok(json!({"plans": plans}))
-        }
+        "plan.list" => plan::list(state, &params).await,
 
-        "plan.respond" => {
-            let plan_id = req_str(&params, "planId")?;
-            let expected_revision = params["expectedRevision"].as_i64().ok_or_else(|| {
-                RpcError::error(
-                    error_code::INVALID_PARAMS,
-                    "expectedRevision must be a number",
-                )
-            })?;
-            let decision = req_str(&params, "decision")?;
-            if !matches!(decision, "approve" | "request_changes" | "defer") {
-                return Err(RpcError::error(
-                    error_code::INVALID_PARAMS,
-                    "decision must be approve | request_changes | defer",
-                ));
-            }
-            let feedback = params["feedback"].as_str();
-            match state
-                .store
-                .submit_plan_decision(plan_id, expected_revision, decision, feedback)
-                .await?
-            {
-                crate::store::PlanSubmit::FeedbackRequired => Err(RpcError::error(
-                    error_code::INVALID_PARAMS,
-                    "request_changes requires non-empty feedback",
-                )),
-                crate::store::PlanSubmit::Incomplete => Err(RpcError::error(
-                    error_code::INVALID_PARAMS,
-                    "plan content is not reviewable — approval refused",
-                )),
-                crate::store::PlanSubmit::NotFound => Err(RpcError::error(
-                    error_code::INVALID_PARAMS,
-                    format!("no plan review {plan_id} revision {expected_revision}"),
-                )),
-                crate::store::PlanSubmit::Conflict(row) => Err(RpcError::error(
-                    error_code::PLAN_CONFLICT,
-                    format!(
-                        "plan decision conflict — revision {} is {} (expected revision {}); refetch via plan.list",
-                        row.revision, row.status, expected_revision
-                    ),
-                )),
-                crate::store::PlanSubmit::Claimed {
-                    session_id,
-                    request_id,
-                    previous,
-                } => {
-                    // Deferred is non-terminal and never touches the
-                    // native ask: the agent's wait stays parked and a
-                    // later plan.respond can still decide it.
-                    if decision == "defer" {
-                        state
-                            .store
-                            .settle_plan(plan_id, expected_revision, decision)
-                            .await?;
-                        return Ok(json!({
-                            "recorded": true, "status": "deferred", "applied": false,
-                            "planId": plan_id, "revision": expected_revision,
-                        }));
-                    }
-                    let ms = state.sessions.get(&session_id).await;
-                    let Some(ms) = ms else {
-                        // The ask died with the session — the intent
-                        // stays recorded, the row returns to its
-                        // pre-claim state.
-                        let _ = state
-                            .store
-                            .revert_plan(plan_id, expected_revision, &previous)
-                            .await;
-                        return Err(RpcError::error(
-                            error_code::SESSION_NOT_LIVE,
-                            "session not live — the plan ask died with it",
-                        ));
-                    };
-                    let response = if decision == "approve" {
-                        PermissionResponse::Allow {
-                            action_id: None,
-                            updated_input: None,
-                            answer: None,
-                            answers: None,
-                        }
-                    } else {
-                        PermissionResponse::Deny {
-                            action_id: None,
-                            // The feedback IS the message the agent
-                            // sees for its next revision.
-                            message: Some(feedback.unwrap_or_default().to_string()),
-                            interrupt: false,
-                        }
-                    };
-                    match ms
-                        .session
-                        .respond_to_permission(&request_id, response)
-                        .await
-                    {
-                        Ok(()) => {
-                            state
-                                .store
-                                .settle_plan(plan_id, expected_revision, decision)
-                                .await?;
-                            Ok(json!({
-                                "recorded": true,
-                                "status": if decision == "approve" { "approved" } else { "changes_requested" },
-                                "applied": true,
-                                "planId": plan_id, "revision": expected_revision,
-                            }))
-                        }
-                        Err(e) => {
-                            // Relay lost: the intent stays on file, the
-                            // row reopens, and the caller sees the
-                            // failure instead of a fake success.
-                            let _ = state
-                                .store
-                                .revert_plan(plan_id, expected_revision, &previous)
-                                .await;
-                            Err(RpcError::error(
-                                error_code::INTERNAL_ERROR,
-                                format!("plan decision recorded but native relay failed: {e:#}"),
-                            ))
-                        }
-                    }
-                }
-            }
-        }
-
-        "session.set_model" => {
-            let id = req_str(&params, "sessionId")?;
-            let ms =
-                state.sessions.get(id).await.ok_or_else(|| {
-                    RpcError::error(error_code::SESSION_NOT_LIVE, "session not live")
-                })?;
-            let model = req_str(&params, "model")?;
-            ms.session.set_model(model).await?;
-            Ok(json!({}))
-        }
-
-        "session.set_mode" => {
-            let id = req_str(&params, "sessionId")?;
-            let ms =
-                state.sessions.get(id).await.ok_or_else(|| {
-                    RpcError::error(error_code::SESSION_NOT_LIVE, "session not live")
-                })?;
-            let mode = req_str(&params, "mode")?;
-            ms.session.set_mode(mode).await?;
-            Ok(json!({}))
-        }
+        "plan.respond" => plan::respond(state, &params).await,
 
         "catalog.models" => {
             let backend = req_str(&params, "backend")?;
@@ -3193,76 +2594,6 @@ async fn dispatch(
     }
 }
 
-fn session_config(params: &Value) -> Result<SessionConfig> {
-    let cwd = params["cwd"]
-        .as_str()
-        .map(std::path::PathBuf::from)
-        .unwrap_or_else(|| std::env::current_dir().unwrap_or_else(|_| ".".into()));
-    let mcp = params["mcpServers"]
-        .as_object()
-        .map(|m| {
-            m.iter()
-                .filter_map(|(name, v)| {
-                    Some((
-                        name.clone(),
-                        McpServerConfig {
-                            command: v["command"].as_str()?.to_string(),
-                            args: serde_json::from_value(v["args"].clone()).unwrap_or_default(),
-                            env: serde_json::from_value(v["env"].clone()).unwrap_or_default(),
-                        },
-                    ))
-                })
-                .collect()
-        })
-        .unwrap_or_default();
-    Ok(SessionConfig {
-        cwd,
-        model: params["model"].as_str().map(String::from),
-        mode: params["mode"].as_str().map(String::from),
-        mcp_servers: mcp,
-        granted_roots: Vec::new(),
-        allowed_tools: params["allowedTools"]
-            .as_array()
-            .map(|a| {
-                a.iter()
-                    .filter_map(|t| t.as_str().map(String::from))
-                    .collect()
-            })
-            .unwrap_or_default(),
-    })
-}
-
-/// Flatten a durable plan-review row for the wire — camelCase, absent
-/// Option fields omitted.
-fn plan_row_json(r: crate::store::PlanRow) -> Value {
-    let mut v = json!({
-        "planId": r.plan_id,
-        "sessionId": r.session_id,
-        "requestId": r.request_id,
-        "revision": r.revision,
-        "title": r.title,
-        "content": r.content,
-        "contentHash": r.content_hash,
-        "complete": r.complete,
-        "status": r.status,
-        "createdAt": r.created_at,
-        "updatedAt": r.updated_at,
-    });
-    if let Some(d) = r.decision {
-        v["decision"] = d;
-    }
-    if let Some(t) = r.decision_intent_at {
-        v["decisionIntentAt"] = json!(t);
-    }
-    if let Some(t) = r.applied_at {
-        v["appliedAt"] = json!(t);
-    }
-    if let Some(s) = r.superseded_by {
-        v["supersededBy"] = json!(s);
-    }
-    v
-}
-
 /// Best-effort canonical form for allowlist matching: absolute, with
 /// symlinks resolved when the path exists. A missing path still
 /// normalizes lexically, so a not-yet-created workspace directory can
@@ -3307,7 +2638,7 @@ async fn stored_cwd(state: &Arc<AppState>, id: &str) -> Result<std::path::PathBu
 /// same jail file.* uses), else a client-supplied cwd through the
 /// same `allowed_dirs` gate as session.create, else the daemon's own
 /// working directory — which is exactly what a session gets when it
-/// omits `cwd` (session_config's fallback), so a picker opened before
+/// omits `cwd` (`session.create`'s fallback), so a picker opened before
 /// the lazy first `session.create` indexes the directory the session
 /// will run in.
 /// The skills hub's root: `$DAMON_SKILLS_HUB_HOME` (tests) else
@@ -3616,7 +2947,7 @@ async fn reattach(state: &Arc<AppState>, conn: &Arc<Conn>, id: &str) -> Result<V
     };
     let ms = state.sessions.resume(id, &handle, cfg, persona).await?;
     let replayed = conn.subscribe(state, &ms).await;
-    let mut out = json!({"sessionId": id, "backend": ms.provider, "replayed": replayed});
+    let mut out = json!({"sessionId": id, "backend": ms.provider, "replayed": replayed, "cursor": ms.cursor()});
     if let Some(p) = &ms.persona {
         out["persona"] = json!(p.bot);
     }
@@ -3670,6 +3001,15 @@ impl crate::mission::MissionAgentRunner for MissionTurnRunner {
             .store
             .create_session(&ms.id, &cwd.to_string_lossy(), Some(&ms.provider))
             .await;
+        // Claim the session for the turn. A mission node runs on a fresh
+        // session, but without the claim the idle sweep would see a
+        // "free" session and could reap it mid-turn.
+        if !self.state.sessions.begin_turn(&ms.id) {
+            return Err("agent node session is already running a turn".to_string());
+        }
+        // The claim travels with the turn, exactly as `turn.start` hands
+        // it over — the guard releases it when the turn ends either way.
+        let busy = BusyGuard::new(self.state.sessions.clone(), &ms.id);
         // A sink connection: turn events are fanned out through the
         // session's broadcast channel; nobody is watching this one.
         let (tx, mut rx) = mpsc::channel::<Message>(256);
@@ -3681,13 +3021,15 @@ impl crate::mission::MissionAgentRunner for MissionTurnRunner {
             closed: std::sync::atomic::AtomicBool::new(false),
             log_follow: Mutex::new(None),
         });
+        let turn_req = turn::Start::from_prompt(PromptInput::text(req.prompt));
         let result = run_turn(
             &self.state,
             &conn,
             &ms,
-            json!({"prompt": req.prompt}),
+            &turn_req,
             false,
             Some(req.cancel.clone()),
+            busy,
         )
         .await;
         if let Err(e) = result {
@@ -3725,24 +3067,22 @@ async fn run_turn(
     state: &Arc<AppState>,
     conn: &Arc<Conn>,
     ms: &Arc<ManagedSession>,
-    params: Value,
+    req: &turn::Start,
     detach: bool,
     cancel: Option<CancellationToken>,
+    mut busy: BusyGuard,
 ) -> Result<Value> {
     let started = std::time::Instant::now();
     // Concurrency cap — held for the turn's whole life, whether the
     // collector ends up on this task or a detached one.
     let slot = PROMPT_SLOTS.acquire().await?;
-    // The dispatcher claimed `busy` with swap() — this guard releases
-    // it on every exit path, including the early parameter errors
-    // below, so a rejected turn never wedges the session. A detached
-    // turn hands the claim to its background collector instead.
-    let mut _busy = BusyGuard::new(ms.clone());
-    let prompt: PromptInput = serde_json::from_value(params["prompt"].clone())
-        .map_err(|_| RpcError::error(error_code::INVALID_PARAMS, "prompt required"))?;
-    let timeout = params["timeoutSecs"]
-        .as_u64()
-        .map(std::time::Duration::from_secs);
+    // The caller claimed the session through the ledger and handed the
+    // claim in with the request — this guard releases it on every exit
+    // path, including the early parameter error below, so a rejected
+    // turn never wedges the session. A detached turn hands the claim to
+    // its background collector instead.
+    let prompt = req.prompt()?;
+    let timeout = req.timeout();
 
     // Persist the user message up front — a crash mid-turn still leaves
     // the prompt in history.
@@ -3760,13 +3100,8 @@ async fn run_turn(
     // history stays human. The config guard is cloned, never held
     // across the store awaits.
     let memory_cfg = state.config.read().memory.clone();
-    let prompt = crate::memory::inject_prompt(
-        &state.store,
-        &memory_cfg,
-        params["memoryOwner"].as_str(),
-        prompt,
-    )
-    .await?;
+    let prompt =
+        crate::memory::inject_prompt(&state.store, &memory_cfg, req.memory_owner(), prompt).await?;
     // Persona injection: a session created with `persona` carries its
     // composed block in front of every turn — identity first, then the
     // memory context block, then the user's words. Same prepend-only
@@ -3776,10 +3111,9 @@ async fn run_turn(
         Some(block) => crate::memory::prepend_block(prompt, block),
         None => prompt,
     };
-    // First use ends the fresh-session reap grace. (`busy` was already
-    // claimed by the turn.start dispatcher — only the guard releases.)
-    ms.ever_used
-        .store(true, std::sync::atomic::Ordering::Relaxed);
+    // First use ends the fresh-session reap grace — the claim set
+    // `everUsed` in the ledger (the dispatcher already took it; only the
+    // guard releases it).
 
     // The registration itself lives in the dispatcher (immediately after
     // the busy claim); this guard removes it again when the turn ends.
@@ -3808,14 +3142,22 @@ async fn run_turn(
         None => ms.session.start_turn(prompt).await?,
     };
 
+    // Both ledgers learn the turn id the backend just handed over: the
+    // store row (the durable one) and the session ledger's open turn (the
+    // live picture a restart reads back).
+    let _ = state.store.begin_turn(&ms.id, &turn_id, &ms.provider).await;
+    state.sessions.note_turn_started(&ms.id, &turn_id);
+    busy.track_turn(&turn_id);
+
     if detach {
-        let busy = _busy.hand_off();
+        let busy = busy.hand_off();
         let st = state.clone();
         let m = ms.clone();
+        let tid = turn_id.clone();
         tokio::spawn(async move {
             let _slot = slot;
             let _busy = busy;
-            if let Err(e) = drive_turn(&st, &m, events, timeout, None, started).await {
+            if let Err(e) = drive_turn(&st, &m, events, timeout, None, started, &tid).await {
                 tracing::warn!(session = %m.id, error = %e, "detached turn ended");
             }
         });
@@ -3823,7 +3165,8 @@ async fn run_turn(
     }
 
     let _slot = slot;
-    let (stop_reason, usage) = drive_turn(state, ms, events, timeout, cancel, started).await?;
+    let (stop_reason, usage) =
+        drive_turn(state, ms, events, timeout, cancel, started, &turn_id).await?;
     Ok(json!({
         "turnId": turn_id,
         "stopReason": stop_reason,
@@ -3832,12 +3175,12 @@ async fn run_turn(
 }
 
 /// Collect one turn's events to its boundary, persist every artifact,
-/// and record metrics. Shared by the blocking and detached paths; the
-/// `cancel` token is the starting connection's disconnect handle (None
-/// for detached turns — nothing but `turn.cancel`, a deny-with-
-/// interrupt, or `timeoutSecs` ends them early). Errors cover both a
-/// `turn_failed` boundary and persistence failures. Returns the stop
-/// reason and the usage snapshot.
+/// settle its turn-ledger row, and record metrics. Shared by the blocking
+/// and detached paths; the `cancel` token is the starting connection's
+/// disconnect handle (None for detached turns — nothing but
+/// `turn.cancel`, a deny-with-interrupt, or `timeoutSecs` ends them
+/// early). Errors cover both a `turn_failed` boundary and persistence
+/// failures. Returns the stop reason and the usage snapshot.
 #[allow(clippy::type_complexity)]
 async fn drive_turn(
     state: &Arc<AppState>,
@@ -3846,6 +3189,7 @@ async fn drive_turn(
     timeout: Option<std::time::Duration>,
     cancel: Option<CancellationToken>,
     started: std::time::Instant,
+    turn_id: &str,
 ) -> Result<(&'static str, Option<Usage>)> {
     let mut assistant = String::new();
     let mut reasoning = String::new();
@@ -4033,7 +3377,7 @@ async fn drive_turn(
     let fresh_handle = ms
         .session
         .persistence_handle()
-        .or_else(|| ms.handle.clone());
+        .or_else(|| state.sessions.handle_of(&ms.id));
     if let Some(h) = &fresh_handle {
         let _ = state
             .store
@@ -4041,32 +3385,75 @@ async fn drive_turn(
             .await;
     }
 
+    // Settle the ledger row with how the turn actually ended. Best-effort
+    // like every write in this phase — and only an OPEN row is settled,
+    // so a turn boot recovery already converged to `interrupted` keeps
+    // that verdict.
+    let _ = state.store.finish_turn(&ms.id, turn_id, stop_reason).await;
+
+    // Same settlement one level up: the session's phase goes back to
+    // idle with the turn's real outcome. The event tap usually got here
+    // first (`session.rs::SessionState::observe`), which makes this a
+    // no-op; it is what settles a turn whose boundary never arrived (a
+    // timeout, a closed channel, a collector error).
+    state.sessions.end_turn(
+        &ms.id,
+        Some(turn_id),
+        match stop_reason {
+            "completed" => TurnOutcome::Completed,
+            "canceled" => TurnOutcome::Canceled,
+            _ => TurnOutcome::Failed,
+        },
+    );
+
     state
         .metrics
         .record_turn(&ms.provider, stop_reason, started.elapsed());
     outcome.map(|()| (stop_reason, usage))
 }
 
-/// Drop-guard: clears the session's busy flag when the turn ends, so the
-/// idle sweep can reap it again. The Option lets a detached turn hand
-/// the claim to its background collector — the flag must stay set until
-/// the turn actually ends, not until run_turn returns its early
-/// response.
-struct BusyGuard(Option<Arc<ManagedSession>>);
+/// Drop-guard: releases the session's turn claim when the turn ends, so
+/// the idle sweep can reap it again. The claim itself lives in the
+/// session ledger (#16); this guard is what guarantees every exit path —
+/// an early parameter error, a failed turn, a panic — releases it.
+///
+/// The Option lets a detached turn hand the claim to its background
+/// collector: the claim must stay set until the turn actually ends, not
+/// until run_turn returns its early response. `turn_id` is set once the
+/// backend reports it, so a guard dropping late cannot settle a *newer*
+/// turn on the same session (`None` only while this task alone holds the
+/// claim, i.e. before the turn started).
+struct BusyGuard {
+    claim: Option<(Arc<crate::session::SessionManager>, String)>,
+    turn_id: Option<String>,
+}
 impl BusyGuard {
-    fn new(ms: Arc<ManagedSession>) -> Self {
-        Self(Some(ms))
+    fn new(sessions: Arc<crate::session::SessionManager>, session_id: &str) -> Self {
+        Self {
+            claim: Some((sessions, session_id.to_string())),
+            turn_id: None,
+        }
     }
-    /// Transfer the busy claim to another owner; the receiver's drop
-    /// releases the flag.
+    /// Pin the claim to the backend's turn id.
+    fn track_turn(&mut self, turn_id: &str) {
+        self.turn_id = Some(turn_id.to_string());
+    }
+    /// Transfer the claim to another owner; the receiver's drop releases
+    /// it.
     fn hand_off(&mut self) -> Self {
-        Self(self.0.take())
+        Self {
+            claim: self.claim.take(),
+            turn_id: self.turn_id.clone(),
+        }
     }
 }
 impl Drop for BusyGuard {
     fn drop(&mut self) {
-        if let Some(ms) = self.0.take() {
-            ms.busy.store(false, std::sync::atomic::Ordering::Relaxed);
+        if let Some((sessions, session_id)) = self.claim.take() {
+            // The event boundary usually settled it already; this is the
+            // fallback that keeps a session from staying claimed forever
+            // when no boundary ever arrived.
+            sessions.end_turn(&session_id, self.turn_id.as_deref(), TurnOutcome::Failed);
         }
     }
 }
@@ -4105,7 +3492,7 @@ fn prompt_text(prompt: &PromptInput) -> String {
 /// contract, returned by `hello` and printed by `damond --print-rpc-schema`.
 pub fn rpc_methods() -> Vec<Value> {
     vec![
-        json!({"name": "hello", "result": {"protocol": "number", "backends": "array", "methods": "array"}}),
+        json!({"name": "hello", "params": {"protocolVersion": "number? — the MAJOR protocol version this client speaks; an unsupported one is refused with -32012 and data.supported[] (param-less hello keeps working as before)", "client": "{name, version}? — informational"}, "result": {"protocol": "number", "minProtocol": "number", "supported": "number[]", "capabilities": "object — feature gates a client may rely on: eventSeq, snapshotRequired, connGap, idempotentTurns, turnLedger, versionNegotiation (unknown keys are ignored)", "backends": "array", "methods": "array"}, "errors": "-32012 protocolVersion outside minProtocol..=protocol (data.requested / data.supported[])"}),
         json!({"name": "backend.list", "result": {"backends": "array"}}),
         json!({"name": "backend.versions", "params": {"backend": "string? — one backend, else all"}, "result": {"versions": "array of {backend, installed, version?, latest?, updateAvailable, updateKind: 'npm'|'manual'|'unknown'} — latest only where an npm package is verified; probes run on this call only, never scheduled"}}),
         json!({"name": "backend.update_plan", "params": {"backend": "string"}, "result": "{backend, action: 'install'|'update', kind: 'npm'|'manual'|'unknown', command: string[], manualCommand: string, canRun: bool, blockers: string[], platform} — the exact argv backend.update runs plus the copy-paste fallback; no side effects"}),
@@ -4123,9 +3510,9 @@ pub fn rpc_methods() -> Vec<Value> {
         json!({"name": "mcp.inventory", "params": {}, "result": {"entries": "array of {backend, name, transport, command?, url?, envKeys?, source, format, version, enabled?, readonlyReason?} — REDACTED: env values never leave the file, URLs lose userinfo/query, stdio shows the program and an arg count", "sources": "array of {backend, source, format, error?} — one per config file; a broken file reports its error and the inventory continues"}}),
         json!({"name": "mcp.probe", "params": {"backend": "string", "name": "string"}, "result": "{backend, name, result: 'connected'|'needs_auth'|'failed'|'unsupported', tools: string[] — names only, ≤40, serverName?, protocolVersion?, elapsedMs, error?} — REAL handshake, explicit request only (never scheduled); stdio 25s cap, HTTP 12s cap; the server's command/args/env never reach the wire"}),
         json!({"name": "mcp.setEnabled", "params": {"backend": "string — claude only this round", "name": "string", "enabled": "boolean", "expectedVersion": "string — CAS from mcp.inventory", "cwd": "string? — project scope for the toggle, default the daemon cwd"}, "result": {"set": "boolean"}, "errors": "-32010 the entry changed since the snapshot (external edit); -32602 readonly backend (reason in the message) or parse-failed config (never written)"}),
-        json!({"name": "session.create", "params": {"backend": "string?", "cwd": "string?", "model": "string?", "mode": "string?", "mcpServers": "object?", "projectId": "string? — scopes the session: root becomes the cwd default, project defaults fill unset params", "persona": "string? — bot id from bot.list; the bot's SOUL/AGENTS block rides in front of every turn, bound for the session's life and restored on resume"}, "result": {"sessionId": "string", "backend": "string", "persona?": "string — the bound bot id, when one was given", "replayed": "number — replay-tagged session.event frames sent for missed history"}, "errors": "-32602 unknown persona id"}),
-        json!({"name": "session.resume", "params": {"sessionId": "string — or", "handle": "{provider, native_handle}", "cwd": "string?", "title": "string?"}, "result": {"sessionId": "string", "backend": "string", "replayed": "number"}}),
-        json!({"name": "session.list", "params": {"limit": "number?", "offset": "number?", "backend": "string?", "cwd": "string?", "tag": "string?", "projectId": "string?"}, "result": {"sessions": "array of {sessionId, createdAt, backend, title, cwd, tags}"}}),
+        json!({"name": "session.create", "params": {"backend": "string?", "cwd": "string?", "model": "string?", "mode": "string?", "mcpServers": "object?", "allowedTools": "string[]? — per-session tool allowlist for backends that enforce one at launch (claude: --allowedTools); non-string entries are dropped", "projectId": "string? — scopes the session: root becomes the cwd default, project defaults fill unset params", "persona": "string? — bot id from bot.list; the bot's SOUL/AGENTS block rides in front of every turn, bound for the session's life and restored on resume"}, "result": {"sessionId": "string", "backend": "string", "persona?": "string — the bound bot id, when one was given", "replayed": "number — replay-tagged session.event frames sent for missed history", "cursor": "number — the newest session event seq handed out so far; the next live frame continues from it (gaps → session.gap)"}, "errors": "-32602 unknown persona id"}),
+        json!({"name": "session.resume", "params": {"sessionId": "string? — resume a session damon already knows", "handle": "{provider, native_handle}? — import a native session that has no damon row yet", "cwd": "string?", "title": "string?"}, "result": {"sessionId": "string", "backend": "string", "replayed": "number", "cursor": "number"}, "errors": "-32602 sessionId or handle required; handle must be {provider, native_handle, metadata?}"}),
+        json!({"name": "session.list", "params": {"limit": "number?", "offset": "number?", "backend": "string?", "cwd": "string?", "tag": "string?", "projectId": "string?", "includeArchived": "boolean? — include archived rows, default false"}, "result": {"sessions": "array of {sessionId, createdAt, backend, title, cwd, tags, pinned, archived}"}}),
         json!({"name": "session.messages", "params": {"sessionId": "string", "limit": "number?", "offset": "number?"}, "result": {"messages": "array of {id, session_id, role, ts, data} — ts is unix ms, 0 when unknown"}}),
         json!({"name": "session.export", "params": {"sessionId": "string"}, "result": {"session": "{sessionId, createdAt, backend, title, tags, cwd}", "messages": "array of {id, role, ts, data}", "usage": "{contextUsed, contextSize, costUsd, turns}"}}),
         json!({"name": "session.import", "params": {"backend": "string", "cwd": "string?"}, "result": {"sessions": "array"}}),
@@ -4133,7 +3520,7 @@ pub fn rpc_methods() -> Vec<Value> {
         json!({"name": "session.rescan", "params": {}, "result": {"scanId": "string", "alreadyRunning": "boolean — true when a scan is in flight; its progress events go to the caller that started it", "report": "{scanned, reparsed, reused, archived, tombstoned, skippedBackends[]} — the finished sweep's summary; imported sessions appear in session.list and their handles resume like any native session"}, "errors": "best-effort: a failing backend is skipped (skippedBackends), never an abort; -32000 on store failure"}),
         json!({"name": "session.close", "params": {"sessionId": "string"}, "result": {"closed": "boolean — kills the live backend process, keeps the row/history; frees a max_sessions slot"}}),
         json!({"name": "session.restart", "params": {"sessionId": "string"}, "result": {"sessionId": "string", "backend": "string", "replayed": "number — kills the live backend (refuses with -32006 mid-turn) and reattaches through the persisted handle"}}),
-        json!({"name": "session.status", "params": {}, "result": {"sessions": "array of {sessionId, backend, busy, idleSecs} — live backend sessions only"}}),
+        json!({"name": "session.status", "params": {}, "result": {"sessions": "array of {sessionId, backend, busy, phase: idle|busy|awaiting_input, idleSecs, turnId?, pendingAsk?: {requestId, kind: permission|question|plan, label?, askedAtMs}} — live backend sessions only; busy is true while a turn is in flight or parked on an answer", "recovered": "array of {sessionId, backend, phase, sinceMs, turnId?} — sessions a previous daemon left mid-turn or awaiting an answer, converged to idle at boot; resuming the session clears the row (kept 24h)"}}),
         json!({"name": "mission.create", "params": {"flowId?": "string — defaults to a fresh uuid", "name?": "string", "definition": "{nodes: [{id, kind: input|agent|human|output, title?, prompt?, value?, backend?, cwd?, readOnly?, allowedTools?, artifact?}], edges: [{from, to, condition? — key=value | key!=value, and over or, missing key ⇒ false; absent = default edge taken only when nothing else matched}], settings?: {concurrency? default 4, retries? default 0}}"}, "result": {"flowId": "string", "version": "number — re-creating a flowId inserts the next version; runs keep their snapshot"}, "errors": "-32602 invalid definition (unknown node kind, missing prompt/backend/value, root rule)"}),
         json!({"name": "mission.start", "params": {"flowId": "string"}, "result": {"runId": "string", "version": "number"}, "errors": "-32602 unknown flow; -32003 backend not registered; -32002 read-only agent node refused — the backend cannot enforce a tool allowlist (never downgraded)"}),
         json!({"name": "mission.cancel", "params": {"runId": "string"}, "result": {"runId": "string", "cancelled": "boolean — false when the run is not live"}, "errors": ""}),
@@ -4156,12 +3543,12 @@ pub fn rpc_methods() -> Vec<Value> {
         json!({"name": "session.set_tags", "params": {"sessionId": "string", "tags": "string[] — replaces the whole list"}, "result": {"updated": "boolean"}}),
         json!({"name": "session.rename", "params": {"sessionId": "string", "title": "string"}, "result": {"renamed": "boolean"}}),
         json!({"name": "session.fork", "params": {"sessionId": "string", "upto": "number?"}, "result": {"sessionId": "string — copies messages, tags, usage history, and the backend resume handle; title suffixed \" (fork)\""}}),
-        json!({"name": "session.usage", "params": {"sessionId": "string?", "daily": "boolean? — global view only", "days": "number? — daily window in days, default 7"}, "result": {"daily": "array of {date, turns, costUsd, contextUsed} when daily, else per-session/per-model totals"}}),
+        json!({"name": "session.usage", "params": {"sessionId": "string?", "daily": "boolean? — global view only", "days": "number? — daily window in days, default 7", "projectId": "string? — per-model view only: totals for one project"}, "result": {"daily": "array of {date, turns, costUsd, contextUsed} when daily, else per-session/per-model totals"}}),
         json!({"name": "session.search", "params": {"query": "string", "limit": "number?", "sessionId": "string?", "backend": "string?", "cwd": "string?", "projectId": "string?", "since": "string? — RFC3339 or YYYY-MM-DD", "until": "string?"}, "result": {"results": "array of {sessionId, messageId, snippet}"}}),
         json!({"name": "usage.summary", "params": {"days": "number? — window in local days, today inclusive, default 7", "tzOffsetMinutes": "number? — caller's UTC offset shifting the day buckets, default 0 (UTC)"}, "result": {"days": "number", "rows": "array of {date, backend, model, turns, contextUsed, contextSize, costUsd} — one per local day × backend × model; context columns sum the per-turn snapshots", "total": "{turns, contextUsed, contextSize, costUsd}"}}),
         json!({"name": "usage.clear", "params": {}, "result": {"cleared": "boolean — every usage row deleted; sessions and messages untouched"}}),
-        json!({"name": "turn.start", "params": {"sessionId": "string", "prompt": "string|array", "timeoutSecs": "number?", "detach": "boolean? — true resolves immediately {turnId, detached:true} and the turn outlives the connection (not cancelled on disconnect); turn.cancel/timeoutSecs still apply", "memoryOwner": "string? — with [memory] enabled, this bot ledger's ACTIVE entries join the user ledger in the injected <memory> block; the persisted user message keeps the clean prompt"}, "result": {"turnId": "string", "stopReason": "string", "usage": "object?"}}),
-        json!({"name": "turn.steer", "params": {"sessionId": "string", "prompt": "string|array"}, "result": {"result": "string"}}),
+        json!({"name": "turn.start", "params": {"sessionId": "string", "prompt": "string|array", "timeoutSecs": "number?", "detach": "boolean? — true resolves immediately {turnId, detached:true} and the turn outlives the connection (not cancelled on disconnect); turn.cancel/timeoutSecs still apply", "idempotencyKey": "string? — Keyed retry: the same key replays the first attempt's result (marked duplicate:true) instead of starting a second turn; while the first is still running the reply is {duplicate:true, inProgress:true} and the connection is subscribed to that turn", "memoryOwner": "string? — with [memory] enabled, this bot ledger's ACTIVE entries join the user ledger in the injected <memory> block; the persisted user message keeps the clean prompt"}, "result": {"turnId": "string", "stopReason": "string", "usage": "object?"}}),
+        json!({"name": "turn.steer", "params": {"sessionId": "string", "prompt": "string|array", "expectedTurn": "string? — a turn id restricts the steer to that turn; absent steers whatever turn is live", "idempotencyKey": "string? — same Keyed rule as turn.start (a repeat replays the first delivery)"}, "result": {"result": "string"}}),
         json!({"name": "turn.cancel", "params": {"sessionId": "string"}, "result": {"cancelled": "boolean"}}),
         json!({"name": "permission.respond", "params": {"sessionId": "string", "requestId": "string", "response": "{behavior: allow|deny, action_id?, updated_input?, answer?, answers?{question → label|[labels]}} — for kind:question asks an answers map submits picks, an allow without answers skips"}, "result": {}, "errors": "-32008 requestId is not a pending ask (answered, withdrawn, or turn ended); delivery failures leave it answerable"}),
         json!({"name": "plan.list", "params": {"sessionId": "string"}, "result": {"plans": "array of {planId, sessionId, requestId, revision, title, content, contentHash, complete, status, decision?, decisionIntentAt?, appliedAt?, createdAt, updatedAt, supersededBy?} — every revision, chain-ordered"}}),

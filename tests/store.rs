@@ -1501,7 +1501,7 @@ async fn v3_migration_reindexes_array_content_rows() {
             .unwrap()
     };
     assert_eq!(
-        v, 10,
+        v, 11,
         "migrations stamp user_version through the current one"
     );
 }
@@ -1791,7 +1791,7 @@ async fn v4_migration_rebuilds_fts_with_trigram_tokenizer() {
             .unwrap()
     };
     assert_eq!(
-        v, 10,
+        v, 11,
         "migrations stamp user_version through the current one"
     );
     let _ = std::fs::remove_file(&path);
@@ -1906,13 +1906,23 @@ async fn usage_aggregate_tz_offset_shifts_day_buckets() {
     );
     {
         let c = rusqlite::Connection::open(&path).unwrap();
+        // Expectations are derived from the rows' own UTC stamps, not from
+        // 'now': between 00:00 and 03:00 UTC the -180-minute shift is still
+        // on yesterday's date, so 'now'-based expectations land a day behind
+        // the rows and the test fails on the hour, not on the code.
         let yesterday: String = c
-            .query_row("SELECT date('now', '-180 minutes', '-1 day')", [], |r| {
-                r.get(0)
-            })
+            .query_row(
+                "SELECT date(strftime('%Y-%m-%d', 'now') || ' 01:00:00', '-180 minutes')",
+                [],
+                |r| r.get(0),
+            )
             .unwrap();
         let today: String = c
-            .query_row("SELECT date('now', '-180 minutes')", [], |r| r.get(0))
+            .query_row(
+                "SELECT date(strftime('%Y-%m-%d', 'now') || ' 12:00:00', '-180 minutes')",
+                [],
+                |r| r.get(0),
+            )
             .unwrap();
         // Ordered by date: yesterday's 01:00-UTC row first.
         assert_eq!(shifted.rows[0].date, yesterday);
@@ -2367,4 +2377,54 @@ async fn device_rows_gate_on_approval_and_revoke_immediately() {
     let id = store.create_device("  ", &hash).await.unwrap();
     assert_eq!(store.devices().await.unwrap()[0].name, "unnamed device");
     assert!(store.revoke_device(&id).await.unwrap());
+}
+
+/// The turn ledger: a row per turn, settled when the turn ends, and
+/// boot recovery converging only the rows a dead daemon left open.
+#[tokio::test]
+async fn turn_ledger_records_and_recovers_interrupted_turns() {
+    let path = temp_db("turn-ledger");
+    let store = Store::open(&path).await.unwrap();
+    store
+        .create_session("s", "/tmp", Some("mock"))
+        .await
+        .unwrap();
+
+    // A turn that ended: settled with its stop reason.
+    store.begin_turn("s", "t1", "mock").await.unwrap();
+    store.finish_turn("s", "t1", "completed").await.unwrap();
+    let (status, ended) = store.turn_row("s", "t1").await.unwrap().unwrap();
+    assert_eq!(status, "completed");
+    assert!(ended.is_some(), "a settled turn carries ended_at");
+
+    // A turn still open — what a daemon killed mid-turn leaves behind.
+    store.begin_turn("s", "t2", "mock").await.unwrap();
+    let (status, ended) = store.turn_row("s", "t2").await.unwrap().unwrap();
+    assert_eq!(status, "running");
+    assert!(ended.is_none());
+
+    // Boot recovery converges ONLY the open row, and says which one.
+    let recovered = store.recover_interrupted_turns().await.unwrap();
+    assert_eq!(recovered, vec![("s".to_string(), "t2".to_string())]);
+    let (status, ended) = store.turn_row("s", "t2").await.unwrap().unwrap();
+    assert_eq!(status, "interrupted");
+    assert!(ended.is_some());
+    assert!(
+        store.recover_interrupted_turns().await.unwrap().is_empty(),
+        "recovery is idempotent — nothing is left open"
+    );
+
+    // A late settle never overwrites the interrupted verdict: the turn
+    // did not complete, and no client may be told that it did.
+    store.finish_turn("s", "t2", "completed").await.unwrap();
+    let (status, _) = store.turn_row("s", "t2").await.unwrap().unwrap();
+    assert_eq!(status, "interrupted");
+
+    // Deleting a session takes its ledger with it, so a later boot
+    // recovery cannot write a marker into a transcript that is gone.
+    store.delete_session("s").await.unwrap();
+    assert!(store.turn_row("s", "t1").await.unwrap().is_none());
+    assert!(store.turn_row("s", "t2").await.unwrap().is_none());
+
+    let _ = std::fs::remove_file(&path);
 }

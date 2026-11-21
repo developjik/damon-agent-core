@@ -1,5 +1,107 @@
 # Changelog
 
+## Unreleased
+
+### Changed — `session.*` request params are typed, and the schema is held to them
+
+- Every `session.*` handler deserializes into a per-method request struct
+  (`src/rpc/session.rs`) instead of indexing the raw `serde_json::Value`
+  — the first slice of the dispatch params refactor, cut along the
+  method-family boundary so the next families can follow the same shape.
+  Wire behavior is unchanged on purpose: the same `-32602` code and
+  message for a missing or ill-typed required param (`"sessionId
+  required"`, `"pinned must be a boolean"`, …), the same defaults, and
+  the same silently-ignored optional params.
+- Each struct declares a `Field` table (`src/rpc/params.rs`) that is both
+  its validation rule and its schema-catalog entry. A new test holds the
+  table to `rpc_methods()` (`hello` / `damond --print-rpc-schema`) in
+  both directions, so a handler reading a param the catalog never names —
+  or a catalog entry left behind by a removed field — fails the build.
+- The catalog caught up with what the handlers already read:
+  `session.create` advertises `allowedTools`, `session.list` advertises
+  `includeArchived` (the protocol doc already listed it), and
+  `session.usage` advertises `projectId` for the per-model view. The
+  `session.resume` params are now marked as the alternatives they are.
+  Additive — a request that worked before is answered the same way.
+
+### Changed — session state is pure data with a boot checkpoint
+
+- The session layer's mutable picture (phase, open turn, parked ask,
+  timestamps, handle, rollups) moved out of the runtime objects into
+  `src/state.rs`: plain serializable records with plain transitions, no
+  IO, no async, no process handles. `SessionManager` owns the processes
+  and journals and applies those transitions; `tests/state_boundary.rs`
+  fails the build gate if the pure module grows a runtime import. Every
+  transition is now unit-tested without spawning an agent CLI.
+- `session.status` rows carry `phase` (`idle` | `busy` |
+  `awaiting_input`), the backend's `turnId` while a turn runs, and
+  `pendingAsk {requestId, kind, label, askedAtMs}` while one is parked.
+  `busy` stays true for a parked turn: it is not reapable.
+- The live state is checkpointed to `sessions.state.json` next to the
+  store (atomic replace, private permissions). A daemon killed mid-turn
+  or mid-ask leaves its rows there; the next boot converges them to idle
+  with a `recovered` mark and returns them as `session.status.recovered`
+  — no ghost session is reported live, and no interruption is counted
+  twice. Resuming a session drops its row; rows age out after 24 h.
+- `hello` advertises `capabilities.sessionPhase`. Additive: the request
+  and response shapes of 0.8.0 (and `damon-chat-desk`) keep working.
+- Mission agent nodes now claim their session's turn too, so the idle
+  sweep cannot reap a session mid-node.
+
+### Added — delivery honesty: a session event cursor and explicit gaps
+
+- Every `session.event` frame now carries `seq`, a session-scoped
+  strictly-increasing cursor assigned once per event (replay and live
+  frames share the numbering). `session.create` / `session.resume` /
+  `session.watch` / `session.restart` return the current `cursor`.
+- The in-flight journal is the session's event fan-out, so replay and
+  live frames cannot disagree about what a client has seen.
+- **`session.snapshot_required`** — when the journal shed a turn
+  (2,048-event cap or a daemon-side lag), the connection is told to
+  resync from `session.messages` instead of being handed a partial turn
+  as the whole answer. This is the case the docs used to describe as
+  "not replayed", with nothing on the wire saying so.
+- **`session.gap`** — a connection whose send queue overflowed (or that
+  fell behind the fan-out) gets `{dropped, cursor}` before the next
+  frame it does receive, instead of silently losing events.
+- The web UI resyncs on `snapshot_required` and reports gaps; the
+  daemon's own `tracing` path is unchanged.
+
+### Added — retry contract: `idempotencyKey` on the Keyed requests
+
+- `turn.start` / `turn.steer` accept an optional `idempotencyKey`
+  (per session + method, remembered 24 h). A repeat while the first
+  attempt runs returns `{duplicate: true, inProgress: true}` and
+  subscribes the retrying connection to that turn; a repeat after it
+  settled replays the original result with `duplicate: true`; a failed
+  or canceled attempt releases its key so the client can retry for real.
+- Without a key nothing changes — 0.8.0 request shapes are untouched.
+
+### Added — version negotiation and a capability set on `hello`
+
+- `hello` accepts `{protocolVersion, client}` and refuses a version it
+  does not speak with typed `-32012` + `error.data.{requested,
+  supported[]}` (ACP v2's shape). A param-less `hello` — the shape
+  every shipped client sends — keeps working exactly as before, which
+  is why this is additive rather than a protocol bump.
+- `hello` (call **and** connect-time push) now reports `minProtocol`,
+  `supported[]`, and `capabilities` (`eventSeq`, `snapshotRequired`,
+  `connGap`, `idempotentTurns`, `turnLedger`, `versionNegotiation`), so
+  a client feature-detects instead of parsing the daemon version.
+
+### Added — turn ledger and crash convergence
+
+- New `turns` table (schema v11): a row per turn, opened once the
+  backend accepts the prompt and settled with its stop reason. The
+  prompt was already persisted up front; the ledger is what makes the
+  TURN durable.
+- Boot recovery converges rows a dead daemon left open to `interrupted`
+  and appends an `error` marker to the transcript, so a reopened
+  session shows that the answer was cut short instead of a prompt with
+  no reply and no explanation — the same discipline the mission runner
+  already applies to its runs. `delete_session` / the retention sweep
+  take the ledger rows with the session.
+
 ## 0.8.0 — 2026-10-24
 
 ### Added — persistent memory ledgers (design ported from desktop-cc-gui's memory system, MIT)
