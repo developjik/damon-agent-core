@@ -94,7 +94,7 @@ agent CLI subprocess (stream-json / NDJSON / HTTP+SSE)
 | `src/backend/droid.rs` | Droid (Factory, stream-jsonrpc) | `DroidClient` |
 | `src/backend/zcode.rs` | ZCode app-server (Z.ai 프로토콜 v1) | `ZcodeClient` |
 | `src/backend/omp.rs` | Oh My Pi rpc-mode + Pi 패밀리 프로파일 | `OmpClient`, `OmpClient::with_profile`, `PI` |
-| `src/backend/opencode.rs` | OpenCode/MiMo HTTP+SSE 클라이언트 | `OpencodeClient::new(resolved, "opencode"|"mimo")` |
+| `src/backend/opencode.rs` | OpenCode/MiMo HTTP+SSE 클라이언트 | `OpencodeClient::new(resolved, "opencode"\|"mimo")` |
 | `src/backend/opencode_server.rs` | `opencode serve` 수명주기 — probe→adopt→spawn | `OpencodeServer` |
 | `src/channel.rs` | 채널 브릿지: 채널 채팅 ↔ damon 세션 매핑, 권한 프롬프트, 큐잉 | `Bridge`, `ChannelApi`, `Incoming`, `Attachment` |
 | `src/telegram.rs` | Telegram 어댑터 (Bot API long-poll) | `ChannelApi` 구현 |
