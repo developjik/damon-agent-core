@@ -79,6 +79,7 @@ Chat in the bundled web UI: `http://127.0.0.1:9470/ui` — sessions, streaming, 
 ```
 
 See [docs/protocol-v2.md](docs/protocol-v2.md) for the wire protocol and [docs/integration.md](docs/integration.md) for copy-paste Node/Python/Rust clients.
+For the full module map and the reasoning behind the key choices — why Rust, a resident daemon, SQLite FTS5, and nine per-CLI protocol adapters — see [ARCHITECTURE.md](ARCHITECTURE.md) and the [ADRs](docs/adr).
 
 ## Configuration
 
