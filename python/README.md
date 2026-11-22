@@ -10,8 +10,9 @@ a thin client. Same API shape as the Node (`damon-agent`) and Rust
 (`damon::client`) SDKs.
 
 - Docs, config reference, protocol: <https://github.com/developjik/damon-agent-core>
-- Install: `pip install damon-agent` (Python ≥ 3.11, single runtime
-  dependency: `websockets`)
+- Install: `pip install -e python` from the repository root (Python ≥
+  3.11, single runtime dependency: `websockets`) — the package is not on
+  PyPI yet
 
 ```python
 import asyncio

@@ -51,7 +51,9 @@ which updates:
 
 - `Cargo.toml` → `version`
 - `npm/package.json` → `version` (install.js builds the tarball URL from it)
-- `Formula/damon.rb` → `version` + download URLs
+- `python/pyproject.toml` → `version` and `python/src/damon_agent/__init__.py` → `__version__`
+
+The Homebrew formula is no longer bumped here — see §5.
 
 ## 4. Push the tag
 
@@ -59,15 +61,25 @@ which updates:
 git tag v0.1.0 && git push origin v0.1.0
 ```
 
-## 5. Homebrew tap (separate step)
+## 5. Homebrew tap (automated)
 
-1. Create the `developjik/homebrew-tap` repository
-2. Copy `Formula/damon.rb` into the tap's `Formula/` directory
-3. After the release, replace each tarball's sha256 with the real value:
-   ```sh
-   curl -fsSL https://github.com/developjik/damon-agent-core/releases/download/v0.1.0/damon-aarch64-apple-darwin.tar.gz | shasum -a 256
-   ```
-4. Install: `brew install developjik/tap/damon`
+The formula lives in [`developjik/homebrew-tap`](https://github.com/developjik/homebrew-tap)
+(`Formula/damon.rb`) — not in this repository. Nothing in it is
+hardcoded: `scripts/update-tap-formula.sh` regenerates it from the
+published release tarballs, computing each sha256 and cross-checking it
+against the CI-uploaded `.sha256` sidecars.
+
+- The tag CI run renders `damon.rb` and attaches it to the release, and
+  pushes it to the tap automatically when a `HOMEBREW_TAP_TOKEN` secret
+  (PAT with write access to the tap repo) is registered — `GITHUB_TOKEN`
+  cannot push cross-repo.
+- Without that secret, run once the release assets are up:
+
+  ```sh
+  scripts/update-tap-formula.sh v0.1.0
+  ```
+
+Install: `brew install developjik/tap/damon`
 
 ## 6. Release signing (SHA256SUMS + minisign)
 
@@ -98,6 +110,18 @@ rsign generate -s minisign.key -p damon-minisign.pub -W   # -W: passwordless
 scripts/verify-release.sh v0.4.0                 # checksums + signature when present
 scripts/verify-release.sh v0.4.0 --require-signature    # CI mode: unsigned = fail
 (pass an assets dir as the only other argument to re-verify a download)
+
+## 7. Verify every install path
+
+After the release is out, confirm all four install paths serve the new
+version:
+
+```sh
+scripts/check-install-paths.sh 0.1.0
+```
+
+which probes npm (`damon-agent`), crates.io (`damon-core`), the Homebrew
+tap formula, and a real `pip install -e python` into a throwaway venv.
 
 
 

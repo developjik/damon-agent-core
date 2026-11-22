@@ -39,6 +39,7 @@ If you already subscribe to an agent CLI, **there is nothing to configure**. Dam
 npm install -g damon-agent        # npm (prebuilt binaries)
 cargo install damon-core          # crates.io
 brew install developjik/tap/damon # Homebrew tap
+pip install -e python             # Python client (from source)
 ```
 
 Or platform tarballs from [GitHub Releases](https://github.com/developjik/damon-agent-core/releases) — macOS (arm64/x86_64), Linux, Windows.
@@ -291,7 +292,7 @@ Each chat maps to its own agent session, replies stream as rendered markdown, an
 - [docs/release.md](docs/release.md) ([ko](docs/release.ko.md)) — release checklist
 - [config.example.toml](config.example.toml) — every option, commented
 - `import { DamonClient } from "damon-agent"` — dependency-free Node client in the npm package
-- `pip install damon-agent` — asyncio Python client ([python/](python))
+- `pip install -e python` — asyncio Python client, installed from source ([python/](python))
 
 ## Contributing
 

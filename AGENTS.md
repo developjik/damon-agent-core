@@ -93,7 +93,7 @@ Linux dev needs `libdbus-1-dev pkg-config`. All six binaries get a `--help` smok
 - **Rust 1.95** (edition 2024), pinned via `rust-toolchain.toml` with rustfmt + clippy; bumping MSRV means updating `rust-toolchain.toml` in the same commit.
 - **Node ≥ 22** for `npm/` (relies on global `WebSocket`; zero runtime deps; `postinstall` downloads release binaries — don't add build steps).
 - **Python ≥ 3.11** for `python/` (uv-managed `uv.lock`; sole runtime dep `websockets`; dev extra via `pip install -e 'python[dev]'`).
-- **Version bumping**: never hand-edit versions — run `scripts/set-version.sh <semver>`; it syncs Cargo.toml, npm/package.json, Formula/damon.rb, pyproject.toml, and `__init__.py`. Release CI verifies tag == all package versions.
+- **Version bumping**: never hand-edit versions — run `scripts/set-version.sh <semver>`; it syncs Cargo.toml, npm/package.json, pyproject.toml, and `__init__.py`. Release CI verifies tag == all package versions. The Homebrew formula lives in `developjik/homebrew-tap`, regenerated per release by `scripts/update-tap-formula.sh`.
 - **Docs are EN/KO pairs** (`README.md`/`README.ko.md`, `docs/*.md`/`*.ko.md`): user-facing doc changes should update both sides.
 
 ## Testing & QA

@@ -9,7 +9,8 @@
 | GitHub Releases tarball | CI 태그 빌드로 생성됨 (4개 타겟) |
 | `npm install -g damon-agent` | CI가 태그 푸시 시 publish; postinstall이 릴리스 tarball 다운로드 |
 | `cargo install damon-core` | CI가 태그 푸시 시 crates.io publish |
-| `brew install developjik/tap/damon` | tap 리포지토리 필요 — 아래 참조 |
+| `brew install developjik/tap/damon` | formula는 [`developjik/homebrew-tap`](https://github.com/developjik/homebrew-tap)에 있고, 릴리스마다 tarball에서 재생성됨 |
+| `pip install -e python` | Python 클라이언트, 소스 설치 — PyPI 미등록 |
 
 
 ## 바이너리
@@ -40,13 +41,21 @@ cargo install damon-core
 
 ## Homebrew
 
-tap 리포지토리(`developjik/homebrew-tap`)가 생성되면:
-
 ```sh
 brew install developjik/tap/damon
 ```
 
-formula는 이 리포지토리의 `Formula/damon.rb` — 릴리스마다 `sha256`을 갱신해야 함.
+formula는 tap 리포지토리([`developjik/homebrew-tap`](https://github.com/developjik/homebrew-tap)의
+`Formula/damon.rb`)에 있다. 릴리스마다 `scripts/update-tap-formula.sh`가
+발행된 tarball에서 sha256을 계산해 재생성한다.
+
+## Python 클라이언트
+
+```sh
+pip install -e python
+```
+
+리포지토리 루트에서 실행. Python ≥ 3.11; PyPI에는 등록되어 있지 않다.
 
 ## 상주 서비스 등록
 

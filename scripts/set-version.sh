@@ -1,6 +1,8 @@
 #!/usr/bin/env bash
 # Sync the release version across Cargo.toml, npm/package.json,
-# Formula/damon.rb, and the python package. Usage: scripts/set-version.sh 0.2.0
+# and the python package. Usage: scripts/set-version.sh 0.2.0
+# (The Homebrew formula is not versioned here — it is regenerated per
+# release by scripts/update-tap-formula.sh from the published tarballs.)
 set -euo pipefail
 
 if [ $# -ne 1 ]; then
@@ -37,12 +39,6 @@ awk -v v="$VERSION" '
 awk -v v="$VERSION" '!done && /"version":/ { sub(/"version": "[^"]*"/, "\"version\": \"" v "\""); done=1 } { print }' \
   "$ROOT/npm/package.json" > "$ROOT/npm/package.json.tmp" && mv "$ROOT/npm/package.json.tmp" "$ROOT/npm/package.json"
 
-# Formula/damon.rb — version line + the v<ver> in both download URLs.
-sed_i \
-  -e "s/^  version \".*\"/  version \"$VERSION\"/" \
-  -e "s|/releases/download/v[0-9][0-9A-Za-z.-]*/|/releases/download/v$VERSION/|g" \
-  "$ROOT/Formula/damon.rb"
-
 # python/pyproject.toml — top-level `version = "…"` in [project]
 # (the only line in the file starting with `version =`).
 sed_i "s/^version = \".*\"/version = \"$VERSION\"/" "$ROOT/python/pyproject.toml"
@@ -51,5 +47,5 @@ sed_i "s/^version = \".*\"/version = \"$VERSION\"/" "$ROOT/python/pyproject.toml
 sed_i "s/^__version__ = \".*\"/__version__ = \"$VERSION\"/" "$ROOT/python/src/damon_agent/__init__.py"
 
 echo "version set to $VERSION in:"
-echo "  Cargo.toml, npm/package.json, Formula/damon.rb, python/pyproject.toml, python/src/damon_agent/__init__.py"
-echo "note: the ci.yml release job rewrites Formula sha256 from the published tarballs"
+echo "  Cargo.toml, npm/package.json, python/pyproject.toml, python/src/damon_agent/__init__.py"
+echo "note: after the tag's release is published, scripts/update-tap-formula.sh regenerates the Homebrew formula in the tap repo"

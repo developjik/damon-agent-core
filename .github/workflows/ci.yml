@@ -120,9 +120,9 @@ jobs:
           tag="${GITHUB_REF_NAME#v}"
           cargo_v=$(grep -m1 '^version = ' Cargo.toml | cut -d'"' -f2)
           npm_v=$(node -p "require('./npm/package.json').version" 2>/dev/null || grep -m1 '"version"' npm/package.json | cut -d'"' -f4)
-          formula_v=$(grep -m1 '^  version ' Formula/damon.rb | cut -d'"' -f2)
-          echo "tag=$tag cargo=$cargo_v npm=$npm_v formula=$formula_v"
-          [ "$tag" = "$cargo_v" ] && [ "$tag" = "$npm_v" ] && [ "$tag" = "$formula_v" ] || {
+          py_v=$(grep -m1 '^version = ' python/pyproject.toml | cut -d'"' -f2)
+          echo "tag=$tag cargo=$cargo_v npm=$npm_v python=$py_v"
+          [ "$tag" = "$cargo_v" ] && [ "$tag" = "$npm_v" ] && [ "$tag" = "$py_v" ] || {
             echo "tag v$tag does not match manifest versions" >&2; exit 1;
           }
       - uses: dtolnay/rust-toolchain@46817827a5bfabe028bf34e1cce71fd40e2ff697 # 1.95.0
@@ -150,70 +150,31 @@ jobs:
       - uses: softprops/action-gh-release@3bb12739c298aeb8a4eeaf626c5b8d85266b0e65 # v2
         with:
           files: damon-*.tar.gz*
-      - name: Update Formula sha256
-        # One leg only: rewrite Formula/damon.rb from the published tarballs
-        # and push to the default branch. Fails loudly if the tag commit is
-        # not the branch head (non-fast-forward push).
+      - name: Homebrew formula — generate, publish asset, sync tap
+        # One leg only: scripts/update-tap-formula.sh downloads every
+        # published tarball, computes each sha256, and cross-checks it
+        # against the uploaded .sha256 sidecar (fails loudly on mismatch).
+        # The rendered formula ships as a release asset (damon.rb) so it is
+        # inspectable; with HOMEBREW_TAP_TOKEN registered it is also pushed
+        # to the tap repo — github.token cannot push cross-repo, so without
+        # that PAT the run prints the manual command instead.
         if: matrix.target == 'x86_64-unknown-linux-gnu'
         shell: bash
         env:
-          DEFAULT_BRANCH: ${{ github.event.repository.default_branch }}
-          MINISIGN_SECRET_KEY: ${{ secrets.MINISIGN_SECRET_KEY }}
+          HOMEBREW_TAP_TOKEN: ${{ secrets.HOMEBREW_TAP_TOKEN }}
           GH_TOKEN: ${{ github.token }}
         run: |
           tag="${GITHUB_REF_NAME}"
-          version="${tag#v}"
-          base="https://github.com/${{ github.repository }}/releases/download/${GITHUB_REF_NAME}"
-
-          targets="aarch64-apple-darwin x86_64-apple-darwin x86_64-unknown-linux-gnu aarch64-unknown-linux-gnu"
-          tmp="$(mktemp -d)"
-
-          sed -i "s/^  version \".*\"/  version \"$version\"/" Formula/damon.rb
-          for target in $targets; do
-            # The release legs run in PARALLEL — this leg's formula step
-            # needs every other leg's sidecar, and the slowest (windows)
-            # can upload minutes later. Wait up to ~10 minutes per asset:
-            # curl retries (10s apart, 600s budget) cover both the upload
-            # race and the stale-CDN case below.
-            curl --proto '=https' --tlsv1.2 --retry 60 --retry-delay 10 --retry-max-time 600 --retry-all-errors -fsSL "$base/damon-$target.tar.gz.sha256" -o "$tmp/$target.published"
-            for attempt in 1 2 3 4 5; do
-              curl --proto '=https' --tlsv1.2 --retry 60 --retry-delay 10 --retry-max-time 600 --retry-all-errors -fsSL "$base/damon-$target.tar.gz" -o "$tmp/$target.tar.gz"
-              computed="$(sha256sum "$tmp/$target.tar.gz" | cut -d' ' -f1)"
-              published="$(cut -d' ' -f1 < "$tmp/$target.published")"
-              [ "$computed" = "$published" ] && break
-              echo "sha256 mismatch for $target (attempt $attempt): CDN served a stale asset, retrying" >&2
-              sleep 20
-            done
-            [ "$computed" = "$published" ] || {
-              echo "computed $computed != published $published for $target after 5 attempts" >&2; exit 1;
-            }
-            echo "$computed" > "$tmp/$target.sha256"
-          done
-          for target in $targets; do
-            awk -v t="$target" -v s="$(cat "$tmp/$target.sha256")" '
-              index($0, "damon-" t ".tar.gz") { url=1 }
-              url && /^ *sha256 / { sub(/"[0-9a-fA-F]*"/, "\"" s "\""); url=0 }
-              { print }
-            ' Formula/damon.rb > Formula/damon.rb.tmp && mv Formula/damon.rb.tmp Formula/damon.rb
-          done
-          for target in $targets; do
-            grep -q "sha256 \"$(cat "$tmp/$target.sha256")\"" Formula/damon.rb || {
-              echo "sha256 for $target not updated in Formula/damon.rb" >&2; exit 1;
-            }
-          done
-
-          git config user.name "github-actions[bot]"
-          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
-          git add Formula/damon.rb
-          if git diff --cached --quiet; then
-            echo "Formula already up to date for ${tag}"
+          scripts/update-tap-formula.sh "$tag" --out damon.rb --no-push
+          gh release upload "$tag" damon.rb --clobber
+          if [ -n "$HOMEBREW_TAP_TOKEN" ]; then
+            GH_TOKEN="$HOMEBREW_TAP_TOKEN" scripts/update-tap-formula.sh "$tag"
           else
-            git commit -m "chore(formula): sha256 for ${tag}"
-            git push origin "HEAD:${DEFAULT_BRANCH:-main}"
+            echo "::notice::HOMEBREW_TAP_TOKEN is not registered — run 'scripts/update-tap-formula.sh $tag' to sync the Homebrew tap (see docs/release.md)"
           fi
 
-      # Runs on the same leg as the Formula pass, which already
-      # verified every tarball against its build-computed .sha256 —
+      # Runs on the same leg as the formula pass, which already
+      # verified every tarball against its uploaded .sha256 sidecar —
       # the manifest is assembled from those verified hashes. With
       # MINISIGN_SECRET_KEY registered (minisign/rsign secret key,
       # passwordless — see docs/release.md) the manifest is signed

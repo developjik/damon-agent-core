@@ -9,7 +9,8 @@
 | GitHub Releases tarball | Built by CI on tag push (4 targets) |
 | `npm install -g damon-agent` | CI publishes on tag push; postinstall downloads the release tarball |
 | `cargo install damon-core` | CI publishes to crates.io on tag push |
-| `brew install developjik/tap/damon` | Requires the tap repository — see below |
+| `brew install developjik/tap/damon` | Formula lives in [`developjik/homebrew-tap`](https://github.com/developjik/homebrew-tap), regenerated from the release tarballs on each release |
+| `pip install -e python` | Python client, from source — not on PyPI |
 
 ## Binaries
 
@@ -39,14 +40,23 @@ cargo install damon-core
 
 ## Homebrew
 
-Once the tap repository (`developjik/homebrew-tap`) exists:
-
 ```sh
 brew install developjik/tap/damon
 ```
 
-The formula lives in this repository at `Formula/damon.rb` — its `sha256`
-must be updated on each release.
+The formula lives in the tap repository
+([`developjik/homebrew-tap`](https://github.com/developjik/homebrew-tap),
+`Formula/damon.rb`). It is regenerated on each release by
+`scripts/update-tap-formula.sh`, which computes the sha256 values from
+the published release tarballs.
+
+## Python client
+
+```sh
+pip install -e python
+```
+
+Run from the repository root. Python ≥ 3.11; the package is not on PyPI.
 
 ## Running as a resident service
 

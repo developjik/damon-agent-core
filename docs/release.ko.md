@@ -45,7 +45,9 @@ scripts/set-version.sh 0.1.0
 
 - `Cargo.toml` → `version`
 - `npm/package.json` → `version` (install.js가 이 값으로 tarball URL 생성)
-- `Formula/damon.rb` → `version` + 다운로드 URL
+- `python/pyproject.toml` → `version` 및 `python/src/damon_agent/__init__.py` → `__version__`
+
+Homebrew formula는 여기서 올리지 않는다 — §5 참조.
 
 ## 4. 태그 푸시
 
@@ -53,15 +55,23 @@ scripts/set-version.sh 0.1.0
 git tag v0.1.0 && git push origin v0.1.0
 ```
 
-## 5. Homebrew tap (별도 작업)
+## 5. Homebrew tap (자동화됨)
 
-1. `developjik/homebrew-tap` 리포 생성
-2. `Formula/damon.rb`를 tap 리포 `Formula/`로 복사
-3. 릴리스 후 각 tarball의 실제 sha256으로 교체:
-   ```sh
-   curl -fsSL https://github.com/developjik/damon-agent-core/releases/download/v0.1.0/damon-aarch64-apple-darwin.tar.gz | shasum -a 256
-   ```
-4. 설치: `brew install developjik/tap/damon`
+formula는 tap 리포지토리([`developjik/homebrew-tap`](https://github.com/developjik/homebrew-tap)의
+`Formula/damon.rb`)에 있고 이 리포지토리에는 없다. 하드코딩된 값은 없다:
+`scripts/update-tap-formula.sh`가 발행된 tarball에서 sha256을 직접 계산하고
+CI가 올린 `.sha256` 사이드카와 대조해 formula를 재생성한다.
+
+- 태그 CI 실행이 `damon.rb`를 만들어 릴리스 자산으로 붙이고, tap 리포에
+  쓰기 권한이 있는 PAT(`HOMEBREW_TAP_TOKEN` 시크릿)가 등록되어 있으면
+  tap까지 자동 push한다 — `GITHUB_TOKEN`은 리포를 넘어 push할 수 없다.
+- 시크릿이 없으면 릴리스 자산이 올라간 뒤 한 번 실행:
+
+  ```sh
+  scripts/update-tap-formula.sh v0.1.0
+  ```
+
+설치: `brew install developjik/tap/damon`
 
 ## 6. 릴리스 서명 (SHA256SUMS + minisign)
 
@@ -90,6 +100,17 @@ rsign generate -s minisign.key -p damon-minisign.pub -W   # -W: 비밀번호 없
 scripts/verify-release.sh v0.4.0                 # 체크섬 + 서명(있으면)
 scripts/verify-release.sh v0.4.0 --require-signature    # CI 모드: 미서명 = 실패
 (에셋 디렉터리를 인자로 주면 기존 다운로드를 재검증)
+
+## 7. 모든 설치 경로 검증
+
+릴리스가 나가면 네 가지 설치 경로가 새 버전을 서빙하는지 확인한다:
+
+```sh
+scripts/check-install-paths.sh 0.1.0
+```
+
+npm(`damon-agent`), crates.io(`damon-core`), Homebrew tap formula,
+그리고 버려지는 venv에 대한 실제 `pip install -e python`을 각각 프로브한다.
 
 ## 알려진 갭 (배포 전 결정 필요)
 

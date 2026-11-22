@@ -39,6 +39,7 @@ Damon은 Rust로 만든 로컬 에이전트 컨트롤 데몬이다. 아홉 코�
 npm install -g damon-agent        # npm (프리빌트 바이너리)
 cargo install damon-core          # crates.io
 brew install developjik/tap/damon # Homebrew tap
+pip install -e python             # Python 클라이언트 (소스 설치)
 ```
 
 또는 [GitHub Releases](https://github.com/developjik/damon-agent-core/releases)에서 플랫폼별 tarball — macOS(arm64/x86_64), Linux, Windows.
@@ -290,7 +291,7 @@ damon-slack    --app-token xapp-… --bot-token xoxb-…
 - [docs/release.ko.md](docs/release.ko.md) ([en](docs/release.md)) — 릴리스 체크리스트
 - [config.example.toml](config.example.toml) — 모든 옵션 주석 포함
 - `import { DamonClient } from "damon-agent"` — npm 패키지에 포함된 무의존성 Node 클라이언트
-- `pip install damon-agent` — asyncio Python 클라이언트 ([python/](python))
+- `pip install -e python` — asyncio Python 클라이언트, 소스에서 설치 ([python/](python))
 
 ## 기여
 
