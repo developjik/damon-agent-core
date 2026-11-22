@@ -1,6 +1,6 @@
 # Changelog
 
-## Unreleased
+## 0.9.0 — 2026-11-22
 
 ### Changed — `session.*` request params are typed, and the schema is held to them
 
