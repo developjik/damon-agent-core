@@ -26,6 +26,11 @@ pub fn mock_config(auth_token: Option<&str>) -> Config {
         tls_key: None,
         backends: Default::default(),
         default_backend: Some("mock".to_string()),
+        // Sandboxing off in tests: the in-process mock backend spawns no
+        // child, and the explicit `none` keeps every test's launch line
+        // independent of whether the CI host has bwrap installed.
+        sandbox: damon_core::sandbox::SandboxRequest::None,
+        sandbox_network: damon_core::sandbox::NetworkPolicy::Backend,
         relay: None,
         permission_timeout_secs: None,
         session_retention_days: None,

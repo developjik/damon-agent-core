@@ -12,6 +12,7 @@ use std::sync::Arc;
 
 use crate::backend::{AgentClient, claude, codex, droid, omp, opencode, qwen, zcode};
 use crate::config::AgentConfig;
+use crate::sandbox::{NetworkPolicy, SandboxDecision, SandboxRequest, SandboxSpec, SandboxSupport};
 
 /// One backend entry: how to detect it and how to launch a session.
 pub struct BackendSpec {
@@ -33,6 +34,15 @@ pub struct BackendSpec {
     /// Copy-paste update command for CLIs npm doesn't distribute.
     /// Empty string + `npm_package: None` = no known update path.
     pub manual_update: &'static str,
+    /// How the backend launches — the thing that decides whether a sandbox
+    /// driver has a per-session child to wrap. Serve-mode backends are
+    /// `unsupported`, never silently `none` (see `sandbox::decide`).
+    pub sandbox_support: SandboxSupport,
+    /// Egress this backend needs when the user leaves
+    /// `sandbox_network = "backend"`. Every spawn-mode agent CLI talks to
+    /// its model API, so denying it here would leave a CLI that cannot
+    /// think; one-off command confinement opts into `deny` instead.
+    pub sandbox_network: NetworkPolicy,
 }
 
 pub const BACKENDS: &[BackendSpec] = &[
@@ -53,6 +63,8 @@ pub const BACKENDS: &[BackendSpec] = &[
         auth_hint: "log in with `claude` once; the subscription follows",
         npm_package: Some("@anthropic-ai/claude-code"),
         manual_update: "",
+        sandbox_support: SandboxSupport::Spawn,
+        sandbox_network: NetworkPolicy::Allow,
     },
     BackendSpec {
         id: "codex",
@@ -69,6 +81,8 @@ pub const BACKENDS: &[BackendSpec] = &[
         auth_hint: "log in with `codex` once; the subscription follows",
         npm_package: Some("@openai/codex"),
         manual_update: "",
+        sandbox_support: SandboxSupport::Spawn,
+        sandbox_network: NetworkPolicy::Allow,
     },
     BackendSpec {
         id: "omp",
@@ -80,6 +94,8 @@ pub const BACKENDS: &[BackendSpec] = &[
         auth_hint: "configure `omp` once; its provider auth follows",
         npm_package: Some("@oh-my-pi/pi-coding-agent"),
         manual_update: "",
+        sandbox_support: SandboxSupport::Spawn,
+        sandbox_network: NetworkPolicy::Allow,
     },
     BackendSpec {
         id: "pi",
@@ -95,6 +111,8 @@ pub const BACKENDS: &[BackendSpec] = &[
         auth_hint: "configure `pi` with a provider API key; auth follows the CLI",
         npm_package: Some("@earendil-works/pi-coding-agent"),
         manual_update: "",
+        sandbox_support: SandboxSupport::Spawn,
+        sandbox_network: NetworkPolicy::Allow,
     },
     BackendSpec {
         id: "qwen",
@@ -117,6 +135,8 @@ pub const BACKENDS: &[BackendSpec] = &[
         auth_hint: "log in with `qwen` (qwen-oauth) or configure an API key in its settings; auth follows the CLI",
         npm_package: Some("@qwen-code/qwen-code"),
         manual_update: "",
+        sandbox_support: SandboxSupport::Spawn,
+        sandbox_network: NetworkPolicy::Allow,
     },
     BackendSpec {
         id: "droid",
@@ -138,6 +158,8 @@ pub const BACKENDS: &[BackendSpec] = &[
         auth_hint: "log in with `droid` or set FACTORY_API_KEY; custom models live in ~/.factory/settings.json",
         npm_package: None,
         manual_update: "curl -fsSL https://app.factory.ai/cli | sh",
+        sandbox_support: SandboxSupport::Spawn,
+        sandbox_network: NetworkPolicy::Allow,
     },
     BackendSpec {
         id: "opencode",
@@ -152,6 +174,10 @@ pub const BACKENDS: &[BackendSpec] = &[
         auth_hint: "configure providers in opencode itself; Damon adopts or spawns `opencode serve`",
         npm_package: Some("opencode-ai"),
         manual_update: "",
+        // HTTP+SSE against a shared `opencode serve`: no per-session child
+        // to confine, so a sandbox request is refused rather than ignored.
+        sandbox_support: SandboxSupport::Serve,
+        sandbox_network: NetworkPolicy::Allow,
     },
     BackendSpec {
         id: "mimo",
@@ -165,6 +191,9 @@ pub const BACKENDS: &[BackendSpec] = &[
         auth_hint: "configure providers in mimo itself; Damon adopts or spawns `mimo serve`",
         npm_package: None,
         manual_update: "curl -fsSL https://mimo.xiaomi.com/install | bash",
+        // opencode's serve surface, and the same sandbox answer: unsupported.
+        sandbox_support: SandboxSupport::Serve,
+        sandbox_network: NetworkPolicy::Allow,
     },
     BackendSpec {
         id: "zcode",
@@ -181,6 +210,8 @@ pub const BACKENDS: &[BackendSpec] = &[
         auth_hint: "log in with `zcode` (GLM Coding Plan); auth follows the CLI",
         npm_package: None,
         manual_update: "",
+        sandbox_support: SandboxSupport::Spawn,
+        sandbox_network: NetworkPolicy::Allow,
     },
 ];
 
@@ -195,12 +226,24 @@ pub struct ResolvedBackend {
     pub auth_hint: String,
     /// Whether the detect binary was found on PATH at resolve time.
     pub detected: bool,
+    /// The sandbox declaration for this backend: its own `[backends.X]
+    /// sandbox`, else the top-level default.
+    pub sandbox: SandboxRequest,
+    /// Spawn vs serve — whether a driver has a child to wrap at all.
+    pub sandbox_support: SandboxSupport,
+    /// Egress inside the sandbox, with `backend` already resolved to the
+    /// catalog's declaration.
+    pub sandbox_network: NetworkPolicy,
 }
 
 /// Resolve catalog + config overrides into launch lines. Shared by boot
 /// and hot-reload so a reloaded config produces exactly the same backend
 /// set a restart would.
-pub fn resolve_backends(overrides: &BTreeMap<String, AgentConfig>) -> Vec<ResolvedBackend> {
+pub fn resolve_backends(
+    overrides: &BTreeMap<String, AgentConfig>,
+    default_sandbox: SandboxRequest,
+    default_network: NetworkPolicy,
+) -> Vec<ResolvedBackend> {
     BACKENDS
         .iter()
         .map(|spec| {
@@ -233,9 +276,68 @@ pub fn resolve_backends(overrides: &BTreeMap<String, AgentConfig>) -> Vec<Resolv
                 },
                 auth_hint: spec.auth_hint.to_string(),
                 detected: which(spec.detect).is_some(),
+                sandbox: o.and_then(|c| c.sandbox).unwrap_or(default_sandbox),
+                sandbox_support: spec.sandbox_support,
+                sandbox_network: match default_network {
+                    NetworkPolicy::Backend => spec.sandbox_network,
+                    explicit => explicit,
+                },
             }
         })
         .collect()
+}
+
+/// [`resolve_backends`] against a loaded config — the sandbox defaults ride
+/// with the launch lines, so every surface (boot, hot reload, `doctor`, the
+/// backend.* RPCs) resolves a backend exactly the same way.
+pub fn resolve_from_config(cfg: &crate::config::Config) -> Vec<ResolvedBackend> {
+    resolve_backends(&cfg.backends, cfg.sandbox, cfg.sandbox_network)
+}
+
+impl ResolvedBackend {
+    /// The isolation decision for one session on this backend.
+    ///
+    /// `Err` is the fail-loudly case: the user (per session, per backend, or
+    /// globally) asked for a driver this backend or host cannot honor. The
+    /// message names the cause and the choices — this is the spawn point's
+    /// chance to refuse before the agent CLI ever starts.
+    pub fn sandbox_decision(
+        &self,
+        session: &crate::backend::types::SessionConfig,
+    ) -> anyhow::Result<SandboxDecision> {
+        let spec = SandboxSpec {
+            backend: &self.id,
+            support: self.sandbox_support,
+            request: session.sandbox.unwrap_or(self.sandbox),
+            network: self.sandbox_network,
+            cwd: &session.cwd,
+            extra_writable: &session.granted_roots,
+        };
+        crate::sandbox::decide(&spec)
+    }
+
+    /// Spawn this backend's stdio child through the sandbox driver.
+    ///
+    /// Every spawn-mode backend's launch goes through here instead of
+    /// `NdjsonTransport::spawn` directly, so "the agent CLI runs under the
+    /// resolved policy" is one call site per backend rather than one more
+    /// thing each backend has to remember.
+    pub async fn spawn_ndjson(
+        &self,
+        args: &[String],
+        env: &std::collections::HashMap<String, String>,
+        session: &crate::backend::types::SessionConfig,
+    ) -> anyhow::Result<Arc<crate::backend::transport::NdjsonTransport>> {
+        let decision = self.sandbox_decision(session)?;
+        crate::backend::transport::NdjsonTransport::spawn(
+            &self.command,
+            args,
+            env,
+            &session.cwd,
+            Some(&decision),
+        )
+        .await
+    }
 }
 
 /// Build the client for a resolved backend. Returns None for an id the
@@ -386,6 +488,53 @@ mod tests {
         );
     }
 
+    /// Only the serve-mode backends have no spawn point to confine; every
+    /// stdio backend does, and every agent CLI declares that it needs its
+    /// model API (network allow).
+    #[test]
+    fn sandbox_support_follows_the_process_model() {
+        for spec in BACKENDS {
+            let want = match spec.id {
+                "opencode" | "mimo" => SandboxSupport::Serve,
+                _ => SandboxSupport::Spawn,
+            };
+            assert_eq!(spec.sandbox_support, want, "{}", spec.id);
+            assert_eq!(spec.sandbox_network, NetworkPolicy::Allow, "{}", spec.id);
+        }
+    }
+
+    /// The global `sandbox_network` override reaches every backend, while
+    /// the default (`backend`) keeps each one's own declaration.
+    #[test]
+    fn network_override_wins_over_the_catalog() {
+        let resolved =
+            resolve_backends(&BTreeMap::new(), SandboxRequest::Auto, NetworkPolicy::Deny);
+        assert!(
+            resolved
+                .iter()
+                .all(|b| b.sandbox_network == NetworkPolicy::Deny)
+        );
+    }
+
+    /// A per-backend `sandbox` beats the top-level default at resolve time,
+    /// which is what the spawn point later sees.
+    #[test]
+    fn backend_sandbox_override_beats_the_default() {
+        let mut overrides = BTreeMap::new();
+        overrides.insert(
+            "codex".to_string(),
+            AgentConfig {
+                sandbox: Some(SandboxRequest::None),
+                ..Default::default()
+            },
+        );
+        let resolved = resolve_backends(&overrides, SandboxRequest::Bwrap, NetworkPolicy::Backend);
+        let codex = resolved.iter().find(|b| b.id == "codex").unwrap();
+        assert_eq!(codex.sandbox, SandboxRequest::None);
+        let claude = resolved.iter().find(|b| b.id == "claude").unwrap();
+        assert_eq!(claude.sandbox, SandboxRequest::Bwrap);
+    }
+
     #[test]
     fn overrides_replace_launch_line() {
         let mut overrides = BTreeMap::new();
@@ -395,9 +544,10 @@ mod tests {
                 command: Some("/opt/claude-custom".to_string()),
                 args: Some(vec!["--flag".to_string()]),
                 env: std::collections::HashMap::from([("K".to_string(), "V".to_string())]),
+                sandbox: None,
             },
         );
-        let resolved = resolve_backends(&overrides);
+        let resolved = resolve_backends(&overrides, SandboxRequest::Auto, NetworkPolicy::Backend);
         let claude = resolved.iter().find(|b| b.id == "claude").unwrap();
         assert_eq!(claude.command, "/opt/claude-custom");
         assert_eq!(claude.args, vec!["--flag"]);

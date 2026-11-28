@@ -31,6 +31,8 @@ Persistence goes through `src/store.rs` (`Store`, tokio-rusqlite wrapper, sessio
 
 `backend/registry.rs` holds the static `BackendSpec` catalog and `resolve_backends()`/`client_for()`. Unsupported features return typed `NOT_SUPPORTED` errors; `Capabilities` structs advertise what works.
 
+**Sandbox (`src/sandbox/`)**: one declarative policy (`sandbox = "auto" | "bwrap" | "seatbelt" | "docker" | "none"`, global / per backend / per session) compiled into the driver's native launcher. `decide()` is the only place the rules live: an explicit request that the backend or host cannot honor is an error naming the cause and choices (never a silent fallback), `auto` may fall back and reports why, and a serve-mode backend (opencode, mimo) resolves to `unsupported` rather than `none` because it has no per-session child to wrap. Spawn-mode backends launch through `ResolvedBackend::spawn_ndjson`, so every one of them inherits the policy; the compiler (`bwrap::compile_args`) is pure and golden-tested, the planner (`compile_policy`) resolves symlinks and refuses `/` or credential paths as writable.
+
 ## Key Directories
 
 | Path | Purpose |
@@ -44,6 +46,7 @@ Persistence goes through `src/store.rs` (`Store`, tokio-rusqlite wrapper, sessio
 | `src/skills_hub/` | Skill package manager: discovery, fetch, install lifecycle, target roots |
 | `src/channel.rs` + `telegram.rs`/`slack.rs`/`discord.rs` | Chat bridge + per-platform adapters |
 | `src/relay.rs`, `src/bin/damon-relay.rs` | E2E-encrypted outbound tunnel (X25519 + AES-256-GCM) |
+| `src/sandbox/` | OS-level isolation: the declarative policy (`SandboxRequest` → `SandboxDecision`), the thin `SandboxDriver` trait, and the bwrap driver (`bwrap.rs`: policy → launcher argv, availability probe). Resolved per session at the spawn point (`ResolvedBackend::spawn_ndjson`); seatbelt/docker are follow-ups to #33 |
 | `tests/` | Integration tests (separate crate), shared harness in `tests/common/mod.rs` |
 | `npm/`, `python/` | Client SDKs mirroring the Rust client contract (see Testing & QA) |
 | `scripts/` | `set-version.sh` (version sync), `verify-release.sh` (release verification) |

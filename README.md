@@ -32,6 +32,7 @@ If you already subscribe to an agent CLI, **there is nothing to configure**. Dam
 - **Damon holds no secrets** — agents manage their own auth. The Damon config is a port and maybe a token.
 - **Reachable from anywhere** — serve `wss` with your own certs, or run `damon-relay` on a public host and the daemon dials out (no inbound port). The tunnel is X25519 + AES-256-GCM end-to-end encrypted.
 - **Built to stay resident** — the Rust daemon itself stays lean (agent processes are the agents' business).
+- **OS sandbox for the agent's own commands (Linux, first cut)** — `sandbox = "auto"` wraps each agent CLI child in bubblewrap: the workdir (and the CLI's own auth dir) writable, the host root read-only, credential stores (`~/.ssh`, `~/.aws`, `~/.gnupg`, …) masked, `SSH_AUTH_SOCK` scrubbed. Naming a driver the host cannot honor fails the session at start instead of silently running unconfined; `damond doctor` reports what each backend would get. Seatbelt (macOS) and Docker drivers follow.
 
 ## Install
 

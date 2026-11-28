@@ -23,6 +23,10 @@ async fn main() -> anyhow::Result<()> {
             .collect(),
         auth_hint: spec.auth_hint.into(),
         detected: true,
+        // Probe unconfined: the point is the protocol, not the policy.
+        sandbox: damon_core::sandbox::SandboxRequest::None,
+        sandbox_support: spec.sandbox_support,
+        sandbox_network: spec.sandbox_network,
     };
     let client = client_for(&resolved).expect("client");
     println!("== {} available: {}", provider, client.is_available().await);

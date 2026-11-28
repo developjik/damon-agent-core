@@ -41,6 +41,12 @@ pub struct SessionConfig {
     /// refuses read-only nodes on backends whose capability says they
     /// cannot enforce the list, so nothing silently downgrades.
     pub allowed_tools: Vec<String>,
+    /// Sandbox override for this session. `None` follows the backend's
+    /// config (which itself defaults to the top-level `sandbox`); a value
+    /// here wins for this session only. An explicit value the backend or
+    /// host cannot honor fails the spawn with the reason (see
+    /// `sandbox::decide`).
+    pub sandbox: Option<crate::sandbox::SandboxRequest>,
 }
 
 /// One stdio MCP server, normalized. Backends translate to their own

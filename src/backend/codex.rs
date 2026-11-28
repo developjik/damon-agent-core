@@ -189,8 +189,7 @@ pub struct CodexSession {
 impl CodexSession {
     async fn spawn(resolved: &ResolvedBackend, config: SessionConfig) -> Result<Arc<Self>> {
         let env: HashMap<String, String> = resolved.env.iter().cloned().collect();
-        let transport =
-            NdjsonTransport::spawn(&resolved.command, &resolved.args, &env, &config.cwd).await?;
+        let transport = resolved.spawn_ndjson(&resolved.args, &env, &config).await?;
 
         let (events, _) = broadcast::channel(512);
         let session = Arc::new(Self {

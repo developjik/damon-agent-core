@@ -97,6 +97,43 @@ async fn read_reply(ws: &mut Ws, id: u64) -> Value {
     }
 }
 
+/// The `sandbox` param is validated at the door: a misspelled mode is a
+/// `-32602`, not a session that silently runs unconfined under a name the
+/// user believes is isolation. A valid value is accepted (the in-process
+/// mock backend spawns nothing, so the policy itself is not exercised
+/// here — the bwrap tests in `sandbox_bwrap.rs` and the policy unit tests
+/// are).
+#[tokio::test]
+async fn session_create_validates_the_sandbox_param() {
+    let (_state, _store, addr) = serve(test_config(None)).await;
+    let (mut ws, _) = ws_connect(&format!("ws://{addr}/ws")).await;
+
+    rpc_send(
+        &mut ws,
+        json!({"id":1,"method":"session.create",
+               "params":{"cwd":"/tmp","sandbox":"bubblewrap"}}),
+    )
+    .await;
+    let bad = read_reply(&mut ws, 1).await;
+    assert_eq!(bad["error"]["code"], -32602, "{bad}");
+    let msg = bad["error"]["message"].as_str().unwrap_or_default();
+    assert!(msg.contains("auto, bwrap, seatbelt, docker, none"), "{msg}");
+
+    for (id, mode) in [(2, "none"), (3, "auto")] {
+        rpc_send(
+            &mut ws,
+            json!({"id":id,"method":"session.create",
+                   "params":{"cwd":"/tmp","sandbox":mode}}),
+        )
+        .await;
+        let ok = read_reply(&mut ws, id).await;
+        assert!(
+            ok["result"]["sessionId"].is_string(),
+            "sandbox={mode} must create: {ok}"
+        );
+    }
+}
+
 /// A turn parked on a hung backend unwinds on turn.cancel — the
 /// turn.start request resolves with stopReason "canceled", the busy
 /// flag clears, and session.delete then removes the row. A hung

@@ -357,7 +357,7 @@ async fn doctor(path: &Path) -> anyhow::Result<()> {
     let cfg_for_backends = cfg
         .clone()
         .unwrap_or_else(|| toml::from_str("").expect("empty config parses"));
-    let resolved = damon_core::backend::registry::resolve_backends(&cfg_for_backends.backends);
+    let resolved = damon_core::backend::registry::resolve_from_config(&cfg_for_backends);
     let runner: std::sync::Arc<dyn damon_core::cli_lifecycle::CommandRunner> =
         std::sync::Arc::new(damon_core::cli_lifecycle::RealRunner);
     let probes = resolved.iter().map(|b| {
@@ -398,6 +398,13 @@ async fn doctor(path: &Path) -> anyhow::Result<()> {
             "no backends available — install claude, codex, or omp, or set [backends.X]",
         );
     }
+
+    // Sandbox: one header for the requested mode and the platform driver,
+    // then one line per detected backend saying what would actually be
+    // applied. This is the surface that keeps `auto` honest — a host with
+    // no usable driver says so here instead of leaving the user to assume
+    // the agent is confined.
+    sandbox_report(&mut ok, &resolved);
 
     if let Some(cfg) = &cfg {
         match &cfg.auth_token {
@@ -448,6 +455,54 @@ async fn doctor(path: &Path) -> anyhow::Result<()> {
 fn report(ok: &mut bool, pass: bool, msg: impl std::fmt::Display) {
     outln(format!("{} {msg}", if pass { "ok  " } else { "FAIL" }));
     *ok &= pass;
+}
+
+/// `doctor` sandbox section: what each detected backend would get.
+///
+/// A requested driver that cannot be honored is a FAIL — that config would
+/// fail every session start, which is exactly what a diagnostic should
+/// catch before the first turn. `auto` without a driver is fine (it is the
+/// zero-config default), and so is the serve-mode `unsupported` state, but
+/// both are printed with the reason rather than as silence.
+fn sandbox_report(ok: &mut bool, resolved: &[damon_core::backend::registry::ResolvedBackend]) {
+    use damon_core::backend::types::SessionConfig;
+    use damon_core::sandbox;
+
+    // The platform driver's own status, independent of any backend.
+    let header = match sandbox::platform_default() {
+        Some(kind) => match sandbox::driver_for(kind) {
+            Some(driver) => {
+                let status = driver.status();
+                let mark = if status.usable {
+                    "usable"
+                } else {
+                    "not usable"
+                };
+                format!("sandbox driver {kind} — {mark}: {}", status.detail)
+            }
+            None => format!("sandbox driver {kind} — not implemented in this release"),
+        },
+        None => "sandbox driver — none for this platform yet".to_string(),
+    };
+    outln(format!("     {header}"));
+
+    // A per-session `sandbox` value is not known here; each backend's own
+    // declaration is what `session.create` inherits when it passes none.
+    let cwd = std::env::current_dir().unwrap_or_else(|_| std::path::PathBuf::from("."));
+    for backend in resolved.iter().filter(|b| b.detected) {
+        let session = SessionConfig {
+            cwd: cwd.clone(),
+            ..Default::default()
+        };
+        match backend.sandbox_decision(&session) {
+            Ok(decision) => report(
+                ok,
+                true,
+                format!("sandbox {} — {}", backend.id, decision.describe()),
+            ),
+            Err(e) => report(ok, false, format!("sandbox {} — {e:#}", backend.id)),
+        }
+    }
 }
 
 /// Write one line to stdout, exiting quietly with 141 (128+SIGPIPE, the

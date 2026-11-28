@@ -756,8 +756,10 @@ async fn dispatch(
                 .get()
                 .cloned()
                 .unwrap_or_else(|| std::sync::Arc::new(crate::cli_lifecycle::RealRunner));
-            let resolved =
-                crate::backend::registry::resolve_backends(&state.config.read().backends);
+            let resolved = {
+                let cfg = state.config.read();
+                crate::backend::registry::resolve_from_config(&cfg)
+            };
             let targets: Vec<_> = resolved
                 .iter()
                 .filter(|b| only.is_none_or(|o| b.id == o))
@@ -819,8 +821,10 @@ async fn dispatch(
                 .get()
                 .cloned()
                 .unwrap_or_else(|| std::sync::Arc::new(crate::cli_lifecycle::RealRunner));
-            let resolved =
-                crate::backend::registry::resolve_backends(&state.config.read().backends);
+            let resolved = {
+                let cfg = state.config.read();
+                crate::backend::registry::resolve_from_config(&cfg)
+            };
             let entry = resolved.iter().find(|b| b.id == backend).ok_or_else(|| {
                 RpcError::error(
                     error_code::INVALID_PARAMS,
@@ -850,8 +854,10 @@ async fn dispatch(
                 .get()
                 .cloned()
                 .unwrap_or_else(|| std::sync::Arc::new(crate::cli_lifecycle::RealRunner));
-            let resolved =
-                crate::backend::registry::resolve_backends(&state.config.read().backends);
+            let resolved = {
+                let cfg = state.config.read();
+                crate::backend::registry::resolve_from_config(&cfg)
+            };
             let entry = resolved.iter().find(|b| b.id == backend).ok_or_else(|| {
                 RpcError::error(
                     error_code::INVALID_PARAMS,
@@ -3510,7 +3516,7 @@ pub fn rpc_methods() -> Vec<Value> {
         json!({"name": "mcp.inventory", "params": {}, "result": {"entries": "array of {backend, name, transport, command?, url?, envKeys?, source, format, version, enabled?, readonlyReason?} — REDACTED: env values never leave the file, URLs lose userinfo/query, stdio shows the program and an arg count", "sources": "array of {backend, source, format, error?} — one per config file; a broken file reports its error and the inventory continues"}}),
         json!({"name": "mcp.probe", "params": {"backend": "string", "name": "string"}, "result": "{backend, name, result: 'connected'|'needs_auth'|'failed'|'unsupported', tools: string[] — names only, ≤40, serverName?, protocolVersion?, elapsedMs, error?} — REAL handshake, explicit request only (never scheduled); stdio 25s cap, HTTP 12s cap; the server's command/args/env never reach the wire"}),
         json!({"name": "mcp.setEnabled", "params": {"backend": "string — claude only this round", "name": "string", "enabled": "boolean", "expectedVersion": "string — CAS from mcp.inventory", "cwd": "string? — project scope for the toggle, default the daemon cwd"}, "result": {"set": "boolean"}, "errors": "-32010 the entry changed since the snapshot (external edit); -32602 readonly backend (reason in the message) or parse-failed config (never written)"}),
-        json!({"name": "session.create", "params": {"backend": "string?", "cwd": "string?", "model": "string?", "mode": "string?", "mcpServers": "object?", "allowedTools": "string[]? — per-session tool allowlist for backends that enforce one at launch (claude: --allowedTools); non-string entries are dropped", "projectId": "string? — scopes the session: root becomes the cwd default, project defaults fill unset params", "persona": "string? — bot id from bot.list; the bot's SOUL/AGENTS block rides in front of every turn, bound for the session's life and restored on resume"}, "result": {"sessionId": "string", "backend": "string", "persona?": "string — the bound bot id, when one was given", "replayed": "number — replay-tagged session.event frames sent for missed history", "cursor": "number — the newest session event seq handed out so far; the next live frame continues from it (gaps → session.gap)"}, "errors": "-32602 unknown persona id"}),
+        json!({"name": "session.create", "params": {"backend": "string?", "cwd": "string?", "model": "string?", "mode": "string?", "mcpServers": "object?", "allowedTools": "string[]? — per-session tool allowlist for backends that enforce one at launch (claude: --allowedTools); non-string entries are dropped", "projectId": "string? — scopes the session: root becomes the cwd default, project defaults fill unset params", "persona": "string? — bot id from bot.list; the bot's SOUL/AGENTS block rides in front of every turn, bound for the session's life and restored on resume", "sandbox": "string? — auto|bwrap|seatbelt|docker|none; unset follows the backend's configured sandbox, and a value this backend or host cannot honor fails the create instead of silently running unconfined"}, "result": {"sessionId": "string", "backend": "string", "persona?": "string — the bound bot id, when one was given", "replayed": "number — replay-tagged session.event frames sent for missed history", "cursor": "number — the newest session event seq handed out so far; the next live frame continues from it (gaps → session.gap)"}, "errors": "-32602 unknown persona id; unknown sandbox mode"}),
         json!({"name": "session.resume", "params": {"sessionId": "string? — resume a session damon already knows", "handle": "{provider, native_handle}? — import a native session that has no damon row yet", "cwd": "string?", "title": "string?"}, "result": {"sessionId": "string", "backend": "string", "replayed": "number", "cursor": "number"}, "errors": "-32602 sessionId or handle required; handle must be {provider, native_handle, metadata?}"}),
         json!({"name": "session.list", "params": {"limit": "number?", "offset": "number?", "backend": "string?", "cwd": "string?", "tag": "string?", "projectId": "string?", "includeArchived": "boolean? — include archived rows, default false"}, "result": {"sessions": "array of {sessionId, createdAt, backend, title, cwd, tags, pinned, archived}"}}),
         json!({"name": "session.messages", "params": {"sessionId": "string", "limit": "number?", "offset": "number?"}, "result": {"messages": "array of {id, session_id, role, ts, data} — ts is unix ms, 0 when unknown"}}),

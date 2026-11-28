@@ -1,5 +1,42 @@
 # Changelog
 
+## Unreleased
+
+### Added — pluggable OS sandbox, first cut: the bwrap driver (#33)
+
+- `sandbox = "auto" | "bwrap" | "seatbelt" | "docker" | "none"` at the
+  top level of the config (the default for every backend), per backend
+  (`[backends.X] sandbox`), and per session (`session.create`'s `sandbox`
+  param). `auto` (default) means this platform's driver when the host can
+  run it; `none` is an explicit opt-out.
+- A request that the backend or host cannot honor **fails the session at
+  start** with the cause and the choices — a missing binary, disabled
+  unprivileged user namespaces, or a backend with no spawn point. Nothing
+  falls back to running unconfined silently; `auto`, whose meaning is "use
+  what this host has", reports its fallback through `damond doctor`.
+- Serve-mode backends (`opencode`, `mimo`) resolve to `unsupported`, not
+  `none`: they attach to a shared `serve` process, so there is no
+  per-session child to wrap yet.
+- The Linux driver compiles one declarative policy into bwrap: the workdir,
+  granted roots and the CLI's own auth/state dir (`~/.claude`, `~/.codex`,
+  `~/.omp`, …) writable; host root read-only; credential stores (`~/.ssh`,
+  `~/.aws`, `~/.gnupg`, `~/.netrc`, `~/.config/gh`, `~/.config/damon`, …)
+  masked after the binds (tmpfs for directories, `/dev/null` for files) so a
+  deny always wins; `SSH_AUTH_SOCK` scrubbed; `--unshare-all` with
+  `--cap-drop ALL`, `--die-with-parent`, `--new-session`.
+- `damond doctor` prints the platform driver's status and what each detected
+  backend would actually get (or why it would get nothing).
+- Tests: golden argv and policy rules in `src/sandbox/`, path-escape cases
+  (relative, `..` traversal, symlinks, `/` as workdir, workdir inside a
+  credential store), and four end-to-end bwrap tests plus a transport wiring
+  test in `tests/sandbox_bwrap.rs` — those skip themselves on hosts without
+  a usable bwrap (no binary, or unprivileged user namespaces disabled), and
+  CI installs bubblewrap on the Linux leg so they normally run there.
+- Egress inside the sandbox defaults to each backend's declared need
+  (`sandbox_network = "backend"`): every agent CLI allows it, because its
+  model API call is the point of running it. Per-command network denial
+  needs a proxy in front of the agent and is a follow-up.
+
 ## 0.9.0 — 2026-11-22
 
 ### Changed — `session.*` request params are typed, and the schema is held to them

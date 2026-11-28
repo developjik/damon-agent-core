@@ -63,6 +63,9 @@ use super::{AgentClient, AgentSession};
 
 pub struct OpencodeClient {
     command: String,
+    /// The resolved backend, kept so the sandbox decision can refuse an
+    /// explicit request: serve mode has no per-session child to wrap.
+    resolved: ResolvedBackend,
     server: tokio::sync::OnceCell<Arc<OpencodeServer>>,
     http: reqwest::Client,
     caps: Capabilities,
@@ -73,6 +76,7 @@ impl OpencodeClient {
     pub fn new(resolved: &ResolvedBackend, provider: &'static str) -> Self {
         Self {
             command: resolved.command.clone(),
+            resolved: resolved.clone(),
             server: tokio::sync::OnceCell::new(),
             http: reqwest::Client::builder()
                 .timeout(Duration::from_secs(30))
@@ -221,6 +225,12 @@ impl AgentClient for OpencodeClient {
     }
 
     async fn create_session(&self, config: SessionConfig) -> Result<Arc<dyn AgentSession>> {
+        // Serve mode: sessions are directories inside a shared server, so
+        // there is nothing here to confine. The decision still runs, because
+        // an explicit `sandbox` request must fail by name here rather than be
+        // silently ignored (sandbox::decide explains why serve mode has no
+        // spawn point).
+        self.resolved.sandbox_decision(&config)?;
         let server = self.srv().await?;
         // opencode has no MCP remove endpoint, and POST /mcp mutates
         // state shared by every session on the server — so damon only
@@ -266,6 +276,9 @@ impl AgentClient for OpencodeClient {
         handle: &PersistenceHandle,
         config: SessionConfig,
     ) -> Result<Arc<dyn AgentSession>> {
+        // Same rule as create_session: an explicit sandbox request on a serve
+        // backend is refused, not ignored.
+        self.resolved.sandbox_decision(&config)?;
         let server = self.srv().await?;
         Ok(self.session(&handle.native_handle, config, &server))
     }
