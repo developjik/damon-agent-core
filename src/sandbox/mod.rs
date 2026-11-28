@@ -810,15 +810,21 @@ mod tests {
     }
 
     /// `..` in the workdir is resolved before the promise "root is read-only"
-    /// is made: `/tmp/x/../..` is `/`, and `/` cannot be bound writable.
+    /// is made: a path that climbs out of the filesystem is `/`, and `/`
+    /// cannot be bound writable.
     #[test]
     fn a_workdir_that_traverses_to_the_host_root_is_rejected() {
         let scratch = Scratch::new("traverse");
         let cwd = scratch.dir("a");
-        let climb = cwd.join("..").join("..").join("..").join("..");
+        // Enough `..` to leave any path behind, so this does not depend on
+        // how deep the platform's temp dir sits (/tmp here,
+        // /var/folders/… on macOS).
+        let mut climb = cwd.clone();
+        for _ in 0..cwd.components().count() + 2 {
+            climb.push("..");
+        }
         // `/` on the host: the workdir resolves to the root itself.
-        let root = Path::new("/");
-        let s = spec("", root, &[]);
+        let s = spec("", Path::new("/"), &[]);
         let err = compile_policy_with(&s, Vec::new()).unwrap_err().to_string();
         assert!(err.contains("cannot be `/`"), "{err}");
         // The climb itself canonicalizes to `/` too.
