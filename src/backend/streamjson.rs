@@ -637,8 +637,9 @@ impl StreamJsonSession {
         let mut args = resolved.args.clone();
         args.extend(dialect.launch_args(&config, resume));
 
-        let transport =
-            NdjsonTransport::spawn(&resolved.command, &args, &HashMap::new(), &config.cwd).await?;
+        let transport = resolved
+            .spawn_ndjson(&args, &HashMap::new(), &config)
+            .await?;
 
         let session = Arc::new(Self {
             transport: transport.clone(),
@@ -961,9 +962,10 @@ impl AgentSession for OneShotSession {
         args.extend(self.dialect.launch_args(&config, resume.as_deref()));
         args.extend(self.dialect.prompt_args(&prompt)?);
 
-        let transport =
-            NdjsonTransport::spawn(&self.resolved.command, &args, &HashMap::new(), &config.cwd)
-                .await?;
+        let transport = self
+            .resolved
+            .spawn_ndjson(&args, &HashMap::new(), &config)
+            .await?;
         *self.active.lock().await = Some(transport.clone());
 
         let turn_id = uuid::Uuid::new_v4().to_string();
@@ -1285,6 +1287,9 @@ pub(crate) mod tests {
             env: vec![],
             auth_hint: String::new(),
             detected: true,
+            sandbox: crate::sandbox::SandboxRequest::None,
+            sandbox_support: crate::sandbox::SandboxSupport::Spawn,
+            sandbox_network: crate::sandbox::NetworkPolicy::Allow,
         };
         let session = StreamJsonSession::spawn(
             &resolved,

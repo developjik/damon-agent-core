@@ -52,6 +52,11 @@ pub(super) struct Create {
     /// (claude: `--allowedTools`). Loose elements are dropped, not
     /// refused — the pre-refactor read filtered non-strings out.
     allowed_tools: Option<Vec<Value>>,
+    /// Per-session sandbox override (`auto|bwrap|seatbelt|docker|none`).
+    /// Unset follows the backend's config. A value the backend or host
+    /// cannot honor fails the create with the reason — see
+    /// `sandbox::decide`.
+    sandbox: Option<String>,
 }
 
 impl Params for Create {
@@ -65,6 +70,7 @@ impl Params for Create {
         Field::str_opt("projectId"),
         Field::str_opt("persona"),
         Field::array_opt("allowedTools"),
+        Field::str_opt("sandbox"),
     ];
 }
 
@@ -72,8 +78,8 @@ impl Create {
     /// The launch config this request asks for, before project defaults
     /// and grants are layered on. `cwd` falls back to the daemon's own
     /// working directory exactly as before.
-    fn config(&self) -> SessionConfig {
-        SessionConfig {
+    fn config(&self) -> Result<SessionConfig> {
+        Ok(SessionConfig {
             cwd: self
                 .cwd
                 .as_deref()
@@ -92,7 +98,16 @@ impl Create {
                         .collect()
                 })
                 .unwrap_or_default(),
-        }
+            // A misspelled mode is an error, not a silent "whatever the
+            // config says": the caller asked this session to be confined.
+            sandbox: match self.sandbox.as_deref() {
+                None => None,
+                Some(raw) => Some(
+                    crate::sandbox::SandboxRequest::parse(raw)
+                        .map_err(|e| RpcError::error(error_code::INVALID_PARAMS, e.to_string()))?,
+                ),
+            },
+        })
     }
 }
 
@@ -450,7 +465,7 @@ pub(super) async fn create(
     params: &Value,
 ) -> Result<Value> {
     let req = Create::parse(params)?;
-    let mut cfg = req.config();
+    let mut cfg = req.config()?;
     let mut backend = req.backend.clone();
     // A project scopes the session: its root becomes the cwd default and
     // its defaults fill whatever the request left unset (explicit params

@@ -8,6 +8,8 @@ use notify::Watcher;
 use serde::Deserialize;
 use tracing::{info, warn};
 
+use crate::sandbox::{NetworkPolicy, SandboxRequest};
+
 /// Daemon configuration. Hot-reloaded: changes to the config file are picked
 /// up without restart, except `bind` which requires a restart.
 #[derive(Clone, Debug, Deserialize)]
@@ -30,6 +32,19 @@ pub struct Config {
     pub backends: BTreeMap<String, AgentConfig>,
     /// Default backend id for session.create without an explicit backend.
     pub default_backend: Option<String>,
+    /// OS-level sandbox for agent CLI child processes — the default for
+    /// every backend that does not set its own `sandbox`: `auto` (this
+    /// platform's driver, when the host can run it), `bwrap`, `seatbelt`,
+    /// `docker`, or `none` (explicit opt-out). An explicitly named driver
+    /// that this backend or host cannot honor fails the session at start
+    /// instead of silently running unconfined. Hot-reloaded.
+    #[serde(default)]
+    pub sandbox: SandboxRequest,
+    /// Egress policy inside the sandbox: `backend` (whatever that backend
+    /// declares — every agent CLI allows it, because its model API call is
+    /// the point), `allow`, or `deny`. Hot-reloaded.
+    #[serde(default)]
+    pub sandbox_network: NetworkPolicy,
     #[serde(rename = "relay")]
     pub relay: Option<RelayConfig>,
     /// Deny tool calls if the permission prompt goes unanswered this long.
@@ -180,6 +195,8 @@ pub struct AgentConfig {
     pub args: Option<Vec<String>>,
     #[serde(default)]
     pub env: HashMap<String, String>,
+    /// Per-backend sandbox override; unset follows the top-level `sandbox`.
+    pub sandbox: Option<SandboxRequest>,
 }
 
 /// `[relay]` — outbound tunnel to a public relay.
@@ -457,10 +474,18 @@ const STARTER_CONFIG: &str = r#"# Damon agent core configuration.
 # permission_timeout_secs = 300    # deny agent permission asks after this
 # session_retention_days = 30      # delete sessions older than this
 
+# OS sandbox for agent CLI child processes — default "auto": use this
+# platform's driver (bwrap on Linux, seatbelt on macOS) when the host can run
+# it, and report it in `damond doctor` when it cannot. "none" is an explicit
+# opt-out; naming a driver this host cannot honor fails the session at start.
+# sandbox = "auto"
+# sandbox_network = "backend"      # backend | allow | deny (see config.example.toml)
+
 # Launch overrides:
 # [backends.claude]
 # command = "claude"                   # default launch line for claude
 # args = ["-p", "--output-format", "stream-json", "--input-format", "stream-json", "--verbose"]
+# sandbox = "bwrap"                    # per-backend override of the top-level sandbox
 # [backends.claude.env]
 # ANTHROPIC_MODEL = "claude-sonnet-4-5"
 "#;
@@ -560,6 +585,41 @@ mod tests {
     #[test]
     fn rejects_unknown_fields() {
         assert!(toml::from_str::<Config>(r#"providers = {}"#).is_err());
+    }
+
+    /// `sandbox` reads at three levels (global default, per backend, per
+    /// session) and an unknown spelling is a config error, not a silent
+    /// "whatever the default was".
+    #[test]
+    fn parses_sandbox_declarations() {
+        let cfg: Config = toml::from_str("").unwrap();
+        assert_eq!(cfg.sandbox, SandboxRequest::Auto);
+        assert_eq!(cfg.sandbox_network, NetworkPolicy::Backend);
+
+        let cfg: Config = toml::from_str(
+            r#"
+            sandbox = "bwrap"
+            sandbox_network = "deny"
+            [backends.claude]
+            sandbox = "seatbelt"
+            "#,
+        )
+        .unwrap();
+        assert_eq!(cfg.sandbox, SandboxRequest::Bwrap);
+        assert_eq!(cfg.sandbox_network, NetworkPolicy::Deny);
+        assert_eq!(
+            cfg.backends["claude"].sandbox,
+            Some(SandboxRequest::Seatbelt)
+        );
+        // A backend without its own declaration follows the default.
+        let resolved = crate::backend::registry::resolve_from_config(&cfg);
+        assert_eq!(
+            resolved.iter().find(|b| b.id == "codex").unwrap().sandbox,
+            SandboxRequest::Bwrap
+        );
+
+        assert!(toml::from_str::<Config>(r#"sandbox = "bubblewrap""#).is_err());
+        assert!(toml::from_str::<Config>(r#"sandbox_network = "maybe""#).is_err());
     }
 
     #[test]

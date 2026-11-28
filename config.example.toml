@@ -28,6 +28,39 @@
 # Each catalog backend implements one native protocol, so adding a new
 # agent is a code change, not a config block.
 
+# OS-level sandbox for agent CLI child processes. The agent runs arbitrary
+# shell commands; without isolation a hallucinated flag or an injected
+# instruction reaches straight into the host (~/.ssh, ~/.aws, cloud and
+# package-registry tokens, the network).
+#
+#   auto      (default) this platform's driver when the host can run it —
+#             bwrap on Linux today; seatbelt and docker are follow-ups. When
+#             the host cannot, the session runs unconfined and `damond doctor`
+#             says why (never silently).
+#   bwrap     Linux/bubblewrap, explicitly. Fails the session at start when it
+#             is not installed or unprivileged user namespaces are disabled,
+#             naming the cause and the choices.
+#   none      explicit opt-out — today's behavior.
+#
+# `[backends.X] sandbox = "..."` overrides this per backend, and
+# `session.create {"sandbox": "..."}` per session. Serve-mode backends
+# (opencode, mimo) report `unsupported`, not `none`: they attach to a shared
+# `serve` process, so there is no per-session child to confine.
+# sandbox = "auto"
+#
+# Egress inside the sandbox: backend (each backend's declared need — every
+# agent CLI allows it, because calling its model API is the point), allow, or
+# deny (offline/proxied setups).
+# sandbox_network = "backend"
+#
+# What the bwrap policy does: the workdir, granted roots and the CLI's own
+# auth/state dir (~/.claude, ~/.codex, …) writable; host root read-only;
+# credential stores (~/.ssh, ~/.aws, ~/.gnupg, ~/.netrc, ~/.config/gh,
+# ~/.config/damon, …) masked with an empty tmpfs or /dev/null; SSH_AUTH_SOCK
+# scrubbed.
+# [backends.claude]
+# sandbox = "bwrap"                # this backend only
+
 # MCP servers are per-session: pass them in session.create's
 # `mcpServers` param — the agent spawns and permissions them (Damon
 # never launches them itself). Only claude forwards them today; other

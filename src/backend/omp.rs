@@ -387,7 +387,7 @@ impl OmpSession {
         let env: HashMap<String, String> = resolved.env.iter().cloned().collect();
         let mut args = resolved.args.clone();
         args.extend(mode_args(profile, config.mode.as_deref()));
-        let transport = NdjsonTransport::spawn(&resolved.command, &args, &env, &config.cwd).await?;
+        let transport = resolved.spawn_ndjson(&args, &env, &config).await?;
 
         let (events, _) = broadcast::channel(512);
         let session = Arc::new(Self {
@@ -1183,6 +1183,9 @@ mod tests {
             env: vec![],
             auth_hint: String::new(),
             detected: true,
+            sandbox: crate::sandbox::SandboxRequest::None,
+            sandbox_support: crate::sandbox::SandboxSupport::Spawn,
+            sandbox_network: crate::sandbox::NetworkPolicy::Allow,
         };
         for profile in [&OMP, &PI] {
             let client = OmpClient::with_profile(resolved.clone(), profile);

@@ -22,6 +22,8 @@ use tokio::io::{AsyncWriteExt, BufReader};
 use tokio::process::{Child, Command};
 use tokio::sync::{Mutex, broadcast, oneshot, watch};
 
+use crate::sandbox::SandboxDecision;
+
 /// Hard cap on one stdout line. Protocol frames are small; a runaway
 /// agent emitting a megabyte-long line must not grow the read buffer
 /// without bound — the line is dropped, the stream lives.
@@ -134,12 +136,29 @@ mod winjob {
 impl NdjsonTransport {
     /// Spawn the process and start the stdout/stderr reader tasks.
     /// No handshake happens here — the backend drives its own.
+    ///
+    /// `sandbox` is this session's resolved isolation decision: a confined
+    /// decision rewrites the launch into the driver's launcher (bwrap), an
+    /// unconfined one passes the command through. It is resolved by the
+    /// caller, so an explicit-but-impossible request fails there, before
+    /// anything spawns — a spawn here never "falls back" on its own.
     pub async fn spawn(
         command: &str,
         args: &[String],
         env: &HashMap<String, String>,
         cwd: &Path,
+        sandbox: Option<&SandboxDecision>,
     ) -> anyhow::Result<Arc<Self>> {
+        // The launcher rewrite happens before any Windows batch handling:
+        // a sandboxed launch never execs the CLI directly.
+        let confined;
+        let (command, args) = match sandbox {
+            Some(decision) => {
+                confined = decision.confine(command, args)?;
+                (confined.program.as_str(), confined.args.as_slice())
+            }
+            None => (command, args),
+        };
         // Windows resolves `npx` to `npx.cmd`, which CreateProcess cannot
         // exec directly — batch files need the cmd interpreter.
         #[cfg(windows)]
@@ -604,6 +623,7 @@ mod tests {
             &[script.to_string_lossy().into_owned()],
             &Default::default(),
             &cwd,
+            None,
         )
         .await
         .unwrap();
@@ -668,6 +688,7 @@ mod tests {
             &[script.to_string_lossy().into_owned()],
             &Default::default(),
             &cwd,
+            None,
         )
         .await
         .unwrap();

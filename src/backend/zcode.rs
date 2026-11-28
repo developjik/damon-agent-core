@@ -136,8 +136,17 @@ impl AgentClient for ZcodeClient {
     /// listing as best-effort, matching the codex backend).
     async fn list_importable_sessions(&self, cwd: &Path) -> Result<Vec<ImportableSession>> {
         let env: HashMap<String, String> = self.resolved.env.iter().cloned().collect();
-        let Ok(transport) =
-            NdjsonTransport::spawn(&self.resolved.command, &self.resolved.args, &env, cwd).await
+        let Ok(transport) = NdjsonTransport::spawn(
+            &self.resolved.command,
+            &self.resolved.args,
+            &env,
+            cwd,
+            // Discovery probe only — it answers `session/list` and never
+            // runs an agent command, so it is not one of the spawns the
+            // sandbox policy exists to confine.
+            None,
+        )
+        .await
         else {
             return Ok(vec![]);
         };
@@ -352,8 +361,7 @@ impl ZcodeSession {
         resume: Option<&str>,
     ) -> Result<Arc<Self>> {
         let env: HashMap<String, String> = resolved.env.iter().cloned().collect();
-        let transport =
-            NdjsonTransport::spawn(&resolved.command, &resolved.args, &env, &config.cwd).await?;
+        let transport = resolved.spawn_ndjson(&resolved.args, &env, &config).await?;
 
         let (events, _) = broadcast::channel(512);
         let session = Arc::new(Self {

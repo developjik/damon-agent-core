@@ -504,7 +504,7 @@ impl SessionManager {
         cfg: &crate::config::Config,
         checkpoint: Option<PathBuf>,
     ) -> Self {
-        let resolved = crate::backend::registry::resolve_backends(&cfg.backends);
+        let resolved = crate::backend::registry::resolve_from_config(cfg);
         let mut clients = HashMap::new();
         for r in resolved {
             if !r.detected {
@@ -560,7 +560,7 @@ impl SessionManager {
     /// their existing backend objects; only new creates/resumes see the
     /// refreshed clients.
     pub fn refresh(&self, cfg: &crate::config::Config) {
-        let resolved = crate::backend::registry::resolve_backends(&cfg.backends);
+        let resolved = crate::backend::registry::resolve_from_config(cfg);
         let mut clients = HashMap::new();
         for r in resolved {
             if !r.detected {

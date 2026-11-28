@@ -18,6 +18,7 @@ pub mod prompts;
 pub mod ratelimit;
 pub mod relay;
 pub mod rpc;
+pub mod sandbox;
 pub mod service;
 pub mod session;
 pub mod skills_hub;
