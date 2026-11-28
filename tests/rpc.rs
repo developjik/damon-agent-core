@@ -105,7 +105,7 @@ async fn read_reply(ws: &mut Ws, id: u64) -> Value {
 /// are).
 #[tokio::test]
 async fn session_create_validates_the_sandbox_param() {
-    let (_state, _store, addr) = serve(test_config(None)).await;
+    let (_state, store, addr) = serve(test_config(None)).await;
     let (mut ws, _) = ws_connect(&format!("ws://{addr}/ws")).await;
 
     rpc_send(
@@ -119,6 +119,7 @@ async fn session_create_validates_the_sandbox_param() {
     let msg = bad["error"]["message"].as_str().unwrap_or_default();
     assert!(msg.contains("auto, bwrap, seatbelt, docker, none"), "{msg}");
 
+    let mut explicit: Option<String> = None;
     for (id, mode) in [(2, "none"), (3, "auto")] {
         rpc_send(
             &mut ws,
@@ -131,7 +132,18 @@ async fn session_create_validates_the_sandbox_param() {
             ok["result"]["sessionId"].is_string(),
             "sandbox={mode} must create: {ok}"
         );
+        if mode == "none" {
+            explicit = ok["result"]["sessionId"].as_str().map(str::to_string);
+        }
     }
+
+    // The explicit value rides the row: resume re-applies it instead of
+    // falling back to the backend's (possibly looser) default.
+    let id = explicit.expect("session id");
+    assert_eq!(
+        store.session_sandbox(&id).await.unwrap().as_deref(),
+        Some("none")
+    );
 }
 
 /// A turn parked on a hung backend unwinds on turn.cancel — the

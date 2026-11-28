@@ -351,6 +351,15 @@ impl SandboxDecision {
     }
 }
 
+/// A sandbox request the backend or host cannot honor.
+///
+/// Typed so the wire can answer `not_supported` instead of a generic
+/// internal error: a client asking a serve-mode backend for `bwrap` is
+/// making a request the backend does not support, not hitting a daemon bug.
+#[derive(Debug, thiserror::Error)]
+#[error("{0}")]
+pub struct SandboxUnsupported(pub String);
+
 /// One backend session's sandbox inputs, before resolution.
 pub struct SandboxSpec<'a> {
     /// Backend id (routing name).
@@ -365,6 +374,10 @@ pub struct SandboxSpec<'a> {
     /// Extra writable roots granted to the session (claude `--add-dir`
     /// style grants). Safe to pass even when the backend ignores them.
     pub extra_writable: &'a [PathBuf],
+    /// The environment the child will run with (`[backends.X].env`).
+    /// State-directory overrides are resolved against it, not the daemon's
+    /// own environment — they are frequently not the same.
+    pub launch_env: &'a [(String, String)],
 }
 
 /// Turn a spec into a decision. Errors are the "explicitly requested but
@@ -384,13 +397,16 @@ pub fn decide(spec: &SandboxSpec<'_>) -> Result<SandboxDecision> {
         // The explicit failure: the user asked for isolation on a backend
         // that cannot have it. Warning and continuing would silently run the
         // agent exactly as unprotected as before.
-        (SandboxSupport::Serve, requested) => bail!(
-            "sandbox = \"{requested}\" cannot confine backend `{}`: {} To proceed, set \
-             sandbox = \"none\" explicitly (accepting no isolation), or use a spawn-mode \
-             backend (claude, codex, omp, pi, qwen, droid, zcode).",
-            spec.backend,
-            serve_reason(spec.backend)
-        ),
+        (SandboxSupport::Serve, requested) => {
+            return Err(SandboxUnsupported(format!(
+                "sandbox = \"{requested}\" cannot confine backend `{}`: {} To proceed, set \
+                 sandbox = \"none\" explicitly (accepting no isolation), or use a spawn-mode \
+                 backend (claude, codex, omp, pi, qwen, droid, zcode).",
+                spec.backend,
+                serve_reason(spec.backend)
+            ))
+            .into());
+        }
         (SandboxSupport::Spawn, SandboxRequest::Auto) => match platform_default() {
             Some(kind) => kind,
             None => {
@@ -495,16 +511,23 @@ fn compile_policy_with(spec: &SandboxSpec<'_>, denied: Vec<PathBuf>) -> Result<S
         bail!("sandbox workdir cannot be `/`: the host root is read-only inside the sandbox");
     }
 
-    // A tmpfs mounts on a directory only, and `.netrc`-shaped credentials
-    // are plain files: those are masked by binding /dev/null over them
-    // instead of by a tmpfs mount.
+    // Only paths that exist are masked, and a directory takes a tmpfs while
+    // a regular file (`.netrc`) takes /dev/null over it — a tmpfs cannot
+    // mount on a file.
+    //
+    // Skipping a missing path is not a hole: the only way it could leak is
+    // by existing, and the sandbox cannot create it either — every parent of
+    // a credential store is inside the read-only root (bwrap also refuses a
+    // mount point it would have to mkdir under a read-only parent, which
+    // would have failed the whole launch instead).
     let (denied_files, denied): (Vec<PathBuf>, Vec<PathBuf>) =
         denied
             .into_iter()
             .fold((Vec::new(), Vec::new()), |(mut files, mut dirs), path| {
                 match std::fs::symlink_metadata(&path) {
                     Ok(meta) if meta.file_type().is_file() => files.push(path),
-                    _ => dirs.push(path),
+                    Ok(_) => dirs.push(path),
+                    Err(_) => {}
                 }
                 (files, dirs)
             });
@@ -519,7 +542,7 @@ fn compile_policy_with(spec: &SandboxSpec<'_>, denied: Vec<PathBuf>) -> Result<S
             writable.push(resolved);
         }
     }
-    for dir in backend_state_dirs(spec.backend) {
+    for dir in backend_state_dirs(spec.backend, spec.launch_env) {
         // The CLI's own home: created when absent so a first run inside the
         // sandbox can write its login instead of failing on a read-only
         // parent.
@@ -666,12 +689,23 @@ pub const SCRUBBED_ENV: &[&str] = &["SSH_AUTH_SOCK"];
 /// The agent CLIs' own auth/state directories, per backend — bound writable
 /// so the CLI keeps its login across sessions. Env overrides win over the
 /// `~/` default, mirroring `skills_hub::targets`.
-pub fn backend_state_dirs(backend: &str) -> Vec<PathBuf> {
+pub fn backend_state_dirs(backend: &str, launch_env: &[(String, String)]) -> Vec<PathBuf> {
     let home = home_dir();
+    // The child's own environment wins over the daemon's: `[backends.X.env]`
+    // is what the CLI will actually see (`CODEX_HOME = "/srv/codex"` there
+    // must be the directory the policy binds, or the CLI cannot write its
+    // state).
     let env_dir = |var: &str| {
-        std::env::var_os(var)
-            .filter(|v| !v.is_empty())
-            .map(PathBuf::from)
+        launch_env
+            .iter()
+            .find(|(k, _)| k == var)
+            .map(|(_, v)| PathBuf::from(v))
+            .filter(|p| !p.as_os_str().is_empty())
+            .or_else(|| {
+                std::env::var_os(var)
+                    .filter(|v| !v.is_empty())
+                    .map(PathBuf::from)
+            })
     };
     let under_home = |rel: &str| home.as_ref().map(|h| h.join(rel));
     let dirs: Vec<Option<PathBuf>> = match backend {
@@ -769,6 +803,7 @@ mod tests {
             network: NetworkPolicy::Deny,
             cwd,
             extra_writable: extra,
+            launch_env: &[],
         }
     }
 
@@ -926,6 +961,41 @@ mod tests {
         );
     }
 
+    /// A credential path that does not exist is not mounted at all: bwrap
+    /// would have to mkdir the mount point under the read-only root, which
+    /// fails the whole launch. Nothing can leak from a path that is absent,
+    /// and the sandbox cannot create it either.
+    #[test]
+    fn a_missing_credential_path_is_not_mounted() {
+        let scratch = Scratch::new("noshadow");
+        let work = scratch.dir("work");
+        let absent = scratch.path().join("no-such-home/.aws");
+        let s = spec("", &work, &[]);
+        let policy = compile_policy_with(&s, vec![absent.clone()]).unwrap();
+        assert!(policy.denied.is_empty(), "{:?}", policy.denied);
+        assert!(policy.denied_files.is_empty());
+    }
+
+    /// The state directory follows the child's environment
+    /// (`[backends.X].env = { CODEX_HOME = … }`), not just the daemon's —
+    /// the CLI writes wherever that variable points, so the bind has to
+    /// match it or the CLI cannot save a session. (Only the override side
+    /// is asserted here: the process env itself is shared with other
+    /// tests, so the `~/.codex` fallback is not a stable expectation.)
+    #[test]
+    fn a_launch_env_state_override_is_honored() {
+        let env = vec![("CODEX_HOME".to_string(), "/srv/codex-home".to_string())];
+        assert_eq!(
+            backend_state_dirs("codex", &env),
+            vec![PathBuf::from("/srv/codex-home")]
+        );
+        let pio = vec![("PI_CODING_AGENT_DIR".to_string(), "/srv/pi".to_string())];
+        assert_eq!(
+            backend_state_dirs("pi", &pio),
+            vec![PathBuf::from("/srv/pi")]
+        );
+    }
+
     /// A missing granted root (deleted workspace) is skipped, not fatal.
     #[test]
     fn a_missing_granted_root_is_skipped() {
@@ -974,6 +1044,7 @@ mod tests {
             network: NetworkPolicy::Allow,
             cwd: &cwd,
             extra_writable: &[],
+            launch_env: &[],
         };
         // Whatever this host can do, auto answers without an error.
         let decision = decide(&auto).unwrap();

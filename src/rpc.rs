@@ -265,6 +265,14 @@ fn error_payload(e: &anyhow::Error) -> (i64, String, Option<Value>) {
     {
         return (error_code::ASK_NOT_FOUND, e.to_string(), None);
     }
+    // A backend or host that cannot honor a sandbox request is a
+    // not-supported surface, not a daemon bug.
+    if e.chain().any(|c| {
+        c.downcast_ref::<crate::sandbox::SandboxUnsupported>()
+            .is_some()
+    }) {
+        return (error_code::NOT_SUPPORTED, e.to_string(), None);
+    }
     (error_code::INTERNAL_ERROR, e.to_string(), None)
 }
 
@@ -2941,6 +2949,14 @@ async fn reattach(state: &Arc<AppState>, conn: &Arc<Conn>, id: &str) -> Result<V
     // Granted roots re-widen on every relaunch: a grant made while a
     // session was down still reaches the backend's sandbox.
     cfg.granted_roots = effective_grants(state, state.store.session_project(id).await?).await?;
+    // The sandbox the session asked for at create, if it asked for one.
+    // Without this a session created with `sandbox: "bwrap"` would come
+    // back unconfined the moment it is reattached.
+    cfg.sandbox = state
+        .store
+        .session_sandbox(id)
+        .await?
+        .and_then(|raw| crate::sandbox::SandboxRequest::parse(&raw).ok());
     // The persona re-resolves from the bot's CURRENT files — persona
     // edits between daemon restarts reach the resumed session. A bot
     // deleted in the meantime unbinds silently, same as `bot.delete`.
