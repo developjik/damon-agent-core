@@ -465,6 +465,20 @@ pub(super) async fn create(
     params: &Value,
 ) -> Result<Value> {
     let req = Create::parse(params)?;
+    // A `sandbox` that is present but not a string must fail here. The field
+    // table drops ill-typed *optional* fields — the wire-compatible rule for
+    // every other param — but dropping this one would answer a client that
+    // asked to be confined with a session it never asked for.
+    // (`null` is the wire's "not set" and stays equivalent to omitting it.)
+    if let Some(raw) = params.get("sandbox")
+        && !raw.is_null()
+        && !raw.is_string()
+    {
+        return Err(RpcError::error(
+            error_code::INVALID_PARAMS,
+            "sandbox must be a string — auto|bwrap|seatbelt|docker|none",
+        ));
+    }
     let mut cfg = req.config()?;
     let mut backend = req.backend.clone();
     // A project scopes the session: its root becomes the cwd default and
@@ -528,6 +542,15 @@ pub(super) async fn create(
         .store
         .create_session(&ms.id, &cfg.cwd.to_string_lossy(), Some(&ms.provider))
         .await?;
+    // An explicit per-session sandbox rides the row: resume/restart must
+    // re-apply the same confinement instead of falling back to the
+    // backend's default (which may be looser).
+    if let Some(mode) = cfg.sandbox {
+        let _ = state
+            .store
+            .set_session_sandbox(&ms.id, Some(&mode.to_string()))
+            .await;
+    }
     if let Some(pid) = &project {
         let _ = state.store.set_session_project(&ms.id, Some(pid)).await;
     }
@@ -606,6 +629,9 @@ pub(super) async fn resume(
             .map(std::path::PathBuf::from)
             .unwrap_or_else(|| std::path::PathBuf::from("."));
         check_cwd_allowed(state, &cwd)?;
+        // An import is a NEW session: there is no stored per-session sandbox
+        // to re-apply, so the backend's configured policy governs it (and a
+        // serve-mode backend still refuses an explicit request there).
         let mut cfg = SessionConfig {
             cwd,
             ..Default::default()

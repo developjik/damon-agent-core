@@ -637,9 +637,12 @@ impl StreamJsonSession {
         let mut args = resolved.args.clone();
         args.extend(dialect.launch_args(&config, resume));
 
-        let transport = resolved
-            .spawn_ndjson(&args, &HashMap::new(), &config)
-            .await?;
+        // `[backends.X].env` reaches the child like every other backend's
+        // (it used to be dropped here, which silently disabled the override
+        // — and, worse for the sandbox, left the policy binding an
+        // `CLAUDE_CONFIG_DIR` the process never saw).
+        let env: HashMap<String, String> = resolved.env.iter().cloned().collect();
+        let transport = resolved.spawn_ndjson(&args, &env, &config).await?;
 
         let session = Arc::new(Self {
             transport: transport.clone(),
@@ -962,10 +965,8 @@ impl AgentSession for OneShotSession {
         args.extend(self.dialect.launch_args(&config, resume.as_deref()));
         args.extend(self.dialect.prompt_args(&prompt)?);
 
-        let transport = self
-            .resolved
-            .spawn_ndjson(&args, &HashMap::new(), &config)
-            .await?;
+        let env: HashMap<String, String> = self.resolved.env.iter().cloned().collect();
+        let transport = self.resolved.spawn_ndjson(&args, &env, &config).await?;
         *self.active.lock().await = Some(transport.clone());
 
         let turn_id = uuid::Uuid::new_v4().to_string();

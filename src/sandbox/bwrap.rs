@@ -20,7 +20,7 @@
 
 use std::path::Path;
 use std::process::{Command, Stdio};
-use std::sync::OnceLock;
+use std::sync::{Mutex, OnceLock};
 use std::time::{Duration, Instant};
 
 use anyhow::{Result, bail};
@@ -31,9 +31,14 @@ use super::{
 };
 
 /// How long the availability probe may take before it counts as unusable.
-/// A working bwrap answers in milliseconds; a hung one must not stall
-/// `doctor` or the first session.
-const PROBE_TIMEOUT: Duration = Duration::from_secs(10);
+/// A working bwrap answers in milliseconds. The probe runs inline on a
+/// tokio worker (the decision is sync), so the cap is short: a hung bwrap
+/// must not hold a worker for a session start.
+const PROBE_TIMEOUT: Duration = Duration::from_secs(3);
+
+/// How long a probe answer is trusted before the next `auto` resolution
+/// re-checks (see `Bwrap::status`).
+const STATUS_TTL: Duration = Duration::from_secs(30);
 
 pub struct Bwrap;
 
@@ -43,8 +48,23 @@ impl SandboxDriver for Bwrap {
     }
 
     fn status(&self) -> DriverStatus {
-        static STATUS: OnceLock<DriverStatus> = OnceLock::new();
-        STATUS.get_or_init(probe).clone()
+        // Re-probed after a short while: `auto` reads this on every session
+        // start, and a driver installed (or a sysctl flipped) while the
+        // daemon runs must take effect without a restart — a forever-cached
+        // "not usable" would leave a resident daemon unconfined with no way
+        // to tell. The probe is one short-lived process, so the window keeps
+        // session starts cheap without pinning the answer.
+        static CACHE: OnceLock<Mutex<Option<(Instant, DriverStatus)>>> = OnceLock::new();
+        let cache = CACHE.get_or_init(|| Mutex::new(None));
+        let mut guard = cache.lock().unwrap_or_else(|e| e.into_inner());
+        if let Some((at, status)) = guard.as_ref()
+            && at.elapsed() < STATUS_TTL
+        {
+            return status.clone();
+        }
+        let status = probe();
+        *guard = Some((Instant::now(), status.clone()));
+        status
     }
 
     fn wrap(
@@ -60,10 +80,15 @@ impl SandboxDriver for Bwrap {
     }
 }
 
-/// The launcher binary name. Resolved through PATH by the spawn, which is
-/// also how the probe found it.
+/// The launcher to exec: resolved to an absolute path against the daemon's
+/// PATH, so the launch does not depend on the *child's* environment — a
+/// `[backends.X].env` PATH (a custom bin dir, a cleanup helper) would
+/// otherwise leave `bwrap` unresolvable and the session unable to start.
+/// It also guarantees the binary the probe validated is the one used.
 fn launcher() -> String {
-    "bwrap".to_string()
+    crate::backend::registry::which("bwrap")
+        .map(|p| p.to_string_lossy().into_owned())
+        .unwrap_or_else(|| "bwrap".to_string())
 }
 
 /// Policy + command → the full `bwrap` argument list (everything after the
@@ -184,6 +209,10 @@ fn probe() -> DriverStatus {
         "/dev",
         "--proc",
         "/proc",
+        // The recipe's own scratch mount, so a host where /tmp cannot be
+        // masked fails here rather than at the first session.
+        "--tmpfs",
+        "/tmp",
         "--unshare-all",
         "--die-with-parent",
         "--new-session",
@@ -460,7 +489,12 @@ mod tests {
             policy: Box::new(policy(NetworkPolicy::Allow)),
         };
         let cmd = confined.confine("claude", &[]).unwrap();
-        assert_eq!(cmd.program, "bwrap");
+        // Absolute when bwrap is on the daemon's PATH, bare otherwise.
+        assert!(
+            cmd.program == "bwrap" || cmd.program.ends_with("/bwrap"),
+            "{}",
+            cmd.program
+        );
         assert_eq!(cmd.args.last().unwrap(), "claude");
     }
 
@@ -475,6 +509,7 @@ mod tests {
             network: NetworkPolicy::Backend,
             cwd: Path::new("/tmp"),
             extra_writable: &[],
+            launch_env: &[],
         };
         let decision = decide(&spec).unwrap();
         assert!(matches!(
@@ -486,9 +521,18 @@ mod tests {
             request: SandboxRequest::Bwrap,
             ..spec
         };
-        let err = decide(&spec).unwrap_err().to_string();
-        assert!(err.contains("opencode"), "{err}");
-        assert!(err.contains("sandbox = \"none\""), "{err}");
+        let err = decide(&spec).unwrap_err();
+        let msg = err.to_string();
+        assert!(msg.contains("opencode"), "{msg}");
+        assert!(msg.contains("sandbox = \"none\""), "{msg}");
+        // Typed, so the wire answers `not_supported` rather than a daemon
+        // bug (see rpc::error_payload).
+        assert!(
+            err.chain().any(|c| c
+                .downcast_ref::<crate::sandbox::SandboxUnsupported>()
+                .is_some()),
+            "the refusal must stay typed: {msg}"
+        );
     }
 
     /// An explicit opt-out is honored everywhere, serve mode included.
@@ -501,6 +545,7 @@ mod tests {
             network: NetworkPolicy::Backend,
             cwd: Path::new("/tmp"),
             extra_writable: &[],
+            launch_env: &[],
         };
         assert_eq!(
             decide(&spec).unwrap(),

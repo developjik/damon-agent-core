@@ -688,6 +688,10 @@ impl Store {
                     "ALTER TABLE sessions ADD COLUMN project_id TEXT",
                 ),
                 ("persona", "ALTER TABLE sessions ADD COLUMN persona TEXT"),
+                // The sandbox a session was created with, when it asked for
+                // one explicitly: resume has to apply the same confinement,
+                // not silently fall back to the backend's default.
+                ("sandbox", "ALTER TABLE sessions ADD COLUMN sandbox TEXT"),
             ] {
                 if !cols.contains(col)
                     && let Err(e) = c.execute_batch(ddl)
@@ -1153,7 +1157,8 @@ impl Store {
                      pinned INTEGER NOT NULL DEFAULT 0,
                      archived INTEGER NOT NULL DEFAULT 0,
                      project_id TEXT,
-                     persona TEXT
+                     persona TEXT,
+                     sandbox TEXT
                  );
                  CREATE TABLE messages (
                      id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -2623,6 +2628,40 @@ impl Store {
             .conn
             .call(move |c| {
                 c.query_row("SELECT persona FROM sessions WHERE id = ?1", [sid], |r| {
+                    r.get::<_, Option<String>>(0)
+                })
+                .optional()
+            })
+            .await?
+            .flatten())
+    }
+
+    /// Persist the sandbox mode a session was created with (None = the
+    /// session followed its backend's configured default). Resume re-applies
+    /// it: a session that asked to be confined must not come back looser
+    /// than it was.
+    pub async fn set_session_sandbox(&self, id: &str, mode: Option<&str>) -> anyhow::Result<()> {
+        let (sid, m) = (id.to_string(), mode.map(String::from));
+        self.conn
+            .call(move |c| {
+                c.execute(
+                    "UPDATE sessions SET sandbox = ?2 WHERE id = ?1",
+                    rusqlite::params![sid, m],
+                )?;
+                Ok::<(), tokio_rusqlite::Error>(())
+            })
+            .await?;
+        Ok(())
+    }
+
+    /// The sandbox mode the session asked for at create (None = inherit the
+    /// backend's default).
+    pub async fn session_sandbox(&self, id: &str) -> anyhow::Result<Option<String>> {
+        let sid = id.to_string();
+        Ok(self
+            .conn
+            .call(move |c| {
+                c.query_row("SELECT sandbox FROM sessions WHERE id = ?1", [sid], |r| {
                     r.get::<_, Option<String>>(0)
                 })
                 .optional()

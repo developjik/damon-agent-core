@@ -154,6 +154,9 @@ impl AgentClient for OmpClient {
             self.profile,
             SessionConfig {
                 cwd: cwd.unwrap_or_else(|| Path::new("/")).to_path_buf(),
+                // Catalog introspection only — see the same note in
+                // codex.rs: the probe lists models and starts no turn.
+                sandbox: Some(crate::sandbox::SandboxRequest::None),
                 ..Default::default()
             },
         )
