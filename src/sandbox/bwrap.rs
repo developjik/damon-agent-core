@@ -80,10 +80,15 @@ impl SandboxDriver for Bwrap {
     }
 }
 
-/// The launcher binary name. Resolved through PATH by the spawn, which is
-/// also how the probe found it.
+/// The launcher to exec: resolved to an absolute path against the daemon's
+/// PATH, so the launch does not depend on the *child's* environment — a
+/// `[backends.X].env` PATH (a custom bin dir, a cleanup helper) would
+/// otherwise leave `bwrap` unresolvable and the session unable to start.
+/// It also guarantees the binary the probe validated is the one used.
 fn launcher() -> String {
-    "bwrap".to_string()
+    crate::backend::registry::which("bwrap")
+        .map(|p| p.to_string_lossy().into_owned())
+        .unwrap_or_else(|| "bwrap".to_string())
 }
 
 /// Policy + command → the full `bwrap` argument list (everything after the
@@ -484,7 +489,12 @@ mod tests {
             policy: Box::new(policy(NetworkPolicy::Allow)),
         };
         let cmd = confined.confine("claude", &[]).unwrap();
-        assert_eq!(cmd.program, "bwrap");
+        // Absolute when bwrap is on the daemon's PATH, bare otherwise.
+        assert!(
+            cmd.program == "bwrap" || cmd.program.ends_with("/bwrap"),
+            "{}",
+            cmd.program
+        );
         assert_eq!(cmd.args.last().unwrap(), "claude");
     }
 

@@ -95,7 +95,11 @@ fn confined(policy: &SandboxPolicy, script: &str) -> SandboxCommand {
 
 fn run(policy: &SandboxPolicy, script: &str) -> std::process::Output {
     let cmd = confined(policy, script);
-    assert_eq!(cmd.program, "bwrap", "the launcher is the sandbox");
+    assert!(
+        cmd.program == "bwrap" || cmd.program.ends_with("/bwrap"),
+        "the launcher is the sandbox: {}",
+        cmd.program
+    );
     Command::new(&cmd.program)
         .args(&cmd.args)
         .output()
