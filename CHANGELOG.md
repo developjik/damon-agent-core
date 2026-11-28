@@ -39,9 +39,11 @@
   test in `tests/sandbox_bwrap.rs` — those skip themselves on hosts without
   a usable bwrap (no binary, or unprivileged user namespaces disabled).
 - Known gaps, left for their own decisions: the sandboxed agent can still
-  reach the daemon's loopback API (RPCs run unconfined), and git writes in
-  a linked worktree or a repo subdirectory (the git dir lives outside the
-  workdir) are not granted.
+  reach the daemon's loopback API (RPCs run unconfined); git writes in a
+  linked worktree or a repo subdirectory (the git dir lives outside the
+  workdir) are not granted; and a credential store created *while* a
+  session runs becomes readable to that session, because only paths that
+  existed at launch are masked (the next session masks it).
 - Egress inside the sandbox defaults to each backend's declared need
   (`sandbox_network = "backend"`): every agent CLI allows it, because its
   model API call is the point of running it. Per-command network denial

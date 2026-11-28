@@ -351,6 +351,12 @@ impl SandboxDecision {
     }
 }
 
+/// [`SandboxUnsupported`] as an `anyhow::Error`, so every refusal keeps the
+/// same wire code (`not_supported`) instead of landing as an internal error.
+fn unsupported(message: String) -> anyhow::Error {
+    SandboxUnsupported(message).into()
+}
+
 /// A sandbox request the backend or host cannot honor.
 ///
 /// Typed so the wire can answer `not_supported` instead of a generic
@@ -398,14 +404,13 @@ pub fn decide(spec: &SandboxSpec<'_>) -> Result<SandboxDecision> {
         // that cannot have it. Warning and continuing would silently run the
         // agent exactly as unprotected as before.
         (SandboxSupport::Serve, requested) => {
-            return Err(SandboxUnsupported(format!(
+            return Err(unsupported(format!(
                 "sandbox = \"{requested}\" cannot confine backend `{}`: {} To proceed, set \
                  sandbox = \"none\" explicitly (accepting no isolation), or use a spawn-mode \
                  backend (claude, codex, omp, pi, qwen, droid, zcode).",
                 spec.backend,
                 serve_reason(spec.backend)
-            ))
-            .into());
+            )));
         }
         (SandboxSupport::Spawn, SandboxRequest::Auto) => match platform_default() {
             Some(kind) => kind,
@@ -432,11 +437,11 @@ pub fn decide(spec: &SandboxSpec<'_>) -> Result<SandboxDecision> {
         if fallback_ok {
             return Ok(SandboxDecision::Unconfined(Unconfined::AutoNoDriver(why)));
         }
-        bail!(
+        return Err(unsupported(format!(
             "sandbox = \"{}\" is not supported on this platform: {why}. Use sandbox = \"auto\" \
              or \"none\".",
             spec.request
-        );
+        )));
     }
     let Some(driver) = driver_for(kind) else {
         let why = format!(
@@ -446,11 +451,11 @@ pub fn decide(spec: &SandboxSpec<'_>) -> Result<SandboxDecision> {
         if fallback_ok {
             return Ok(SandboxDecision::Unconfined(Unconfined::AutoNoDriver(why)));
         }
-        bail!(
+        return Err(unsupported(format!(
             "sandbox = \"{}\" is not available: {why}. Use sandbox = \"auto\" or \"none\", or the \
              bwrap driver on Linux.",
             spec.request
-        );
+        )));
     };
 
     let status = driver.status();
@@ -459,11 +464,11 @@ pub fn decide(spec: &SandboxSpec<'_>) -> Result<SandboxDecision> {
         if fallback_ok {
             return Ok(SandboxDecision::Unconfined(Unconfined::AutoNoDriver(why)));
         }
-        bail!(
+        return Err(unsupported(format!(
             "sandbox = \"{}\" is not usable here: {why}. Fix the driver (see `damond doctor`) or \
              set sandbox = \"none\" to run without isolation.",
             spec.request
-        );
+        )));
     }
 
     let policy = compile_policy(spec)?;

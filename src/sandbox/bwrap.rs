@@ -31,9 +31,10 @@ use super::{
 };
 
 /// How long the availability probe may take before it counts as unusable.
-/// A working bwrap answers in milliseconds; a hung one must not stall
-/// `doctor` or the first session.
-const PROBE_TIMEOUT: Duration = Duration::from_secs(10);
+/// A working bwrap answers in milliseconds. The probe runs inline on a
+/// tokio worker (the decision is sync), so the cap is short: a hung bwrap
+/// must not hold a worker for a session start.
+const PROBE_TIMEOUT: Duration = Duration::from_secs(3);
 
 /// How long a probe answer is trusted before the next `auto` resolution
 /// re-checks (see `Bwrap::status`).

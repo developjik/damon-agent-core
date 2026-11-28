@@ -78,6 +78,16 @@ pub fn mock_client_with_listing(
 /// (prompt containing "perm"), optionally hangs (prompt containing
 /// "hang") until interrupted. `listing` backs
 /// list_importable/list_all_importable for the history-scanner tests.
+/// Every `SessionConfig` a mock backend was handed, in order. Tests that
+/// care what the daemon launched with (the sandbox a session resumes under,
+/// for one) read the tail of this instead of reaching into the manager.
+pub fn mock_config_log() -> Arc<parking_lot::Mutex<Vec<SessionConfig>>> {
+    static LOG: std::sync::OnceLock<Arc<parking_lot::Mutex<Vec<SessionConfig>>>> =
+        std::sync::OnceLock::new();
+    LOG.get_or_init(|| Arc::new(parking_lot::Mutex::new(Vec::new())))
+        .clone()
+}
+
 struct MockClient {
     listing: Arc<parking_lot::Mutex<Vec<ImportableSession>>>,
 }
@@ -109,7 +119,8 @@ impl AgentClient for MockClient {
     async fn fetch_catalog(&self, _cwd: Option<&std::path::Path>) -> Result<ProviderCatalog> {
         Ok(ProviderCatalog::default())
     }
-    async fn create_session(&self, _config: SessionConfig) -> Result<Arc<dyn AgentSession>> {
+    async fn create_session(&self, config: SessionConfig) -> Result<Arc<dyn AgentSession>> {
+        mock_config_log().lock().push(config);
         Ok(Arc::new(MockSession::new()))
     }
 
@@ -123,8 +134,9 @@ impl AgentClient for MockClient {
     async fn resume_session(
         &self,
         handle: &PersistenceHandle,
-        _config: SessionConfig,
+        config: SessionConfig,
     ) -> Result<Arc<dyn AgentSession>> {
+        mock_config_log().lock().push(config);
         let s = MockSession::new();
         *s.handle.lock().await = Some(handle.clone());
         Ok(Arc::new(s))

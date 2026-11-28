@@ -137,12 +137,42 @@ async fn session_create_validates_the_sandbox_param() {
         }
     }
 
-    // The explicit value rides the row: resume re-applies it instead of
-    // falling back to the backend's (possibly looser) default.
+    // The explicit value rides the row, and the reattach path hands it back
+    // to the backend — a session created with an explicit mode must not come
+    // back under the backend's (possibly looser) default.
     let id = explicit.expect("session id");
     assert_eq!(
         store.session_sandbox(&id).await.unwrap().as_deref(),
         Some("none")
+    );
+    // Reattach needs a persisted native handle; the mock has none from a
+    // plain create, so give the row one and resume through it.
+    store
+        .set_agent_session(&id, "mock", "native-1")
+        .await
+        .unwrap();
+    // Close the live one first: an already-live session answers resume by
+    // subscribing, no relaunch involved.
+    rpc_send(
+        &mut ws,
+        json!({"id":8,"method":"session.close","params":{"sessionId":id}}),
+    )
+    .await;
+    let _ = read_reply(&mut ws, 8).await;
+    let log = common::mock_config_log();
+    log.lock().clear();
+    rpc_send(
+        &mut ws,
+        json!({"id":9,"method":"session.resume","params":{"sessionId":id}}),
+    )
+    .await;
+    let restarted = read_reply(&mut ws, 9).await;
+    assert!(restarted["result"]["sessionId"].is_string(), "{restarted}");
+    let relaunched = log.lock().last().cloned().expect("a relaunch config");
+    assert_eq!(
+        relaunched.sandbox,
+        Some(damon_core::sandbox::SandboxRequest::None),
+        "resume must re-apply the stored sandbox"
     );
 }
 
