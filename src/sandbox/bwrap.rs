@@ -302,6 +302,7 @@ mod tests {
     /// Golden: the compiled launcher argv, in order. Order is the policy —
     /// read-only root first, binds next, deny overlays after them, the
     /// command last — so this test is the review of the whole shape.
+    #[cfg(unix)]
     #[test]
     fn compiles_the_golden_argv() {
         let args = compile_args(
@@ -352,6 +353,7 @@ mod tests {
     /// A workdir under /tmp keeps the host's read-only /tmp: a tmpfs there
     /// would hide the bind, and bwrap resolves a mount's source in the
     /// namespace it has built so far.
+    #[cfg(unix)]
     #[test]
     fn a_tmp_workdir_does_not_shadow_itself() {
         let mut p = policy(NetworkPolicy::Allow);
@@ -375,6 +377,7 @@ mod tests {
     }
 
     /// Network is denied by `--unshare-all` and shared back only on ask.
+    #[cfg(unix)]
     #[test]
     fn shares_the_network_only_when_the_policy_allows_it() {
         let denied = compile_args(&policy(NetworkPolicy::Deny), "sh", &[]).unwrap();
@@ -387,6 +390,7 @@ mod tests {
 
     /// Every deny overlay is compiled after every writable bind, so a deny
     /// masks a wider allow instead of being masked by it.
+    #[cfg(unix)]
     #[test]
     fn deny_overlays_come_after_the_binds_they_mask() {
         let mut p = policy(NetworkPolicy::Allow);
@@ -408,6 +412,7 @@ mod tests {
 
     /// A credential that is a plain file is masked by /dev/null, not by a
     /// tmpfs (which cannot mount on a file and would fail the whole launch).
+    #[cfg(unix)]
     #[test]
     fn a_file_credential_is_masked_with_dev_null() {
         let mut p = policy(NetworkPolicy::Allow);
@@ -440,12 +445,16 @@ mod tests {
     /// The decision → command path the transport uses: unconfined passes the
     /// command through untouched, confined rewrites it to bwrap.
     #[test]
-    fn confine_rewrites_the_command_only_when_confined() {
+    fn an_unconfined_decision_passes_the_command_through() {
         let unconfined = SandboxDecision::Unconfined(Unconfined::ExplicitNone);
         let cmd = unconfined.confine("claude", &["-p".to_string()]).unwrap();
         assert_eq!(cmd.program, "claude");
         assert_eq!(cmd.args, vec!["-p"]);
+    }
 
+    #[cfg(unix)]
+    #[test]
+    fn a_confined_decision_rewrites_the_command_to_the_launcher() {
         let confined = SandboxDecision::Confined {
             kind: SandboxKind::Bwrap,
             policy: Box::new(policy(NetworkPolicy::Allow)),

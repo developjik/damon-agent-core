@@ -812,6 +812,7 @@ mod tests {
     /// `..` in the workdir is resolved before the promise "root is read-only"
     /// is made: a path that climbs out of the filesystem is `/`, and `/`
     /// cannot be bound writable.
+    #[cfg(unix)]
     #[test]
     fn a_workdir_that_traverses_to_the_host_root_is_rejected() {
         let scratch = Scratch::new("traverse");
@@ -834,6 +835,7 @@ mod tests {
 
     /// A symlinked writable root is bound at its target: the name cannot
     /// carry the mount somewhere the policy did not intend.
+    #[cfg(unix)]
     #[test]
     fn a_symlinked_writable_root_binds_its_target() {
         let scratch = Scratch::new("symlink");
@@ -854,6 +856,7 @@ mod tests {
     }
 
     /// A link pointing at `/` must not become a writable root.
+    #[cfg(unix)]
     #[test]
     fn a_symlink_to_the_host_root_is_not_writable() {
         let scratch = Scratch::new("rootlink");
