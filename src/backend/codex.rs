@@ -82,6 +82,11 @@ impl AgentClient for CodexClient {
             &self.resolved,
             SessionConfig {
                 cwd: cwd.unwrap_or_else(|| Path::new("/")).to_path_buf(),
+                // Catalog introspection: this probe answers `model/list` and
+                // never starts a turn, so it is not one of the spawns the
+                // sandbox policy exists to confine — and its cwd is `/`,
+                // which a policy refuses as a writable root.
+                sandbox: Some(crate::sandbox::SandboxRequest::None),
                 ..Default::default()
             },
         )

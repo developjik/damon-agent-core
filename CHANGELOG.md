@@ -7,8 +7,11 @@
 - `sandbox = "auto" | "bwrap" | "seatbelt" | "docker" | "none"` at the
   top level of the config (the default for every backend), per backend
   (`[backends.X] sandbox`), and per session (`session.create`'s `sandbox`
-  param). `auto` (default) means this platform's driver when the host can
-  run it; `none` is an explicit opt-out.
+  param, stored with the session so resume re-applies it rather than
+  falling back to a possibly looser default). `auto` (default) means this
+  platform's driver when the host can run it; `none` is an explicit
+  opt-out. The param is strictly typed — a present non-string answers
+  `-32602` instead of being dropped.
 - A request that the backend or host cannot honor **fails the session at
   start** with the cause and the choices — a missing binary, disabled
   unprivileged user namespaces, or a backend with no spawn point. Nothing
@@ -26,12 +29,19 @@
   `--cap-drop ALL`, `--die-with-parent`, `--new-session`.
 - `damond doctor` prints the platform driver's status and what each detected
   backend would actually get (or why it would get nothing).
+- Only credential paths that exist are masked: bwrap would have to create
+  a mount point under the read-only root otherwise, which fails the whole
+  launch (a path that does not exist has nothing to leak, and the sandbox
+  cannot create it either).
 - Tests: golden argv and policy rules in `src/sandbox/`, path-escape cases
   (relative, `..` traversal, symlinks, `/` as workdir, workdir inside a
   credential store), and four end-to-end bwrap tests plus a transport wiring
   test in `tests/sandbox_bwrap.rs` — those skip themselves on hosts without
-  a usable bwrap (no binary, or unprivileged user namespaces disabled), and
-  CI installs bubblewrap on the Linux leg so they normally run there.
+  a usable bwrap (no binary, or unprivileged user namespaces disabled).
+- Known gaps, left for their own decisions: the sandboxed agent can still
+  reach the daemon's loopback API (RPCs run unconfined), and git writes in
+  a linked worktree or a repo subdirectory (the git dir lives outside the
+  workdir) are not granted.
 - Egress inside the sandbox defaults to each backend's declared need
   (`sandbox_network = "backend"`): every agent CLI allows it, because its
   model API call is the point of running it. Per-command network denial

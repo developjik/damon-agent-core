@@ -312,6 +312,7 @@ impl ResolvedBackend {
             network: self.sandbox_network,
             cwd: &session.cwd,
             extra_writable: &session.granted_roots,
+            launch_env: &self.env,
         };
         crate::sandbox::decide(&spec)
     }
